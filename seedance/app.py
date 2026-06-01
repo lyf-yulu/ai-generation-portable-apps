@@ -495,6 +495,12 @@ def resolve_output_dir(raw: str | None) -> Path:
     return path.resolve()
 
 
+def desktop_output_dir() -> str:
+    desktop = Path.home() / "Desktop"
+    parent = desktop if desktop.exists() else Path.home()
+    return str((parent / "seedance_outputs").resolve())
+
+
 def run_one(job_id: str, index: int, form_values: dict[str, Any], form_files: dict[str, tuple[str, bytes]]) -> dict[str, Any]:
     class MemoryForm(dict):
         pass
@@ -601,6 +607,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if self.path == "/api/archives":
             json_response(self, 200, {"archives": list_archives()})
+            return
+        if self.path == "/api/default-output-dir":
+            json_response(self, 200, {"path": desktop_output_dir()})
             return
         if self.path.startswith("/api/preset-media/"):
             field = self.path.rsplit("/", 1)[-1]

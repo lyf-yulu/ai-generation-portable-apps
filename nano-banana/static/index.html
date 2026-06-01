@@ -17,6 +17,12 @@
             <input name="api_key" type="password" autocomplete="off" placeholder="留空使用本地配置">
           </label>
           <p id="keyHint" class="hint"></p>
+          <label>供应商
+            <select name="provider">
+              <option value="t8star" selected>T8Star Images API</option>
+              <option value="gemini">第三方 Gemini GenerateContent</option>
+            </select>
+          </label>
           <label>Base URL
             <input name="base_url" value="https://ai.t8star.cn">
           </label>
@@ -84,6 +90,48 @@
               <option value="fixed">fixed</option>
             </select>
           </label>
+          <section class="resizeBox">
+            <label class="inlineToggle"><input name="resize_enabled" type="checkbox"> 启用 Image Resize</label>
+            <div id="resizeControls" class="resizeControls isDisabled">
+              <div class="grid2">
+                <label>宽度
+                  <input name="resize_width" type="number" min="1" max="8192" value="1700" disabled>
+                </label>
+                <label>高度
+                  <input name="resize_height" type="number" min="1" max="8192" value="2500" disabled>
+                </label>
+              </div>
+              <div class="grid2">
+                <label>插值
+                  <select name="resize_interpolation" disabled>
+                    <option value="high" selected>bicubic</option>
+                    <option value="medium">bilinear</option>
+                    <option value="low">nearest</option>
+                  </select>
+                </label>
+                <label>方法
+                  <select name="resize_method" disabled>
+                    <option value="stretch" selected>stretch</option>
+                    <option value="contain">contain</option>
+                    <option value="cover">cover</option>
+                  </select>
+                </label>
+              </div>
+              <div class="grid2">
+                <label>条件
+                  <select name="resize_condition" disabled>
+                    <option value="always" selected>always</option>
+                    <option value="only_downscale">only downscale</option>
+                    <option value="only_upscale">only upscale</option>
+                  </select>
+                </label>
+                <label>multiple_of
+                  <input name="resize_multiple_of" type="number" min="0" max="512" value="0" disabled>
+                </label>
+              </div>
+              <p class="hint">勾选后才会在提交生成时处理参考图；不勾选则发送原图。</p>
+            </div>
+          </section>
           <div class="toggles">
             <label><input name="skip_error" type="checkbox"> 跳过错误</label>
             <label><input name="vary_seed" type="checkbox" checked> 每次 seed +1</label>

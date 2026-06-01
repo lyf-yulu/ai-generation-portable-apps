@@ -1,6 +1,6 @@
 # AI Generation Portable Apps
 
-Version: `v0.1`
+Version: `v0.2`
 
 This repository contains two local portable web apps:
 
@@ -62,4 +62,5 @@ nano-banana/Start_Nano_Banana.cmd
 
 ## Release
 
-Initial version: `v0.1`
+- `v0.2`: Added Nano Banana provider switching, optional browser-side image resize, drag-and-drop uploads, and cross-platform desktop output path helpers.
+- `v0.1`: Initial portable release.

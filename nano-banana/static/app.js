@@ -16,6 +16,17 @@ const presetHint = document.querySelector("#presetHint");
 const previewDialog = document.querySelector("#previewDialog");
 const previewDialogBody = document.querySelector("#previewDialogBody");
 const closePreviewBtn = document.querySelector("#closePreviewBtn");
+const resizeControls = document.querySelector("#resizeControls");
+const providerModels = {
+  t8star: {
+    baseUrl: "https://ai.t8star.cn",
+    models: ["nano-banana-2", "gemini-3.1-flash-image-preview"],
+  },
+  gemini: {
+    baseUrl: "https://chiyun.work",
+    models: ["banana2-ssvip", "nano-banana2[2K]-base"],
+  },
+};
 let savedMedia = {};
 
 function field(name) {
@@ -31,6 +42,7 @@ function openPreview(url) {
 }
 
 function renderPreview(drop, url, filename) {
+  drop.classList.add("hasPreview");
   drop.querySelector(".preview")?.remove();
   const img = document.createElement("img");
   img.className = "preview";
@@ -45,8 +57,16 @@ function renderPreview(drop, url, filename) {
 }
 
 function clearPreview(drop) {
+  drop.classList.remove("hasPreview");
   drop.querySelector(".preview")?.remove();
   drop.querySelector("span").textContent = "未上传";
+}
+
+function assignFile(input, file) {
+  const transfer = new DataTransfer();
+  transfer.items.add(file);
+  input.files = transfer.files;
+  input.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
 function wireFileInput(input) {
@@ -59,6 +79,22 @@ function wireFileInput(input) {
     }
     delete savedMedia[input.name];
     renderPreview(drop, URL.createObjectURL(file), file.name);
+  });
+
+  const drop = input.closest(".drop");
+  drop.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    drop.classList.add("isDragging");
+  });
+  drop.addEventListener("dragleave", () => {
+    drop.classList.remove("isDragging");
+  });
+  drop.addEventListener("drop", (event) => {
+    event.preventDefault();
+    drop.classList.remove("isDragging");
+    const file = event.dataTransfer?.files?.[0];
+    if (!file || !file.type.startsWith("image/")) return;
+    assignFile(input, file);
   });
 }
 
@@ -73,13 +109,45 @@ function makeDrop(name, label) {
   input.setAttribute("form", "jobForm");
   const span = document.createElement("span");
   span.textContent = "未上传";
-  wireFileInput(input);
   el.append(input, span);
+  wireFileInput(input);
   return el;
 }
 
 for (let i = 1; i <= 14; i += 1) {
   document.querySelector("#imageRefs").append(makeDrop(`image_${i}`, `Image ${i}`));
+}
+
+function setOptions(select, values, selected) {
+  select.innerHTML = "";
+  for (const value of values) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    select.append(option);
+  }
+  select.value = values.includes(selected) ? selected : values[0];
+}
+
+function updateProviderOptions(preserveCurrent = true) {
+  const provider = field("provider").value || "t8star";
+  const config = providerModels[provider] || providerModels.t8star;
+  const currentModel = preserveCurrent ? field("model").value : "";
+  setOptions(field("model"), config.models, currentModel);
+  const currentBase = field("base_url").value.trim();
+  const knownBases = Object.values(providerModels).map((item) => item.baseUrl);
+  if (!currentBase || knownBases.includes(currentBase)) {
+    field("base_url").value = config.baseUrl;
+  }
+  field("response_format").disabled = provider === "gemini";
+}
+
+function updateResizeState() {
+  const enabled = field("resize_enabled").checked;
+  resizeControls.classList.toggle("isDisabled", !enabled);
+  resizeControls.querySelectorAll("input, select").forEach((input) => {
+    input.disabled = !enabled;
+  });
 }
 
 async function loadConfig() {
@@ -116,6 +184,8 @@ function applyPreset(preset) {
       input.value = value;
     }
   }
+  updateProviderOptions(true);
+  updateResizeState();
   savedMedia = preset.media || {};
   for (const [name, item] of Object.entries(savedMedia)) {
     const input = field(name);
@@ -137,15 +207,110 @@ async function loadArchives() {
   if (res.ok) renderArchives((await res.json()).archives);
 }
 
-function formDataWithSavedMedia() {
+function appendDisabledResizeValues(data) {
+  for (const name of ["resize_width", "resize_height", "resize_interpolation", "resize_method", "resize_condition", "resize_multiple_of"]) {
+    const input = field(name);
+    if (input) data.set(name, input.value);
+  }
+}
+
+async function imageUrlToFile(url, filename) {
+  const res = await fetch(url);
+  const blob = await res.blob();
+  return new File([blob], filename || "image.png", { type: blob.type || "image/png" });
+}
+
+function targetResizeSize(fileWidth, fileHeight) {
+  let width = Math.max(1, Number(field("resize_width").value) || fileWidth);
+  let height = Math.max(1, Number(field("resize_height").value) || fileHeight);
+  const multiple = Math.max(0, Number(field("resize_multiple_of").value) || 0);
+  if (multiple > 1) {
+    width = Math.max(multiple, Math.round(width / multiple) * multiple);
+    height = Math.max(multiple, Math.round(height / multiple) * multiple);
+  }
+  const condition = field("resize_condition").value;
+  if (condition === "only_downscale" && (width >= fileWidth || height >= fileHeight)) return null;
+  if (condition === "only_upscale" && (width <= fileWidth || height <= fileHeight)) return null;
+  return { width, height };
+}
+
+async function resizeImageFile(file) {
+  if (!field("resize_enabled").checked || !file.type.startsWith("image/")) return file;
+  const bitmap = await createImageBitmap(file);
+  const target = targetResizeSize(bitmap.width, bitmap.height);
+  if (!target) return file;
+  const canvas = document.createElement("canvas");
+  canvas.width = target.width;
+  canvas.height = target.height;
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = field("resize_interpolation").value;
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  let sx = 0;
+  let sy = 0;
+  let sw = bitmap.width;
+  let sh = bitmap.height;
+  let dx = 0;
+  let dy = 0;
+  let dw = canvas.width;
+  let dh = canvas.height;
+  const method = field("resize_method").value;
+  if (method === "contain" || method === "cover") {
+    const imageRatio = bitmap.width / bitmap.height;
+    const targetRatio = canvas.width / canvas.height;
+    if (method === "contain") {
+      if (imageRatio > targetRatio) {
+        dw = canvas.width;
+        dh = Math.round(canvas.width / imageRatio);
+      } else {
+        dh = canvas.height;
+        dw = Math.round(canvas.height * imageRatio);
+      }
+      dx = Math.round((canvas.width - dw) / 2);
+      dy = Math.round((canvas.height - dh) / 2);
+    } else if (imageRatio > targetRatio) {
+      sw = Math.round(bitmap.height * targetRatio);
+      sx = Math.round((bitmap.width - sw) / 2);
+    } else {
+      sh = Math.round(bitmap.width / targetRatio);
+      sy = Math.round((bitmap.height - sh) / 2);
+    }
+  }
+  ctx.drawImage(bitmap, sx, sy, sw, sh, dx, dy, dw, dh);
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+  bitmap.close();
+  if (!blob) return file;
+  const stem = file.name.replace(/\.[^.]+$/, "");
+  return new File([blob], `${stem}_resized.png`, { type: "image/png" });
+}
+
+async function formDataWithSavedMedia(options = {}) {
   const data = new FormData(form);
-  data.set("saved_media", JSON.stringify(savedMedia));
+  appendDisabledResizeValues(data);
+  const savedForBackend = { ...savedMedia };
+  if (options.resizeImages && field("resize_enabled").checked) {
+    for (let i = 1; i <= 14; i += 1) {
+      const name = `image_${i}`;
+      const input = field(name);
+      let file = input?.files?.[0] || null;
+      if (!file && savedMedia[name]) {
+        file = await imageUrlToFile(savedMedia[name].url, savedMedia[name].filename);
+      }
+      if (!file) continue;
+      const resized = await resizeImageFile(file);
+      data.set(name, resized, resized.name);
+      delete savedForBackend[name];
+    }
+  }
+  data.set("saved_media", JSON.stringify(savedForBackend));
   return data;
 }
 
 async function savePreset() {
   presetHint.textContent = "保存中...";
-  const res = await fetch("/api/preset", { method: "POST", body: formDataWithSavedMedia() });
+  const res = await fetch("/api/preset", { method: "POST", body: await formDataWithSavedMedia() });
   const data = await res.json();
   if (!res.ok) {
     presetHint.textContent = data.error || "保存失败";
@@ -247,7 +412,7 @@ form.addEventListener("submit", async (event) => {
   statusText.textContent = "提交中";
   resultsEl.innerHTML = "";
   eventsEl.textContent = "";
-  const res = await fetch("/api/jobs", { method: "POST", body: formDataWithSavedMedia() });
+  const res = await fetch("/api/jobs", { method: "POST", body: await formDataWithSavedMedia({ resizeImages: true }) });
   const payload = await res.json();
   if (!res.ok) {
     submitBtn.disabled = false;
@@ -263,6 +428,8 @@ loadArchiveBtn.addEventListener("click", loadArchive);
 deleteArchiveBtn.addEventListener("click", deleteArchive);
 clearPresetBtn.addEventListener("click", clearPreset);
 closePreviewBtn.addEventListener("click", () => previewDialog.close());
+field("provider").addEventListener("change", () => updateProviderOptions(false));
+field("resize_enabled").addEventListener("change", updateResizeState);
 previewDialog.addEventListener("click", (event) => {
   if (event.target === previewDialog) previewDialog.close();
 });
@@ -279,8 +446,14 @@ chooseOutputBtn.addEventListener("click", async () => {
   }
 });
 appOutputBtn.addEventListener("click", () => { field("output_dir").value = ""; });
-desktopOutputBtn.addEventListener("click", () => { field("output_dir").value = `${navigator.platform.includes("Mac") ? "/Users/Shared" : ""}/NanoBanana_outputs`; });
+desktopOutputBtn.addEventListener("click", async () => {
+  const res = await fetch("/api/default-output-dir");
+  const data = await res.json();
+  if (res.ok && data.path) field("output_dir").value = data.path;
+});
 
 loadConfig();
+updateProviderOptions(true);
+updateResizeState();
 loadPreset();
 loadArchives();

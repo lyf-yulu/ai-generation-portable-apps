@@ -211,6 +211,12 @@ textarea {
   padding: 8px;
 }
 
+.drop.isDragging {
+  border-color: #2673e8;
+  background: #eef5ff;
+  box-shadow: 0 0 0 3px rgba(38, 115, 232, 0.12);
+}
+
 .drop input {
   display: none;
 }

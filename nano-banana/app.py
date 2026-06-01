@@ -39,9 +39,11 @@ LOCK = threading.Lock()
 
 FILE_FIELDS = {f"image_{i}" for i in range(1, 15)}
 VALUE_FIELDS = {
-    "api_key", "base_url", "output_dir", "mode", "model", "aspect_ratio", "image_size",
+    "api_key", "base_url", "output_dir", "provider", "mode", "model", "aspect_ratio", "image_size",
     "response_format", "seed", "control_after_generate", "skip_error", "repeat_count",
     "concurrency", "poll_interval", "timeout", "vary_seed", "prompt", "archive_name",
+    "resize_enabled", "resize_width", "resize_height", "resize_interpolation", "resize_method",
+    "resize_condition", "resize_multiple_of",
 }
 
 
@@ -85,6 +87,10 @@ def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | Non
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {exc.code}: {raw}") from exc
+
+
+def request_gemini_generate(url: str, api_key: str, payload: dict[str, Any], timeout: int = 300) -> dict[str, Any]:
+    return request_json("POST", url, api_key, payload, timeout=timeout)
 
 
 def multipart_post(url: str, api_key: str, fields: dict[str, str], files: list[tuple[str, str, bytes, str]], timeout: int = 300) -> dict[str, Any]:
@@ -292,6 +298,12 @@ def resolve_output_dir(raw: str | None) -> Path:
     return path.resolve()
 
 
+def desktop_output_dir() -> str:
+    desktop = Path.home() / "Desktop"
+    parent = desktop if desktop.exists() else Path.home()
+    return str((parent / "NanoBanana_outputs").resolve())
+
+
 def extract_items(result: dict[str, Any]) -> list[dict[str, Any]]:
     data = result.get("data")
     if isinstance(data, dict) and "data" in data:
@@ -324,6 +336,38 @@ def save_image_item(item: dict[str, Any], out_dir: Path, prefix: str, idx: int) 
     raise RuntimeError(f"No image data in result item: {item}")
 
 
+def extract_gemini_images(result: dict[str, Any]) -> list[dict[str, str]]:
+    images: list[dict[str, str]] = []
+    candidates = result.get("candidates") if isinstance(result.get("candidates"), list) else []
+    for candidate in candidates:
+        content = candidate.get("content", {}) if isinstance(candidate, dict) else {}
+        parts = content.get("parts", []) if isinstance(content, dict) else []
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            image_node = part.get("inlineData") or part.get("inline_data")
+            if isinstance(image_node, dict) and image_node.get("data"):
+                images.append({
+                    "b64_json": str(image_node["data"]),
+                    "mime_type": str(image_node.get("mimeType") or image_node.get("mime_type") or "image/png"),
+                })
+    return images
+
+
+def save_gemini_image_item(item: dict[str, str], out_dir: Path, prefix: str, idx: int) -> tuple[str, str]:
+    mime = item.get("mime_type", "image/png")
+    suffix = mimetypes.guess_extension(mime) or ".png"
+    if suffix == ".jpe":
+        suffix = ".jpg"
+    out_path = out_dir / f"{prefix}_{idx}{suffix}"
+    data = item["b64_json"]
+    missing_padding = len(data) % 4
+    if missing_padding:
+        data += "=" * (4 - missing_padding)
+    out_path.write_bytes(base64.b64decode(data))
+    return "", str(out_path)
+
+
 def build_form(values: dict[str, Any], files: dict[str, tuple[str, bytes]]) -> dict[str, Any]:
     form: dict[str, Any] = {}
     for k, v in values.items():
@@ -347,6 +391,7 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
     form = build_form(values, files)
     api_key = str(values["api_key"]).strip()
     base_url = str(values.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+    provider = get_field(form, "provider", "t8star")
     mode = get_field(form, "mode", "img2img")
     seed_raw = get_field(form, "seed", "").strip()
     seed = int(seed_raw) if seed_raw else 0
@@ -365,7 +410,57 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
     if seed > 0:
         common["seed"] = str(seed)
 
-    add_event(job_id, f"Run {index}: submitting {mode}")
+    add_event(job_id, f"Run {index}: submitting {provider}/{mode}")
+    if provider == "gemini":
+        image_count = 0
+        parts: list[dict[str, Any]] = [{"text": common["prompt"]}]
+        if mode != "text2img":
+            for i in range(1, 15):
+                file_data = get_file_or_saved(form, f"image_{i}")
+                if not file_data:
+                    continue
+                filename, blob = file_data
+                parts.append({
+                    "inline_data": {
+                        "mime_type": mimetypes.guess_type(filename)[0] or "image/png",
+                        "data": base64.b64encode(blob).decode("utf-8"),
+                    }
+                })
+                image_count += 1
+        generation_config: dict[str, Any] = {"imageConfig": {}}
+        if common.get("aspect_ratio") and common["aspect_ratio"] != "auto":
+            generation_config["imageConfig"]["aspectRatio"] = common["aspect_ratio"]
+        if image_size:
+            generation_config["imageConfig"]["imageSize"] = image_size
+        if seed > 0:
+            generation_config["seed"] = seed
+        model_path = urllib.parse.quote(common["model"], safe="")
+        result = request_gemini_generate(
+            f"{base_url}/v1beta/models/{model_path}:generateContent",
+            api_key,
+            {"contents": [{"parts": parts}], "generationConfig": generation_config},
+        )
+        task_id = f"gemini_{uuid.uuid4().hex[:12]}"
+        items = extract_gemini_images(result)
+        if not items:
+            raise RuntimeError(f"No image result found: {result}")
+        out_dir = resolve_output_dir(values.get("output_dir"))
+        file_token_results = []
+        prefix = f"{time.strftime('%Y%m%d_%H%M%S')}_run{index}_{task_id}"
+        for i, item in enumerate(items, 1):
+            image_url, local_path = save_gemini_image_item(item, out_dir, prefix, i)
+            token = uuid.uuid4().hex
+            with LOCK:
+                FILES[token] = Path(local_path)
+            file_token_results.append({
+                "image_url": image_url,
+                "download_url": f"/api/download/{token}",
+                "filename": Path(local_path).name,
+                "local_path": local_path,
+            })
+        add_event(job_id, f"Run {index}: saved {len(file_token_results)} image(s), input_images:{image_count}")
+        return {"index": index, "task_id": task_id, "status": "succeeded", "images": file_token_results}
+
     if mode == "text2img":
         payload = dict(common)
         if seed > 0:
@@ -475,6 +570,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if self.path == "/api/archives":
             json_response(self, 200, {"archives": list_archives()})
+            return
+        if self.path == "/api/default-output-dir":
+            json_response(self, 200, {"path": desktop_output_dir()})
             return
         if self.path.startswith("/api/preset-media/"):
             field = self.path.rsplit("/", 1)[-1]

@@ -61,6 +61,13 @@ function clearPreview(drop) {
   drop.querySelector("span").textContent = "未上传";
 }
 
+function assignFile(input, file) {
+  const transfer = new DataTransfer();
+  transfer.items.add(file);
+  input.files = transfer.files;
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
 function wireFileInput(input) {
   input.addEventListener("change", () => {
     const drop = input.closest(".drop");
@@ -71,6 +78,26 @@ function wireFileInput(input) {
     }
     delete savedMedia[input.name];
     renderPreview(drop, mediaKind(input.name), URL.createObjectURL(file), file.name);
+  });
+
+  const drop = input.closest(".drop");
+  drop.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    drop.classList.add("isDragging");
+  });
+  drop.addEventListener("dragleave", () => {
+    drop.classList.remove("isDragging");
+  });
+  drop.addEventListener("drop", (event) => {
+    event.preventDefault();
+    drop.classList.remove("isDragging");
+    const file = event.dataTransfer?.files?.[0];
+    if (!file) return;
+    if (input.accept && !input.accept.split(",").some((accept) => {
+      const rule = accept.trim();
+      return rule.endsWith("/*") ? file.type.startsWith(rule.slice(0, -1)) : file.type === rule;
+    })) return;
+    assignFile(input, file);
   });
 }
 
@@ -87,9 +114,9 @@ function makeDrop(name, label, accept) {
 
   const span = document.createElement("span");
   span.textContent = "未上传";
-  wireFileInput(input);
 
   el.append(input, span);
+  wireFileInput(input);
   return el;
 }
 
@@ -100,7 +127,6 @@ for (let i = 1; i <= 3; i += 1) {
   document.querySelector("#videoRefs").append(makeDrop(`ref_video_${i}`, `参考视频 ${i}`, "video/*"));
   document.querySelector("#audioRefs").append(makeDrop(`ref_audio_${i}`, `参考音频 ${i}`, "audio/*"));
 }
-document.querySelectorAll('.drop input[type="file"]').forEach(wireFileInput);
 
 async function loadConfig() {
   const res = await fetch("/api/config");
@@ -313,8 +339,10 @@ appOutputBtn.addEventListener("click", () => {
   field("output_dir").value = "";
 });
 
-desktopOutputBtn.addEventListener("click", () => {
-  field("output_dir").value = "/Users/260413a/Desktop/seedance_outputs";
+desktopOutputBtn.addEventListener("click", async () => {
+  const res = await fetch("/api/default-output-dir");
+  const data = await res.json();
+  if (res.ok && data.path) field("output_dir").value = data.path;
 });
 
 loadConfig();

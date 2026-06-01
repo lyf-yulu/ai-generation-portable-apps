@@ -53,8 +53,11 @@ input:focus, select:focus, textarea:focus {
 .hint { margin: -4px 0 10px; color: #697386; font-size: 12px; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .toggles { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.toggles label { display: flex; align-items: center; gap: 8px; margin: 0; }
-.toggles input { width: 16px; height: 16px; }
+.toggles label, .inlineToggle { display: flex; align-items: center; gap: 8px; margin: 0; }
+.toggles input, .inlineToggle input { width: 16px; height: 16px; }
+.resizeBox { margin: 4px 0 12px; padding: 12px; border: 1px solid #dde1e8; border-radius: 8px; background: #fbfcfe; }
+.resizeControls { margin-top: 12px; }
+.resizeControls.isDisabled { opacity: .55; }
 
 button {
   width: 100%;
@@ -118,6 +121,14 @@ textarea { min-height: 220px; resize: vertical; line-height: 1.55; }
   align-content: center;
   text-align: center;
   cursor: pointer;
+}
+.drop.hasPreview {
+  padding: 8px;
+}
+.drop.isDragging {
+  border-color: #2673e8;
+  background: #eef5ff;
+  box-shadow: 0 0 0 3px rgba(38, 115, 232, .12);
 }
 .drop input { display: none; }
 .drop span {
