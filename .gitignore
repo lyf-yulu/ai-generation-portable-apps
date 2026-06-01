@@ -1,0 +1,21 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+.portable_python/
+
+# Runtime data
+outputs/*
+archives/*
+state/*
+logs/*
+!outputs/.gitkeep
+!archives/.gitkeep
+!state/.gitkeep
+!state/media/.gitkeep
+!logs/.gitkeep
+
+# Secrets and local configs
+*.seedance
+*.nanobanana
+*.env

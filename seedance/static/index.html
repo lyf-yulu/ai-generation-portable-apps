@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Seedance 多参考生成</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="app">
+    <aside class="sidebar">
+      <h1>Seedance</h1>
+      <form id="jobForm">
+        <section>
+          <h2>接口</h2>
+          <label>API Key
+            <input name="api_key" type="password" autocomplete="off" placeholder="留空使用本地配置">
+          </label>
+          <p id="keyHint" class="hint"></p>
+          <label>Base URL
+            <input name="base_url" value="https://ai.t8star.cn">
+          </label>
+          <label>输出目录
+            <input name="output_dir" placeholder="留空则保存到本程序 outputs 文件夹">
+          </label>
+          <div class="rowButtons">
+            <button id="chooseOutputBtn" type="button">选择目录</button>
+            <button id="appOutputBtn" type="button">程序 outputs</button>
+            <button id="desktopOutputBtn" type="button">桌面 outputs</button>
+          </div>
+        </section>
+
+        <section>
+          <h2>参数</h2>
+          <label>模型
+            <select name="model">
+              <option value="doubao-seedance-2-0-260128">Seedance 2.0</option>
+              <option value="doubao-seedance-2-0-fast-260128">Seedance 2.0 Fast</option>
+            </select>
+          </label>
+          <div class="grid2">
+            <label>时长
+              <input name="duration" type="number" min="4" max="15" value="12">
+            </label>
+            <label>分辨率
+              <select name="resolution">
+                <option>720p</option>
+                <option>480p</option>
+                <option>1080p</option>
+                <option>native1080p</option>
+                <option>2k</option>
+                <option>4k</option>
+              </select>
+            </label>
+          </div>
+          <div class="grid2">
+            <label>比例
+              <select name="ratio">
+                <option>16:9</option>
+                <option>9:16</option>
+                <option>1:1</option>
+                <option>4:3</option>
+                <option>3:4</option>
+                <option>21:9</option>
+                <option>9:21</option>
+                <option>adaptive</option>
+              </select>
+            </label>
+            <label>Seed
+              <input name="seed" type="number" min="0" max="2147483647" placeholder="随机">
+            </label>
+          </div>
+          <div class="toggles">
+            <label><input name="generate_audio" type="checkbox"> 生成音频</label>
+            <label><input name="watermark" type="checkbox"> 水印</label>
+            <label><input name="return_last_frame" type="checkbox"> 返回尾帧</label>
+            <label><input name="web_search" type="checkbox"> Web Search</label>
+          </div>
+        </section>
+
+        <section>
+          <h2>并发重复</h2>
+          <p class="hint">实际生成次数取「重复次数」和「并发数」中较大的值。</p>
+          <div class="grid2">
+            <label>重复次数
+              <input name="repeat_count" type="number" min="1" max="20" value="1">
+            </label>
+            <label>并发数
+              <input name="concurrency" type="number" min="1" max="20" value="1">
+            </label>
+          </div>
+          <div class="grid2">
+            <label>轮询秒
+              <input name="poll_interval" type="number" min="3" max="120" value="10">
+            </label>
+            <label>超时秒
+              <input name="timeout" type="number" min="60" value="3600">
+            </label>
+          </div>
+          <div class="toggles">
+            <label><input name="vary_seed" type="checkbox" checked> 每次 seed +1</label>
+          </div>
+        </section>
+
+        <button id="submitBtn" type="submit">开始生成</button>
+        <section class="archiveBox">
+          <h2>存档</h2>
+          <label>存档名
+            <input name="archive_name" placeholder="例如 Sarah_Nova_门口冲突">
+          </label>
+          <label>读取存档
+            <select id="archiveSelect"></select>
+          </label>
+          <div class="rowButtons archiveActions">
+            <button id="savePresetBtn" type="button">保存为文件</button>
+            <button id="loadArchiveBtn" type="button">读取存档</button>
+            <button id="deleteArchiveBtn" type="button">删除存档</button>
+          </div>
+          <p id="presetHint" class="hint"></p>
+        </section>
+        <button id="clearPresetBtn" class="secondaryWide" type="button">清空当前读取配置</button>
+      </form>
+    </aside>
+
+    <section class="workspace">
+      <div class="promptPanel">
+        <h2>Prompt</h2>
+        <textarea name="prompt" form="jobForm" spellcheck="false">电影级三维动画剧情镜头，固定角色身份，不得混淆人物。
+Sarah（人物形象为@ref_image5）
+
+Nova（人物形象为@ref_image6）
+
+剧情发生在@ref_image9红圈处（仅作为3D画面的2.5D示意图）
+角色外观固定，场景连续统一。分镜之间衔接合理，不要直接跳转。
+
+0-3秒：Sarah 在游戏房内听见门外有细微声响，神情疑惑又警觉，慢慢朝门口走去。镜头从她背后中景缓慢跟拍，气氛安静但略带不安。关键帧参考@ref_image1。
+
+3-6秒：Sarah 刚走到门口，Nova 突然从门外出现，脸上带着狡黠、挑衅又不怀好意的笑，猛地逼近 Sarah。Sarah 被吓得下意识后退，身体后仰，露出惊讶和防备的反应。镜头切为门口冲突中景，动作突然。关键帧参考@ref_image2。
+
+6-9秒：Nova 一边举起手机开始拍摄，一边径直越过 Sarah 走进游戏房。Sarah 立刻回身追上去，伸手试图拦住 Nova，不想让她拍摄。Nova 始终拿着手机向前移动，Sarah 处于阻拦却拦不住的状态。镜头保持双人中景，动作连贯。关键帧参考@ref_image3。
+
+9-12秒：Sarah 极力阻止 Nova 拍摄，但没有成功。Sarah 在前景焦急地伸手，表情慌乱又无力。Nova 在中远景或侧前方依旧举着手机继续拍摄，神情得意、轻蔑，完全不理会 Sarah。镜头强调 Sarah 的无力感和 Nova 的强势闯入。关键帧参考@ref_image4。</textarea>
+      </div>
+
+      <div class="uploadPanel">
+        <h2>首尾帧</h2>
+        <div class="uploadGrid two">
+          <label class="drop">首帧<input form="jobForm" name="first_frame" type="file" accept="image/*"><span>未上传</span></label>
+          <label class="drop">尾帧<input form="jobForm" name="last_frame" type="file" accept="image/*"><span>未上传</span></label>
+        </div>
+
+        <h2>参考图</h2>
+        <div class="uploadGrid refs" id="imageRefs"></div>
+
+        <h2>参考视频</h2>
+        <div class="uploadGrid three" id="videoRefs"></div>
+
+        <h2>参考音频</h2>
+        <div class="uploadGrid three" id="audioRefs"></div>
+      </div>
+
+      <div class="resultPanel">
+        <div class="resultHeader">
+          <h2>结果</h2>
+          <div id="statusText">空闲</div>
+        </div>
+        <div id="results" class="results"></div>
+        <pre id="events"></pre>
+      </div>
+    </section>
+  </main>
+  <dialog id="previewDialog" class="previewDialog">
+    <button id="closePreviewBtn" type="button" aria-label="关闭">×</button>
+    <div id="previewDialogBody"></div>
+  </dialog>
+  <script src="/app.js"></script>
+</body>
+</html>
