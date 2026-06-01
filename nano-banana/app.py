@@ -93,6 +93,10 @@ def request_gemini_generate(url: str, api_key: str, payload: dict[str, Any], tim
     return request_json("POST", url, api_key, payload, timeout=timeout)
 
 
+def request_chat_completion(url: str, api_key: str, payload: dict[str, Any], timeout: int = 300) -> dict[str, Any]:
+    return request_json("POST", url, api_key, payload, timeout=timeout)
+
+
 def multipart_post(url: str, api_key: str, fields: dict[str, str], files: list[tuple[str, str, bytes, str]], timeout: int = 300) -> dict[str, Any]:
     boundary = f"----nanobanana{uuid.uuid4().hex}"
     body = bytearray()
@@ -354,6 +358,39 @@ def extract_gemini_images(result: dict[str, Any]) -> list[dict[str, str]]:
     return images
 
 
+def extract_chat_completion_images(result: dict[str, Any]) -> list[dict[str, str]]:
+    images: list[dict[str, str]] = []
+    for choice in result.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str):
+            for url in re.findall(r"https?://[^)\s]+", content):
+                images.append({"url": url})
+        elif isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                text = part.get("text")
+                if isinstance(text, str):
+                    for url in re.findall(r"https?://[^)\s]+", text):
+                        images.append({"url": url})
+                image_url = part.get("image_url")
+                if isinstance(image_url, dict) and image_url.get("url"):
+                    images.append({"url": str(image_url["url"])})
+                if part.get("b64_json"):
+                    images.append({"b64_json": str(part["b64_json"])})
+        if message.get("b64_json"):
+            images.append({"b64_json": str(message["b64_json"])})
+    return images
+
+
+def file_to_data_url(filename: str, blob: bytes) -> str:
+    mime = mimetypes.guess_type(filename)[0] or "image/png"
+    return f"data:{mime};base64,{base64.b64encode(blob).decode('utf-8')}"
+
+
 def save_gemini_image_item(item: dict[str, str], out_dir: Path, prefix: str, idx: int) -> tuple[str, str]:
     mime = item.get("mime_type", "image/png")
     suffix = mimetypes.guess_extension(mime) or ".png"
@@ -413,6 +450,43 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
     add_event(job_id, f"Run {index}: submitting {provider}/{mode}")
     if provider == "gemini":
         image_count = 0
+        if common["model"] == "gpt-image-2":
+            content: list[dict[str, Any]] = [{"type": "text", "text": common["prompt"]}]
+            if mode != "text2img":
+                for i in range(1, 15):
+                    file_data = get_file_or_saved(form, f"image_{i}")
+                    if not file_data:
+                        continue
+                    filename, blob = file_data
+                    content.append({"type": "image_url", "image_url": {"url": file_to_data_url(filename, blob)}})
+                    image_count += 1
+            payload = {
+                "model": common["model"],
+                "messages": [{"role": "user", "content": content}],
+                "max_tokens": 256,
+            }
+            result = request_chat_completion(f"{base_url}/v1/chat/completions", api_key, payload)
+            task_id = f"chat_{uuid.uuid4().hex[:12]}"
+            items = extract_chat_completion_images(result)
+            if not items:
+                raise RuntimeError(f"No image result found: {result}")
+            out_dir = resolve_output_dir(values.get("output_dir"))
+            file_token_results = []
+            prefix = f"{time.strftime('%Y%m%d_%H%M%S')}_run{index}_{task_id}"
+            for i, item in enumerate(items, 1):
+                image_url, local_path = save_image_item(item, out_dir, prefix, i)
+                token = uuid.uuid4().hex
+                with LOCK:
+                    FILES[token] = Path(local_path)
+                file_token_results.append({
+                    "image_url": image_url,
+                    "download_url": f"/api/download/{token}",
+                    "filename": Path(local_path).name,
+                    "local_path": local_path,
+                })
+            add_event(job_id, f"Run {index}: saved {len(file_token_results)} image(s), input_images:{image_count}")
+            return {"index": index, "task_id": task_id, "status": "succeeded", "images": file_token_results}
+
         parts: list[dict[str, Any]] = [{"text": common["prompt"]}]
         if mode != "text2img":
             for i in range(1, 15):

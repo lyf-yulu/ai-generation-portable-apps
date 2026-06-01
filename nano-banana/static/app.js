@@ -24,7 +24,7 @@ const providerModels = {
   },
   gemini: {
     baseUrl: "https://chiyun.work",
-    models: ["banana2-ssvip", "nano-banana2[2K]-base"],
+    models: ["banana2-ssvip", "nano-banana2[2K]-base", "gpt-image-2"],
   },
 };
 let savedMedia = {};
