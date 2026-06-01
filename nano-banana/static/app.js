@@ -62,6 +62,12 @@ function clearPreview(drop) {
   drop.querySelector("span").textContent = "未上传";
 }
 
+function clearSelectedMedia(input) {
+  input.value = "";
+  delete savedMedia[input.name];
+  clearPreview(input.closest(".drop"));
+}
+
 function assignFile(input, file) {
   const transfer = new DataTransfer();
   transfer.items.add(file);
@@ -109,7 +115,18 @@ function makeDrop(name, label) {
   input.setAttribute("form", "jobForm");
   const span = document.createElement("span");
   span.textContent = "未上传";
-  el.append(input, span);
+
+  const removeBtn = document.createElement("button");
+  removeBtn.className = "removeMediaBtn";
+  removeBtn.type = "button";
+  removeBtn.textContent = "移除";
+  removeBtn.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    clearSelectedMedia(input);
+  });
+
+  el.append(input, span, removeBtn);
   wireFileInput(input);
   return el;
 }
