@@ -11,6 +11,19 @@
     <aside class="sidebar">
       <h1>Nano Banana</h1>
       <form id="jobForm">
+        <section class="workspaceBox">
+          <h2>主题工作区</h2>
+          <label>当前主题
+            <input id="workspaceName" placeholder="例如 产品A / 电商图 / 角色设定">
+          </label>
+          <div class="rowButtons">
+            <button id="newWorkspaceBtn" type="button">新主题页</button>
+            <button id="duplicateWorkspaceBtn" type="button">复制当前</button>
+            <button id="saveWorkspaceBtn" type="button">保存草稿</button>
+          </div>
+          <p id="workspaceHint" class="hint"></p>
+        </section>
+
         <section>
           <h2>接口</h2>
           <label>API Key

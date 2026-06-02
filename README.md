@@ -1,6 +1,6 @@
 # AI Generation Portable Apps
 
-Version: `v0.2.1`
+Version: `v0.2.2`
 
 This repository contains two local portable web apps:
 
@@ -62,6 +62,7 @@ nano-banana/Start_Nano_Banana.cmd
 
 ## Release
 
+- `v0.2.2`: Added browser-side topic workspaces so multiple independent theme pages can run different prompts and settings concurrently from one local service.
 - `v0.2.1`: Fixed Windows launcher startup reliability and wired Seedance first/last frame uploads into preview, drag/drop, and removal controls.
 - `v0.2`: Added Nano Banana provider switching, optional browser-side image resize, drag-and-drop uploads, and cross-platform desktop output path helpers.
 - `v0.1`: Initial portable release.

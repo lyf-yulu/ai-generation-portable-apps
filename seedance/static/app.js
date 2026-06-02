@@ -16,10 +16,89 @@ const resultsEl = document.querySelector("#results");
 const eventsEl = document.querySelector("#events");
 const keyHint = document.querySelector("#keyHint");
 const presetHint = document.querySelector("#presetHint");
+const workspaceName = document.querySelector("#workspaceName");
+const newWorkspaceBtn = document.querySelector("#newWorkspaceBtn");
+const duplicateWorkspaceBtn = document.querySelector("#duplicateWorkspaceBtn");
+const saveWorkspaceBtn = document.querySelector("#saveWorkspaceBtn");
+const workspaceHint = document.querySelector("#workspaceHint");
+const urlParams = new URLSearchParams(window.location.search);
+const workspaceId = urlParams.get("ws") || "default";
+const workspaceKey = `seedance.workspace.${workspaceId}`;
 let savedMedia = {};
+let workspaceSaveTimer = 0;
 
 function field(name) {
   return form.elements[name] || document.querySelector(`[name="${name}"]`);
+}
+
+function isWorkspaceMode() {
+  return workspaceId !== "default";
+}
+
+function workspaceLabel() {
+  return workspaceName.value.trim() || (isWorkspaceMode() ? `主题 ${workspaceId.slice(0, 6)}` : "默认主题");
+}
+
+function collectWorkspaceValues() {
+  const values = {};
+  for (const item of form.elements) {
+    if (!item.name || item.type === "file") continue;
+    values[item.name] = item.type === "checkbox" ? (item.checked ? "on" : "") : item.value;
+  }
+  return values;
+}
+
+function saveWorkspaceDraft() {
+  const payload = {
+    name: workspaceLabel(),
+    values: collectWorkspaceValues(),
+    media: savedMedia,
+    saved_at: Date.now(),
+  };
+  localStorage.setItem(workspaceKey, JSON.stringify(payload));
+  workspaceHint.textContent = `已保存草稿：${payload.name}`;
+}
+
+function scheduleWorkspaceSave() {
+  clearTimeout(workspaceSaveTimer);
+  workspaceSaveTimer = setTimeout(saveWorkspaceDraft, 500);
+}
+
+function loadWorkspaceDraft() {
+  workspaceName.value = isWorkspaceMode() ? workspaceLabel() : "默认主题";
+  workspaceHint.textContent = isWorkspaceMode() ? "当前是独立主题页，可与其它主题并发提交" : "默认主题会读取当前保存配置";
+  const raw = localStorage.getItem(workspaceKey);
+  if (!raw) return false;
+  try {
+    const draft = JSON.parse(raw);
+    workspaceName.value = draft.name || workspaceName.value;
+    applyPreset({ values: draft.values || {}, media: draft.media || {} });
+    workspaceHint.textContent = `已读取主题草稿：${workspaceName.value}`;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function workspaceUrl(id) {
+  const url = new URL(window.location.href);
+  url.searchParams.set("ws", id);
+  return url.toString();
+}
+
+function newWorkspaceId() {
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function openWorkspace(copyCurrent) {
+  if (copyCurrent) saveWorkspaceDraft();
+  const id = newWorkspaceId();
+  if (copyCurrent) {
+    const current = JSON.parse(localStorage.getItem(workspaceKey) || "{}");
+    current.name = `${workspaceLabel()} 副本`;
+    localStorage.setItem(`seedance.workspace.${id}`, JSON.stringify(current));
+  }
+  window.open(workspaceUrl(id), "_blank");
 }
 
 function mediaKind(name) {
@@ -219,6 +298,12 @@ async function loadArchives() {
 }
 
 async function loadPreset() {
+  if (isWorkspaceMode() && loadWorkspaceDraft()) return;
+  if (isWorkspaceMode()) {
+    loadWorkspaceDraft();
+    return;
+  }
+  workspaceName.value = "默认主题";
   const res = await fetch("/api/preset");
   if (!res.ok) return;
   applyPreset(await res.json());
@@ -232,6 +317,7 @@ function formDataWithSavedMedia() {
 
 async function savePreset() {
   presetHint.textContent = "保存中...";
+  saveWorkspaceDraft();
   const res = await fetch("/api/preset", { method: "POST", body: formDataWithSavedMedia() });
   const data = await res.json();
   if (!res.ok) {
@@ -334,6 +420,7 @@ async function poll(jobId) {
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
+  saveWorkspaceDraft();
   submitBtn.disabled = true;
   submitBtn.textContent = "生成中";
   statusText.textContent = "提交中";
@@ -355,6 +442,11 @@ savePresetBtn.addEventListener("click", savePreset);
 clearPresetBtn.addEventListener("click", clearPreset);
 loadArchiveBtn.addEventListener("click", loadArchive);
 deleteArchiveBtn.addEventListener("click", deleteArchive);
+newWorkspaceBtn.addEventListener("click", () => openWorkspace(false));
+duplicateWorkspaceBtn.addEventListener("click", () => openWorkspace(true));
+saveWorkspaceBtn.addEventListener("click", saveWorkspaceDraft);
+form.addEventListener("input", scheduleWorkspaceSave);
+form.addEventListener("change", scheduleWorkspaceSave);
 closePreviewBtn.addEventListener("click", () => previewDialog.close());
 previewDialog.addEventListener("click", (event) => {
   if (event.target === previewDialog) previewDialog.close();

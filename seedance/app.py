@@ -592,6 +592,7 @@ def run_job(job_id: str, form_values: dict[str, Any], form_files: dict[str, tupl
 
 class Handler(SimpleHTTPRequestHandler):
     def translate_path(self, path: str) -> str:
+        path = urllib.parse.urlparse(path).path
         if path.startswith("/outputs/"):
             return str((OUTPUT_DIR / path.removeprefix("/outputs/")).resolve())
         if path in {"/", "/index.html"}:

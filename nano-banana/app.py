@@ -631,6 +631,7 @@ def run_job(job_id: str, values: dict[str, Any], files: dict[str, tuple[str, byt
 
 class Handler(SimpleHTTPRequestHandler):
     def translate_path(self, path: str) -> str:
+        path = urllib.parse.urlparse(path).path
         if path in {"/", "/index.html"}:
             return str(STATIC_DIR / "index.html")
         return str((STATIC_DIR / path.lstrip("/")).resolve())

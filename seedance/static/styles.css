@@ -144,6 +144,16 @@ button {
   border-top: 1px solid #dde1e8;
 }
 
+.workspaceBox {
+  margin-bottom: 18px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid #dde1e8;
+}
+
+.workspaceBox .rowButtons {
+  margin-top: -4px;
+}
+
 .secondaryWide {
   border: 1px solid #cbd2dd;
   background: #ffffff;

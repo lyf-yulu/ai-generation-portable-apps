@@ -86,6 +86,8 @@ button:disabled { opacity: .55; cursor: wait; }
 }
 .archiveActions { grid-template-columns: 1fr 1fr 1fr; margin: 0 0 8px; }
 .archiveBox { margin-top: 18px; padding-top: 18px; border-top: 1px solid #dde1e8; }
+.workspaceBox { margin-bottom: 18px; padding-bottom: 18px; border-bottom: 1px solid #dde1e8; }
+.workspaceBox .rowButtons { margin-top: -4px; }
 
 .workspace {
   display: grid;
