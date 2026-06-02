@@ -75,6 +75,8 @@ function assignFile(input, file) {
 }
 
 function wireFileInput(input) {
+  if (input.dataset.wired === "1") return;
+  input.dataset.wired = "1";
   input.addEventListener("change", () => {
     const drop = input.closest(".drop");
     const file = input.files?.[0];
@@ -136,6 +138,24 @@ function makeDrop(name, label, accept) {
   return el;
 }
 
+function ensureDropControls(input) {
+  const drop = input.closest(".drop");
+  if (!drop) return;
+  if (!drop.querySelector(".removeMediaBtn")) {
+    const removeBtn = document.createElement("button");
+    removeBtn.className = "removeMediaBtn";
+    removeBtn.type = "button";
+    removeBtn.textContent = "移除";
+    removeBtn.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      clearSelectedMedia(input);
+    });
+    drop.append(removeBtn);
+  }
+  wireFileInput(input);
+}
+
 for (let i = 1; i <= 9; i += 1) {
   document.querySelector("#imageRefs").append(makeDrop(`ref_image_${i}`, `@ref_image${i}`, "image/*"));
 }
@@ -143,6 +163,7 @@ for (let i = 1; i <= 3; i += 1) {
   document.querySelector("#videoRefs").append(makeDrop(`ref_video_${i}`, `参考视频 ${i}`, "video/*"));
   document.querySelector("#audioRefs").append(makeDrop(`ref_audio_${i}`, `参考音频 ${i}`, "audio/*"));
 }
+document.querySelectorAll('.drop input[type="file"]').forEach(ensureDropControls);
 
 async function loadConfig() {
   const res = await fetch("/api/config");
