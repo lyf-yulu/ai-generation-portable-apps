@@ -153,18 +153,23 @@ def read_preset() -> dict[str, Any]:
     return {"values": {}, "media": {}}
 
 
-def preset_for_client() -> dict[str, Any]:
-    data = read_preset()
+def preset_to_client(data: dict[str, Any]) -> dict[str, Any]:
     media = {}
     for field, item in data.get("media", {}).items():
         path = MEDIA_DIR / item.get("stored", "")
         if path.exists():
+            stored = path.name
             media[field] = {
                 "filename": item.get("filename", path.name),
                 "mime": item.get("mime", mimetypes.guess_type(path.name)[0] or "image/png"),
-                "url": f"/api/preset-media/{field}",
+                "stored": stored,
+                "url": f"/api/media/{urllib.parse.quote(stored)}?v={int(path.stat().st_mtime)}",
             }
     return {"values": data.get("values", {}), "media": media}
+
+
+def preset_for_client() -> dict[str, Any]:
+    return preset_to_client(read_preset())
 
 
 def parse_saved_media(form: cgi.FieldStorage | dict[str, Any]) -> dict[str, Any]:
@@ -179,8 +184,14 @@ def get_file_or_saved(form: cgi.FieldStorage | dict[str, Any], name: str) -> tup
     uploaded = get_file(form, name)
     if uploaded:
         return uploaded
-    if name not in parse_saved_media(form):
+    saved = parse_saved_media(form).get(name)
+    if not isinstance(saved, dict):
         return None
+    stored = Path(str(saved.get("stored", ""))).name
+    if stored:
+        path = MEDIA_DIR / stored
+        if path.exists():
+            return (saved.get("filename", path.name), path.read_bytes())
     item = read_preset().get("media", {}).get(name)
     if not item:
         return None
@@ -188,10 +199,23 @@ def get_file_or_saved(form: cgi.FieldStorage | dict[str, Any], name: str) -> tup
     return (item.get("filename", path.name), path.read_bytes()) if path.exists() else None
 
 
-def collect_preset_from_form(form: cgi.FieldStorage) -> dict[str, Any]:
+def collect_media_from_form(form: cgi.FieldStorage) -> dict[str, Any]:
     preset = read_preset()
-    values = {key: get_field(form, key) for key in VALUE_FIELDS if key in form and not getattr(form[key], "filename", None)}
-    media = dict(preset.get("media", {}))
+    active_media = preset.get("media", {})
+    saved_media = parse_saved_media(form)
+    media = {}
+    for key, item in saved_media.items():
+        if not isinstance(item, dict):
+            continue
+        stored = Path(str(item.get("stored", ""))).name
+        if stored and (MEDIA_DIR / stored).exists():
+            media[key] = {
+                "filename": item.get("filename", stored),
+                "stored": stored,
+                "mime": item.get("mime") or mimetypes.guess_type(stored)[0] or "image/png",
+            }
+        elif key in active_media:
+            media[key] = active_media[key]
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     for key in FILE_FIELDS:
         file_data = get_file(form, key)
@@ -199,10 +223,19 @@ def collect_preset_from_form(form: cgi.FieldStorage) -> dict[str, Any]:
             continue
         filename, blob = file_data
         suffix = Path(filename).suffix or ".png"
-        stored = f"{key}{suffix}"
+        stored = f"{uuid.uuid4().hex}_{key}{suffix}"
         (MEDIA_DIR / stored).write_bytes(blob)
         media[key] = {"filename": filename, "stored": stored, "mime": mimetypes.guess_type(filename)[0] or "image/png"}
-    return {"values": values, "media": media}
+    return media
+
+
+def collect_workspace_snapshot_from_form(form: cgi.FieldStorage) -> dict[str, Any]:
+    values = {key: get_field(form, key) for key in VALUE_FIELDS if key in form and not getattr(form[key], "filename", None)}
+    return {"values": values, "media": collect_media_from_form(form)}
+
+
+def collect_preset_from_form(form: cgi.FieldStorage) -> dict[str, Any]:
+    return collect_workspace_snapshot_from_form(form)
 
 
 def write_active_preset(preset: dict[str, Any]) -> None:
@@ -242,14 +275,18 @@ def load_archive_file(name: str) -> dict[str, Any]:
     path = archive_path(name)
     if not path.exists():
         raise FileNotFoundError(f"Archive not found: {name}")
-    if MEDIA_DIR.exists():
-        shutil.rmtree(MEDIA_DIR)
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "r") as zf:
         preset = json.loads(zf.read("preset.json").decode("utf-8"))
-        for info in zf.infolist():
-            if info.filename.startswith("media/") and not info.is_dir():
-                (MEDIA_DIR / Path(info.filename).name).write_bytes(zf.read(info.filename))
+        names = set(zf.namelist())
+        for item in preset.get("media", {}).values():
+            original = Path(str(item.get("stored", ""))).name
+            archive_name = f"media/{original}"
+            if archive_name not in names:
+                continue
+            target_name = f"{uuid.uuid4().hex}_{original}"
+            (MEDIA_DIR / target_name).write_bytes(zf.read(archive_name))
+            item["stored"] = target_name
     write_active_preset(preset)
     return preset_for_client()
 
@@ -659,6 +696,21 @@ class Handler(SimpleHTTPRequestHandler):
             mime = item.get("mime") or "image/png"
             self.send_response(200)
             self.send_header("Content-Type", mime)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(path.stat().st_size))
+            self.end_headers()
+            self.wfile.write(path.read_bytes())
+            return
+        if urllib.parse.urlparse(self.path).path.startswith("/api/media/"):
+            raw_name = urllib.parse.urlparse(self.path).path.rsplit("/", 1)[-1]
+            stored = Path(urllib.parse.unquote(raw_name)).name
+            path = MEDIA_DIR / stored
+            if not path.exists():
+                json_response(self, 404, {"error": "media not found"})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "image/png")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(path.stat().st_size))
             self.end_headers()
             self.wfile.write(path.read_bytes())
@@ -690,6 +742,13 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path == "/api/choose-output-dir":
             try:
                 json_response(self, 200, {"path": choose_output_dir()})
+            except Exception as exc:
+                json_response(self, 500, {"error": str(exc)})
+            return
+        if self.path == "/api/workspace/snapshot":
+            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
+            try:
+                json_response(self, 200, preset_to_client(collect_workspace_snapshot_from_form(form)))
             except Exception as exc:
                 json_response(self, 500, {"error": str(exc)})
             return

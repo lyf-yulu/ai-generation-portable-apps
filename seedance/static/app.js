@@ -16,6 +16,7 @@ const resultsEl = document.querySelector("#results");
 const eventsEl = document.querySelector("#events");
 const keyHint = document.querySelector("#keyHint");
 const presetHint = document.querySelector("#presetHint");
+const providerHint = document.querySelector("#providerHint");
 const workspaceName = document.querySelector("#workspaceName");
 const newWorkspaceBtn = document.querySelector("#newWorkspaceBtn");
 const duplicateWorkspaceBtn = document.querySelector("#duplicateWorkspaceBtn");
@@ -26,9 +27,48 @@ const workspaceId = urlParams.get("ws") || "default";
 const workspaceKey = `seedance.workspace.${workspaceId}`;
 let savedMedia = {};
 let workspaceSaveTimer = 0;
+const providerDefaults = {
+  t8star: {
+    baseUrl: "https://ai.t8star.cn",
+    models: [
+      ["doubao-seedance-2-0-260128", "doubao-seedance-2-0-260128"],
+      ["doubao-seedance-2-0-fast-260128", "doubao-seedance-2-0-fast-260128"],
+    ],
+    hint: "使用原有 T8Star 兼容接口，素材会先上传到 /v1/files。",
+  },
+  volcengine: {
+    baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+    models: [
+      ["doubao-seedance-2-0-260128", "doubao-seedance-2-0-260128"],
+      ["doubao-seedance-2-0-fast-260128", "doubao-seedance-2-0-fast-260128"],
+    ],
+    hint: "使用豆包官方火山方舟 API。首尾帧模式不能与参考素材混用；本地素材会以 data URL 发送。",
+  },
+};
 
 function field(name) {
   return form.elements[name] || document.querySelector(`[name="${name}"]`);
+}
+
+function updateProviderOptions(preserveBase = true) {
+  const provider = field("provider")?.value || "t8star";
+  const config = providerDefaults[provider] || providerDefaults.t8star;
+  const baseInput = field("base_url");
+  const modelInput = field("model");
+  const currentModel = modelInput.value;
+  const knownBases = Object.values(providerDefaults).map((item) => item.baseUrl);
+  if (!preserveBase || !baseInput.value.trim() || knownBases.includes(baseInput.value.trim())) {
+    baseInput.value = config.baseUrl;
+  }
+  modelInput.innerHTML = "";
+  for (const [value, label] of config.models) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    modelInput.append(option);
+  }
+  modelInput.value = config.models.some(([value]) => value === currentModel) ? currentModel : config.models[0][0];
+  providerHint.textContent = config.hint;
 }
 
 function isWorkspaceMode() {
@@ -48,15 +88,38 @@ function collectWorkspaceValues() {
   return values;
 }
 
-function saveWorkspaceDraft() {
-  const payload = {
+function mediaSnapshot(media = savedMedia) {
+  return JSON.parse(JSON.stringify(media || {}));
+}
+
+function localWorkspaceSnapshot() {
+  return {
     name: workspaceLabel(),
     values: collectWorkspaceValues(),
-    media: savedMedia,
+    media: mediaSnapshot(),
     saved_at: Date.now(),
   };
+}
+
+async function workspaceSnapshot(options = {}) {
+  if (!options.persistMedia) return localWorkspaceSnapshot();
+  const res = await fetch("/api/workspace/snapshot", { method: "POST", body: formDataWithSavedMedia() });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "保存主题素材失败");
+  applyPreset(data);
+  return {
+    name: workspaceLabel(),
+    values: collectWorkspaceValues(),
+    media: mediaSnapshot(data.media),
+    saved_at: Date.now(),
+  };
+}
+
+async function saveWorkspaceDraft(options = {}) {
+  const payload = await workspaceSnapshot(options);
   localStorage.setItem(workspaceKey, JSON.stringify(payload));
   workspaceHint.textContent = `已保存草稿：${payload.name}`;
+  return payload;
 }
 
 function scheduleWorkspaceSave() {
@@ -90,11 +153,10 @@ function newWorkspaceId() {
   return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function openWorkspace(copyCurrent) {
-  if (copyCurrent) saveWorkspaceDraft();
+async function openWorkspace(copyCurrent) {
   const id = newWorkspaceId();
   if (copyCurrent) {
-    const current = JSON.parse(localStorage.getItem(workspaceKey) || "{}");
+    const current = await saveWorkspaceDraft({ persistMedia: true });
     current.name = `${workspaceLabel()} 副本`;
     localStorage.setItem(`seedance.workspace.${id}`, JSON.stringify(current));
   }
@@ -144,6 +206,14 @@ function clearSelectedMedia(input) {
   input.value = "";
   delete savedMedia[input.name];
   clearPreview(input.closest(".drop"));
+}
+
+function clearAllMediaInputs() {
+  document.querySelectorAll('.drop input[type="file"]').forEach((input) => {
+    input.value = "";
+    const drop = input.closest(".drop");
+    if (drop) clearPreview(drop);
+  });
 }
 
 function assignFile(input, file) {
@@ -251,6 +321,7 @@ async function loadConfig() {
 }
 
 function applyPreset(preset) {
+  clearAllMediaInputs();
   const values = preset.values || {};
   for (const [name, value] of Object.entries(values)) {
     const input = field(name);
@@ -261,8 +332,9 @@ function applyPreset(preset) {
       input.value = value;
     }
   }
+  updateProviderOptions(true);
 
-  savedMedia = preset.media || {};
+  savedMedia = mediaSnapshot(preset.media);
   for (const [name, item] of Object.entries(savedMedia)) {
     const input = field(name);
     const drop = input?.closest(".drop");
@@ -443,10 +515,29 @@ clearPresetBtn.addEventListener("click", clearPreset);
 loadArchiveBtn.addEventListener("click", loadArchive);
 deleteArchiveBtn.addEventListener("click", deleteArchive);
 newWorkspaceBtn.addEventListener("click", () => openWorkspace(false));
-duplicateWorkspaceBtn.addEventListener("click", () => openWorkspace(true));
-saveWorkspaceBtn.addEventListener("click", saveWorkspaceDraft);
+duplicateWorkspaceBtn.addEventListener("click", async () => {
+  duplicateWorkspaceBtn.disabled = true;
+  try {
+    await openWorkspace(true);
+  } catch (error) {
+    workspaceHint.textContent = error.message || "复制主题失败";
+  } finally {
+    duplicateWorkspaceBtn.disabled = false;
+  }
+});
+saveWorkspaceBtn.addEventListener("click", async () => {
+  saveWorkspaceBtn.disabled = true;
+  try {
+    await saveWorkspaceDraft({ persistMedia: true });
+  } catch (error) {
+    workspaceHint.textContent = error.message || "保存草稿失败";
+  } finally {
+    saveWorkspaceBtn.disabled = false;
+  }
+});
 form.addEventListener("input", scheduleWorkspaceSave);
 form.addEventListener("change", scheduleWorkspaceSave);
+field("provider").addEventListener("change", () => updateProviderOptions(false));
 closePreviewBtn.addEventListener("click", () => previewDialog.close());
 previewDialog.addEventListener("click", (event) => {
   if (event.target === previewDialog) previewDialog.close();
@@ -474,6 +565,7 @@ desktopOutputBtn.addEventListener("click", async () => {
   if (res.ok && data.path) field("output_dir").value = data.path;
 });
 
+updateProviderOptions(true);
 loadConfig();
 loadPreset();
 loadArchives();

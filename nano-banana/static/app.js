@@ -59,15 +59,38 @@ function collectWorkspaceValues() {
   return values;
 }
 
-function saveWorkspaceDraft() {
-  const payload = {
+function mediaSnapshot(media = savedMedia) {
+  return JSON.parse(JSON.stringify(media || {}));
+}
+
+function localWorkspaceSnapshot() {
+  return {
     name: workspaceLabel(),
     values: collectWorkspaceValues(),
-    media: savedMedia,
+    media: mediaSnapshot(),
     saved_at: Date.now(),
   };
+}
+
+async function workspaceSnapshot(options = {}) {
+  if (!options.persistMedia) return localWorkspaceSnapshot();
+  const res = await fetch("/api/workspace/snapshot", { method: "POST", body: await formDataWithSavedMedia() });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "保存主题素材失败");
+  applyPreset(data);
+  return {
+    name: workspaceLabel(),
+    values: collectWorkspaceValues(),
+    media: mediaSnapshot(data.media),
+    saved_at: Date.now(),
+  };
+}
+
+async function saveWorkspaceDraft(options = {}) {
+  const payload = await workspaceSnapshot(options);
   localStorage.setItem(workspaceKey, JSON.stringify(payload));
   workspaceHint.textContent = `已保存草稿：${payload.name}`;
+  return payload;
 }
 
 function scheduleWorkspaceSave() {
@@ -101,11 +124,10 @@ function newWorkspaceId() {
   return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function openWorkspace(copyCurrent) {
-  if (copyCurrent) saveWorkspaceDraft();
+async function openWorkspace(copyCurrent) {
   const id = newWorkspaceId();
   if (copyCurrent) {
-    const current = JSON.parse(localStorage.getItem(workspaceKey) || "{}");
+    const current = await saveWorkspaceDraft({ persistMedia: true });
     current.name = `${workspaceLabel()} 副本`;
     localStorage.setItem(`nano-banana.workspace.${id}`, JSON.stringify(current));
   }
@@ -145,6 +167,14 @@ function clearSelectedMedia(input) {
   input.value = "";
   delete savedMedia[input.name];
   clearPreview(input.closest(".drop"));
+}
+
+function clearAllMediaInputs() {
+  document.querySelectorAll('.drop input[type="file"]').forEach((input) => {
+    input.value = "";
+    const drop = input.closest(".drop");
+    if (drop) clearPreview(drop);
+  });
 }
 
 function assignFile(input, file) {
@@ -270,6 +300,7 @@ function renderArchives(archives) {
 }
 
 function applyPreset(preset) {
+  clearAllMediaInputs();
   const values = preset.values || {};
   for (const [name, value] of Object.entries(values)) {
     const input = field(name);
@@ -282,7 +313,7 @@ function applyPreset(preset) {
   }
   updateProviderOptions(true);
   updateResizeState();
-  savedMedia = preset.media || {};
+  savedMedia = mediaSnapshot(preset.media);
   for (const [name, item] of Object.entries(savedMedia)) {
     const input = field(name);
     const drop = input?.closest(".drop");
@@ -533,8 +564,26 @@ deleteArchiveBtn.addEventListener("click", deleteArchive);
 clearPresetBtn.addEventListener("click", clearPreset);
 closePreviewBtn.addEventListener("click", () => previewDialog.close());
 newWorkspaceBtn.addEventListener("click", () => openWorkspace(false));
-duplicateWorkspaceBtn.addEventListener("click", () => openWorkspace(true));
-saveWorkspaceBtn.addEventListener("click", saveWorkspaceDraft);
+duplicateWorkspaceBtn.addEventListener("click", async () => {
+  duplicateWorkspaceBtn.disabled = true;
+  try {
+    await openWorkspace(true);
+  } catch (error) {
+    workspaceHint.textContent = error.message || "复制主题失败";
+  } finally {
+    duplicateWorkspaceBtn.disabled = false;
+  }
+});
+saveWorkspaceBtn.addEventListener("click", async () => {
+  saveWorkspaceBtn.disabled = true;
+  try {
+    await saveWorkspaceDraft({ persistMedia: true });
+  } catch (error) {
+    workspaceHint.textContent = error.message || "保存草稿失败";
+  } finally {
+    saveWorkspaceBtn.disabled = false;
+  }
+});
 form.addEventListener("input", scheduleWorkspaceSave);
 form.addEventListener("change", scheduleWorkspaceSave);
 field("provider").addEventListener("change", () => updateProviderOptions(false));

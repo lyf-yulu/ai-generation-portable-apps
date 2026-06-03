@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.error
 import urllib.request
 import uuid
@@ -30,6 +31,7 @@ MEDIA_DIR = STATE_DIR / "media"
 PRESET_PATH = STATE_DIR / "preset.json"
 ARCHIVE_DIR = ROOT / "archives"
 DEFAULT_BASE_URL = "https://ai.t8star.cn"
+OFFICIAL_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_CONFIG = Path.home() / "ComfyUI/custom_nodes/Comfyui-zhenzhen/Comflyapi.json"
 TERMINAL_STATUSES = {"succeeded", "success", "failed", "fail", "failure", "cancelled", "canceled"}
 
@@ -46,6 +48,7 @@ FILE_FIELDS = {
 }
 VALUE_FIELDS = {
     "api_key",
+    "provider",
     "base_url",
     "output_dir",
     "model",
@@ -102,18 +105,23 @@ def read_preset() -> dict[str, Any]:
     return {"values": {}, "media": {}}
 
 
-def preset_for_client() -> dict[str, Any]:
-    data = read_preset()
+def preset_to_client(data: dict[str, Any]) -> dict[str, Any]:
     media = {}
     for field, item in data.get("media", {}).items():
         path = MEDIA_DIR / item.get("stored", "")
         if path.exists():
+            stored = path.name
             media[field] = {
                 "filename": item.get("filename", path.name),
                 "mime": item.get("mime", mimetypes.guess_type(path.name)[0] or "application/octet-stream"),
-                "url": f"/api/preset-media/{field}",
+                "stored": stored,
+                "url": f"/api/media/{urllib.parse.quote(stored)}?v={int(path.stat().st_mtime)}",
             }
     return {"values": data.get("values", {}), "media": media}
+
+
+def preset_for_client() -> dict[str, Any]:
+    return preset_to_client(read_preset())
 
 
 def safe_archive_name(raw: str) -> str:
@@ -140,10 +148,23 @@ def list_archives() -> list[dict[str, Any]]:
     return items
 
 
-def collect_preset_from_form(form: cgi.FieldStorage) -> dict[str, Any]:
+def collect_media_from_form(form: cgi.FieldStorage) -> dict[str, Any]:
     preset = read_preset()
-    values = {key: get_field(form, key) for key in VALUE_FIELDS if key in form and not getattr(form[key], "filename", None)}
-    media = dict(preset.get("media", {}))
+    active_media = preset.get("media", {})
+    saved_media = parse_saved_media(form)
+    media = {}
+    for key, item in saved_media.items():
+        if not isinstance(item, dict):
+            continue
+        stored = Path(str(item.get("stored", ""))).name
+        if stored and (MEDIA_DIR / stored).exists():
+            media[key] = {
+                "filename": item.get("filename", stored),
+                "stored": stored,
+                "mime": item.get("mime") or mimetypes.guess_type(stored)[0] or "application/octet-stream",
+            }
+        elif key in active_media:
+            media[key] = active_media[key]
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     for key in FILE_FIELDS:
         file_data = get_file(form, key)
@@ -151,7 +172,7 @@ def collect_preset_from_form(form: cgi.FieldStorage) -> dict[str, Any]:
             continue
         filename, blob = file_data
         suffix = Path(filename).suffix or mimetypes.guess_extension(mimetypes.guess_type(filename)[0] or "") or ".bin"
-        stored = f"{key}{suffix}"
+        stored = f"{uuid.uuid4().hex}_{key}{suffix}"
         path = MEDIA_DIR / stored
         path.write_bytes(blob)
         media[key] = {
@@ -159,7 +180,16 @@ def collect_preset_from_form(form: cgi.FieldStorage) -> dict[str, Any]:
             "stored": stored,
             "mime": mimetypes.guess_type(filename)[0] or "application/octet-stream",
         }
-    return {"values": values, "media": media}
+    return media
+
+
+def collect_workspace_snapshot_from_form(form: cgi.FieldStorage) -> dict[str, Any]:
+    values = {key: get_field(form, key) for key in VALUE_FIELDS if key in form and not getattr(form[key], "filename", None)}
+    return {"values": values, "media": collect_media_from_form(form)}
+
+
+def collect_preset_from_form(form: cgi.FieldStorage) -> dict[str, Any]:
+    return collect_workspace_snapshot_from_form(form)
 
 
 def write_active_preset(preset: dict[str, Any]) -> None:
@@ -185,16 +215,19 @@ def load_archive_file(name: str) -> dict[str, Any]:
     path = archive_path(name)
     if not path.exists():
         raise FileNotFoundError(f"Archive not found: {name}")
-    if MEDIA_DIR.exists():
-        shutil.rmtree(MEDIA_DIR)
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "r") as zf:
         preset = json.loads(zf.read("preset.json").decode("utf-8"))
-        for info in zf.infolist():
-            if not info.filename.startswith("media/") or info.is_dir():
+        names = set(zf.namelist())
+        for item in preset.get("media", {}).values():
+            original = Path(str(item.get("stored", ""))).name
+            archive_name = f"media/{original}"
+            if archive_name not in names:
                 continue
-            target = MEDIA_DIR / Path(info.filename).name
-            target.write_bytes(zf.read(info.filename))
+            target_name = f"{uuid.uuid4().hex}_{original}"
+            target = MEDIA_DIR / target_name
+            target.write_bytes(zf.read(archive_name))
+            item["stored"] = target_name
     write_active_preset(preset)
     return preset_for_client()
 
@@ -297,6 +330,12 @@ def upload_file(base_url: str, api_key: str, blob: bytes, filename: str, content
     return str(data["url"])
 
 
+def media_reference(provider: str, base_url: str, api_key: str, blob: bytes, filename: str, mime: str) -> str:
+    if provider == "volcengine":
+        return to_data_url(blob, filename, mime)
+    return upload_file(base_url, api_key, blob, filename, mime)
+
+
 def to_data_url(blob: bytes, filename: str, fallback: str) -> str:
     mime = mimetypes.guess_type(filename)[0] or fallback
     return f"data:{mime};base64,{base64.b64encode(blob).decode('ascii')}"
@@ -394,6 +433,11 @@ def get_file_or_saved(form: cgi.FieldStorage, name: str) -> tuple[str, bytes] | 
     saved = parse_saved_media(form).get(name)
     if not isinstance(saved, dict):
         return None
+    stored = Path(str(saved.get("stored", ""))).name
+    if stored:
+        path = MEDIA_DIR / stored
+        if path.exists():
+            return saved.get("filename", path.name), path.read_bytes()
     preset = read_preset()
     item = preset.get("media", {}).get(name)
     if not item:
@@ -409,48 +453,59 @@ def replace_refs(prompt: str) -> str:
 
 
 def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index: int) -> dict[str, Any]:
+    provider = get_field(form, "provider", "t8star")
     prompt = replace_refs(get_field(form, "prompt").strip())
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    has_frame_input = False
+    has_reference_input = False
+    has_visual_reference = False
 
     first = get_file_or_saved(form, "first_frame")
     if first:
+        has_frame_input = True
         filename, blob = first
         mime = mimetypes.guess_type(filename)[0] or "image/png"
-        url = upload_file(base_url, api_key, blob, filename, mime)
+        url = media_reference(provider, base_url, api_key, blob, filename, mime)
         content.append({"type": "image_url", "image_url": {"url": url}, "role": "first_frame"})
 
     last = get_file_or_saved(form, "last_frame")
     if last:
+        has_frame_input = True
         filename, blob = last
         mime = mimetypes.guess_type(filename)[0] or "image/png"
-        url = upload_file(base_url, api_key, blob, filename, mime)
+        url = media_reference(provider, base_url, api_key, blob, filename, mime)
         content.append({"type": "image_url", "image_url": {"url": url}, "role": "last_frame"})
 
     for i in range(1, 10):
         file_data = get_file_or_saved(form, f"ref_image_{i}")
         if not file_data:
             continue
+        has_reference_input = True
+        has_visual_reference = True
         filename, blob = file_data
         mime = mimetypes.guess_type(filename)[0] or "image/png"
-        url = upload_file(base_url, api_key, blob, filename, mime)
+        url = media_reference(provider, base_url, api_key, blob, filename, mime)
         content.append({"type": "image_url", "image_url": {"url": url}, "role": "reference_image"})
 
     for i in range(1, 4):
         file_data = get_file_or_saved(form, f"ref_video_{i}")
         if not file_data:
             continue
+        has_reference_input = True
+        has_visual_reference = True
         filename, blob = file_data
         mime = mimetypes.guess_type(filename)[0] or "video/mp4"
-        url = upload_file(base_url, api_key, blob, filename, mime)
+        url = media_reference(provider, base_url, api_key, blob, filename, mime)
         content.append({"type": "video_url", "video_url": {"url": url}, "role": "reference_video"})
 
     for i in range(1, 4):
         file_data = get_file_or_saved(form, f"ref_audio_{i}")
         if not file_data:
             continue
+        has_reference_input = True
         filename, blob = file_data
         mime = mimetypes.guess_type(filename)[0] or "audio/wav"
-        url = upload_file(base_url, api_key, blob, filename, mime)
+        url = media_reference(provider, base_url, api_key, blob, filename, mime)
         content.append({"type": "audio_url", "audio_url": {"url": url}, "role": "reference_audio"})
 
     seed_raw = get_field(form, "seed", "").strip()
@@ -473,6 +528,11 @@ def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index
         payload["return_last_frame"] = True
     if parse_bool(get_field(form, "web_search")):
         payload["tools"] = [{"type": "web_search"}]
+    if provider == "volcengine":
+        if has_frame_input and has_reference_input:
+            raise RuntimeError("豆包官方 API 不允许首尾帧与参考图/视频/音频混用，请二选一提交。")
+        if has_reference_input and not has_visual_reference:
+            raise RuntimeError("豆包官方 API 不允许单独输入参考音频，请至少加入 1 个参考图或参考视频。")
     return payload
 
 
@@ -512,8 +572,10 @@ def run_one(job_id: str, index: int, form_values: dict[str, Any], form_files: di
         form[key] = type("Field", (), {"filename": filename, "file": type("Reader", (), {"read": lambda self, b=blob: b})()})()
 
     api_key = str(form_values["api_key"]).strip()
-    base_url = str(form_values.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
-    create_url = f"{base_url}/seedance/v3/contents/generations/tasks"
+    provider = str(form_values.get("provider") or "t8star")
+    default_base = OFFICIAL_ARK_BASE_URL if provider == "volcengine" else DEFAULT_BASE_URL
+    base_url = str(form_values.get("base_url") or default_base).rstrip("/")
+    create_url = f"{base_url}/contents/generations/tasks" if provider == "volcengine" else f"{base_url}/seedance/v3/contents/generations/tasks"
     add_event(job_id, f"Run {index}: preparing payload")
     payload = build_payload(form, api_key, base_url, index - 1)
     add_event(job_id, f"Run {index}: creating task ({content_counts(payload)})")
@@ -623,6 +685,21 @@ class Handler(SimpleHTTPRequestHandler):
             mime = item.get("mime") or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
             self.send_response(200)
             self.send_header("Content-Type", mime)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(path.stat().st_size))
+            self.end_headers()
+            self.wfile.write(path.read_bytes())
+            return
+        if urllib.parse.urlparse(self.path).path.startswith("/api/media/"):
+            raw_name = urllib.parse.urlparse(self.path).path.rsplit("/", 1)[-1]
+            stored = Path(urllib.parse.unquote(raw_name)).name
+            path = MEDIA_DIR / stored
+            if not path.exists():
+                json_response(self, 404, {"error": "media not found"})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(path.stat().st_size))
             self.end_headers()
             self.wfile.write(path.read_bytes())
@@ -654,6 +731,13 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path == "/api/choose-output-dir":
             try:
                 json_response(self, 200, {"path": choose_output_dir()})
+            except Exception as exc:
+                json_response(self, 500, {"error": str(exc)})
+            return
+        if self.path == "/api/workspace/snapshot":
+            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
+            try:
+                json_response(self, 200, preset_to_client(collect_workspace_snapshot_from_form(form)))
             except Exception as exc:
                 json_response(self, 500, {"error": str(exc)})
             return
