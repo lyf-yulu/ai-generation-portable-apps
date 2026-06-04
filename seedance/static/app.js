@@ -11,6 +11,14 @@ const closePreviewBtn = document.querySelector("#closePreviewBtn");
 const chooseOutputBtn = document.querySelector("#chooseOutputBtn");
 const appOutputBtn = document.querySelector("#appOutputBtn");
 const desktopOutputBtn = document.querySelector("#desktopOutputBtn");
+const mainTabBtn = document.querySelector("#mainTabBtn");
+const activityTabBtn = document.querySelector("#activityTabBtn");
+const mainView = document.querySelector("#mainView");
+const activityView = document.querySelector("#activityView");
+const refreshActivityBtn = document.querySelector("#refreshActivityBtn");
+const activityStats = document.querySelector("#activityStats");
+const activityList = document.querySelector("#activityList");
+const activityDetail = document.querySelector("#activityDetail");
 const statusText = document.querySelector("#statusText");
 const resultsEl = document.querySelector("#results");
 const eventsEl = document.querySelector("#events");
@@ -476,6 +484,69 @@ function renderJob(job) {
   }
 }
 
+function setActiveTab(tab) {
+  const showActivity = tab === "activity";
+  mainTabBtn.classList.toggle("isActive", !showActivity);
+  activityTabBtn.classList.toggle("isActive", showActivity);
+  mainView.classList.toggle("hidden", showActivity);
+  activityView.classList.toggle("hidden", !showActivity);
+  if (showActivity) loadActivity();
+}
+
+function renderActivityStats(counts) {
+  const items = [
+    ["总记录", counts.total || 0],
+    ["页面运行", counts.page || 0],
+    ["API 调用", counts.api || 0],
+    ["成功", counts.succeeded || 0],
+    ["失败", counts.failed || 0],
+    ["运行中", counts.running || 0],
+  ];
+  activityStats.innerHTML = items.map(([label, value]) => (
+    `<div class="activityStat"><strong>${value}</strong><span>${label}</span></div>`
+  )).join("");
+}
+
+function renderActivityList(records) {
+  activityList.innerHTML = "";
+  if (!records.length) {
+    activityList.textContent = "暂无记录";
+    return;
+  }
+  for (const record of records) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "activityItem";
+    button.dataset.id = record.id;
+    button.textContent = `${record.source === "api" ? "API" : "页面"} · ${record.status || "unknown"}`;
+    const meta = document.createElement("span");
+    meta.className = "activityItemMeta";
+    meta.textContent = `${record.created_at || ""} · ${record.title || record.job_id || record.id}`;
+    button.append(meta);
+    button.addEventListener("click", () => loadActivityDetail(record.id, button));
+    activityList.append(button);
+  }
+}
+
+async function loadActivity() {
+  const res = await fetch("/api/activity");
+  const data = await res.json();
+  if (!res.ok) {
+    activityDetail.textContent = data.error || "读取后台记录失败";
+    return;
+  }
+  renderActivityStats(data.counts || {});
+  renderActivityList(data.records || []);
+}
+
+async function loadActivityDetail(id, activeButton) {
+  activityList.querySelectorAll(".activityItem").forEach((item) => item.classList.remove("isActive"));
+  activeButton?.classList.add("isActive");
+  const res = await fetch(`/api/activity/${id}`);
+  const data = await res.json();
+  activityDetail.textContent = JSON.stringify(data, null, 2);
+}
+
 async function poll(jobId) {
   while (true) {
     const res = await fetch(`/api/jobs/${jobId}`);
@@ -484,6 +555,7 @@ async function poll(jobId) {
     if (["succeeded", "failed"].includes(job.status)) {
       submitBtn.disabled = false;
       submitBtn.textContent = "开始生成";
+      loadActivity();
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, 2500));
@@ -515,6 +587,9 @@ clearPresetBtn.addEventListener("click", clearPreset);
 loadArchiveBtn.addEventListener("click", loadArchive);
 deleteArchiveBtn.addEventListener("click", deleteArchive);
 newWorkspaceBtn.addEventListener("click", () => openWorkspace(false));
+mainTabBtn.addEventListener("click", () => setActiveTab("main"));
+activityTabBtn.addEventListener("click", () => setActiveTab("activity"));
+refreshActivityBtn.addEventListener("click", loadActivity);
 duplicateWorkspaceBtn.addEventListener("click", async () => {
   duplicateWorkspaceBtn.disabled = true;
   try {

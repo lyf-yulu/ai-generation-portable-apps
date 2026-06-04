@@ -29,6 +29,7 @@ OUTPUT_DIR = ROOT / "outputs"
 STATE_DIR = ROOT / "state"
 MEDIA_DIR = STATE_DIR / "media"
 PRESET_PATH = STATE_DIR / "preset.json"
+ACTIVITY_PATH = STATE_DIR / "activity_log.json"
 ARCHIVE_DIR = ROOT / "archives"
 DEFAULT_BASE_URL = "https://ai.t8star.cn"
 DEFAULT_CONFIG = Path.home() / "ComfyUI/custom_nodes/Comfyui-zhenzhen/Comflyapi.json"
@@ -36,6 +37,7 @@ DEFAULT_CONFIG = Path.home() / "ComfyUI/custom_nodes/Comfyui-zhenzhen/Comflyapi.
 JOBS: dict[str, dict[str, Any]] = {}
 FILES: dict[str, Path] = {}
 LOCK = threading.Lock()
+ACTIVITY_LIMIT = 300
 
 FILE_FIELDS = {f"image_{i}" for i in range(1, 15)}
 VALUE_FIELDS = {
@@ -54,6 +56,166 @@ def json_response(handler: SimpleHTTPRequestHandler, status: int, data: dict[str
     handler.send_header("Content-Length", str(len(raw)))
     handler.end_headers()
     handler.wfile.write(raw)
+
+
+def now_text() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def read_activity_log() -> list[dict[str, Any]]:
+    if not ACTIVITY_PATH.exists():
+        return []
+    try:
+        data = json.loads(ACTIVITY_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def write_activity_log(items: list[dict[str, Any]]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ACTIVITY_PATH.write_text(json.dumps(items[-ACTIVITY_LIMIT:], ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def summarize_media_item(item: Any) -> Any:
+    if not isinstance(item, dict):
+        return item
+    result = {key: value for key, value in item.items() if key != "data_url"}
+    if item.get("data_url"):
+        result["data_url"] = True
+        result["chars"] = len(str(item["data_url"]))
+    return result
+
+
+def summarize_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            if key == "api_key":
+                result[key] = mask_key(str(item))
+            elif key == "media" and isinstance(item, dict):
+                result[key] = {name: summarize_media_item(media_item) for name, media_item in item.items()}
+            else:
+                result[key] = summarize_payload(item)
+        return result
+    if isinstance(value, list):
+        return [summarize_payload(item) for item in value]
+    if isinstance(value, str) and value.startswith("data:"):
+        return {"data_url": True, "chars": len(value)}
+    return value
+
+
+def summarize_values_files(values: dict[str, Any], files: dict[str, tuple[str, bytes]]) -> dict[str, Any]:
+    return {
+        "values": {key: (mask_key(str(value)) if key == "api_key" else value) for key, value in values.items()},
+        "files": {key: {"filename": item[0], "bytes": len(item[1])} for key, item in files.items()},
+    }
+
+
+def record_activity(record: dict[str, Any]) -> None:
+    items = read_activity_log()
+    record.setdefault("id", uuid.uuid4().hex)
+    record.setdefault("created_at", now_text())
+    record.setdefault("updated_at", record["created_at"])
+    items.append(record)
+    write_activity_log(items)
+
+
+def update_activity(activity_id: str | None, **updates: Any) -> None:
+    if not activity_id:
+        return
+    items = read_activity_log()
+    for item in items:
+        if item.get("id") == activity_id:
+            item.update(updates)
+            item["updated_at"] = now_text()
+            write_activity_log(items)
+            return
+
+
+def activity_list() -> dict[str, Any]:
+    items = read_activity_log()
+    summary = []
+    counts = {"total": len(items), "page": 0, "api": 0, "succeeded": 0, "failed": 0, "running": 0}
+    for item in items:
+        source = str(item.get("source") or "")
+        status = str(item.get("status") or "")
+        if source in counts:
+            counts[source] += 1
+        if status in counts:
+            counts[status] += 1
+        summary.append({
+            "id": item.get("id"),
+            "job_id": item.get("job_id"),
+            "source": source,
+            "status": status,
+            "created_at": item.get("created_at"),
+            "updated_at": item.get("updated_at"),
+            "title": item.get("title"),
+            "request_kind": item.get("request_kind"),
+        })
+    summary.reverse()
+    return {"counts": counts, "records": summary}
+
+
+def read_json_body(handler: SimpleHTTPRequestHandler, max_bytes: int = 100 * 1024 * 1024) -> dict[str, Any]:
+    length = int(handler.headers.get("Content-Length") or "0")
+    if length <= 0:
+        return {}
+    if length > max_bytes:
+        raise ValueError(f"JSON body too large: {length} bytes")
+    data = json.loads(handler.rfile.read(length).decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("JSON body must be an object")
+    return data
+
+
+def decode_data_url(data_url: str) -> tuple[str, bytes]:
+    match = re.match(r"^data:([^;,]+)?(;base64)?,(.*)$", data_url, re.DOTALL)
+    if not match:
+        raise ValueError("Invalid data_url")
+    mime = match.group(1) or "application/octet-stream"
+    payload = urllib.parse.unquote_to_bytes(match.group(3))
+    if match.group(2):
+        payload = base64.b64decode(payload)
+    return mime, payload
+
+
+def filename_from_media(field: str, item: dict[str, Any], mime: str = "image/png") -> str:
+    raw = str(item.get("filename") or "").strip()
+    if raw:
+        return Path(raw).name
+    if item.get("url"):
+        path = urllib.parse.urlparse(str(item["url"])).path
+        name = Path(urllib.parse.unquote(path)).name
+        if name:
+            return name
+    suffix = mimetypes.guess_extension(mime) or ".png"
+    return f"{field}{suffix}"
+
+
+def media_item_to_file(field: str, item: Any) -> tuple[str, bytes] | None:
+    if item in (None, "", False):
+        return None
+    if not isinstance(item, dict):
+        raise ValueError(f"media.{field} must be an object")
+    if item.get("data_url"):
+        mime, blob = decode_data_url(str(item["data_url"]))
+        return filename_from_media(field, item, mime), blob
+    if item.get("url"):
+        url = str(item["url"])
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            blob = resp.read()
+            mime = resp.headers.get_content_type() or mimetypes.guess_type(url)[0] or "image/png"
+        if not blob:
+            raise ValueError(f"media.{field} url returned empty content")
+        return filename_from_media(field, item, mime), blob
+    raise ValueError(f"media.{field} must include data_url or url")
+
+
+def job_id_response(job_id: str) -> dict[str, str]:
+    return {"job_id": job_id, "status_url": f"/api/jobs/{job_id}"}
 
 
 def load_default_key() -> str:
@@ -345,6 +507,105 @@ def desktop_output_dir() -> str:
     return str((parent / "NanoBanana_outputs").resolve())
 
 
+def api_schema() -> dict[str, Any]:
+    return {
+        "app": "nano-banana",
+        "endpoints": {
+            "schema": "GET /api/schema",
+            "submit_json": "POST /api/jobs/json",
+            "job_status": "GET /api/jobs/{job_id}",
+            "download": "GET /api/download/{token}",
+        },
+        "providers": {
+            "t8star": {
+                "base_url": DEFAULT_BASE_URL,
+                "models": ["nano-banana-2", "gemini-3.1-flash-image-preview"],
+            },
+            "gemini": {
+                "base_url": "https://chiyun.work",
+                "models": ["banana2-ssvip", "nano-banana2[2K]-base", "gpt-image-2"],
+            },
+        },
+        "value_fields": sorted(VALUE_FIELDS),
+        "file_fields": sorted(FILE_FIELDS),
+        "media_item": {
+            "data_url": "data:image/png;base64,...",
+            "url": "https://example.com/image.png",
+            "filename": "optional-name.png",
+        },
+        "example": {
+            "provider": "t8star",
+            "model": "nano-banana-2",
+            "mode": "img2img",
+            "prompt": "图片提示词",
+            "image_size": "2K",
+            "repeat_count": 1,
+            "concurrency": 1,
+            "media": {
+                "image_1": {"data_url": "data:image/png;base64,...", "filename": "image1.png"},
+            },
+        },
+    }
+
+
+def values_files_from_json(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, tuple[str, bytes]]]:
+    values = {key: payload[key] for key in VALUE_FIELDS if key in payload and payload[key] is not None}
+    provider = str(values.get("provider") or "t8star")
+    values.setdefault("provider", provider)
+    values.setdefault("base_url", "https://chiyun.work" if provider == "gemini" else DEFAULT_BASE_URL)
+    values.setdefault("mode", "img2img")
+    values.setdefault("model", "banana2-ssvip" if provider == "gemini" else "nano-banana-2")
+    values.setdefault("aspect_ratio", "auto")
+    values.setdefault("image_size", "2K")
+    values.setdefault("response_format", "url")
+    values.setdefault("control_after_generate", "randomize")
+    values.setdefault("repeat_count", 1)
+    values.setdefault("concurrency", 1)
+    values.setdefault("poll_interval", 10)
+    values.setdefault("timeout", 900)
+    values.setdefault("vary_seed", True)
+    values.setdefault("prompt", "")
+    values.setdefault("resize_enabled", False)
+    values.setdefault("resize_width", 1700)
+    values.setdefault("resize_height", 2500)
+    values.setdefault("resize_interpolation", "high")
+    values.setdefault("resize_method", "stretch")
+    values.setdefault("resize_condition", "always")
+    values.setdefault("resize_multiple_of", 0)
+
+    media = payload.get("media") or {}
+    if not isinstance(media, dict):
+        raise ValueError("media must be an object")
+    files: dict[str, tuple[str, bytes]] = {}
+    for field in FILE_FIELDS:
+        if field not in media:
+            continue
+        file_data = media_item_to_file(field, media[field])
+        if file_data:
+            files[field] = file_data
+    return values, files
+
+
+def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], source: str, request_kind: str, request_data: dict[str, Any]) -> str:
+    job_id = uuid.uuid4().hex
+    activity_id = uuid.uuid4().hex
+    with LOCK:
+        JOBS[job_id] = {"id": job_id, "status": "queued", "events": [], "results": [], "errors": [], "done": 0, "total": 0}
+    response = job_id_response(job_id)
+    record_activity({
+        "id": activity_id,
+        "job_id": job_id,
+        "source": source,
+        "request_kind": request_kind,
+        "status": "running",
+        "title": str(values.get("prompt") or "")[:80] or "Nano Banana task",
+        "request": request_data,
+        "response": response,
+    })
+    threading.Thread(target=run_job, args=(job_id, values, files, activity_id), daemon=True).start()
+    return job_id
+
+
 def extract_items(result: dict[str, Any]) -> list[dict[str, Any]]:
     data = result.get("data")
     if isinstance(data, dict) and "data" in data:
@@ -469,7 +730,7 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
     mode = get_field(form, "mode", "img2img")
     seed_raw = get_field(form, "seed", "").strip()
     seed = int(seed_raw) if seed_raw else 0
-    if seed > 0 and get_field(form, "vary_seed", "") in {"on", "true", "1"}:
+    if seed > 0 and get_field(form, "vary_seed", "").lower() in {"on", "true", "1"}:
         seed += index - 1
 
     common = {
@@ -636,7 +897,7 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
     return {"index": index, "task_id": task_id, "status": "succeeded", "images": file_token_results}
 
 
-def run_job(job_id: str, values: dict[str, Any], files: dict[str, tuple[str, bytes]]) -> None:
+def run_job(job_id: str, values: dict[str, Any], files: dict[str, tuple[str, bytes]], activity_id: str | None = None) -> None:
     try:
         requested_count = max(1, min(50, int(values.get("repeat_count") or 1)))
         requested_concurrency = max(1, min(20, int(values.get("concurrency") or 1)))
@@ -659,10 +920,17 @@ def run_job(job_id: str, values: dict[str, Any], files: dict[str, tuple[str, byt
                     add_event(job_id, f"Error: {exc}")
         with LOCK:
             errors = JOBS[job_id]["errors"]
-        set_job(job_id, status="failed" if errors else "succeeded")
+            final_job = json.loads(json.dumps(JOBS[job_id]))
+        final_status = "failed" if errors else "succeeded"
+        set_job(job_id, status=final_status)
+        final_job["status"] = final_status
+        update_activity(activity_id, status=final_status, result=final_job)
         add_event(job_id, "Finished")
     except Exception as exc:
         set_job(job_id, status="failed", errors=[str(exc)])
+        with LOCK:
+            final_job = json.loads(json.dumps(JOBS.get(job_id, {})))
+        update_activity(activity_id, status="failed", error=str(exc), result=final_job)
         add_event(job_id, f"Fatal: {exc}")
 
 
@@ -682,6 +950,17 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if self.path == "/api/archives":
             json_response(self, 200, {"archives": list_archives()})
+            return
+        if self.path == "/api/schema":
+            json_response(self, 200, api_schema())
+            return
+        if self.path == "/api/activity":
+            json_response(self, 200, activity_list())
+            return
+        if self.path.startswith("/api/activity/"):
+            activity_id = self.path.rsplit("/", 1)[-1]
+            record = next((item for item in read_activity_log() if item.get("id") == activity_id), None)
+            json_response(self, 200 if record else 404, record or {"error": "activity not found"})
             return
         if self.path == "/api/default-output-dir":
             json_response(self, 200, {"path": desktop_output_dir()})
@@ -784,6 +1063,39 @@ class Handler(SimpleHTTPRequestHandler):
                 shutil.rmtree(STATE_DIR)
             json_response(self, 200, {"ok": True})
             return
+        if self.path == "/api/jobs/json":
+            try:
+                payload = read_json_body(self)
+                values, files = values_files_from_json(payload)
+                api_key = str(values.get("api_key") or load_default_key()).strip()
+                if not api_key and not payload.get("dry_run"):
+                    json_response(self, 400, {"error": "API key is required"})
+                    return
+                if api_key:
+                    values["api_key"] = api_key
+                if payload.get("dry_run"):
+                    response = {
+                        "ok": True,
+                        "dry_run": True,
+                        "values": {k: ("***" if k == "api_key" else v) for k, v in values.items()},
+                        "files": {k: {"filename": v[0], "bytes": len(v[1])} for k, v in files.items()},
+                    }
+                    record_activity({
+                        "source": "api",
+                        "request_kind": "json_dry_run",
+                        "status": "succeeded",
+                        "title": str(values.get("prompt") or "")[:80] or "Nano Banana dry run",
+                        "request": summarize_payload(payload),
+                        "response": response,
+                    })
+                    json_response(self, 200, response)
+                    return
+                request_data = {"raw": summarize_payload(payload), "parsed": summarize_values_files(values, files)}
+                job_id = create_job(values, files, "api", "json", request_data)
+                json_response(self, 200, job_id_response(job_id))
+            except Exception as exc:
+                json_response(self, 400, {"error": str(exc)})
+            return
         if self.path != "/api/jobs":
             json_response(self, 404, {"error": "not found"})
             return
@@ -801,11 +1113,9 @@ class Handler(SimpleHTTPRequestHandler):
                 blob = item.file.read()
                 if blob:
                     files[key] = (Path(item.filename).name, blob)
-        job_id = uuid.uuid4().hex
-        with LOCK:
-            JOBS[job_id] = {"id": job_id, "status": "queued", "events": [], "results": [], "errors": [], "done": 0, "total": 0}
-        threading.Thread(target=run_job, args=(job_id, values, files), daemon=True).start()
-        json_response(self, 200, {"job_id": job_id})
+        request_data = summarize_values_files(values, files)
+        job_id = create_job(values, files, "page", "multipart", request_data)
+        json_response(self, 200, job_id_response(job_id))
 
 
 def main() -> None:

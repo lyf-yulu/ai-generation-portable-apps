@@ -194,6 +194,11 @@
     </aside>
 
     <section class="workspace">
+      <div class="tabs">
+        <button id="mainTabBtn" class="tabBtn isActive" type="button">生成</button>
+        <button id="activityTabBtn" class="tabBtn" type="button">后台记录</button>
+      </div>
+      <div id="mainView" class="workspaceView">
       <div class="panel">
         <h2>Prompt</h2>
         <textarea name="prompt" form="jobForm" spellcheck="false" placeholder="输入提示词。多图参考可写：参考 Image 1 的人物，参考 Image 2 的背景..."></textarea>
@@ -211,6 +216,21 @@
         </div>
         <div id="results" class="results"></div>
         <pre id="events"></pre>
+      </div>
+      </div>
+
+      <div id="activityView" class="workspaceView hidden">
+        <div class="panel">
+          <div class="resultHeader">
+            <h2>后台记录</h2>
+            <button id="refreshActivityBtn" class="smallButton" type="button">刷新</button>
+          </div>
+          <div id="activityStats" class="activityStats"></div>
+          <div class="activityLayout">
+            <div id="activityList" class="activityList"></div>
+            <pre id="activityDetail" class="activityDetail">选择一条记录查看详情</pre>
+          </div>
+        </div>
       </div>
     </section>
   </main>
