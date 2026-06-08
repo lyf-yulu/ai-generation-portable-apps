@@ -35,7 +35,7 @@ const workspaceId = urlParams.get("ws") || "default";
 const workspaceKey = `seedance.workspace.${workspaceId}`;
 let savedMedia = {};
 let workspaceSaveTimer = 0;
-const providerDefaults = {
+let providerDefaults = {
   t8star: {
     baseUrl: "https://ai.t8star.cn",
     models: [
@@ -53,6 +53,22 @@ const providerDefaults = {
     hint: "使用豆包官方火山方舟 API。首尾帧模式不能与参考素材混用；本地素材会以 data URL 发送。",
   },
 };
+
+function providersFromConfig(providers) {
+  const next = {};
+  for (const [id, provider] of Object.entries(providers || {})) {
+    next[id] = {
+      baseUrl: provider.base_url || "",
+      models: (provider.models || []).map((item) => {
+        if (typeof item === "string") return [item, item];
+        return [item.id, item.label || item.id];
+      }).filter(([value]) => value),
+      hint: provider.hint || "",
+      label: provider.label || id,
+    };
+  }
+  return Object.keys(next).length ? next : providerDefaults;
+}
 
 function field(name) {
   return form.elements[name] || document.querySelector(`[name="${name}"]`);
@@ -326,6 +342,23 @@ async function loadConfig() {
   const res = await fetch("/api/config");
   const data = await res.json();
   keyHint.textContent = data.has_key ? `已检测到本地 key：${data.masked_key}` : "未检测到本地 key，请手动填写";
+  if (data.config_error) {
+    keyHint.textContent = `${keyHint.textContent}；供应商配置读取失败，请联系维护者：${data.config_error.detail || data.config_error.message}`;
+    submitBtn.disabled = true;
+    return;
+  }
+  providerDefaults = providersFromConfig(data.providers);
+  const providerSelect = field("provider");
+  const currentProvider = providerSelect.value;
+  providerSelect.innerHTML = "";
+  for (const [id, provider] of Object.entries(providerDefaults)) {
+    const option = document.createElement("option");
+    option.value = id;
+    option.textContent = provider.label || id;
+    providerSelect.append(option);
+  }
+  providerSelect.value = providerDefaults[currentProvider] ? currentProvider : (data.default_provider || Object.keys(providerDefaults)[0]);
+  updateProviderOptions(true);
 }
 
 function applyPreset(preset) {
@@ -544,7 +577,30 @@ async function loadActivityDetail(id, activeButton) {
   activeButton?.classList.add("isActive");
   const res = await fetch(`/api/activity/${id}`);
   const data = await res.json();
-  activityDetail.textContent = JSON.stringify(data, null, 2);
+  activityDetail.innerHTML = "";
+  const actions = document.createElement("div");
+  actions.className = "rowButtons";
+  const restoreBtn = document.createElement("button");
+  restoreBtn.type = "button";
+  restoreBtn.textContent = "恢复到当前页";
+  restoreBtn.disabled = !data.restore;
+  restoreBtn.addEventListener("click", () => {
+    applyPreset(data.restore);
+    saveWorkspaceDraft();
+    setActiveTab("main");
+    presetHint.textContent = data.restore.warning || "已从后台记录恢复参数和素材";
+  });
+  actions.append(restoreBtn);
+  activityDetail.append(actions);
+  if (data.restore?.warning) {
+    const warning = document.createElement("p");
+    warning.className = "hint";
+    warning.textContent = data.restore.warning;
+    activityDetail.append(warning);
+  }
+  const pre = document.createElement("pre");
+  pre.textContent = JSON.stringify(data, null, 2);
+  activityDetail.append(pre);
 }
 
 async function poll(jobId) {

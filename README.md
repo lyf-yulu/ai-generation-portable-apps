@@ -1,6 +1,6 @@
 # AI Generation Portable Apps
 
-Version: `v0.2.2`
+Version: `v0.2.5`
 
 This repository contains two local portable web apps:
 
@@ -62,6 +62,9 @@ nano-banana/Start_Nano_Banana.cmd
 
 ## Release
 
+- `v0.2.5`: Moved provider/model defaults into `providers.json`, added `/api/config` and `/api/request-template` for agents, added compatible API error fields, added history restore back to the current page, and made Nano empty-seed batch runs auto-assign non-reused seeds when `vary_seed` is enabled.
+- `v0.2.4`: Added local JSON API submission and backend activity records for page/API runs.
+- `v0.2.3`: Added Seedance official Ark provider support and Seedance 2.0/2.0-fast model entries.
 - `v0.2.2`: Added browser-side topic workspaces so multiple independent theme pages can run different prompts and settings concurrently from one local service.
 - `v0.2.1`: Fixed Windows launcher startup reliability and wired Seedance first/last frame uploads into preview, drag/drop, and removal controls.
 - `v0.2`: Added Nano Banana provider switching, optional browser-side image resize, drag-and-drop uploads, and cross-platform desktop output path helpers.

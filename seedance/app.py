@@ -31,6 +31,7 @@ MEDIA_DIR = STATE_DIR / "media"
 PRESET_PATH = STATE_DIR / "preset.json"
 ACTIVITY_PATH = STATE_DIR / "activity_log.json"
 ARCHIVE_DIR = ROOT / "archives"
+PROVIDERS_PATH = ROOT / "providers.json"
 DEFAULT_BASE_URL = "https://ai.t8star.cn"
 OFFICIAL_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_CONFIG = Path.home() / "ComfyUI/custom_nodes/Comfyui-zhenzhen/Comflyapi.json"
@@ -54,6 +55,7 @@ VALUE_FIELDS = {
     "base_url",
     "output_dir",
     "model",
+    "custom_model",
     "duration",
     "resolution",
     "ratio",
@@ -68,6 +70,30 @@ VALUE_FIELDS = {
     "timeout",
     "vary_seed",
     "prompt",
+}
+
+FALLBACK_PROVIDERS = {
+    "schema_version": 1,
+    "app": "seedance",
+    "default_provider": "t8star",
+    "providers": {
+        "t8star": {
+            "label": "T8Star 兼容接口",
+            "base_url": DEFAULT_BASE_URL,
+            "api_style": "t8star_seedance",
+            "hint": "使用原有 T8Star 兼容接口，素材会先上传到 /v1/files。",
+            "defaults": {"model": "doubao-seedance-2-0-260128", "duration": 12, "resolution": "720p", "ratio": "16:9", "repeat_count": 1, "concurrency": 1, "poll_interval": 10, "timeout": 3600, "vary_seed": True},
+            "models": [{"id": "doubao-seedance-2-0-260128", "label": "doubao-seedance-2-0-260128"}, {"id": "doubao-seedance-2-0-fast-260128", "label": "doubao-seedance-2-0-fast-260128"}],
+        },
+        "volcengine": {
+            "label": "豆包官方 / 火山方舟",
+            "base_url": OFFICIAL_ARK_BASE_URL,
+            "api_style": "ark_seedance",
+            "hint": "使用豆包官方火山方舟 API。首尾帧模式不能与参考素材混用；本地素材会以 data URL 发送。",
+            "defaults": {"model": "doubao-seedance-2-0-260128", "duration": 12, "resolution": "720p", "ratio": "16:9", "repeat_count": 1, "concurrency": 1, "poll_interval": 10, "timeout": 3600, "vary_seed": True},
+            "models": [{"id": "doubao-seedance-2-0-260128", "label": "doubao-seedance-2-0-260128"}, {"id": "doubao-seedance-2-0-fast-260128", "label": "doubao-seedance-2-0-fast-260128"}],
+        },
+    },
 }
 
 
@@ -91,6 +117,54 @@ def json_response(handler: SimpleHTTPRequestHandler, status: int, data: dict[str
     handler.send_header("Content-Length", str(len(raw)))
     handler.end_headers()
     handler.wfile.write(raw)
+
+
+def api_error(code: str, message: str, detail: str = "", retryable: bool = False) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": message,
+        "error_detail": detail,
+        "error_code": code,
+        "error_info": {
+            "code": code,
+            "message": message,
+            "detail": detail,
+            "retryable": retryable,
+        },
+    }
+
+
+def load_provider_config() -> tuple[dict[str, Any], dict[str, Any] | None]:
+    try:
+        config = json.loads(PROVIDERS_PATH.read_text(encoding="utf-8"))
+        if config.get("schema_version") != 1 or config.get("app") != "seedance":
+            raise ValueError("providers.json schema_version/app mismatch")
+        if not isinstance(config.get("providers"), dict) or not config["providers"]:
+            raise ValueError("providers.json providers must be a non-empty object")
+        return config, None
+    except Exception as exc:
+        return FALLBACK_PROVIDERS, {
+            "code": "provider_config_error",
+            "message": "供应商配置读取失败，请联系维护者",
+            "detail": str(exc),
+            "retryable": False,
+        }
+
+
+def provider_defaults(config: dict[str, Any], provider: str, model: str = "") -> dict[str, Any]:
+    providers = config.get("providers") or {}
+    provider_cfg = providers.get(provider) or providers.get(config.get("default_provider")) or next(iter(providers.values()))
+    defaults = dict(provider_cfg.get("defaults") or {})
+    if provider_cfg.get("base_url"):
+        defaults.setdefault("base_url", provider_cfg["base_url"])
+    defaults.setdefault("provider", provider)
+    models = provider_cfg.get("models") if isinstance(provider_cfg.get("models"), list) else []
+    selected = model or str(defaults.get("model") or "")
+    for item in models:
+        if isinstance(item, dict) and item.get("id") == selected:
+            defaults.update(item.get("defaults") or {})
+            break
+    return defaults
 
 
 def now_text() -> str:
@@ -256,8 +330,8 @@ def media_item_to_file(field: str, item: Any) -> tuple[str, bytes] | None:
     raise ValueError(f"media.{field} must include data_url or url")
 
 
-def job_id_response(job_id: str) -> dict[str, str]:
-    return {"job_id": job_id, "status_url": f"/api/jobs/{job_id}"}
+def job_id_response(job_id: str) -> dict[str, Any]:
+    return {"ok": True, "job_id": job_id, "status_url": f"/api/jobs/{job_id}"}
 
 
 def read_preset() -> dict[str, Any]:
@@ -291,6 +365,82 @@ def preset_to_client(data: dict[str, Any]) -> dict[str, Any]:
 
 def preset_for_client() -> dict[str, Any]:
     return preset_to_client(read_preset())
+
+
+def copy_files_to_restore(values: dict[str, Any], files: dict[str, tuple[str, bytes]], prefix: str) -> dict[str, Any]:
+    safe_values = {
+        key: value for key, value in values.items()
+        if key not in {"api_key", "saved_media"}
+    }
+    media: dict[str, Any] = {}
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        saved_media = json.loads(str(values.get("saved_media") or "{}"))
+    except Exception:
+        saved_media = {}
+    if isinstance(saved_media, dict):
+        for key, item in saved_media.items():
+            if key not in FILE_FIELDS or not isinstance(item, dict):
+                continue
+            stored = Path(str(item.get("stored", ""))).name
+            if stored and (MEDIA_DIR / stored).exists():
+                media[key] = {
+                    "filename": item.get("filename", stored),
+                    "stored": stored,
+                    "mime": item.get("mime") or mimetypes.guess_type(stored)[0] or "application/octet-stream",
+                }
+    for key, file_data in files.items():
+        if key not in FILE_FIELDS:
+            continue
+        filename, blob = file_data
+        if not blob:
+            continue
+        suffix = Path(filename).suffix or mimetypes.guess_extension(mimetypes.guess_type(filename)[0] or "") or ".bin"
+        stored = f"{prefix}_{uuid.uuid4().hex}_{key}{suffix}"
+        (MEDIA_DIR / stored).write_bytes(blob)
+        media[key] = {
+            "filename": filename,
+            "stored": stored,
+            "mime": mimetypes.guess_type(filename)[0] or "application/octet-stream",
+        }
+    return {"values": safe_values, "media": media}
+
+
+def activity_record_for_client(record: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not record:
+        return None
+    data = json.loads(json.dumps(record))
+    if isinstance(data.get("restore"), dict):
+        data["restore"] = preset_to_client(data["restore"])
+        return data
+    request = data.get("request") or {}
+    values = ((request.get("parsed") or {}).get("values") or request.get("values") or {})
+    if isinstance(values, dict) and values:
+        media: dict[str, Any] = {}
+        try:
+            saved_media = json.loads(str(values.get("saved_media") or "{}"))
+        except Exception:
+            saved_media = {}
+        if isinstance(saved_media, dict):
+            for key, item in saved_media.items():
+                if key not in FILE_FIELDS or not isinstance(item, dict):
+                    continue
+                stored = Path(str(item.get("stored", ""))).name
+                if stored and (MEDIA_DIR / stored).exists():
+                    media[key] = {
+                        "filename": item.get("filename", stored),
+                        "stored": stored,
+                        "mime": item.get("mime") or mimetypes.guess_type(stored)[0] or "application/octet-stream",
+                    }
+        legacy = preset_to_client({"values": {
+            key: value for key, value in values.items()
+            if key not in {"api_key", "saved_media"} and key not in FILE_FIELDS
+        }, "media": media})
+        data["restore"] = {
+            **legacy,
+            "warning": "" if legacy.get("media") else "这条旧记录没有保存素材副本，只能恢复参数。",
+        }
+    return data
 
 
 def safe_archive_name(raw: str) -> str:
@@ -683,7 +833,7 @@ def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index
         seed += run_index
 
     payload: dict[str, Any] = {
-        "model": get_field(form, "model", "doubao-seedance-2-0-260128"),
+        "model": get_field(form, "custom_model").strip() or get_field(form, "model", "doubao-seedance-2-0-260128"),
         "content": content,
         "duration": int(get_field(form, "duration", "12")),
         "ratio": get_field(form, "ratio", "16:9"),
@@ -731,6 +881,7 @@ def desktop_output_dir() -> str:
 
 
 def api_schema() -> dict[str, Any]:
+    config, config_error = load_provider_config()
     return {
         "app": "seedance",
         "endpoints": {
@@ -739,11 +890,9 @@ def api_schema() -> dict[str, Any]:
             "job_status": "GET /api/jobs/{job_id}",
             "download": "GET /api/download/{token}",
         },
-        "providers": {
-            "t8star": {"base_url": DEFAULT_BASE_URL},
-            "volcengine": {"base_url": OFFICIAL_ARK_BASE_URL},
-        },
-        "models": ["doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128"],
+        "providers": config.get("providers", {}),
+        "default_provider": config.get("default_provider"),
+        "config_error": config_error,
         "value_fields": sorted(VALUE_FIELDS),
         "file_fields": sorted(FILE_FIELDS),
         "media_item": {
@@ -769,19 +918,79 @@ def api_schema() -> dict[str, Any]:
     }
 
 
+def request_template() -> dict[str, Any]:
+    config, config_error = load_provider_config()
+    provider = str(config.get("default_provider") or "t8star")
+    defaults = provider_defaults(config, provider)
+    minimal = {
+        "api_key": "YOUR_API_KEY",
+        "prompt": "describe the video you want",
+        "media": {
+            "ref_image_1": {
+                "filename": "reference.png",
+                "data_url": "data:image/png;base64,..."
+            }
+        },
+    }
+    media = {
+        "first_frame": None,
+        "last_frame": None,
+        **{f"ref_image_{i}": None for i in range(1, 10)},
+        **{f"ref_video_{i}": None for i in range(1, 4)},
+        **{f"ref_audio_{i}": None for i in range(1, 4)},
+    }
+    media["ref_image_1"] = {"filename": "reference.png", "data_url": "data:image/png;base64,..."}
+    full = {
+        "api_key": "YOUR_API_KEY",
+        "provider": provider,
+        "base_url": defaults.get("base_url", DEFAULT_BASE_URL),
+        "model": defaults.get("model", "doubao-seedance-2-0-260128"),
+        "custom_model": "",
+        "prompt": "describe the video you want",
+        "duration": defaults.get("duration", 12),
+        "resolution": defaults.get("resolution", "720p"),
+        "ratio": defaults.get("ratio", "16:9"),
+        "seed": "",
+        "vary_seed": defaults.get("vary_seed", True),
+        "generate_audio": False,
+        "watermark": False,
+        "return_last_frame": False,
+        "web_search": False,
+        "repeat_count": defaults.get("repeat_count", 1),
+        "concurrency": defaults.get("concurrency", 1),
+        "poll_interval": defaults.get("poll_interval", 10),
+        "timeout": defaults.get("timeout", 3600),
+        "media": media,
+    }
+    return {
+        "ok": config_error is None,
+        "app": "seedance",
+        "endpoint": "POST /api/jobs/json",
+        "content_type": "application/json",
+        "config_error": config_error,
+        "templates": {"minimal": minimal, "full": full},
+        "field_notes": {
+            "api_key": "可省略；省略时使用本地配置中的 key。",
+            "custom_model": "高级字段；非空时覆盖 model 下拉值。",
+            "media.*.data_url": "使用 data URL，例如 data:video/mp4;base64,...。",
+            "first_frame/last_frame": "首尾帧槽位；豆包官方 API 不允许与参考素材混用。",
+            "repeat_count": "请求生成次数；如果 concurrency 更大，后端会按 concurrency 数启动。",
+            "concurrency": "同一任务内同时运行的生成数量。",
+        },
+    }
+
+
 def values_files_from_json(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, tuple[str, bytes]]]:
-    values = {key: payload[key] for key in VALUE_FIELDS if key in payload and payload[key] is not None}
-    values.setdefault("provider", "t8star")
-    values.setdefault("base_url", OFFICIAL_ARK_BASE_URL if values.get("provider") == "volcengine" else DEFAULT_BASE_URL)
-    values.setdefault("model", "doubao-seedance-2-0-260128")
-    values.setdefault("duration", 12)
-    values.setdefault("resolution", "720p")
-    values.setdefault("ratio", "16:9")
-    values.setdefault("repeat_count", 1)
-    values.setdefault("concurrency", 1)
-    values.setdefault("poll_interval", 10)
-    values.setdefault("timeout", 3600)
-    values.setdefault("vary_seed", True)
+    config, config_error = load_provider_config()
+    if config_error:
+        raise ValueError(f"{config_error['message']}: {config_error['detail']}")
+    incoming = {key: payload[key] for key in VALUE_FIELDS if key in payload and payload[key] is not None}
+    provider = str(incoming.get("provider") or config.get("default_provider") or "t8star")
+    values = provider_defaults(config, provider, str(incoming.get("model") or ""))
+    values.update(incoming)
+    values["provider"] = provider
+    if values.get("custom_model"):
+        values["model"] = str(values["custom_model"]).strip()
     values.setdefault("prompt", "")
 
     media = payload.get("media") or {}
@@ -812,6 +1021,7 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
         "title": str(values.get("prompt") or "")[:80] or "Seedance task",
         "request": request_data,
         "response": response,
+        "restore": copy_files_to_restore(values, files, activity_id),
     })
     thread = threading.Thread(target=run_job, args=(job_id, values, files, activity_id), daemon=True)
     thread.start()
@@ -927,7 +1137,18 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/api/config":
-            json_response(self, 200, {"has_key": bool(load_default_key()), "masked_key": mask_key(load_default_key())})
+            providers, config_error = load_provider_config()
+            json_response(self, 200, {
+                "ok": config_error is None,
+                "has_key": bool(load_default_key()),
+                "masked_key": mask_key(load_default_key()),
+                "providers": providers.get("providers", {}),
+                "default_provider": providers.get("default_provider"),
+                "config_error": config_error,
+            })
+            return
+        if self.path == "/api/request-template":
+            json_response(self, 200, request_template())
             return
         if self.path == "/api/preset":
             json_response(self, 200, preset_for_client())
@@ -944,7 +1165,7 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/activity/"):
             activity_id = self.path.rsplit("/", 1)[-1]
             record = next((item for item in read_activity_log() if item.get("id") == activity_id), None)
-            json_response(self, 200 if record else 404, record or {"error": "activity not found"})
+            json_response(self, 200 if record else 404, activity_record_for_client(record) or {"error": "activity not found"})
             return
         if self.path == "/api/default-output-dir":
             json_response(self, 200, {"path": desktop_output_dir()})
@@ -1056,7 +1277,7 @@ class Handler(SimpleHTTPRequestHandler):
                 values, files = values_files_from_json(payload)
                 api_key = str(values.get("api_key") or load_default_key()).strip()
                 if not api_key and not payload.get("dry_run"):
-                    json_response(self, 400, {"error": "API key is required"})
+                    json_response(self, 400, api_error("invalid_request", "API key is required"))
                     return
                 if api_key:
                     values["api_key"] = api_key
@@ -1081,7 +1302,7 @@ class Handler(SimpleHTTPRequestHandler):
                 job_id = create_job(values, files, "api", "json", request_data)
                 json_response(self, 200, job_id_response(job_id))
             except Exception as exc:
-                json_response(self, 400, {"error": str(exc)})
+                json_response(self, 400, api_error("invalid_request", str(exc)))
             return
         if self.path != "/api/jobs":
             json_response(self, 404, {"error": "not found"})
@@ -1089,7 +1310,7 @@ class Handler(SimpleHTTPRequestHandler):
         form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
         api_key = get_field(form, "api_key") or load_default_key()
         if not api_key:
-            json_response(self, 400, {"error": "API key is required"})
+            json_response(self, 400, api_error("invalid_request", "API key is required"))
             return
 
         form_values = {key: get_field(form, key) for key in form.keys() if not getattr(form[key], "filename", None)}

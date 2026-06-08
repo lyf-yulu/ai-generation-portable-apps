@@ -8,6 +8,7 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -31,8 +32,10 @@ MEDIA_DIR = STATE_DIR / "media"
 PRESET_PATH = STATE_DIR / "preset.json"
 ACTIVITY_PATH = STATE_DIR / "activity_log.json"
 ARCHIVE_DIR = ROOT / "archives"
+PROVIDERS_PATH = ROOT / "providers.json"
 DEFAULT_BASE_URL = "https://ai.t8star.cn"
 DEFAULT_CONFIG = Path.home() / "ComfyUI/custom_nodes/Comfyui-zhenzhen/Comflyapi.json"
+MAX_SEED = 2147483647
 
 JOBS: dict[str, dict[str, Any]] = {}
 FILES: dict[str, Path] = {}
@@ -42,10 +45,32 @@ ACTIVITY_LIMIT = 300
 FILE_FIELDS = {f"image_{i}" for i in range(1, 15)}
 VALUE_FIELDS = {
     "api_key", "base_url", "output_dir", "provider", "mode", "model", "aspect_ratio", "image_size",
-    "response_format", "seed", "control_after_generate", "skip_error", "repeat_count",
+    "custom_model", "response_format", "seed", "control_after_generate", "skip_error", "repeat_count",
     "concurrency", "poll_interval", "timeout", "vary_seed", "prompt", "archive_name",
     "resize_enabled", "resize_width", "resize_height", "resize_interpolation", "resize_method",
     "resize_condition", "resize_multiple_of",
+}
+
+FALLBACK_PROVIDERS = {
+    "schema_version": 1,
+    "app": "nano-banana",
+    "default_provider": "t8star",
+    "providers": {
+        "t8star": {
+            "label": "T8Star Images API",
+            "base_url": DEFAULT_BASE_URL,
+            "api_style": "openai_images",
+            "defaults": {"mode": "img2img", "model": "nano-banana-2", "aspect_ratio": "auto", "image_size": "2K", "response_format": "url", "control_after_generate": "randomize", "repeat_count": 1, "concurrency": 1, "poll_interval": 10, "timeout": 900, "vary_seed": True, "resize_enabled": False, "resize_width": 1700, "resize_height": 2500, "resize_interpolation": "high", "resize_method": "stretch", "resize_condition": "always", "resize_multiple_of": 0},
+            "models": [{"id": "nano-banana-2", "label": "nano-banana-2"}, {"id": "gemini-3.1-flash-image-preview", "label": "gemini-3.1-flash-image-preview"}],
+        },
+        "gemini": {
+            "label": "Chiyun",
+            "base_url": "https://chiyun.work",
+            "api_style": "gemini_generate_content",
+            "defaults": {"mode": "img2img", "model": "banana2-ssvip", "aspect_ratio": "auto", "image_size": "2K", "response_format": "url", "control_after_generate": "randomize", "repeat_count": 1, "concurrency": 1, "poll_interval": 10, "timeout": 900, "vary_seed": True, "resize_enabled": False, "resize_width": 1700, "resize_height": 2500, "resize_interpolation": "high", "resize_method": "stretch", "resize_condition": "always", "resize_multiple_of": 0},
+            "models": [{"id": "banana2-ssvip", "label": "banana2-ssvip"}, {"id": "nano-banana2[2K]-base", "label": "nano-banana2[2K]-base"}, {"id": "gpt-image-2", "label": "gpt-image-2"}],
+        },
+    },
 }
 
 
@@ -56,6 +81,54 @@ def json_response(handler: SimpleHTTPRequestHandler, status: int, data: dict[str
     handler.send_header("Content-Length", str(len(raw)))
     handler.end_headers()
     handler.wfile.write(raw)
+
+
+def api_error(code: str, message: str, detail: str = "", retryable: bool = False) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": message,
+        "error_detail": detail,
+        "error_code": code,
+        "error_info": {
+            "code": code,
+            "message": message,
+            "detail": detail,
+            "retryable": retryable,
+        },
+    }
+
+
+def load_provider_config() -> tuple[dict[str, Any], dict[str, Any] | None]:
+    try:
+        config = json.loads(PROVIDERS_PATH.read_text(encoding="utf-8"))
+        if config.get("schema_version") != 1 or config.get("app") != "nano-banana":
+            raise ValueError("providers.json schema_version/app mismatch")
+        if not isinstance(config.get("providers"), dict) or not config["providers"]:
+            raise ValueError("providers.json providers must be a non-empty object")
+        return config, None
+    except Exception as exc:
+        return FALLBACK_PROVIDERS, {
+            "code": "provider_config_error",
+            "message": "供应商配置读取失败，请联系维护者",
+            "detail": str(exc),
+            "retryable": False,
+        }
+
+
+def provider_defaults(config: dict[str, Any], provider: str, model: str = "") -> dict[str, Any]:
+    providers = config.get("providers") or {}
+    provider_cfg = providers.get(provider) or providers.get(config.get("default_provider")) or next(iter(providers.values()))
+    defaults = dict(provider_cfg.get("defaults") or {})
+    if provider_cfg.get("base_url"):
+        defaults.setdefault("base_url", provider_cfg["base_url"])
+    defaults.setdefault("provider", provider)
+    models = provider_cfg.get("models") if isinstance(provider_cfg.get("models"), list) else []
+    selected = model or str(defaults.get("model") or "")
+    for item in models:
+        if isinstance(item, dict) and item.get("id") == selected:
+            defaults.update(item.get("defaults") or {})
+            break
+    return defaults
 
 
 def now_text() -> str:
@@ -214,8 +287,8 @@ def media_item_to_file(field: str, item: Any) -> tuple[str, bytes] | None:
     raise ValueError(f"media.{field} must include data_url or url")
 
 
-def job_id_response(job_id: str) -> dict[str, str]:
-    return {"job_id": job_id, "status_url": f"/api/jobs/{job_id}"}
+def job_id_response(job_id: str) -> dict[str, Any]:
+    return {"ok": True, "job_id": job_id, "status_url": f"/api/jobs/{job_id}"}
 
 
 def load_default_key() -> str:
@@ -332,6 +405,82 @@ def preset_to_client(data: dict[str, Any]) -> dict[str, Any]:
 
 def preset_for_client() -> dict[str, Any]:
     return preset_to_client(read_preset())
+
+
+def copy_files_to_restore(values: dict[str, Any], files: dict[str, tuple[str, bytes]], prefix: str) -> dict[str, Any]:
+    safe_values = {
+        key: value for key, value in values.items()
+        if key not in {"api_key", "saved_media", "_auto_seed_base"}
+    }
+    media: dict[str, Any] = {}
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        saved_media = json.loads(str(values.get("saved_media") or "{}"))
+    except Exception:
+        saved_media = {}
+    if isinstance(saved_media, dict):
+        for key, item in saved_media.items():
+            if key not in FILE_FIELDS or not isinstance(item, dict):
+                continue
+            stored = Path(str(item.get("stored", ""))).name
+            if stored and (MEDIA_DIR / stored).exists():
+                media[key] = {
+                    "filename": item.get("filename", stored),
+                    "stored": stored,
+                    "mime": item.get("mime") or mimetypes.guess_type(stored)[0] or "image/png",
+                }
+    for key, file_data in files.items():
+        if key not in FILE_FIELDS:
+            continue
+        filename, blob = file_data
+        if not blob:
+            continue
+        suffix = Path(filename).suffix or mimetypes.guess_extension(mimetypes.guess_type(filename)[0] or "") or ".png"
+        stored = f"{prefix}_{uuid.uuid4().hex}_{key}{suffix}"
+        (MEDIA_DIR / stored).write_bytes(blob)
+        media[key] = {
+            "filename": filename,
+            "stored": stored,
+            "mime": mimetypes.guess_type(filename)[0] or "image/png",
+        }
+    return {"values": safe_values, "media": media}
+
+
+def activity_record_for_client(record: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not record:
+        return None
+    data = json.loads(json.dumps(record))
+    if isinstance(data.get("restore"), dict):
+        data["restore"] = preset_to_client(data["restore"])
+        return data
+    request = data.get("request") or {}
+    values = ((request.get("parsed") or {}).get("values") or request.get("values") or {})
+    if isinstance(values, dict) and values:
+        media: dict[str, Any] = {}
+        try:
+            saved_media = json.loads(str(values.get("saved_media") or "{}"))
+        except Exception:
+            saved_media = {}
+        if isinstance(saved_media, dict):
+            for key, item in saved_media.items():
+                if key not in FILE_FIELDS or not isinstance(item, dict):
+                    continue
+                stored = Path(str(item.get("stored", ""))).name
+                if stored and (MEDIA_DIR / stored).exists():
+                    media[key] = {
+                        "filename": item.get("filename", stored),
+                        "stored": stored,
+                        "mime": item.get("mime") or mimetypes.guess_type(stored)[0] or "image/png",
+                    }
+        legacy = preset_to_client({"values": {
+            key: value for key, value in values.items()
+            if key not in {"api_key", "saved_media"} and key not in FILE_FIELDS
+        }, "media": media})
+        data["restore"] = {
+            **legacy,
+            "warning": "" if legacy.get("media") else "这条旧记录没有保存素材副本，只能恢复参数。",
+        }
+    return data
 
 
 def parse_saved_media(form: cgi.FieldStorage | dict[str, Any]) -> dict[str, Any]:
@@ -508,6 +657,7 @@ def desktop_output_dir() -> str:
 
 
 def api_schema() -> dict[str, Any]:
+    config, config_error = load_provider_config()
     return {
         "app": "nano-banana",
         "endpoints": {
@@ -516,16 +666,8 @@ def api_schema() -> dict[str, Any]:
             "job_status": "GET /api/jobs/{job_id}",
             "download": "GET /api/download/{token}",
         },
-        "providers": {
-            "t8star": {
-                "base_url": DEFAULT_BASE_URL,
-                "models": ["nano-banana-2", "gemini-3.1-flash-image-preview"],
-            },
-            "gemini": {
-                "base_url": "https://chiyun.work",
-                "models": ["banana2-ssvip", "nano-banana2[2K]-base", "gpt-image-2"],
-            },
-        },
+        "providers": config.get("providers", {}),
+        "config_error": config_error,
         "value_fields": sorted(VALUE_FIELDS),
         "file_fields": sorted(FILE_FIELDS),
         "media_item": {
@@ -548,30 +690,77 @@ def api_schema() -> dict[str, Any]:
     }
 
 
+def request_template() -> dict[str, Any]:
+    config, config_error = load_provider_config()
+    provider = str(config.get("default_provider") or "t8star")
+    defaults = provider_defaults(config, provider)
+    minimal = {
+        "api_key": "YOUR_API_KEY",
+        "prompt": "describe the image you want",
+        "media": {
+            "image_1": {
+                "filename": "reference.png",
+                "data_url": "data:image/png;base64,..."
+            }
+        },
+    }
+    full = {
+        "api_key": "YOUR_API_KEY",
+        "provider": provider,
+        "base_url": defaults.get("base_url", DEFAULT_BASE_URL),
+        "model": defaults.get("model", "nano-banana-2"),
+        "custom_model": "",
+        "mode": defaults.get("mode", "img2img"),
+        "prompt": "describe the image you want",
+        "aspect_ratio": defaults.get("aspect_ratio", "auto"),
+        "image_size": defaults.get("image_size", "2K"),
+        "response_format": defaults.get("response_format", "url"),
+        "seed": "",
+        "vary_seed": defaults.get("vary_seed", True),
+        "repeat_count": defaults.get("repeat_count", 1),
+        "concurrency": defaults.get("concurrency", 1),
+        "poll_interval": defaults.get("poll_interval", 10),
+        "timeout": defaults.get("timeout", 900),
+        "resize_enabled": defaults.get("resize_enabled", False),
+        "resize_width": defaults.get("resize_width", 1700),
+        "resize_height": defaults.get("resize_height", 2500),
+        "resize_interpolation": defaults.get("resize_interpolation", "high"),
+        "resize_method": defaults.get("resize_method", "stretch"),
+        "resize_condition": defaults.get("resize_condition", "always"),
+        "resize_multiple_of": defaults.get("resize_multiple_of", 0),
+        "media": {f"image_{i}": None for i in range(1, 15)},
+    }
+    full["media"]["image_1"] = {"filename": "reference.png", "data_url": "data:image/png;base64,..."}
+    return {
+        "ok": config_error is None,
+        "app": "nano-banana",
+        "endpoint": "POST /api/jobs/json",
+        "content_type": "application/json",
+        "config_error": config_error,
+        "templates": {"minimal": minimal, "full": full},
+        "field_notes": {
+            "api_key": "可省略；省略时使用本地配置中的 key。",
+            "custom_model": "高级字段；非空时覆盖 model 下拉值。",
+            "media.image_1.data_url": "使用 data URL，例如 data:image/png;base64,...。",
+            "repeat_count": "请求生成次数；如果 concurrency 更大，后端会按 concurrency 数启动。",
+            "concurrency": "同一任务内同时运行的生成数量。",
+            "seed": "为空且 vary_seed=true 时，后端会为每个 run 自动分配不复用 seed。",
+        },
+    }
+
+
 def values_files_from_json(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, tuple[str, bytes]]]:
-    values = {key: payload[key] for key in VALUE_FIELDS if key in payload and payload[key] is not None}
-    provider = str(values.get("provider") or "t8star")
-    values.setdefault("provider", provider)
-    values.setdefault("base_url", "https://chiyun.work" if provider == "gemini" else DEFAULT_BASE_URL)
-    values.setdefault("mode", "img2img")
-    values.setdefault("model", "banana2-ssvip" if provider == "gemini" else "nano-banana-2")
-    values.setdefault("aspect_ratio", "auto")
-    values.setdefault("image_size", "2K")
-    values.setdefault("response_format", "url")
-    values.setdefault("control_after_generate", "randomize")
-    values.setdefault("repeat_count", 1)
-    values.setdefault("concurrency", 1)
-    values.setdefault("poll_interval", 10)
-    values.setdefault("timeout", 900)
-    values.setdefault("vary_seed", True)
+    config, config_error = load_provider_config()
+    if config_error:
+        raise ValueError(f"{config_error['message']}: {config_error['detail']}")
+    incoming = {key: payload[key] for key in VALUE_FIELDS if key in payload and payload[key] is not None}
+    provider = str(incoming.get("provider") or config.get("default_provider") or "t8star")
+    values = provider_defaults(config, provider, str(incoming.get("model") or ""))
+    values.update(incoming)
+    values["provider"] = provider
+    if values.get("custom_model"):
+        values["model"] = str(values["custom_model"]).strip()
     values.setdefault("prompt", "")
-    values.setdefault("resize_enabled", False)
-    values.setdefault("resize_width", 1700)
-    values.setdefault("resize_height", 2500)
-    values.setdefault("resize_interpolation", "high")
-    values.setdefault("resize_method", "stretch")
-    values.setdefault("resize_condition", "always")
-    values.setdefault("resize_multiple_of", 0)
 
     media = payload.get("media") or {}
     if not isinstance(media, dict):
@@ -601,6 +790,7 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
         "title": str(values.get("prompt") or "")[:80] or "Nano Banana task",
         "request": request_data,
         "response": response,
+        "restore": copy_files_to_restore(values, files, activity_id),
     })
     threading.Thread(target=run_job, args=(job_id, values, files, activity_id), daemon=True).start()
     return job_id
@@ -722,6 +912,10 @@ def add_event(job_id: str, message: str) -> None:
         JOBS[job_id].setdefault("events", []).append({"time": time.strftime("%H:%M:%S"), "message": message})
 
 
+def truthy(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"on", "true", "1", "yes"}
+
+
 def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tuple[str, bytes]]) -> dict[str, Any]:
     form = build_form(values, files)
     api_key = str(values["api_key"]).strip()
@@ -729,13 +923,15 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
     provider = get_field(form, "provider", "t8star")
     mode = get_field(form, "mode", "img2img")
     seed_raw = get_field(form, "seed", "").strip()
-    seed = int(seed_raw) if seed_raw else 0
-    if seed > 0 and get_field(form, "vary_seed", "").lower() in {"on", "true", "1"}:
+    auto_seed_base = int(values.get("_auto_seed_base") or 0)
+    seed = int(seed_raw) if seed_raw else auto_seed_base
+    if seed > 0 and truthy(get_field(form, "vary_seed")):
         seed += index - 1
+        seed = ((seed - 1) % MAX_SEED) + 1
 
     common = {
         "prompt": get_field(form, "prompt").strip(),
-        "model": get_field(form, "model", "nano-banana-2"),
+        "model": get_field(form, "custom_model").strip() or get_field(form, "model", "nano-banana-2"),
         "aspect_ratio": get_field(form, "aspect_ratio", "auto"),
         "response_format": get_field(form, "response_format", "url"),
     }
@@ -745,7 +941,8 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
     if seed > 0:
         common["seed"] = str(seed)
 
-    add_event(job_id, f"Run {index}: submitting {provider}/{mode}")
+    seed_label = f", seed:{seed}" if seed > 0 else ""
+    add_event(job_id, f"Run {index}: submitting {provider}/{mode}{seed_label}")
     if provider == "gemini":
         image_count = 0
         if common["model"] == "gpt-image-2":
@@ -783,7 +980,7 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
                     "local_path": local_path,
                 })
             add_event(job_id, f"Run {index}: saved {len(file_token_results)} image(s), input_images:{image_count}")
-            return {"index": index, "task_id": task_id, "status": "succeeded", "images": file_token_results}
+            return {"index": index, "task_id": task_id, "status": "succeeded", "seed": seed or None, "images": file_token_results}
 
         parts: list[dict[str, Any]] = [{"text": common["prompt"]}]
         if mode != "text2img":
@@ -831,7 +1028,7 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
                 "local_path": local_path,
             })
         add_event(job_id, f"Run {index}: saved {len(file_token_results)} image(s), input_images:{image_count}")
-        return {"index": index, "task_id": task_id, "status": "succeeded", "images": file_token_results}
+        return {"index": index, "task_id": task_id, "status": "succeeded", "seed": seed or None, "images": file_token_results}
 
     if mode == "text2img":
         payload = dict(common)
@@ -894,7 +1091,7 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
             "local_path": local_path,
         })
     add_event(job_id, f"Run {index}: saved {len(file_token_results)} image(s)")
-    return {"index": index, "task_id": task_id, "status": "succeeded", "images": file_token_results}
+    return {"index": index, "task_id": task_id, "status": "succeeded", "seed": seed or None, "images": file_token_results}
 
 
 def run_job(job_id: str, values: dict[str, Any], files: dict[str, tuple[str, bytes]], activity_id: str | None = None) -> None:
@@ -903,6 +1100,9 @@ def run_job(job_id: str, values: dict[str, Any], files: dict[str, tuple[str, byt
         requested_concurrency = max(1, min(20, int(values.get("concurrency") or 1)))
         count = max(requested_count, requested_concurrency)
         concurrency = min(count, requested_concurrency)
+        if not str(values.get("seed") or "").strip() and truthy(values.get("vary_seed")):
+            values = dict(values)
+            values["_auto_seed_base"] = secrets.randbelow(MAX_SEED) + 1
         set_job(job_id, status="running", total=count, done=0, results=[], errors=[])
         add_event(job_id, f"Started {count} run(s), concurrency {concurrency}, key {mask_key(values.get('api_key', ''))}")
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -943,7 +1143,18 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/api/config":
-            json_response(self, 200, {"has_key": bool(load_default_key()), "masked_key": mask_key(load_default_key())})
+            providers, config_error = load_provider_config()
+            json_response(self, 200, {
+                "ok": config_error is None,
+                "has_key": bool(load_default_key()),
+                "masked_key": mask_key(load_default_key()),
+                "providers": providers.get("providers", {}),
+                "default_provider": providers.get("default_provider"),
+                "config_error": config_error,
+            })
+            return
+        if self.path == "/api/request-template":
+            json_response(self, 200, request_template())
             return
         if self.path == "/api/preset":
             json_response(self, 200, preset_for_client())
@@ -960,7 +1171,7 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/activity/"):
             activity_id = self.path.rsplit("/", 1)[-1]
             record = next((item for item in read_activity_log() if item.get("id") == activity_id), None)
-            json_response(self, 200 if record else 404, record or {"error": "activity not found"})
+            json_response(self, 200 if record else 404, activity_record_for_client(record) or {"error": "activity not found"})
             return
         if self.path == "/api/default-output-dir":
             json_response(self, 200, {"path": desktop_output_dir()})
@@ -1069,7 +1280,7 @@ class Handler(SimpleHTTPRequestHandler):
                 values, files = values_files_from_json(payload)
                 api_key = str(values.get("api_key") or load_default_key()).strip()
                 if not api_key and not payload.get("dry_run"):
-                    json_response(self, 400, {"error": "API key is required"})
+                    json_response(self, 400, api_error("invalid_request", "API key is required"))
                     return
                 if api_key:
                     values["api_key"] = api_key
@@ -1094,7 +1305,7 @@ class Handler(SimpleHTTPRequestHandler):
                 job_id = create_job(values, files, "api", "json", request_data)
                 json_response(self, 200, job_id_response(job_id))
             except Exception as exc:
-                json_response(self, 400, {"error": str(exc)})
+                json_response(self, 400, api_error("invalid_request", str(exc)))
             return
         if self.path != "/api/jobs":
             json_response(self, 404, {"error": "not found"})
@@ -1102,7 +1313,7 @@ class Handler(SimpleHTTPRequestHandler):
         form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
         api_key = get_field(form, "api_key") or load_default_key()
         if not api_key:
-            json_response(self, 400, {"error": "API key is required"})
+            json_response(self, 400, api_error("invalid_request", "API key is required"))
             return
         values = {key: get_field(form, key) for key in form.keys() if not getattr(form[key], "filename", None)}
         values["api_key"] = api_key

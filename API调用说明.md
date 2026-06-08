@@ -7,6 +7,35 @@
 
 ## 通用接口
 
+### 查看当前配置
+
+```bash
+curl http://127.0.0.1:8787/api/config
+curl http://127.0.0.1:8797/api/config
+```
+
+返回内容包含：
+
+- `providers`：当前 `providers.json` 中可用供应商、模型、默认参数
+- `default_provider`：默认供应商
+- `config_error`：配置文件损坏时的错误详情
+- `has_key` / `masked_key`：本地是否能读取到默认 key
+
+### 查看请求模板
+
+Agent 建议先读这个接口学习当前版本的标准调用格式。
+
+```bash
+curl http://127.0.0.1:8787/api/request-template
+curl http://127.0.0.1:8797/api/request-template
+```
+
+返回内容包含：
+
+- `templates.minimal`：最小可用 JSON 请求
+- `templates.full`：完整字段 JSON 请求
+- `field_notes`：关键字段说明
+
 ### 查看接口结构
 
 ```bash
@@ -17,7 +46,6 @@ curl http://127.0.0.1:8797/api/schema
 返回内容包含：
 
 - `providers`：可用供应商和默认 Base URL
-- `models`：可用模型
 - `value_fields`：可提交的参数字段
 - `file_fields`：可提交的素材字段
 - `media_item`：素材上传格式
@@ -33,8 +61,25 @@ Content-Type: application/json
 
 ```json
 {
+  "ok": true,
   "job_id": "xxxx",
   "status_url": "/api/jobs/xxxx"
+}
+```
+
+失败时会保留旧版 `error` 字符串，同时增加结构化错误字段：
+
+```json
+{
+  "ok": false,
+  "error": "API key is required",
+  "error_code": "invalid_request",
+  "error_info": {
+    "code": "invalid_request",
+    "message": "API key is required",
+    "detail": "",
+    "retryable": false
+  }
 }
 ```
 
@@ -64,6 +109,26 @@ curl http://127.0.0.1:8797/api/activity/记录ID
 ```
 
 详情里包含请求摘要、返回摘要、任务结果、错误信息。API Key 会脱敏，`data_url` 不保存完整 base64，只保存是否存在和字符长度。
+
+从 v0.2.5 开始，后台记录详情会额外返回 `restore` 字段。网页里的“后台记录”详情页可以点击“恢复到当前页”，把当次提示词、参数和素材恢复到当前生成页继续使用。旧记录如果当时没有保存素材副本，会尽量恢复参数；如果旧记录里有 `saved_media` 引用，也会恢复这些素材。
+
+## 供应商增量更新
+
+两个 app 根目录都有 `providers.json`：
+
+- `seedance/providers.json`
+- `nano-banana/providers.json`
+
+这个文件用于开发端维护供应商、模型、默认 Base URL 和默认参数。客户正常不需要修改；需要增量更新模型时，可以替换同名 `providers.json` 后重启 app。
+
+支持通过 JSON 增量调整：
+
+- 供应商显示名
+- 默认 `base_url`
+- 模型列表
+- 默认模型和默认参数
+
+不支持只靠 JSON 新增后端未实现过的全新 API 协议。`api_style` 必须是程序已经支持的接口类型。
 
 ## 素材上传格式
 
@@ -110,6 +175,7 @@ curl http://127.0.0.1:8797/api/activity/记录ID
 - `provider`：`t8star` 或 `volcengine`
 - `base_url`
 - `model`
+- `custom_model`：高级字段，非空时覆盖 `model`
 - `prompt`
 - `duration`
 - `resolution`
@@ -209,6 +275,7 @@ curl -X POST http://127.0.0.1:8787/api/jobs/json \
 - `base_url`
 - `mode`：`img2img` 或 `text2img`
 - `model`
+- `custom_model`：高级字段，非空时覆盖 `model`
 - `prompt`
 - `aspect_ratio`
 - `image_size`
@@ -290,21 +357,24 @@ Chiyun 模式：
 }
 ```
 
-可用模型以 `/api/schema` 返回为准。
+可用模型以 `/api/config` 或 `/api/schema` 返回为准。
 
 ## OpenClaw 接入建议
 
 1. 先调用 `/api/schema` 获取字段列表。
-2. 把工作流里的参数映射到 `value_fields`。
-3. 把图片、视频、音频转成 `media` 对象。
-4. 先用 `dry_run: true` 测试解析。
-5. 正式提交后轮询 `status_url`。
-6. 从任务结果里的 `download_url` 下载文件。
+2. 调用 `/api/request-template` 获取 `minimal/full` 请求模板。
+3. 把工作流里的参数映射到 `value_fields`。
+4. 把图片、视频、音频转成 `media` 对象。
+5. 先用 `dry_run: true` 测试解析。
+6. 正式提交后轮询 `status_url`。
+7. 从任务结果里的 `download_url` 下载文件。
 
 最小流程：
 
 ```text
 GET  /api/schema
+GET  /api/config
+GET  /api/request-template
 POST /api/jobs/json
 GET  /api/jobs/{job_id}
 GET  /api/download/{token}
