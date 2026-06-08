@@ -11,6 +11,8 @@ const closePreviewBtn = document.querySelector("#closePreviewBtn");
 const chooseOutputBtn = document.querySelector("#chooseOutputBtn");
 const appOutputBtn = document.querySelector("#appOutputBtn");
 const desktopOutputBtn = document.querySelector("#desktopOutputBtn");
+const openOutputBtn = document.querySelector("#openOutputBtn");
+const cleanCacheBtn = document.querySelector("#cleanCacheBtn");
 const mainTabBtn = document.querySelector("#mainTabBtn");
 const activityTabBtn = document.querySelector("#activityTabBtn");
 const mainView = document.querySelector("#mainView");
@@ -694,6 +696,34 @@ desktopOutputBtn.addEventListener("click", async () => {
   const res = await fetch("/api/default-output-dir");
   const data = await res.json();
   if (res.ok && data.path) field("output_dir").value = data.path;
+});
+
+openOutputBtn.addEventListener("click", async () => {
+  openOutputBtn.disabled = true;
+  try {
+    const data = new FormData();
+    data.set("output_dir", field("output_dir").value);
+    const res = await fetch("/api/open-output-dir", { method: "POST", body: data });
+    const payload = await res.json();
+    presetHint.textContent = res.ok ? `已打开输出目录：${payload.path}` : (payload.error || "打开输出目录失败");
+  } finally {
+    openOutputBtn.disabled = false;
+  }
+});
+
+cleanCacheBtn.addEventListener("click", async () => {
+  cleanCacheBtn.disabled = true;
+  try {
+    const res = await fetch("/api/cleanup-cache", { method: "POST" });
+    const data = await res.json();
+    if (res.ok) {
+      presetHint.textContent = `已清理缓存：素材 ${data.media_deleted || 0} 个，日志 ${data.logs_deleted || 0} 个`;
+    } else {
+      presetHint.textContent = data.error || "清理缓存失败";
+    }
+  } finally {
+    cleanCacheBtn.disabled = false;
+  }
 });
 
 updateProviderOptions(true);

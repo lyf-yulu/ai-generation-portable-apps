@@ -1,6 +1,6 @@
 # AI Generation Portable Apps
 
-Version: `v0.2.5`
+Version: `v0.2.6`
 
 This repository contains two local portable web apps:
 
@@ -62,6 +62,7 @@ nano-banana/Start_Nano_Banana.cmd
 
 ## Release
 
+- `v0.2.6`: Added an “open output directory” control in both apps and a manual cache cleanup action for old orphan media and logs. Generated outputs are never deleted by this cleanup.
 - `v0.2.5`: Moved provider/model defaults into `providers.json`, added `/api/config` and `/api/request-template` for agents, added compatible API error fields, added history restore back to the current page, and made Nano empty-seed batch runs auto-assign non-reused seeds when `vary_seed` is enabled.
 - `v0.2.4`: Added local JSON API submission and backend activity records for page/API runs.
 - `v0.2.3`: Added Seedance official Ark provider support and Seedance 2.0/2.0-fast model entries.

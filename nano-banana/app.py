@@ -656,6 +656,82 @@ def desktop_output_dir() -> str:
     return str((parent / "NanoBanana_outputs").resolve())
 
 
+def open_output_dir(raw: str | None) -> str:
+    path = resolve_output_dir(raw)
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    elif sys.platform.startswith("win"):
+        os.startfile(str(path))  # type: ignore[attr-defined]
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
+    return str(path)
+
+
+def referenced_media_names() -> set[str]:
+    names: set[str] = set()
+
+    def collect_media(media: Any) -> None:
+        if not isinstance(media, dict):
+            return
+        for item in media.values():
+            if not isinstance(item, dict):
+                continue
+            stored = Path(str(item.get("stored", ""))).name
+            if stored:
+                names.add(stored)
+
+    def collect_saved_media(values: Any) -> None:
+        if not isinstance(values, dict):
+            return
+        try:
+            saved = json.loads(str(values.get("saved_media") or "{}"))
+        except Exception:
+            saved = {}
+        collect_media(saved)
+
+    collect_media(read_preset().get("media"))
+    for record in read_activity_log():
+        collect_media((record.get("restore") or {}).get("media"))
+        request = record.get("request") or {}
+        collect_saved_media(request.get("values"))
+        collect_saved_media((request.get("parsed") or {}).get("values"))
+    return names
+
+
+def cleanup_cache(media_days: int = 30, log_days: int = 14) -> dict[str, Any]:
+    now = time.time()
+    referenced = referenced_media_names()
+    media_cutoff = now - max(1, media_days) * 86400
+    log_cutoff = now - max(1, log_days) * 86400
+    stats = {
+        "ok": True,
+        "media_days": media_days,
+        "log_days": log_days,
+        "media_deleted": 0,
+        "logs_deleted": 0,
+        "bytes_deleted": 0,
+        "kept_referenced_media": len(referenced),
+    }
+    if MEDIA_DIR.exists():
+        for path in MEDIA_DIR.iterdir():
+            if not path.is_file() or path.name in referenced or path.stat().st_mtime >= media_cutoff:
+                continue
+            size = path.stat().st_size
+            path.unlink()
+            stats["media_deleted"] += 1
+            stats["bytes_deleted"] += size
+    logs_dir = ROOT / "logs"
+    if logs_dir.exists():
+        for path in logs_dir.iterdir():
+            if not path.is_file() or path.stat().st_mtime >= log_cutoff:
+                continue
+            size = path.stat().st_size
+            path.unlink()
+            stats["logs_deleted"] += 1
+            stats["bytes_deleted"] += size
+    return stats
+
+
 def api_schema() -> dict[str, Any]:
     config, config_error = load_provider_config()
     return {
@@ -1234,6 +1310,19 @@ class Handler(SimpleHTTPRequestHandler):
                 json_response(self, 200, {"path": choose_output_dir()})
             except Exception as exc:
                 json_response(self, 500, {"error": str(exc)})
+            return
+        if self.path == "/api/open-output-dir":
+            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
+            try:
+                json_response(self, 200, {"ok": True, "path": open_output_dir(get_field(form, "output_dir"))})
+            except Exception as exc:
+                json_response(self, 500, api_error("open_output_dir_failed", "打开输出目录失败", str(exc)))
+            return
+        if self.path == "/api/cleanup-cache":
+            try:
+                json_response(self, 200, cleanup_cache())
+            except Exception as exc:
+                json_response(self, 500, api_error("cleanup_cache_failed", "清理缓存失败", str(exc)))
             return
         if self.path == "/api/workspace/snapshot":
             form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})

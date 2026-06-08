@@ -1,4 +1,5 @@
 更新日志：
+v0.2.6 加入直接打开输出目录按钮，并加入手动清理旧孤立素材和旧日志的功能；不会清理 outputs 生成结果
 v0.2.5 供应商和模型迁移到 providers.json；加入 /api/config、/api/request-template；后台记录可恢复到当前页；空 seed 批量运行会自动分配不复用 seed
 v0.2.4 加入本地 API 调用和后台记录
 v0.2.3 补充 Chiyun 模型配置

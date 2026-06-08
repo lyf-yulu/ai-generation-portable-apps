@@ -112,6 +112,34 @@ curl http://127.0.0.1:8797/api/activity/记录ID
 
 从 v0.2.5 开始，后台记录详情会额外返回 `restore` 字段。网页里的“后台记录”详情页可以点击“恢复到当前页”，把当次提示词、参数和素材恢复到当前生成页继续使用。旧记录如果当时没有保存素材副本，会尽量恢复参数；如果旧记录里有 `saved_media` 引用，也会恢复这些素材。
 
+### 本地维护接口
+
+打开当前输出目录：
+
+```bash
+curl -X POST http://127.0.0.1:8787/api/open-output-dir \
+  -F 'output_dir=/Users/你的用户名/Desktop/seedance_outputs'
+
+curl -X POST http://127.0.0.1:8797/api/open-output-dir \
+  -F 'output_dir=/Users/你的用户名/Desktop/nano_outputs'
+```
+
+`output_dir` 可以省略；省略时会打开程序默认输出目录。这个接口会在本机调用系统文件管理器：macOS 使用 `open`，Windows 使用 `os.startfile`，Linux 使用 `xdg-open`。
+
+手动清理缓存：
+
+```bash
+curl -X POST http://127.0.0.1:8787/api/cleanup-cache
+curl -X POST http://127.0.0.1:8797/api/cleanup-cache
+```
+
+清理策略：
+
+- 删除 `state/media` 中超过 30 天、且没有被当前存档或后台记录引用的孤立素材。
+- 删除 `logs` 中超过 14 天的日志文件。
+- 不删除 `outputs` 里的生成结果。
+- 不会自动定时运行，只在网页点击“清理缓存”或调用接口时执行。
+
 ## 供应商增量更新
 
 两个 app 根目录都有 `providers.json`：
