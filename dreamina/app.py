@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import concurrent.futures
+import json
+import mimetypes
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import uuid
+import webbrowser
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent
+STATIC_DIR = ROOT / "static"
+OUTPUT_DIR = ROOT / "outputs"
+UPLOAD_DIR = ROOT / "uploads"
+LOG_DIR = ROOT / "logs"
+STATE_DIR = ROOT / "state"
+HISTORY_PATH = STATE_DIR / "history.json"
+CONFIG_PATH = ROOT / "config.json"
+
+DEFAULT_CONFIG = {
+    "port": 8888,
+    "max_concurrent": 5,
+    "poll_image": 60,
+    "poll_video": 300,
+    "login_timeout": 120,
+    "upload_max_age_days": 7,
+}
+
+JOBS: dict[str, dict[str, Any]] = {}
+LOCK = threading.Lock()
+LOGIN_PROC: subprocess.Popen | None = None
+LOGIN_LOCK = threading.Lock()
+EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def load_config() -> dict[str, Any]:
+    if CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(CONFIG_PATH.read_text("utf-8"))
+            merged = {**DEFAULT_CONFIG, **cfg}
+            return merged
+        except Exception:
+            pass
+    return dict(DEFAULT_CONFIG)
+
+
+def ensure_dirs():
+    for d in (OUTPUT_DIR, UPLOAD_DIR, LOG_DIR, STATE_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def cleanup_old_uploads():
+    cfg = load_config()
+    max_age = cfg.get("upload_max_age_days", 7) * 86400
+    now = time.time()
+    if not UPLOAD_DIR.exists():
+        return
+    for f in UPLOAD_DIR.iterdir():
+        if f.is_file() and (now - f.stat().st_mtime) > max_age:
+            f.unlink(missing_ok=True)
+
+
+def find_available_port(start: int) -> int:
+    for port in range(start, start + 100):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    return start + 100
+
+
+def run_cmd(args: list[str], timeout: int = 30) -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout
+        )
+        return {
+            "returncode": result.returncode,
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip(),
+        }
+    except subprocess.TimeoutExpired:
+        return {"returncode": -1, "stdout": "", "stderr": "timeout"}
+    except FileNotFoundError:
+        return {"returncode": -1, "stdout": "", "stderr": "command not found"}
+
+
+def check_cli_installed() -> bool:
+    r = run_cmd(["which", "dreamina"], timeout=5)
+    if r["returncode"] == 0:
+        return True
+    return Path.home().joinpath(".dreamina_cli").exists()
+
+
+def check_login() -> dict[str, Any]:
+    r = run_cmd(["dreamina", "user_credit"], timeout=15)
+    if r["returncode"] != 0:
+        return {"logged_in": False, "credit": None, "raw": r["stderr"]}
+    try:
+        data = json.loads(r["stdout"])
+        return {"logged_in": True, "credit": data}
+    except json.JSONDecodeError:
+        if "credit" in r["stdout"].lower() or "{" in r["stdout"]:
+            return {"logged_in": True, "credit": r["stdout"]}
+        return {"logged_in": False, "credit": None, "raw": r["stdout"]}
+
+
+def read_history() -> list[dict[str, Any]]:
+    if not HISTORY_PATH.exists():
+        return []
+    try:
+        return json.loads(HISTORY_PATH.read_text("utf-8"))
+    except Exception:
+        return []
+
+
+def write_history(items: list[dict[str, Any]]):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    HISTORY_PATH.write_text(json.dumps(items[-500:], ensure_ascii=False, indent=2), "utf-8")
+
+
+def record_job(job: dict[str, Any]):
+    items = read_history()
+    items.append(job)
+    write_history(items)
+
+
+def update_job_in_history(job_id: str, updates: dict[str, Any]):
+    items = read_history()
+    for item in items:
+        if item.get("job_id") == job_id:
+            item.update(updates)
+            break
+    write_history(items)
+
+
+def execute_task(job_id: str, task_type: str, args: list[str], params: dict[str, Any]):
+    with LOCK:
+        JOBS[job_id]["status"] = "running"
+
+    result = run_cmd(args, timeout=params.get("timeout", 600))
+
+    with LOCK:
+        job = JOBS[job_id]
+        job["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    if result["returncode"] == 0:
+        stdout = result["stdout"]
+        try:
+            data = json.loads(stdout)
+        except json.JSONDecodeError:
+            data = {"raw": stdout}
+
+        submit_id = data.get("submit_id") or data.get("id") or ""
+        status_str = data.get("status") or data.get("gen_status") or ""
+
+        if status_str in ("success", "completed") or data.get("images") or data.get("videos"):
+            download_result = download_if_needed(submit_id, data, task_type, job_id)
+            with LOCK:
+                job["status"] = "completed"
+                job["result"] = download_result or data
+        elif submit_id:
+            with LOCK:
+                job["status"] = "querying"
+                job["submit_id"] = submit_id
+                job["result"] = data
+        else:
+            with LOCK:
+                job["status"] = "completed"
+                job["result"] = data
+    else:
+        error_msg = result["stderr"] or result["stdout"] or "unknown error"
+        retryable = any(kw in error_msg.lower() for kw in ["timeout", "network", "retry", "排队"])
+        with LOCK:
+            job["status"] = "failed"
+            job["error"] = error_msg
+            job["retryable"] = retryable
+
+    with LOCK:
+        final_job = dict(JOBS[job_id])
+    update_job_in_history(job_id, {
+        "status": final_job["status"],
+        "result": final_job.get("result"),
+        "error": final_job.get("error"),
+        "finished_at": final_job.get("finished_at"),
+    })
+
+
+def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str) -> dict | None:
+    if not submit_id:
+        return None
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    short_id = job_id[:8]
+    dl_dir = OUTPUT_DIR / f"{ts}_{task_type}_{short_id}"
+    dl_dir.mkdir(parents=True, exist_ok=True)
+
+    r = run_cmd(["dreamina", "query_result", f"--submit_id={submit_id}", f"--download_dir={dl_dir}"], timeout=60)
+    if r["returncode"] == 0:
+        files = [str(f.relative_to(ROOT)) for f in dl_dir.iterdir() if f.is_file()]
+        return {"download_dir": str(dl_dir.relative_to(ROOT)), "files": files, "cli_output": r["stdout"]}
+    return {"download_dir": str(dl_dir.relative_to(ROOT)), "files": [], "cli_output": data}
+
+
+def json_response(handler, status: int, data: dict):
+    raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(raw)))
+    handler.end_headers()
+    handler.wfile.write(raw)
+
+
+def read_json_body(handler, max_bytes: int = 50 * 1024 * 1024) -> dict:
+    length = int(handler.headers.get("Content-Length") or "0")
+    if length <= 0:
+        return {}
+    if length > max_bytes:
+        raise ValueError("body too large")
+    return json.loads(handler.rfile.read(length).decode("utf-8"))
+
+
+def parse_multipart(handler) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
+    content_type = handler.headers.get("Content-Type", "")
+    boundary_match = re.search(r"boundary=(.+)", content_type)
+    if not boundary_match:
+        raise ValueError("no boundary")
+    boundary = boundary_match.group(1).encode()
+    length = int(handler.headers.get("Content-Length", "0"))
+    body = handler.rfile.read(length)
+
+    fields: dict[str, str] = {}
+    files: dict[str, tuple[str, bytes]] = {}
+
+    parts = body.split(b"--" + boundary)
+    for part in parts[1:]:
+        if part.strip() in (b"", b"--", b"--\r\n"):
+            continue
+        header_end = part.find(b"\r\n\r\n")
+        if header_end < 0:
+            continue
+        headers_raw = part[:header_end].decode("utf-8", errors="replace")
+        content = part[header_end + 4:]
+        if content.endswith(b"\r\n"):
+            content = content[:-2]
+
+        name_match = re.search(r'name="([^"]+)"', headers_raw)
+        filename_match = re.search(r'filename="([^"]*)"', headers_raw)
+        if not name_match:
+            continue
+        name = name_match.group(1)
+        if filename_match and filename_match.group(1):
+            files[name] = (filename_match.group(1), content)
+        else:
+            fields[name] = content.decode("utf-8", errors="replace")
+
+    return fields, files
+
+
+class Handler(SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/env/check":
+            self.handle_env_check()
+        elif path == "/api/env/login-poll":
+            self.handle_login_poll()
+        elif path == "/api/jobs":
+            self.handle_jobs_list()
+        elif path.startswith("/api/jobs/"):
+            job_id = path.split("/api/jobs/")[1].split("/")[0]
+            self.handle_job_status(job_id)
+        elif path == "/api/history":
+            self.handle_history()
+        elif path.startswith("/outputs/"):
+            self.serve_file(OUTPUT_DIR, path[len("/outputs/"):])
+        elif path.startswith("/uploads/"):
+            self.serve_file(UPLOAD_DIR, path[len("/uploads/"):])
+        else:
+            self.serve_static(path)
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+
+        if path == "/api/env/install-cli":
+            self.handle_install_cli()
+        elif path == "/api/env/login":
+            self.handle_login()
+        elif path == "/api/env/login-cancel":
+            self.handle_login_cancel()
+        elif path == "/api/env/switch-account":
+            self.handle_switch_account()
+        elif path == "/api/env/update-cli":
+            self.handle_install_cli()
+        elif path == "/api/text2image":
+            self.handle_generate("text2image")
+        elif path == "/api/image2image":
+            self.handle_generate("image2image")
+        elif path == "/api/text2video":
+            self.handle_generate("text2video")
+        elif path == "/api/image2video":
+            self.handle_generate("image2video")
+        elif path.startswith("/api/jobs/") and path.endswith("/retry"):
+            job_id = path.split("/api/jobs/")[1].split("/")[0]
+            self.handle_retry(job_id)
+        elif path == "/api/cache/clean":
+            self.handle_cache_clean()
+        else:
+            json_response(self, 404, {"ok": False, "error": "not found"})
+
+    def handle_env_check(self):
+        installed = check_cli_installed()
+        login_info = check_login() if installed else {"logged_in": False, "credit": None}
+        json_response(self, 200, {
+            "ok": True,
+            "cli_installed": installed,
+            "logged_in": login_info["logged_in"],
+            "credit": login_info.get("credit"),
+        })
+
+    def handle_login_poll(self):
+        info = check_login()
+        json_response(self, 200, {"ok": True, **info})
+
+    def handle_install_cli(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        def send_event(data: str):
+            self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
+            self.wfile.flush()
+
+        try:
+            proc = subprocess.Popen(
+                ["bash", "-c", "curl -fsSL https://jimeng.jianying.com/cli | bash"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            )
+            for line in proc.stdout:
+                send_event(json.dumps({"type": "log", "text": line.rstrip()}))
+            proc.wait()
+            if proc.returncode == 0:
+                send_event(json.dumps({"type": "done", "success": True}))
+            else:
+                send_event(json.dumps({"type": "done", "success": False, "error": f"exit code {proc.returncode}"}))
+        except Exception as e:
+            send_event(json.dumps({"type": "done", "success": False, "error": str(e)}))
+
+    def handle_login(self):
+        global LOGIN_PROC
+        with LOGIN_LOCK:
+            if LOGIN_PROC and LOGIN_PROC.poll() is None:
+                json_response(self, 200, {"ok": True, "message": "login already in progress"})
+                return
+            try:
+                LOGIN_PROC = subprocess.Popen(
+                    ["dreamina", "login"],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, start_new_session=True,
+                )
+            except FileNotFoundError:
+                json_response(self, 400, {"ok": False, "error": "dreamina not found"})
+                return
+
+        cfg = load_config()
+        timeout = cfg.get("login_timeout", 120)
+        auth_url = ""
+
+        def read_output_and_open_browser():
+            nonlocal auth_url
+            try:
+                for line in LOGIN_PROC.stdout:
+                    if "verification_uri:" in line:
+                        auth_url = line.split("verification_uri:", 1)[1].strip()
+                        webbrowser.open(auth_url)
+                        break
+            except Exception:
+                pass
+
+        threading.Thread(target=read_output_and_open_browser, daemon=True).start()
+
+        def kill_after_timeout():
+            time.sleep(timeout)
+            with LOGIN_LOCK:
+                if LOGIN_PROC and LOGIN_PROC.poll() is None:
+                    LOGIN_PROC.kill()
+
+        threading.Thread(target=kill_after_timeout, daemon=True).start()
+
+        time.sleep(2)
+        json_response(self, 200, {"ok": True, "message": "login started", "timeout": timeout, "auth_url": auth_url})
+
+    def handle_login_cancel(self):
+        global LOGIN_PROC
+        with LOGIN_LOCK:
+            if LOGIN_PROC and LOGIN_PROC.poll() is None:
+                LOGIN_PROC.kill()
+                LOGIN_PROC = None
+        json_response(self, 200, {"ok": True, "message": "login cancelled"})
+
+    def handle_switch_account(self):
+        r = run_cmd(["dreamina", "relogin"], timeout=5)
+        global LOGIN_PROC
+        with LOGIN_LOCK:
+            try:
+                LOGIN_PROC = subprocess.Popen(
+                    ["dreamina", "login"],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, start_new_session=True,
+                )
+            except FileNotFoundError:
+                json_response(self, 400, {"ok": False, "error": "dreamina not found"})
+                return
+
+        cfg = load_config()
+        timeout = cfg.get("login_timeout", 120)
+        auth_url = ""
+
+        def read_output_and_open_browser():
+            nonlocal auth_url
+            try:
+                for line in LOGIN_PROC.stdout:
+                    if "verification_uri:" in line:
+                        auth_url = line.split("verification_uri:", 1)[1].strip()
+                        webbrowser.open(auth_url)
+                        break
+            except Exception:
+                pass
+
+        threading.Thread(target=read_output_and_open_browser, daemon=True).start()
+
+        def kill_after_timeout():
+            time.sleep(timeout)
+            with LOGIN_LOCK:
+                if LOGIN_PROC and LOGIN_PROC.poll() is None:
+                    LOGIN_PROC.kill()
+
+        threading.Thread(target=kill_after_timeout, daemon=True).start()
+
+        time.sleep(2)
+        json_response(self, 200, {"ok": True, "message": "switch account started", "timeout": timeout, "auth_url": auth_url})
+
+    def handle_generate(self, task_type: str):
+        cfg = load_config()
+        running = sum(1 for j in JOBS.values() if j["status"] in ("pending", "running"))
+        if running >= cfg["max_concurrent"]:
+            json_response(self, 429, {"ok": False, "error": "max concurrent reached", "max": cfg["max_concurrent"]})
+            return
+
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart" in content_type:
+            fields, files = parse_multipart(self)
+        else:
+            fields = read_json_body(self)
+            files = {}
+
+        prompt = fields.get("prompt", "")
+        if not prompt:
+            json_response(self, 400, {"ok": False, "error": "prompt is required"})
+            return
+
+        uploaded_path = None
+        if files:
+            file_key = next(iter(files))
+            filename, blob = files[file_key]
+            suffix = Path(filename).suffix or ".png"
+            stored_name = f"{uuid.uuid4().hex}{suffix}"
+            uploaded_path = UPLOAD_DIR / stored_name
+            uploaded_path.write_bytes(blob)
+
+        args = self.build_cli_args(task_type, fields, uploaded_path, cfg)
+        poll_timeout = cfg["poll_video"] if "video" in task_type else cfg["poll_image"]
+        total_timeout = poll_timeout + 30
+
+        job_id = uuid.uuid4().hex
+        job = {
+            "job_id": job_id,
+            "task_type": task_type,
+            "status": "pending",
+            "params": {k: v for k, v in fields.items()},
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "finished_at": None,
+            "result": None,
+            "error": None,
+            "retryable": False,
+        }
+
+        with LOCK:
+            JOBS[job_id] = job
+
+        record_job(job)
+        EXECUTOR.submit(execute_task, job_id, task_type, args, {"timeout": total_timeout})
+
+        json_response(self, 200, {"ok": True, "job_id": job_id})
+
+    def build_cli_args(self, task_type: str, fields: dict, uploaded_path: Path | None, cfg: dict) -> list[str]:
+        prompt = fields.get("prompt", "")
+        ratio = fields.get("ratio", "1:1")
+        resolution = fields.get("resolution_type", "2k")
+        duration = fields.get("duration", "5")
+        video_resolution = fields.get("video_resolution", "720P")
+        poll = cfg["poll_video"] if "video" in task_type else cfg["poll_image"]
+
+        if task_type == "text2image":
+            return ["dreamina", "text2image", f"--prompt={prompt}", f"--ratio={ratio}", f"--resolution_type={resolution}", f"--poll={poll}"]
+        elif task_type == "image2image":
+            img = str(uploaded_path) if uploaded_path else ""
+            return ["dreamina", "image2image", "--images", img, f"--prompt={prompt}", f"--resolution_type={resolution}", f"--poll={poll}"]
+        elif task_type == "text2video":
+            return ["dreamina", "text2video", f"--prompt={prompt}", f"--duration={duration}", f"--ratio={ratio}", f"--video_resolution={video_resolution}", f"--poll={poll}"]
+        elif task_type == "image2video":
+            img = str(uploaded_path) if uploaded_path else ""
+            return ["dreamina", "image2video", "--image", img, f"--prompt={prompt}", f"--duration={duration}", f"--poll={poll}"]
+        return []
+
+    def handle_retry(self, job_id: str):
+        with LOCK:
+            job = JOBS.get(job_id)
+        if not job:
+            json_response(self, 404, {"ok": False, "error": "job not found"})
+            return
+        if job["status"] not in ("failed",):
+            json_response(self, 400, {"ok": False, "error": "job is not failed"})
+            return
+
+        cfg = load_config()
+        task_type = job["task_type"]
+        fields = job.get("params", {})
+        args = self.build_cli_args(task_type, fields, None, cfg)
+        poll = cfg["poll_video"] if "video" in task_type else cfg["poll_image"]
+
+        new_job_id = uuid.uuid4().hex
+        new_job = {
+            "job_id": new_job_id,
+            "task_type": task_type,
+            "status": "pending",
+            "params": fields,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "finished_at": None,
+            "result": None,
+            "error": None,
+            "retryable": False,
+        }
+        with LOCK:
+            JOBS[new_job_id] = new_job
+        record_job(new_job)
+        EXECUTOR.submit(execute_task, new_job_id, task_type, args, {"timeout": poll + 30})
+        json_response(self, 200, {"ok": True, "job_id": new_job_id})
+
+    def handle_jobs_list(self):
+        with LOCK:
+            jobs = list(JOBS.values())
+        json_response(self, 200, {"ok": True, "jobs": jobs})
+
+    def handle_job_status(self, job_id: str):
+        with LOCK:
+            job = JOBS.get(job_id)
+        if not job:
+            json_response(self, 404, {"ok": False, "error": "not found"})
+            return
+        json_response(self, 200, {"ok": True, "job": job})
+
+    def handle_history(self):
+        items = read_history()
+        json_response(self, 200, {"ok": True, "history": items[-100:]})
+
+    def handle_cache_clean(self):
+        removed_uploads = 0
+        if UPLOAD_DIR.exists():
+            for f in UPLOAD_DIR.iterdir():
+                if f.is_file():
+                    f.unlink()
+                    removed_uploads += 1
+        json_response(self, 200, {"ok": True, "removed_uploads": removed_uploads})
+
+    def serve_static(self, path: str):
+        if path == "/" or path == "":
+            path = "/index.html"
+        file_path = STATIC_DIR / path.lstrip("/")
+        if not file_path.exists() or not file_path.is_file():
+            file_path = STATIC_DIR / "index.html"
+        if not file_path.exists():
+            self.send_error(404)
+            return
+        mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+        content = file_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def serve_file(self, base_dir: Path, rel_path: str):
+        file_path = base_dir / urllib.parse.unquote(rel_path)
+        if not file_path.exists() or not file_path.is_file():
+            self.send_error(404)
+            return
+        mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+        content = file_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+
+def main():
+    global EXECUTOR
+    ensure_dirs()
+    cleanup_old_uploads()
+
+    cfg = load_config()
+    EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=cfg["max_concurrent"])
+
+    port = find_available_port(cfg["port"])
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+
+    url = f"http://127.0.0.1:{port}"
+    print(f"Dreamina App running at {url}")
+    print("Press Ctrl+C to stop")
+
+    threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        server.shutdown()
+        EXECUTOR.shutdown(wait=False)
+
+
+if __name__ == "__main__":
+    main()
