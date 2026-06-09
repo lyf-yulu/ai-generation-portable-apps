@@ -30,31 +30,69 @@
       </div>
 
       <div class="topbar-actions">
-        <button id="switchAccountBtn" class="btn-small" title="切换账号">切换账号</button>
-        <button id="cleanCacheBtn" class="btn-small" title="清理缓存">清理缓存</button>
-        <button id="updateCliBtn" class="btn-small" title="更新 CLI">更新 CLI</button>
+        <button id="switchAccountBtn" class="btn-small">切换账号</button>
+        <button id="cleanCacheBtn" class="btn-small">清理缓存</button>
+        <button id="updateCliBtn" class="btn-small">更新 CLI</button>
       </div>
 
-      <div class="tabs">
-        <button class="tab-btn active" data-tab="text2image">文生图</button>
-        <button class="tab-btn" data-tab="image2image">图生图</button>
-        <button class="tab-btn" data-tab="text2video">文生视频</button>
-        <button class="tab-btn" data-tab="image2video">图生视频</button>
+      <div class="tabs major-tabs">
+        <button class="tab-btn active" data-major="image">图片生成</button>
+        <button class="tab-btn" data-major="video">视频生成</button>
       </div>
 
       <form id="genForm">
+        <div id="imageModeSection">
+          <div class="sub-tabs">
+            <button type="button" class="sub-tab active" data-mode="text2image">文生图</button>
+            <button type="button" class="sub-tab" data-mode="image2image">图生图(多参考)</button>
+          </div>
+        </div>
+
+        <div id="videoModeSection" class="hidden">
+          <div class="sub-tabs">
+            <button type="button" class="sub-tab active" data-mode="frames2video">首尾帧</button>
+            <button type="button" class="sub-tab" data-mode="multimodal2video">全能参考</button>
+            <button type="button" class="sub-tab" data-mode="multiframe2video">智能多帧</button>
+          </div>
+        </div>
+
         <div class="form-group">
           <label for="prompt">Prompt</label>
           <textarea id="prompt" name="prompt" rows="4" placeholder="描述你想生成的内容..."></textarea>
         </div>
 
-        <div id="imageUploadGroup" class="form-group hidden">
-          <label>参考图 / 首帧图</label>
-          <div class="upload-area" id="uploadArea">
-            <input type="file" id="fileInput" accept="image/*" hidden>
-            <p class="upload-hint">点击或拖拽上传图片</p>
-            <img id="uploadPreview" class="upload-preview hidden" alt="preview">
+        <div id="multiRefSection" class="form-group hidden">
+          <label>参考图 (最多 9 张)</label>
+          <div class="upload-grid refs" id="imageRefs"></div>
+        </div>
+
+        <div id="framesSection" class="hidden">
+          <label>首尾帧</label>
+          <div class="upload-grid two">
+            <label class="drop" id="firstFrameDrop">首帧<input type="file" name="first_frame" accept="image/*" hidden><span>未上传</span></label>
+            <label class="drop" id="lastFrameDrop">尾帧<input type="file" name="last_frame" accept="image/*" hidden><span>未上传</span></label>
           </div>
+        </div>
+
+        <div id="multimodalSection" class="hidden">
+          <label>参考图 (最多 9 张)</label>
+          <div class="upload-grid refs" id="mmImageRefs"></div>
+          <label>参考视频 (最多 3 个)</label>
+          <div class="upload-grid three" id="mmVideoRefs"></div>
+          <label>参考音频 (最多 3 个)</label>
+          <div class="upload-grid three" id="mmAudioRefs"></div>
+        </div>
+
+        <div id="multiframeSection" class="hidden">
+          <div class="multiframe-header">
+            <label>关键帧 (2-9 帧)</label>
+            <div class="frame-controls">
+              <button type="button" id="removeFrameBtn" class="btn-icon">−</button>
+              <span id="frameCount">2</span>
+              <button type="button" id="addFrameBtn" class="btn-icon">+</button>
+            </div>
+          </div>
+          <div id="framesContainer"></div>
         </div>
 
         <div class="form-row">
@@ -85,8 +123,12 @@
             <div class="form-group">
               <label for="duration">时长(秒)</label>
               <select id="duration" name="duration">
+                <option value="4">4s</option>
                 <option value="5" selected>5s</option>
+                <option value="8">8s</option>
                 <option value="10">10s</option>
+                <option value="12">12s</option>
+                <option value="15">15s</option>
               </select>
             </div>
             <div class="form-group">
@@ -96,6 +138,15 @@
                 <option value="1080P">1080P</option>
               </select>
             </div>
+          </div>
+          <div class="form-group" id="modelVersionGroup">
+            <label for="model_version">模型版本</label>
+            <select id="model_version" name="model_version">
+              <option value="seedance2.0fast">Seedance 2.0 Fast</option>
+              <option value="seedance2.0">Seedance 2.0</option>
+              <option value="seedance2.0_vip">Seedance 2.0 VIP</option>
+              <option value="seedance2.0fast_vip">Seedance 2.0 Fast VIP</option>
+            </select>
           </div>
         </div>
 

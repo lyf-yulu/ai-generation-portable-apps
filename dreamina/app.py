@@ -269,6 +269,19 @@ def parse_multipart(handler) -> tuple[dict[str, str], dict[str, tuple[str, bytes
     return fields, files
 
 
+def save_uploaded_files(files: dict[str, tuple[str, bytes]], prefix: str) -> list[Path]:
+    """Save all files whose key starts with prefix, return sorted paths."""
+    saved = []
+    for key in sorted(files.keys()):
+        if key.startswith(prefix):
+            filename, blob = files[key]
+            suffix = Path(filename).suffix or ".bin"
+            stored = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
+            stored.write_bytes(blob)
+            saved.append(stored)
+    return saved
+
+
 class Handler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -316,6 +329,12 @@ class Handler(SimpleHTTPRequestHandler):
             self.handle_generate("text2video")
         elif path == "/api/image2video":
             self.handle_generate("image2video")
+        elif path == "/api/frames2video":
+            self.handle_generate("frames2video")
+        elif path == "/api/multimodal2video":
+            self.handle_generate("multimodal2video")
+        elif path == "/api/multiframe2video":
+            self.handle_generate("multiframe2video")
         elif path.startswith("/api/jobs/") and path.endswith("/retry"):
             job_id = path.split("/api/jobs/")[1].split("/")[0]
             self.handle_retry(job_id)
@@ -473,20 +492,24 @@ class Handler(SimpleHTTPRequestHandler):
             files = {}
 
         prompt = fields.get("prompt", "")
-        if not prompt:
+        if not prompt and task_type not in ("multimodal2video",):
             json_response(self, 400, {"ok": False, "error": "prompt is required"})
             return
 
-        uploaded_path = None
+        uploaded_paths = {}
         if files:
-            file_key = next(iter(files))
-            filename, blob = files[file_key]
-            suffix = Path(filename).suffix or ".png"
-            stored_name = f"{uuid.uuid4().hex}{suffix}"
-            uploaded_path = UPLOAD_DIR / stored_name
-            uploaded_path.write_bytes(blob)
+            uploaded_paths["ref_image"] = save_uploaded_files(files, "ref_image_")
+            uploaded_paths["ref_video"] = save_uploaded_files(files, "ref_video_")
+            uploaded_paths["ref_audio"] = save_uploaded_files(files, "ref_audio_")
+            uploaded_paths["first_frame"] = save_uploaded_files(files, "first_frame")
+            uploaded_paths["last_frame"] = save_uploaded_files(files, "last_frame")
+            uploaded_paths["frame_"] = save_uploaded_files(files, "frame_")
+            if not any(uploaded_paths.values()):
+                legacy = save_uploaded_files(files, "image")
+                if legacy:
+                    uploaded_paths["ref_image"] = legacy
 
-        args = self.build_cli_args(task_type, fields, uploaded_path, cfg)
+        args = self.build_cli_args(task_type, fields, uploaded_paths, cfg)
         poll_timeout = cfg["poll_video"] if "video" in task_type else cfg["poll_image"]
         total_timeout = poll_timeout + 30
 
@@ -511,24 +534,65 @@ class Handler(SimpleHTTPRequestHandler):
 
         json_response(self, 200, {"ok": True, "job_id": job_id})
 
-    def build_cli_args(self, task_type: str, fields: dict, uploaded_path: Path | None, cfg: dict) -> list[str]:
+    def build_cli_args(self, task_type: str, fields: dict, uploaded_paths: dict, cfg: dict) -> list[str]:
         prompt = fields.get("prompt", "")
         ratio = fields.get("ratio", "1:1")
         resolution = fields.get("resolution_type", "2k")
         duration = fields.get("duration", "5")
         video_resolution = fields.get("video_resolution", "720P")
+        model_version = fields.get("model_version", "seedance2.0fast")
         poll = cfg["poll_video"] if "video" in task_type else cfg["poll_image"]
 
         if task_type == "text2image":
             return ["dreamina", "text2image", f"--prompt={prompt}", f"--ratio={ratio}", f"--resolution_type={resolution}", f"--poll={poll}"]
+
         elif task_type == "image2image":
-            img = str(uploaded_path) if uploaded_path else ""
-            return ["dreamina", "image2image", "--images", img, f"--prompt={prompt}", f"--resolution_type={resolution}", f"--poll={poll}"]
+            images = uploaded_paths.get("ref_image", [])
+            img_str = ",".join(str(p) for p in images) if images else ""
+            return ["dreamina", "image2image", "--images", img_str, f"--prompt={prompt}", f"--ratio={ratio}", f"--resolution_type={resolution}", f"--poll={poll}"]
+
         elif task_type == "text2video":
             return ["dreamina", "text2video", f"--prompt={prompt}", f"--duration={duration}", f"--ratio={ratio}", f"--video_resolution={video_resolution}", f"--poll={poll}"]
+
         elif task_type == "image2video":
-            img = str(uploaded_path) if uploaded_path else ""
+            images = uploaded_paths.get("ref_image", [])
+            img = str(images[0]) if images else ""
             return ["dreamina", "image2video", "--image", img, f"--prompt={prompt}", f"--duration={duration}", f"--poll={poll}"]
+
+        elif task_type == "frames2video":
+            first_list = uploaded_paths.get("first_frame", [])
+            last_list = uploaded_paths.get("last_frame", [])
+            first = str(first_list[0]) if first_list else ""
+            last = str(last_list[0]) if last_list else ""
+            args = ["dreamina", "frames2video", "--first", first, "--last", last, f"--prompt={prompt}", f"--duration={duration}", f"--video_resolution={video_resolution}", f"--poll={poll}"]
+            if model_version:
+                args.append(f"--model_version={model_version}")
+            return args
+
+        elif task_type == "multimodal2video":
+            args = ["dreamina", "multimodal2video", f"--prompt={prompt}", f"--duration={duration}", f"--ratio={ratio}", f"--video_resolution={video_resolution}", f"--model_version={model_version}", f"--poll={poll}"]
+            for img in uploaded_paths.get("ref_image", []):
+                args.extend(["--image", str(img)])
+            for vid in uploaded_paths.get("ref_video", []):
+                args.extend(["--video", str(vid)])
+            for aud in uploaded_paths.get("ref_audio", []):
+                args.extend(["--audio", str(aud)])
+            return args
+
+        elif task_type == "multiframe2video":
+            frames = uploaded_paths.get("frame_", [])
+            img_str = ",".join(str(p) for p in frames) if frames else ""
+            args = ["dreamina", "multiframe2video", "--images", img_str, f"--poll={poll}"]
+            idx = 1
+            while f"transition_prompt_{idx}" in fields:
+                args.extend(["--transition-prompt", fields[f"transition_prompt_{idx}"]])
+                idx += 1
+            idx = 1
+            while f"transition_duration_{idx}" in fields:
+                args.extend(["--transition-duration", fields[f"transition_duration_{idx}"]])
+                idx += 1
+            return args
+
         return []
 
     def handle_retry(self, job_id: str):

@@ -83,13 +83,14 @@ body { min-height: 100vh; }
 /* === Tabs === */
 .tabs {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
   gap: 4px;
   margin-bottom: 18px;
   background: #f1f3f7;
   border-radius: 8px;
   padding: 4px;
 }
+
+.major-tabs { grid-template-columns: repeat(2, 1fr); }
 
 .tab-btn {
   padding: 7px 4px;
@@ -104,6 +105,28 @@ body { min-height: 100vh; }
 }
 .tab-btn:hover { color: #17191f; }
 .tab-btn.active { background: #ffffff; color: #17191f; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+
+/* === Sub-tabs === */
+.sub-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.sub-tab {
+  padding: 5px 12px;
+  border-radius: 6px;
+  border: 1px solid #dde1e8;
+  background: #ffffff;
+  color: #4b5565;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.sub-tab:hover { border-color: #2673e8; color: #2673e8; }
+.sub-tab.active { background: #2673e8; color: #ffffff; border-color: #2673e8; }
 
 /* === Form === */
 .form-group { margin-bottom: 14px; }
@@ -136,7 +159,129 @@ textarea { min-height: 100px; line-height: 1.5; }
 
 .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 
-/* === Upload === */
+/* === Upload Grid (seedance-style) === */
+.upload-grid {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.upload-grid.two { grid-template-columns: repeat(2, 1fr); }
+.upload-grid.three { grid-template-columns: repeat(3, 1fr); }
+.upload-grid.refs { grid-template-columns: repeat(3, 1fr); }
+
+.drop {
+  min-height: 76px;
+  margin: 0;
+  padding: 10px;
+  border: 1px dashed #aeb8c7;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #344054;
+  display: grid;
+  align-content: center;
+  text-align: center;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  transition: border-color 0.15s;
+}
+.drop:hover { border-color: #2673e8; }
+.drop.has-preview { min-height: 96px; padding: 6px; }
+.drop input[type="file"] { display: none; }
+.drop span {
+  display: block;
+  margin-top: 4px;
+  color: #697386;
+  font-size: 11px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.drop .preview {
+  display: block;
+  width: 100%;
+  height: 60px;
+  object-fit: contain;
+  border-radius: 4px;
+  margin-top: 4px;
+  background: #e8edf4;
+  cursor: zoom-in;
+}
+.drop audio.preview {
+  height: 32px;
+  cursor: default;
+}
+
+/* === Multiframe === */
+.multiframe-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.multiframe-header label { margin: 0; }
+
+.frame-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.frame-controls span {
+  font-size: 14px;
+  font-weight: 700;
+  min-width: 16px;
+  text-align: center;
+}
+
+.btn-icon {
+  width: 28px;
+  height: 28px;
+  border: 1px solid #cbd2dd;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #293244;
+  font-size: 18px;
+  font-weight: 700;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  line-height: 1;
+}
+.btn-icon:hover { border-color: #2673e8; color: #2673e8; }
+
+.frame-item {
+  border: 1px solid #dde1e8;
+  border-radius: 8px;
+  padding: 10px;
+  margin-bottom: 10px;
+  background: #fbfcfe;
+}
+.frame-item-header {
+  font-size: 12px;
+  font-weight: 650;
+  color: #4b5565;
+  margin-bottom: 6px;
+}
+.frame-item .drop { min-height: 64px; }
+.transition-input {
+  width: 100%;
+  border: 1px solid #cbd2dd;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #17191f;
+  font: inherit;
+  font-size: 12px;
+  padding: 7px 9px;
+  margin-top: 8px;
+  outline: none;
+}
+.transition-input:focus {
+  border-color: #2673e8;
+  box-shadow: 0 0 0 3px rgba(38, 115, 232, 0.12);
+}
+
+/* === Upload (legacy single) === */
 .upload-area {
   min-height: 100px;
   border: 1px dashed #aeb8c7;

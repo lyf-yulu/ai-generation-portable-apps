@@ -4,36 +4,31 @@
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
 
-let currentTab = 'text2image';
-let uploadedFile = null;
+let currentMajor = 'image';
+let currentMode = 'text2image';
+let frameCount = 2;
 let pollTimers = {};
 
 // === Init ===
 document.addEventListener('DOMContentLoaded', () => {
   checkEnv();
-  bindTabs();
+  bindMajorTabs();
+  bindSubTabs();
   bindForm();
-  bindUpload();
   bindTopbar();
   bindFilter();
   bindPreview();
+  buildUploadSlots();
+  buildMultiframeUI();
+  bindMultiframeControls();
 });
 
 // === Environment Check ===
 async function checkEnv() {
   const res = await api('/api/env/check');
-  if (!res.ok) {
-    showSetup('error', '无法连接后端');
-    return;
-  }
-  if (!res.cli_installed) {
-    showSetup('install', '即梦 CLI 未安装', '点击下方按钮一键安装即梦 CLI');
-    return;
-  }
-  if (!res.logged_in) {
-    showSetup('login', '需要登录', '点击下方按钮登录你的即梦账号，浏览器将自动打开授权页面');
-    return;
-  }
+  if (!res.ok) { showSetup('error', '无法连接后端'); return; }
+  if (!res.cli_installed) { showSetup('install', '即梦 CLI 未安装', '点击下方按钮一键安装即梦 CLI'); return; }
+  if (!res.logged_in) { showSetup('login', '需要登录', '点击下方按钮登录你的即梦账号，浏览器将自动打开授权页面'); return; }
   enterMain(res);
 }
 
@@ -47,13 +42,8 @@ function showSetup(mode, title, desc) {
   $('#loginCancelBtn').classList.add('hidden');
   $('#setupLog').classList.add('hidden');
   $('#setupSpinner').classList.add('hidden');
-
-  if (mode === 'install') {
-    $('#setupBtn').onclick = installCli;
-  }
-  if (mode === 'login') {
-    $('#loginBtn').onclick = startLogin;
-  }
+  if (mode === 'install') $('#setupBtn').onclick = installCli;
+  if (mode === 'login') $('#loginBtn').onclick = startLogin;
 }
 
 async function installCli() {
@@ -61,12 +51,10 @@ async function installCli() {
   $('#setupLog').classList.remove('hidden');
   $('#setupSpinner').classList.remove('hidden');
   $('#setupLog').textContent = '';
-
   const response = await fetch('/api/env/install-cli', { method: 'POST' });
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -81,9 +69,8 @@ async function installCli() {
         $('#setupLog').scrollTop = $('#setupLog').scrollHeight;
       } else if (data.type === 'done') {
         $('#setupSpinner').classList.add('hidden');
-        if (data.success) {
-          checkEnv();
-        } else {
+        if (data.success) checkEnv();
+        else {
           $('#setupTitle').textContent = '安装失败';
           $('#setupDesc').textContent = data.error || '请重试';
           $('#setupBtn').classList.remove('hidden');
@@ -100,13 +87,11 @@ async function startLogin() {
   $('#setupSpinner').classList.remove('hidden');
   $('#setupTitle').textContent = '等待授权...';
   $('#setupDesc').textContent = '浏览器即将打开，请在浏览器中完成登录授权';
-
   const res = await api('/api/env/login', 'POST');
   if (res && res.auth_url) {
-    $('#setupDesc').innerHTML = '浏览器已打开授权页面。如果没有弹出，请<a href="' + res.auth_url + '" target="_blank" style="color:var(--accent);">点击此处手动打开</a>';
+    $('#setupDesc').innerHTML = '浏览器已打开授权页面。如果没有弹出，请<a href="' + res.auth_url + '" target="_blank" style="color:#2673e8;">点击此处手动打开</a>';
   }
   pollLogin();
-
   $('#loginCancelBtn').onclick = async () => {
     await api('/api/env/login-cancel', 'POST');
     showSetup('login', '登录已取消', '点击重新登录');
@@ -118,16 +103,9 @@ function pollLogin() {
   let elapsed = 0;
   window._loginPoll = setInterval(async () => {
     elapsed += 3;
-    if (elapsed > 120) {
-      clearInterval(window._loginPoll);
-      showSetup('login', '登录超时', '请重试');
-      return;
-    }
+    if (elapsed > 120) { clearInterval(window._loginPoll); showSetup('login', '登录超时', '请重试'); return; }
     const res = await api('/api/env/login-poll');
-    if (res && res.logged_in) {
-      clearInterval(window._loginPoll);
-      enterMain(res);
-    }
+    if (res && res.logged_in) { clearInterval(window._loginPoll); enterMain(res); }
   }, 3000);
 }
 
@@ -141,38 +119,162 @@ function enterMain(envData) {
 
 function updateStatus(data) {
   const badge = $('#statusText');
-  if (data && data.logged_in) {
-    badge.textContent = '已登录';
-    badge.className = 'status-badge ok';
-  } else {
-    badge.textContent = '未登录';
-    badge.className = 'status-badge error';
-  }
+  if (data && data.logged_in) { badge.textContent = '已登录'; badge.className = 'status-badge ok'; }
+  else { badge.textContent = '未登录'; badge.className = 'status-badge error'; }
   if (data && data.credit) {
     const c = typeof data.credit === 'string' ? data.credit : JSON.stringify(data.credit);
     $('#creditText').textContent = c.length > 60 ? c.slice(0, 60) + '...' : c;
   }
 }
 
-// === Tabs ===
-function bindTabs() {
-  $$('.tab-btn').forEach(btn => {
+// === Major Tabs ===
+function bindMajorTabs() {
+  $$('.major-tabs .tab-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      $$('.tab-btn').forEach(b => b.classList.remove('active'));
+      $$('.major-tabs .tab-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
-      currentTab = btn.dataset.tab;
+      currentMajor = btn.dataset.major;
+      if (currentMajor === 'image') {
+        currentMode = $('#imageModeSection .sub-tab.active').dataset.mode;
+      } else {
+        currentMode = $('#videoModeSection .sub-tab.active').dataset.mode;
+      }
+      updateFormVisibility();
+    });
+  });
+}
+
+function bindSubTabs() {
+  $$('.sub-tab').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const section = btn.closest('#imageModeSection, #videoModeSection');
+      section.querySelectorAll('.sub-tab').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      currentMode = btn.dataset.mode;
       updateFormVisibility();
     });
   });
 }
 
 function updateFormVisibility() {
-  const isImg2img = currentTab === 'image2image';
-  const isImg2video = currentTab === 'image2video';
-  const isVideo = currentTab === 'text2video' || currentTab === 'image2video';
-
-  $('#imageUploadGroup').classList.toggle('hidden', !isImg2img && !isImg2video);
+  const isVideo = currentMajor === 'video';
+  $('#imageModeSection').classList.toggle('hidden', isVideo);
+  $('#videoModeSection').classList.toggle('hidden', !isVideo);
   $('#videoParams').classList.toggle('hidden', !isVideo);
+  $('#multiRefSection').classList.toggle('hidden', currentMode !== 'image2image');
+  $('#framesSection').classList.toggle('hidden', currentMode !== 'frames2video');
+  $('#multimodalSection').classList.toggle('hidden', currentMode !== 'multimodal2video');
+  $('#multiframeSection').classList.toggle('hidden', currentMode !== 'multiframe2video');
+  $('#modelVersionGroup')?.classList.toggle('hidden', currentMode === 'multiframe2video');
+}
+
+// === Upload Slots ===
+function buildUploadSlots() {
+  const imageRefs = $('#imageRefs');
+  const mmImageRefs = $('#mmImageRefs');
+  const mmVideoRefs = $('#mmVideoRefs');
+  const mmAudioRefs = $('#mmAudioRefs');
+
+  for (let i = 1; i <= 9; i++) {
+    imageRefs.appendChild(makeDrop(`ref_image_${i}`, `参考${i}`, 'image/*'));
+    mmImageRefs.appendChild(makeDrop(`ref_image_${i}`, `参考${i}`, 'image/*'));
+  }
+  for (let i = 1; i <= 3; i++) {
+    mmVideoRefs.appendChild(makeDrop(`ref_video_${i}`, `视频${i}`, 'video/*'));
+    mmAudioRefs.appendChild(makeDrop(`ref_audio_${i}`, `音频${i}`, 'audio/*'));
+  }
+
+  wireAllDrops();
+}
+
+function makeDrop(name, label, accept) {
+  const el = document.createElement('label');
+  el.className = 'drop';
+  el.textContent = label;
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.name = name;
+  input.accept = accept;
+  input.hidden = true;
+  const span = document.createElement('span');
+  span.textContent = '未上传';
+  el.appendChild(input);
+  el.appendChild(span);
+  return el;
+}
+
+function wireAllDrops() {
+  $$('.drop input[type="file"]').forEach(input => {
+    input.addEventListener('change', () => {
+      const drop = input.closest('.drop');
+      const file = input.files?.[0];
+      if (!file) { clearDropPreview(drop); return; }
+      renderDropPreview(drop, input.accept, file);
+    });
+  });
+}
+
+function renderDropPreview(drop, accept, file) {
+  drop.classList.add('has-preview');
+  drop.querySelector('.preview')?.remove();
+  const kind = accept.includes('video') ? 'video' : accept.includes('audio') ? 'audio' : 'image';
+  const media = document.createElement(kind === 'image' ? 'img' : kind);
+  media.className = 'preview';
+  media.src = URL.createObjectURL(file);
+  if (kind !== 'image') media.controls = true;
+  if (kind === 'image') {
+    media.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); openPreview(media.src); });
+  }
+  drop.appendChild(media);
+  drop.querySelector('span').textContent = file.name;
+}
+
+function clearDropPreview(drop) {
+  drop.classList.remove('has-preview');
+  drop.querySelector('.preview')?.remove();
+  drop.querySelector('span').textContent = '未上传';
+}
+
+// === Multiframe UI ===
+function buildMultiframeUI() {
+  renderFrames();
+}
+
+function bindMultiframeControls() {
+  $('#addFrameBtn').addEventListener('click', () => {
+    if (frameCount >= 9) return;
+    frameCount++;
+    $('#frameCount').textContent = frameCount;
+    renderFrames();
+  });
+  $('#removeFrameBtn').addEventListener('click', () => {
+    if (frameCount <= 2) return;
+    frameCount--;
+    $('#frameCount').textContent = frameCount;
+    renderFrames();
+  });
+}
+
+function renderFrames() {
+  const container = $('#framesContainer');
+  container.innerHTML = '';
+  for (let i = 1; i <= frameCount; i++) {
+    const item = document.createElement('div');
+    item.className = 'frame-item';
+    item.innerHTML = `<div class="frame-item-header">帧 ${i}</div>`;
+    const drop = makeDrop(`frame_${i}`, `上传图片`, 'image/*');
+    item.appendChild(drop);
+    if (i < frameCount) {
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'transition-input';
+      input.name = `transition_prompt_${i}`;
+      input.placeholder = `帧${i} → 帧${i+1} 过渡描述`;
+      item.appendChild(input);
+    }
+    container.appendChild(item);
+  }
+  wireAllDrops();
 }
 
 // === Form Submit ===
@@ -185,38 +287,36 @@ function bindForm() {
 
 async function submitJob() {
   const prompt = $('#prompt').value.trim();
-  if (!prompt) { alert('请输入 Prompt'); return; }
+  if (!prompt && currentMode !== 'multiframe2video') { alert('请输入 Prompt'); return; }
 
   const btn = $('#submitBtn');
   btn.disabled = true;
   btn.textContent = '提交中...';
 
   try {
-    let res;
-    const needsFile = currentTab === 'image2image' || currentTab === 'image2video';
+    const formData = new FormData();
+    formData.append('prompt', prompt);
+    formData.append('ratio', $('#ratio').value);
+    formData.append('resolution_type', $('#resolution_type').value);
+    formData.append('duration', $('#duration').value);
+    formData.append('video_resolution', $('#video_resolution').value);
+    formData.append('model_version', $('#model_version').value);
 
-    if (needsFile && uploadedFile) {
-      const formData = new FormData();
-      formData.append('prompt', prompt);
-      formData.append('ratio', $('#ratio').value);
-      formData.append('resolution_type', $('#resolution_type').value);
-      formData.append('duration', $('#duration').value);
-      formData.append('video_resolution', $('#video_resolution').value);
-      formData.append('image', uploadedFile);
-      res = await fetch(`/api/${currentTab}`, { method: 'POST', body: formData });
-      res = await res.json();
-    } else if (needsFile && !uploadedFile) {
-      alert('请上传参考图');
-      return;
-    } else {
-      res = await api(`/api/${currentTab}`, 'POST', {
-        prompt,
-        ratio: $('#ratio').value,
-        resolution_type: $('#resolution_type').value,
-        duration: $('#duration').value,
-        video_resolution: $('#video_resolution').value,
-      });
+    if (currentMode === 'image2image') {
+      collectFiles(formData, '#imageRefs');
+    } else if (currentMode === 'frames2video') {
+      collectFrameFiles(formData);
+    } else if (currentMode === 'multimodal2video') {
+      collectFiles(formData, '#mmImageRefs');
+      collectFiles(formData, '#mmVideoRefs');
+      collectFiles(formData, '#mmAudioRefs');
+    } else if (currentMode === 'multiframe2video') {
+      collectFiles(formData, '#framesContainer');
+      collectTransitionPrompts(formData);
     }
+
+    const response = await fetch(`/api/${currentMode}`, { method: 'POST', body: formData });
+    const res = await response.json();
 
     if (res.ok) {
       startPollingJob(res.job_id);
@@ -230,28 +330,29 @@ async function submitJob() {
   }
 }
 
-// === Upload ===
-function bindUpload() {
-  const area = $('#uploadArea');
-  const input = $('#fileInput');
-
-  area.addEventListener('click', () => input.click());
-  area.addEventListener('dragover', e => { e.preventDefault(); area.classList.add('dragover'); });
-  area.addEventListener('dragleave', () => area.classList.remove('dragover'));
-  area.addEventListener('drop', e => {
-    e.preventDefault();
-    area.classList.remove('dragover');
-    if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+function collectFiles(formData, containerSelector) {
+  const container = $(containerSelector);
+  if (!container) return;
+  container.querySelectorAll('input[type="file"]').forEach(input => {
+    if (input.files && input.files[0]) {
+      formData.append(input.name, input.files[0]);
+    }
   });
-  input.addEventListener('change', () => { if (input.files.length) handleFile(input.files[0]); });
 }
 
-function handleFile(file) {
-  uploadedFile = file;
-  const preview = $('#uploadPreview');
-  preview.src = URL.createObjectURL(file);
-  preview.classList.remove('hidden');
-  $('.upload-hint').textContent = file.name;
+function collectFrameFiles(formData) {
+  const first = $('#firstFrameDrop input[type="file"]');
+  const last = $('#lastFrameDrop input[type="file"]');
+  if (first?.files?.[0]) formData.append('first_frame', first.files[0]);
+  if (last?.files?.[0]) formData.append('last_frame', last.files[0]);
+}
+
+function collectTransitionPrompts(formData) {
+  $$('.transition-input').forEach(input => {
+    if (input.value.trim()) {
+      formData.append(input.name, input.value.trim());
+    }
+  });
 }
 
 // === Jobs Polling ===
@@ -280,13 +381,8 @@ function renderJobsList(jobs) {
   const active = jobs.filter(j => j.status === 'pending' || j.status === 'running' || j.status === 'querying');
   const recent = jobs.filter(j => j.status === 'completed' || j.status === 'failed').slice(-10).reverse();
   const all = [...active, ...recent];
-
   $('#runningCount').textContent = active.length ? `${active.length} 进行中` : '';
-
-  if (!all.length) {
-    list.innerHTML = '<p style="color:var(--text-dim);font-size:13px;">暂无任务</p>';
-    return;
-  }
+  if (!all.length) { list.innerHTML = '<p style="color:#697386;font-size:13px;">暂无任务</p>'; return; }
   list.innerHTML = all.map(renderJobCard).join('');
   bindRetryButtons();
   bindThumbClicks();
@@ -306,17 +402,14 @@ function renderJobCard(job) {
       return `<img class="result-thumb" src="/${f}" data-src="/${f}" alt="result">`;
     }).join('') + '</div>';
   }
-
   let errorHtml = '';
   if (job.status === 'failed' && job.error) {
     errorHtml = `<div class="job-error">${escHtml(job.error.slice(0, 200))}</div>`;
   }
-
   let actionsHtml = '';
   if (job.status === 'failed' && job.retryable) {
     actionsHtml = `<div class="job-actions"><button class="btn-retry" data-job="${job.job_id}">重试</button></div>`;
   }
-
   return `<div class="job-card">
     <div class="job-card-header">
       <span class="job-type">${typeLabel(job.task_type)}</span>
@@ -331,12 +424,8 @@ function renderJobCard(job) {
 function bindRetryButtons() {
   $$('.btn-retry').forEach(btn => {
     btn.addEventListener('click', async () => {
-      const jobId = btn.dataset.job;
-      const res = await api(`/api/jobs/${jobId}/retry`, 'POST');
-      if (res && res.ok) {
-        startPollingJob(res.job_id);
-        loadJobs();
-      }
+      const res = await api(`/api/jobs/${btn.dataset.job}/retry`, 'POST');
+      if (res && res.ok) { startPollingJob(res.job_id); loadJobs(); }
     });
   });
 }
@@ -360,11 +449,7 @@ function renderHistory(items) {
   if (filter === 'image') filtered = filtered.filter(i => i.task_type?.includes('image'));
   if (filter === 'video') filtered = filtered.filter(i => i.task_type?.includes('video'));
   filtered = filtered.slice(0, 50);
-
-  if (!filtered.length) {
-    list.innerHTML = '<p style="color:var(--text-dim);font-size:13px;">暂无历史记录</p>';
-    return;
-  }
+  if (!filtered.length) { list.innerHTML = '<p style="color:#697386;font-size:13px;">暂无历史记录</p>'; return; }
   list.innerHTML = filtered.map(renderJobCard).join('');
   bindThumbClicks();
 }
@@ -392,21 +477,16 @@ function bindTopbar() {
     $('#loginCancelBtn').classList.remove('hidden');
     $('#setupSpinner').classList.remove('hidden');
     $('#setupLog').classList.add('hidden');
-
     const res = await api('/api/env/switch-account', 'POST');
     if (res && res.auth_url) {
       $('#setupTitle').textContent = '等待新账号授权...';
-      $('#setupDesc').innerHTML = '浏览器已打开授权页面。如果没有弹出，请<a href="' + res.auth_url + '" target="_blank" style="color:var(--accent);">点击此处手动打开</a>';
+      $('#setupDesc').innerHTML = '浏览器已打开授权页面。如果没有弹出，请<a href="' + res.auth_url + '" target="_blank" style="color:#2673e8;">点击此处手动打开</a>';
     } else {
       $('#setupTitle').textContent = '等待授权...';
       $('#setupDesc').textContent = '请在浏览器中完成登录';
     }
     pollLogin();
-
-    $('#loginCancelBtn').onclick = async () => {
-      await api('/api/env/login-cancel', 'POST');
-      checkEnv();
-    };
+    $('#loginCancelBtn').onclick = async () => { await api('/api/env/login-cancel', 'POST'); checkEnv(); };
   });
 
   $('#cleanCacheBtn').addEventListener('click', async () => {
@@ -426,7 +506,6 @@ function bindTopbar() {
     $('#setupLog').classList.remove('hidden');
     $('#setupSpinner').classList.remove('hidden');
     $('#setupLog').textContent = '';
-
     const response = await fetch('/api/env/update-cli', { method: 'POST' });
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -466,7 +545,7 @@ function openPreview(src) {
   if (['mp4','webm','mov'].includes(ext)) {
     content.innerHTML = `<video src="${src}" controls autoplay style="max-width:85vw;max-height:85vh;"></video>`;
   } else {
-    content.innerHTML = `<img src="${src}" alt="preview">`;
+    content.innerHTML = `<img src="${src}" alt="preview" style="max-width:85vw;max-height:85vh;">`;
   }
   $('#previewDialog').showModal();
 }
@@ -475,19 +554,14 @@ function openPreview(src) {
 async function api(url, method, body) {
   try {
     const opts = { method: method || 'GET' };
-    if (body) {
-      opts.headers = { 'Content-Type': 'application/json' };
-      opts.body = JSON.stringify(body);
-    }
+    if (body) { opts.headers = { 'Content-Type': 'application/json' }; opts.body = JSON.stringify(body); }
     const res = await fetch(url, opts);
     return await res.json();
-  } catch (e) {
-    return { ok: false, error: e.message };
-  }
+  } catch (e) { return { ok: false, error: e.message }; }
 }
 
 function typeLabel(t) {
-  const map = { text2image: '文生图', image2image: '图生图', text2video: '文生视频', image2video: '图生视频' };
+  const map = { text2image: '文生图', image2image: '图生图', text2video: '文生视频', image2video: '图生视频', frames2video: '首尾帧', multimodal2video: '全能参考', multiframe2video: '智能多帧' };
   return map[t] || t;
 }
 
