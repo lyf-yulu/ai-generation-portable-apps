@@ -15,6 +15,7 @@ import time
 import urllib.parse
 import uuid
 import webbrowser
+import zipfile
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -25,16 +26,23 @@ OUTPUT_DIR = ROOT / "outputs"
 UPLOAD_DIR = ROOT / "uploads"
 LOG_DIR = ROOT / "logs"
 STATE_DIR = ROOT / "state"
+ARCHIVE_DIR = ROOT / "archives"
+MEDIA_DIR = STATE_DIR / "media"
+PRESET_PATH = STATE_DIR / "preset.json"
 HISTORY_PATH = STATE_DIR / "history.json"
 CONFIG_PATH = ROOT / "config.json"
 
+APP_VERSION = "0.2.0"
+
 DEFAULT_CONFIG = {
     "port": 8888,
+    "host": "127.0.0.1",
     "max_concurrent": 5,
     "poll_image": 60,
     "poll_video": 300,
     "login_timeout": 120,
     "upload_max_age_days": 7,
+    "cors": False,
 }
 
 JOBS: dict[str, dict[str, Any]] = {}
@@ -56,7 +64,7 @@ def load_config() -> dict[str, Any]:
 
 
 def ensure_dirs():
-    for d in (OUTPUT_DIR, UPLOAD_DIR, LOG_DIR, STATE_DIR):
+    for d in (OUTPUT_DIR, UPLOAD_DIR, LOG_DIR, STATE_DIR, ARCHIVE_DIR, MEDIA_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -149,45 +157,66 @@ def update_job_in_history(job_id: str, updates: dict[str, Any]):
 
 def execute_task(job_id: str, task_type: str, args: list[str], params: dict[str, Any]):
     with LOCK:
-        JOBS[job_id]["status"] = "running"
+        job = JOBS[job_id]
+        job["status"] = "running"
 
-    result = run_cmd(args, timeout=params.get("timeout", 600))
+    total = job.get("total", 1)
+    concurrency = job.get("concurrency", 1)
+
+    def add_event(msg: str):
+        with LOCK:
+            job["events"].append({"time": time.strftime("%H:%M:%S"), "message": msg})
+
+    def run_one(index: int):
+        add_event(f"子任务 {index}/{total} 开始")
+        result = run_cmd(args, timeout=params.get("timeout", 600))
+        with LOCK:
+            job["done"] += 1
+        if result["returncode"] == 0:
+            try:
+                data = json.loads(result["stdout"])
+            except json.JSONDecodeError:
+                data = {"raw": result["stdout"]}
+            submit_id = data.get("submit_id") or ""
+            if submit_id:
+                dl = download_if_needed(submit_id, data, task_type, job_id)
+                if dl:
+                    with LOCK:
+                        job["results"].append(dl)
+                    add_event(f"子任务 {index}/{total} 完成")
+                    return
+            with LOCK:
+                job["results"].append(data)
+            add_event(f"子任务 {index}/{total} 完成")
+        else:
+            error_msg = result["stderr"] or result["stdout"] or "unknown error"
+            with LOCK:
+                job["errors"].append(f"[{index}] {error_msg}")
+            add_event(f"子任务 {index}/{total} 失败: {error_msg[:80]}")
+
+    if total <= 1:
+        run_one(1)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = [pool.submit(run_one, i) for i in range(1, total + 1)]
+            concurrent.futures.wait(futures)
 
     with LOCK:
-        job = JOBS[job_id]
         job["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-
-    if result["returncode"] == 0:
-        stdout = result["stdout"]
-        try:
-            data = json.loads(stdout)
-        except json.JSONDecodeError:
-            data = {"raw": stdout}
-
-        submit_id = data.get("submit_id") or data.get("id") or ""
-        status_str = data.get("status") or data.get("gen_status") or ""
-
-        if status_str in ("success", "completed") or data.get("images") or data.get("videos"):
-            download_result = download_if_needed(submit_id, data, task_type, job_id)
-            with LOCK:
-                job["status"] = "completed"
-                job["result"] = download_result or data
-        elif submit_id:
-            with LOCK:
-                job["status"] = "querying"
-                job["submit_id"] = submit_id
-                job["result"] = data
-        else:
-            with LOCK:
-                job["status"] = "completed"
-                job["result"] = data
-    else:
-        error_msg = result["stderr"] or result["stdout"] or "unknown error"
-        retryable = any(kw in error_msg.lower() for kw in ["timeout", "network", "retry", "排队"])
-        with LOCK:
+        if job["errors"] and not job["results"]:
             job["status"] = "failed"
-            job["error"] = error_msg
-            job["retryable"] = retryable
+            job["error"] = "; ".join(job["errors"][:3])
+            job["retryable"] = True
+        else:
+            job["status"] = "completed"
+            if len(job["results"]) == 1:
+                job["result"] = job["results"][0]
+            else:
+                all_files = []
+                for r in job["results"]:
+                    if isinstance(r, dict):
+                        all_files.extend(r.get("files", []))
+                job["result"] = {"files": all_files, "count": len(job["results"])}
 
     with LOCK:
         final_job = dict(JOBS[job_id])
@@ -196,6 +225,8 @@ def execute_task(job_id: str, task_type: str, args: list[str], params: dict[str,
         "result": final_job.get("result"),
         "error": final_job.get("error"),
         "finished_at": final_job.get("finished_at"),
+        "done": final_job.get("done"),
+        "total": final_job.get("total"),
     })
 
 
@@ -215,10 +246,15 @@ def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str) 
 
 
 def json_response(handler, status: int, data: dict):
+    cfg = load_config()
     raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(raw)))
+    if cfg.get("cors"):
+        handler.send_header("Access-Control-Allow-Origin", "*")
+        handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        handler.send_header("Access-Control-Allow-Headers", "Content-Type")
     handler.end_headers()
     handler.wfile.write(raw)
 
@@ -282,6 +318,87 @@ def save_uploaded_files(files: dict[str, tuple[str, bytes]], prefix: str) -> lis
     return saved
 
 
+# === Archive / Preset Helpers ===
+
+def sanitize_archive_name(name: str) -> str:
+    clean = re.sub(r'[^\w一-鿿\-]', '_', name).strip('_')
+    return clean or time.strftime("%Y%m%d_%H%M%S")
+
+
+def read_preset() -> dict[str, Any]:
+    if not PRESET_PATH.exists():
+        return {"values": {}, "media": {}}
+    try:
+        return json.loads(PRESET_PATH.read_text("utf-8"))
+    except Exception:
+        return {"values": {}, "media": {}}
+
+
+def write_preset(data: dict[str, Any]):
+    PRESET_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+
+
+def preset_for_client() -> dict[str, Any]:
+    data = read_preset()
+    media = {}
+    for field, item in data.get("media", {}).items():
+        path = MEDIA_DIR / item.get("stored", "")
+        if path.exists():
+            media[field] = {
+                "filename": item.get("filename", path.name),
+                "url": f"/api/preset-media/{field}",
+            }
+    return {"values": data.get("values", {}), "media": media, "archives": list_archives()}
+
+
+def list_archives() -> list[dict[str, Any]]:
+    if not ARCHIVE_DIR.exists():
+        return []
+    archives = []
+    for f in sorted(ARCHIVE_DIR.iterdir()):
+        if f.suffix == ".dreamina" and f.is_file():
+            archives.append({"name": f.stem, "size": f.stat().st_size, "mtime": f.stat().st_mtime})
+    return archives
+
+
+def save_archive(name: str, preset: dict[str, Any]):
+    safe_name = sanitize_archive_name(name)
+    path = ARCHIVE_DIR / f"{safe_name}.dreamina"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("preset.json", json.dumps(preset, ensure_ascii=False, indent=2))
+        for field, item in preset.get("media", {}).items():
+            src = MEDIA_DIR / item.get("stored", "")
+            if src.exists():
+                zf.write(src, f"media/{item['stored']}")
+    return safe_name
+
+
+def load_archive(name: str) -> dict[str, Any] | None:
+    path = ARCHIVE_DIR / f"{name}.dreamina"
+    if not path.exists():
+        return None
+    if MEDIA_DIR.exists():
+        shutil.rmtree(MEDIA_DIR)
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "r") as zf:
+        preset = json.loads(zf.read("preset.json").decode("utf-8"))
+        for info in zf.infolist():
+            if info.filename.startswith("media/") and not info.is_dir():
+                stored_name = info.filename[len("media/"):]
+                target = MEDIA_DIR / stored_name
+                target.write_bytes(zf.read(info.filename))
+    write_preset(preset)
+    return preset_for_client()
+
+
+def delete_archive(name: str) -> bool:
+    path = ARCHIVE_DIR / f"{name}.dreamina"
+    if path.exists():
+        path.unlink()
+        return True
+    return False
+
+
 class Handler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -301,12 +418,32 @@ class Handler(SimpleHTTPRequestHandler):
             self.handle_job_status(job_id)
         elif path == "/api/history":
             self.handle_history()
+        elif path == "/api/preset":
+            json_response(self, 200, {"ok": True, **preset_for_client()})
+        elif path == "/api/archives":
+            json_response(self, 200, {"ok": True, "archives": list_archives()})
+        elif path.startswith("/api/preset-media/"):
+            field = path[len("/api/preset-media/"):]
+            self.handle_preset_media(field)
+        elif path == "/api/v1/meta":
+            self.handle_meta()
         elif path.startswith("/outputs/"):
             self.serve_file(OUTPUT_DIR, path[len("/outputs/"):])
         elif path.startswith("/uploads/"):
             self.serve_file(UPLOAD_DIR, path[len("/uploads/"):])
         else:
             self.serve_static(path)
+
+    def do_OPTIONS(self):
+        cfg = load_config()
+        self.send_response(204)
+        if cfg.get("cors"):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
@@ -340,6 +477,16 @@ class Handler(SimpleHTTPRequestHandler):
             self.handle_retry(job_id)
         elif path == "/api/cache/clean":
             self.handle_cache_clean()
+        elif path == "/api/preset":
+            self.handle_preset_save()
+        elif path == "/api/preset/clear":
+            self.handle_preset_clear()
+        elif path == "/api/archive/load":
+            self.handle_archive_load()
+        elif path == "/api/archive/delete":
+            self.handle_archive_delete()
+        elif path == "/api/archive/from-history":
+            self.handle_archive_from_history()
         else:
             json_response(self, 404, {"ok": False, "error": "not found"})
 
@@ -513,11 +660,21 @@ class Handler(SimpleHTTPRequestHandler):
         poll_timeout = cfg["poll_video"] if "video" in task_type else cfg["poll_image"]
         total_timeout = poll_timeout + 30
 
+        repeat_count = max(1, min(10, int(fields.get("repeat_count") or 1)))
+        concurrency_val = max(1, min(5, int(fields.get("concurrency") or 1)))
+        total = max(repeat_count, concurrency_val)
+
         job_id = uuid.uuid4().hex
         job = {
             "job_id": job_id,
             "task_type": task_type,
             "status": "pending",
+            "total": total,
+            "done": 0,
+            "concurrency": concurrency_val,
+            "events": [],
+            "results": [],
+            "errors": [],
             "params": {k: v for k, v in fields.items()},
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "finished_at": None,
@@ -655,6 +812,130 @@ class Handler(SimpleHTTPRequestHandler):
                     removed_uploads += 1
         json_response(self, 200, {"ok": True, "removed_uploads": removed_uploads})
 
+    def handle_preset_save(self):
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart" in content_type:
+            fields, files = parse_multipart(self)
+        else:
+            fields = read_json_body(self)
+            files = {}
+
+        values = {}
+        for k, v in fields.items():
+            if k not in ("archive_name",):
+                values[k] = v
+
+        media_info = {}
+        for key, (filename, blob) in files.items():
+            suffix = Path(filename).suffix or ".bin"
+            stored_name = f"{key}{suffix}"
+            (MEDIA_DIR / stored_name).write_bytes(blob)
+            media_info[key] = {"filename": filename, "stored": stored_name, "mime": mimetypes.guess_type(filename)[0] or "application/octet-stream"}
+
+        preset = read_preset()
+        preset["values"] = values
+        preset["media"].update(media_info)
+        write_preset(preset)
+
+        archive_name = fields.get("archive_name", "").strip()
+        if archive_name:
+            save_archive(archive_name, preset)
+
+        json_response(self, 200, {"ok": True, **preset_for_client()})
+
+    def handle_preset_clear(self):
+        if MEDIA_DIR.exists():
+            shutil.rmtree(MEDIA_DIR)
+        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        write_preset({"values": {}, "media": {}})
+        json_response(self, 200, {"ok": True})
+
+    def handle_preset_media(self, field: str):
+        preset = read_preset()
+        item = preset.get("media", {}).get(field)
+        if not item:
+            self.send_error(404)
+            return
+        path = MEDIA_DIR / item["stored"]
+        if not path.exists():
+            self.send_error(404)
+            return
+        mime = item.get("mime", mimetypes.guess_type(str(path))[0] or "application/octet-stream")
+        content = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Content-Disposition", f'inline; filename="{item.get("filename", path.name)}"')
+        self.end_headers()
+        self.wfile.write(content)
+
+    def handle_archive_load(self):
+        data = read_json_body(self)
+        name = data.get("name", "")
+        if not name:
+            json_response(self, 400, {"ok": False, "error": "name required"})
+            return
+        result = load_archive(name)
+        if result is None:
+            json_response(self, 404, {"ok": False, "error": "archive not found"})
+            return
+        json_response(self, 200, {"ok": True, **result})
+
+    def handle_archive_delete(self):
+        data = read_json_body(self)
+        name = data.get("name", "")
+        if not name:
+            json_response(self, 400, {"ok": False, "error": "name required"})
+            return
+        if delete_archive(name):
+            json_response(self, 200, {"ok": True})
+        else:
+            json_response(self, 404, {"ok": False, "error": "archive not found"})
+
+    def handle_archive_from_history(self):
+        data = read_json_body(self)
+        job_id = data.get("job_id", "")
+        archive_name = data.get("archive_name", "").strip()
+        if not job_id or not archive_name:
+            json_response(self, 400, {"ok": False, "error": "job_id and archive_name required"})
+            return
+
+        items = read_history()
+        target = None
+        for item in items:
+            if item.get("job_id") == job_id:
+                target = item
+                break
+        if not target:
+            json_response(self, 404, {"ok": False, "error": "job not found in history"})
+            return
+
+        params = target.get("params", {})
+        media_info = {}
+        for key in sorted(params.keys()):
+            if key.startswith(("ref_image_", "ref_video_", "ref_audio_", "frame_", "first_frame", "last_frame")):
+                path = Path(params[key]) if params[key] else None
+                if path and path.exists():
+                    suffix = path.suffix or ".bin"
+                    stored_name = f"{key}{suffix}"
+                    shutil.copy2(path, MEDIA_DIR / stored_name)
+                    media_info[key] = {"filename": path.name, "stored": stored_name, "mime": mimetypes.guess_type(str(path))[0] or "application/octet-stream"}
+
+        values = {k: v for k, v in params.items() if not k.startswith(("ref_image_", "ref_video_", "ref_audio_", "frame_", "first_frame", "last_frame"))}
+        preset = {"values": values, "media": media_info}
+        save_archive(archive_name, preset)
+        json_response(self, 200, {"ok": True, "archive_name": sanitize_archive_name(archive_name), "archives": list_archives()})
+
+    def handle_meta(self):
+        cfg = load_config()
+        json_response(self, 200, {
+            "app": "dreamina",
+            "version": APP_VERSION,
+            "capabilities": ["text2image", "image2image", "frames2video", "multimodal2video", "multiframe2video"],
+            "max_concurrent": cfg["max_concurrent"],
+            "status": "ready",
+        })
+
     def serve_static(self, path: str):
         if path == "/" or path == "":
             path = "/index.html"
@@ -695,7 +976,8 @@ def main():
     EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=cfg["max_concurrent"])
 
     port = find_available_port(cfg["port"])
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    host = cfg.get("host", "127.0.0.1")
+    server = ThreadingHTTPServer((host, port), Handler)
 
     url = f"http://127.0.0.1:{port}"
     print(f"Dreamina App running at {url}")

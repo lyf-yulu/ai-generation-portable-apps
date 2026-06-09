@@ -150,8 +150,49 @@
           </div>
         </div>
 
+        <div class="form-row">
+          <div class="form-group">
+            <label for="repeat_count">重复次数</label>
+            <select id="repeat_count" name="repeat_count">
+              <option value="1" selected>1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+              <option value="6">6</option>
+              <option value="8">8</option>
+              <option value="10">10</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="concurrency">并发数</label>
+            <select id="concurrency" name="concurrency">
+              <option value="1" selected>1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+            </select>
+          </div>
+        </div>
+
         <button id="submitBtn" type="submit" class="btn-primary">开始生成</button>
       </form>
+
+      <div class="archive-section">
+        <label>项目存档</label>
+        <div class="archive-controls">
+          <input type="text" id="archiveName" placeholder="存档名称...">
+          <button id="archiveSaveBtn" class="btn-small">保存</button>
+        </div>
+        <div class="archive-list-wrap">
+          <select id="archiveSelect">
+            <option value="">选择存档...</option>
+          </select>
+          <button id="archiveLoadBtn" class="btn-small">读取</button>
+          <button id="archiveDeleteBtn" class="btn-small">删除</button>
+        </div>
+      </div>
     </aside>
 
     <section class="workspace">

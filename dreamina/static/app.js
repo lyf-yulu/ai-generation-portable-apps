@@ -18,6 +18,7 @@ document.addEventListener('DOMContentLoaded', () => {
   bindTopbar();
   bindFilter();
   bindPreview();
+  bindArchive();
   buildUploadSlots();
   buildMultiframeUI();
   bindMultiframeControls();
@@ -301,6 +302,8 @@ async function submitJob() {
     formData.append('duration', $('#duration').value);
     formData.append('video_resolution', $('#video_resolution').value);
     formData.append('model_version', $('#model_version').value);
+    formData.append('repeat_count', $('#repeat_count').value);
+    formData.append('concurrency', $('#concurrency').value);
 
     if (currentMode === 'image2image') {
       collectFiles(formData, '#imageRefs');
@@ -402,6 +405,16 @@ function renderJobCard(job) {
       return `<img class="result-thumb" src="/${f}" data-src="/${f}" alt="result">`;
     }).join('') + '</div>';
   }
+  let progressHtml = '';
+  if (job.total > 1 && (job.status === 'running' || job.status === 'pending')) {
+    const pct = job.total ? Math.round((job.done || 0) / job.total * 100) : 0;
+    progressHtml = `<div class="job-progress">${job.done || 0}/${job.total} 完成<div class="job-progress-bar"><div class="job-progress-bar-fill" style="width:${pct}%"></div></div></div>`;
+  }
+  let eventsHtml = '';
+  if (job.events && job.events.length > 0) {
+    const recent = job.events.slice(-3);
+    eventsHtml = '<div class="job-events">' + recent.map(e => `<div>${e.time} ${escHtml(e.message)}</div>`).join('') + '</div>';
+  }
   let errorHtml = '';
   if (job.status === 'failed' && job.error) {
     errorHtml = `<div class="job-error">${escHtml(job.error.slice(0, 200))}</div>`;
@@ -410,6 +423,10 @@ function renderJobCard(job) {
   if (job.status === 'failed' && job.retryable) {
     actionsHtml = `<div class="job-actions"><button class="btn-retry" data-job="${job.job_id}">重试</button></div>`;
   }
+  let templateBtn = '';
+  if (job.status === 'completed') {
+    templateBtn = `<div class="job-actions"><button class="btn-template" data-job="${job.job_id}">存为模板</button></div>`;
+  }
   return `<div class="job-card">
     <div class="job-card-header">
       <span class="job-type">${typeLabel(job.task_type)}</span>
@@ -417,7 +434,7 @@ function renderJobCard(job) {
     </div>
     <div class="job-prompt">${escHtml(job.params?.prompt || '')}</div>
     <div class="job-time">${job.created_at || ''}</div>
-    ${resultHtml}${errorHtml}${actionsHtml}
+    ${progressHtml}${eventsHtml}${resultHtml}${errorHtml}${actionsHtml}${templateBtn}
   </div>`;
 }
 
@@ -426,6 +443,15 @@ function bindRetryButtons() {
     btn.addEventListener('click', async () => {
       const res = await api(`/api/jobs/${btn.dataset.job}/retry`, 'POST');
       if (res && res.ok) { startPollingJob(res.job_id); loadJobs(); }
+    });
+  });
+  $$('.btn-template').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const name = prompt('输入存档名称:');
+      if (!name) return;
+      const res = await api('/api/archive/from-history', 'POST', { job_id: btn.dataset.job, archive_name: name });
+      if (res && res.ok) { refreshArchiveList(); alert('已保存为模板'); }
+      else alert(res?.error || '保存失败');
     });
   });
 }
@@ -452,6 +478,7 @@ function renderHistory(items) {
   if (!filtered.length) { list.innerHTML = '<p style="color:#697386;font-size:13px;">暂无历史记录</p>'; return; }
   list.innerHTML = filtered.map(renderJobCard).join('');
   bindThumbClicks();
+  bindRetryButtons();
 }
 
 function bindFilter() {
@@ -548,6 +575,64 @@ function openPreview(src) {
     content.innerHTML = `<img src="${src}" alt="preview" style="max-width:85vw;max-height:85vh;">`;
   }
   $('#previewDialog').showModal();
+}
+
+// === Archive ===
+function bindArchive() {
+  $('#archiveSaveBtn').addEventListener('click', async () => {
+    const name = $('#archiveName').value.trim();
+    if (!name) { alert('请输入存档名称'); return; }
+    const formData = new FormData($('#genForm'));
+    formData.append('archive_name', name);
+    const response = await fetch('/api/preset', { method: 'POST', body: formData });
+    const res = await response.json();
+    if (res.ok) { refreshArchiveList(); $('#archiveName').value = ''; }
+    else alert(res.error || '保存失败');
+  });
+
+  $('#archiveLoadBtn').addEventListener('click', async () => {
+    const name = $('#archiveSelect').value;
+    if (!name) { alert('请选择存档'); return; }
+    const res = await api('/api/archive/load', 'POST', { name });
+    if (res && res.ok) { applyPreset(res); alert('已加载存档'); }
+    else alert(res?.error || '加载失败');
+  });
+
+  $('#archiveDeleteBtn').addEventListener('click', async () => {
+    const name = $('#archiveSelect').value;
+    if (!name) { alert('请选择存档'); return; }
+    if (!confirm(`确定删除存档「${name}」？`)) return;
+    const res = await api('/api/archive/delete', 'POST', { name });
+    if (res && res.ok) refreshArchiveList();
+    else alert(res?.error || '删除失败');
+  });
+
+  refreshArchiveList();
+}
+
+async function refreshArchiveList() {
+  const res = await api('/api/archives');
+  if (!res || !res.ok) return;
+  const select = $('#archiveSelect');
+  select.innerHTML = '<option value="">选择存档...</option>';
+  for (const a of res.archives) {
+    const opt = document.createElement('option');
+    opt.value = a.name;
+    opt.textContent = a.name;
+    select.appendChild(opt);
+  }
+}
+
+function applyPreset(data) {
+  const values = data.values || {};
+  if (values.prompt) $('#prompt').value = values.prompt;
+  if (values.ratio) $('#ratio').value = values.ratio;
+  if (values.resolution_type) $('#resolution_type').value = values.resolution_type;
+  if (values.duration) $('#duration').value = values.duration;
+  if (values.video_resolution) $('#video_resolution').value = values.video_resolution;
+  if (values.model_version) $('#model_version').value = values.model_version;
+  if (values.repeat_count) $('#repeat_count').value = values.repeat_count;
+  if (values.concurrency) $('#concurrency').value = values.concurrency;
 }
 
 // === Helpers ===
