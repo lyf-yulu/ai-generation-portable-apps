@@ -115,6 +115,10 @@ def json_response(handler: SimpleHTTPRequestHandler, status: int, data: dict[str
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(raw)))
+    if os.environ.get("CORS") == "1":
+        handler.send_header("Access-Control-Allow-Origin", "*")
+        handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        handler.send_header("Access-Control-Allow-Headers", "Content-Type")
     handler.end_headers()
     handler.wfile.write(raw)
 
@@ -1212,6 +1216,15 @@ class Handler(SimpleHTTPRequestHandler):
         return str((STATIC_DIR / path.lstrip("/")).resolve())
 
     def do_GET(self) -> None:
+        if self.path == "/api/v1/meta":
+            json_response(self, 200, {
+                "app": "seedance",
+                "version": "1.0.0",
+                "port": int(os.environ.get("PORT", "8787")),
+                "capabilities": ["text2video", "image2video", "frames2video", "multimodal2video"],
+                "status": "ready",
+            })
+            return
         if self.path == "/api/config":
             providers, config_error = load_provider_config()
             json_response(self, 200, {
@@ -1298,6 +1311,16 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.write(path.read_bytes())
             return
         super().do_GET()
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        if os.environ.get("CORS") == "1":
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_POST(self) -> None:
         if self.path == "/api/choose-output-dir":
@@ -1420,8 +1443,9 @@ class Handler(SimpleHTTPRequestHandler):
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     port = int(os.environ.get("PORT", "8787"))
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"Seedance GUI running at http://127.0.0.1:{port}")
+    host = os.environ.get("HOST", "127.0.0.1")
+    server = ThreadingHTTPServer((host, port), Handler)
+    print(f"Seedance GUI running at http://{host}:{port}")
     server.serve_forever()
 
 

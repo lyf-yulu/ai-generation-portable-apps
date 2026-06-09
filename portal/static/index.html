@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Generation Portal</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="portal">
+    <header class="portal-header">
+      <h1>AI Generation Portal</h1>
+      <div class="lan-info" id="lanInfo">detecting...</div>
+    </header>
+
+    <section class="apps-grid" id="appsGrid"></section>
+
+    <section class="stats-panel">
+      <h2>Usage Statistics</h2>
+      <div class="stats-row" id="statsRow">
+        <div class="stat-card"><div class="stat-value" id="todayJobs">-</div><div class="stat-label">Today Jobs</div></div>
+        <div class="stat-card"><div class="stat-value" id="todayRequests">-</div><div class="stat-label">Today Requests</div></div>
+      </div>
+      <div class="stats-by-app" id="statsByApp"></div>
+    </section>
+
+    <section class="activity-panel">
+      <h2>Recent Activity</h2>
+      <div class="activity-list" id="activityList"></div>
+    </section>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
