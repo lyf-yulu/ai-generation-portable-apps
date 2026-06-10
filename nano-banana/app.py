@@ -46,7 +46,7 @@ FILE_FIELDS = {f"image_{i}" for i in range(1, 15)}
 VALUE_FIELDS = {
     "api_key", "base_url", "output_dir", "provider", "mode", "model", "aspect_ratio", "image_size",
     "custom_model", "response_format", "seed", "control_after_generate", "skip_error", "repeat_count",
-    "concurrency", "poll_interval", "timeout", "vary_seed", "prompt", "archive_name",
+    "concurrency", "poll_interval", "timeout", "vary_seed", "prompt", "archive_name", "output_name",
     "resize_enabled", "resize_width", "resize_height", "resize_interpolation", "resize_method",
     "resize_condition", "resize_multiple_of",
 }
@@ -1047,7 +1047,12 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
                 raise RuntimeError(f"No image result found: {result}")
             out_dir = resolve_output_dir(values.get("output_dir"))
             file_token_results = []
-            prefix = f"{time.strftime('%Y%m%d_%H%M%S')}_run{index}_{task_id}"
+            custom_name = values.get("output_name", "").strip()
+            if custom_name:
+                total = max(1, int(values.get("repeat_count") or 1), int(values.get("concurrency") or 1))
+                prefix = f"{custom_name}-{index}" if total > 1 else custom_name
+            else:
+                prefix = f"{time.strftime('%Y%m%d_%H%M%S')}_run{index}_{task_id}"
             for i, item in enumerate(items, 1):
                 image_url, local_path = save_image_item(item, out_dir, prefix, i)
                 token = uuid.uuid4().hex
@@ -1095,7 +1100,12 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
             raise RuntimeError(f"No image result found: {result}")
         out_dir = resolve_output_dir(values.get("output_dir"))
         file_token_results = []
-        prefix = f"{time.strftime('%Y%m%d_%H%M%S')}_run{index}_{task_id}"
+        custom_name = values.get("output_name", "").strip()
+        if custom_name:
+            total = max(1, int(values.get("repeat_count") or 1), int(values.get("concurrency") or 1))
+            prefix = f"{custom_name}-{index}" if total > 1 else custom_name
+        else:
+            prefix = f"{time.strftime('%Y%m%d_%H%M%S')}_run{index}_{task_id}"
         for i, item in enumerate(items, 1):
             image_url, local_path = save_gemini_image_item(item, out_dir, prefix, i)
             token = uuid.uuid4().hex

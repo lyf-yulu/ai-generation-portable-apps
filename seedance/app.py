@@ -69,6 +69,7 @@ VALUE_FIELDS = {
     "poll_interval",
     "timeout",
     "vary_seed",
+    "output_name",
     "prompt",
 }
 
@@ -1151,7 +1152,17 @@ def run_one(job_id: str, index: int, form_values: dict[str, Any], form_files: di
         if not video_url:
             raise RuntimeError(f"Task {task_id} succeeded but no video URL was found")
         out_dir = resolve_output_dir(form_values.get("output_dir"))
-        out_name = f"{time.strftime('%Y%m%d_%H%M%S')}_run{index}_{task_id}.mp4"
+        custom_name = form_values.get("output_name", "").strip()
+        if custom_name:
+            total = max(1, int(form_values.get("repeat_count") or 1), int(form_values.get("concurrency") or 1))
+            if total > 1:
+                out_name = f"{custom_name}-{index}.mp4"
+            else:
+                out_name = f"{custom_name}.mp4"
+            if (out_dir / out_name).exists():
+                out_name = f"{custom_name}-{index}_{time.strftime('%H%M%S')}.mp4"
+        else:
+            out_name = f"{time.strftime('%Y%m%d_%H%M%S')}_run{index}_{task_id}.mp4"
         out_path = out_dir / out_name
         download_video(video_url, out_path)
         file_token = uuid.uuid4().hex

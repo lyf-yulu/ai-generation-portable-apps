@@ -28,10 +28,19 @@ APPS = {
     "dreamina": {"dir": ROOT.parent / "dreamina", "port": 8888},
 }
 
-PORTAL_PORT = 8080
+PORTAL_PORT = 9090
 
 
 def get_lan_ip() -> str:
+    try:
+        out = subprocess.check_output(["ifconfig"], text=True, stderr=subprocess.DEVNULL)
+        for line in out.splitlines():
+            if "inet " in line and "127.0.0.1" not in line:
+                ip = line.strip().split()[1]
+                if ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172."):
+                    return ip
+    except Exception:
+        pass
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -113,6 +122,8 @@ class UsageTracker:
     def __init__(self):
         self._lock = threading.Lock()
         self._data = self._load()
+        self._pending_jobs: list[dict] = []
+        threading.Thread(target=self._job_poll_loop, daemon=True).start()
 
     def _load(self) -> dict[str, Any]:
         if USAGE_PATH.exists():
@@ -140,6 +151,51 @@ class UsageTracker:
                 app_stats["jobs"] += 1
             self._save()
 
+    def register_job(self, app: str, job_id: str, client_ip: str):
+        with self._lock:
+            self._pending_jobs.append({
+                "app": app, "job_id": job_id, "ip": client_ip,
+                "submitted_at": time.time(), "date": time.strftime("%Y-%m-%d")
+            })
+
+    def _job_poll_loop(self):
+        while True:
+            time.sleep(15)
+            with self._lock:
+                jobs = list(self._pending_jobs)
+            if not jobs:
+                continue
+            done_ids = []
+            for job in jobs:
+                try:
+                    port = APPS[job["app"]]["port"]
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                    conn.request("GET", f"/api/jobs/{job['job_id']}")
+                    resp = conn.getresponse()
+                    if resp.status == 200:
+                        data = json.loads(resp.read())
+                        status = data.get("status", "")
+                        terminal = status in ("succeeded", "failed", "completed")
+                        if terminal:
+                            actual = data.get("total", 1)
+                            self._add_ip_jobs(job["date"], job["ip"], job["app"], actual)
+                            done_ids.append(job["job_id"])
+                    conn.close()
+                except Exception:
+                    pass
+                if time.time() - job["submitted_at"] > 7200:
+                    done_ids.append(job["job_id"])
+            if done_ids:
+                with self._lock:
+                    self._pending_jobs = [j for j in self._pending_jobs if j["job_id"] not in done_ids]
+
+    def _add_ip_jobs(self, date: str, ip: str, app: str, count: int):
+        with self._lock:
+            by_ip = self._data.setdefault("by_ip", {}).setdefault(date, {})
+            ip_stats = by_ip.setdefault(ip, {})
+            ip_stats[app] = ip_stats.get(app, 0) + count
+            self._save()
+
     def _is_job_request(self, method: str, path: str) -> bool:
         if method != "POST":
             return False
@@ -154,11 +210,13 @@ class UsageTracker:
             total_jobs = sum(v.get("jobs", 0) for v in today_stats.values())
             total_requests = sum(v.get("requests", 0) for v in today_stats.values())
             recent = self._data["records"][-20:]
+            by_ip_today = self._data.get("by_ip", {}).get(today, {})
         return {
             "today": today,
             "today_jobs": total_jobs,
             "today_requests": total_requests,
             "by_app": today_stats,
+            "by_ip": by_ip_today,
             "recent": recent,
             "daily": dict(list(self._data["daily"].items())[-7:]),
         }
@@ -239,6 +297,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _proxy(self, app_name: str, port: int, method: str, target_path: str):
         client_ip = self.client_address[0]
+        is_job = tracker._is_job_request(method, target_path)
         tracker.record(app_name, client_ip, method, target_path)
 
         try:
@@ -258,19 +317,26 @@ class Handler(SimpleHTTPRequestHandler):
             conn.request(method, target_path, body=body, headers=headers)
             resp = conn.getresponse()
 
+            resp_body = resp.read()
+
+            if is_job and resp.status in (200, 201):
+                try:
+                    resp_data = json.loads(resp_body)
+                    job_id = resp_data.get("job_id") or resp_data.get("id")
+                    if job_id:
+                        tracker.register_job(app_name, str(job_id), client_ip)
+                except Exception:
+                    pass
+
             self.send_response(resp.status)
             for key, value in resp.getheaders():
                 if key.lower() in ("transfer-encoding", "connection"):
                     continue
                 self.send_header(key, value)
             self._cors_headers()
+            self.send_header("Content-Length", str(len(resp_body)))
             self.end_headers()
-
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
+            self.wfile.write(resp_body)
             conn.close()
         except Exception as e:
             self._json(502, {"ok": False, "error": f"proxy error: {e}"})
@@ -289,6 +355,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self._cors_headers()
         self.end_headers()
         self.wfile.write(content)

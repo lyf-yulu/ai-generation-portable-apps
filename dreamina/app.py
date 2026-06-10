@@ -179,7 +179,9 @@ def execute_task(job_id: str, task_type: str, args: list[str], params: dict[str,
                 data = {"raw": result["stdout"]}
             submit_id = data.get("submit_id") or ""
             if submit_id:
-                dl = download_if_needed(submit_id, data, task_type, job_id)
+                dl = download_if_needed(submit_id, data, task_type, job_id,
+                                        output_name=job.get("output_name", ""),
+                                        sub_index=index, total=total)
                 if dl:
                     with LOCK:
                         job["results"].append(dl)
@@ -230,12 +232,110 @@ def execute_task(job_id: str, task_type: str, args: list[str], params: dict[str,
     })
 
 
-def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str) -> dict | None:
+def choose_output_dir() -> str:
+    prompt = "选择 Dreamina 输出目录"
+    if sys.platform == "darwin":
+        script = f'POSIX path of (choose folder with prompt "{prompt}")'
+        result = subprocess.run(["osascript", "-e", script], check=True, capture_output=True, text=True)
+        return result.stdout.strip().rstrip("/")
+    if sys.platform.startswith("win"):
+        ps = (
+            "$folder = (New-Object -ComObject Shell.Application)."
+            f"BrowseForFolder(0, '{prompt}', 0, 0); "
+            "if ($folder) { [Console]::OutputEncoding = [Text.UTF8Encoding]::UTF8; "
+            "Write-Output $folder.Self.Path }"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+            check=True, capture_output=True, text=True,
+        )
+        selected = result.stdout.strip()
+        if selected:
+            return selected
+        raise RuntimeError("未选择输出目录")
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        selected = filedialog.askdirectory(title=prompt)
+    finally:
+        root.destroy()
+    if selected:
+        return selected
+    raise RuntimeError("未选择输出目录")
+
+
+def resolve_output_dir(raw: str | None) -> Path:
+    if raw and raw.strip():
+        path = Path(raw.strip()).expanduser()
+    else:
+        path = OUTPUT_DIR
+    path.mkdir(parents=True, exist_ok=True)
+    return path.resolve()
+
+
+def desktop_output_dir() -> str:
+    desktop = Path.home() / "Desktop"
+    parent = desktop if desktop.exists() else Path.home()
+    return str((parent / "dreamina_outputs").resolve())
+
+
+def open_output_dir(raw: str | None) -> str:
+    path = resolve_output_dir(raw)
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    elif sys.platform.startswith("win"):
+        os.startfile(str(path))
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
+    return str(path)
+
+
+def cleanup_cache(media_days: int = 30, log_days: int = 14) -> dict[str, Any]:
+    now = time.time()
+    media_cutoff = now - max(1, media_days) * 86400
+    log_cutoff = now - max(1, log_days) * 86400
+    stats = {
+        "ok": True,
+        "media_deleted": 0,
+        "logs_deleted": 0,
+        "bytes_deleted": 0,
+    }
+    if UPLOAD_DIR.exists():
+        for path in UPLOAD_DIR.iterdir():
+            if not path.is_file() or path.stat().st_mtime >= media_cutoff:
+                continue
+            size = path.stat().st_size
+            path.unlink()
+            stats["media_deleted"] += 1
+            stats["bytes_deleted"] += size
+    if LOG_DIR.exists():
+        for path in LOG_DIR.iterdir():
+            if not path.is_file() or path.stat().st_mtime >= log_cutoff:
+                continue
+            size = path.stat().st_size
+            path.unlink()
+            stats["logs_deleted"] += 1
+            stats["bytes_deleted"] += size
+    return stats
+
+
+def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str, output_name: str = "", sub_index: int = 1, total: int = 1) -> dict | None:
     if not submit_id:
         return None
     ts = time.strftime("%Y%m%d_%H%M%S")
     short_id = job_id[:8]
-    dl_dir = OUTPUT_DIR / f"{ts}_{task_type}_{short_id}"
+    custom_name = (output_name or "").strip()
+    if custom_name:
+        if total > 1:
+            dl_dir = OUTPUT_DIR / f"{custom_name}-{sub_index}"
+        else:
+            dl_dir = OUTPUT_DIR / custom_name
+        if dl_dir.exists():
+            dl_dir = OUTPUT_DIR / f"{custom_name}-{sub_index}_{ts}"
+    else:
+        dl_dir = OUTPUT_DIR / f"{ts}_{task_type}_{short_id}"
     dl_dir.mkdir(parents=True, exist_ok=True)
 
     r = run_cmd(["dreamina", "query_result", f"--submit_id={submit_id}", f"--download_dir={dl_dir}"], timeout=60)
@@ -427,6 +527,8 @@ class Handler(SimpleHTTPRequestHandler):
             self.handle_preset_media(field)
         elif path == "/api/v1/meta":
             self.handle_meta()
+        elif path == "/api/default-output-dir":
+            json_response(self, 200, {"path": desktop_output_dir()})
         elif path.startswith("/outputs/"):
             self.serve_file(OUTPUT_DIR, path[len("/outputs/"):])
         elif path.startswith("/uploads/"):
@@ -477,6 +579,35 @@ class Handler(SimpleHTTPRequestHandler):
             self.handle_retry(job_id)
         elif path == "/api/cache/clean":
             self.handle_cache_clean()
+        elif path == "/api/choose-output-dir":
+            try:
+                json_response(self, 200, {"path": choose_output_dir()})
+            except Exception as exc:
+                json_response(self, 500, {"ok": False, "error": str(exc)})
+        elif path == "/api/open-output-dir":
+            try:
+                ct = self.headers.get("Content-Type", "")
+                output_dir = None
+                if "json" in ct:
+                    body = read_json_body(self)
+                    output_dir = body.get("output_dir")
+                elif "multipart" in ct:
+                    fields, _ = parse_multipart(self)
+                    output_dir = fields.get("output_dir")
+                else:
+                    length = int(self.headers.get("Content-Length") or "0")
+                    raw = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else ""
+                    for part in raw.split("&"):
+                        if part.startswith("output_dir="):
+                            output_dir = urllib.parse.unquote_plus(part[len("output_dir="):])
+                json_response(self, 200, {"ok": True, "path": open_output_dir(output_dir)})
+            except Exception as exc:
+                json_response(self, 500, {"ok": False, "error": str(exc)})
+        elif path == "/api/cleanup-cache":
+            try:
+                json_response(self, 200, cleanup_cache())
+            except Exception as exc:
+                json_response(self, 500, {"ok": False, "error": str(exc)})
         elif path == "/api/preset":
             self.handle_preset_save()
         elif path == "/api/preset/clear":
@@ -672,6 +803,7 @@ class Handler(SimpleHTTPRequestHandler):
             "total": total,
             "done": 0,
             "concurrency": concurrency_val,
+            "output_name": fields.get("output_name", ""),
             "events": [],
             "results": [],
             "errors": [],
@@ -983,7 +1115,8 @@ def main():
     print(f"Dreamina App running at {url}")
     print("Press Ctrl+C to stop")
 
-    threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    if not os.environ.get("CORS"):
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
 
     try:
         server.serve_forever()
