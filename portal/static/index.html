@@ -22,39 +22,37 @@
     <button class="app-tab" data-tab="stats">统计</button>
   </div>
 
-  <!-- ═══════════════ SEEDANCE ═══════════════ -->
-  <div class="tab-panel active" id="tab-seedance">
+  <!-- SEEDANCE -->
+  <div class="tab-panel active" id="tab-seedance" v-scope="SeedanceApp()" @vue:mounted="init()">
     <main class="app">
       <aside class="sidebar">
-        <h1>Seedance <span class="app-status-dot" id="sd-dot"></span></h1>
-        <form id="sd-form">
+        <h1>Seedance <span class="app-status-dot" :class="appStatus"></span></h1>
+        <form id="sd-form" ref="form" @submit.prevent="submit()">
           <section>
             <h2>接口</h2>
             <label>API Key<input name="api_key" type="password" autocomplete="off" placeholder="留空使用本地配置"></label>
-            <p id="sd-keyHint" class="hint"></p>
+            <p class="hint">{{ keyHint }}</p>
             <label>供应商
-              <select name="provider">
-                <option value="t8star">T8Star 兼容接口</option>
-                <option value="volcengine">豆包官方 / 火山方舟</option>
+              <select name="provider" @change="applyProvider($event.target.value)">
+                <option v-for="(cfg, key) in providers" :value="key">{{ cfg.label || key }}</option>
               </select>
             </label>
-            <label>Base URL<input name="base_url" value="https://ai.t8star.cn"></label>
-            <p id="sd-providerHint" class="hint"></p>
-            <label>输出目录<input name="output_dir" placeholder="留空则保存到 outputs 文件夹"></label>
+            <label>Base URL<input name="base_url" v-model="baseUrl"></label>
+            <p class="hint">{{ providerHint }}</p>
+            <label>输出目录<input name="output_dir" v-model="outputDir" placeholder="留空则保存到 outputs 文件夹"></label>
             <div class="rowButtons outputDirBtns">
-              <button id="sd-chooseOutputBtn" type="button">选择目录</button>
-              <button id="sd-appOutputBtn" type="button">程序 outputs</button>
-              <button id="sd-desktopOutputBtn" type="button">桌面 outputs</button>
-              <button id="sd-openOutputBtn" type="button">打开目录</button>
-              <button id="sd-cleanCacheBtn" type="button">清理缓存</button>
+              <button type="button" @click="chooseOutputDir()">选择目录</button>
+              <button type="button" @click="outputDir=''">程序 outputs</button>
+              <button type="button" @click="desktopOutput()">桌面 outputs</button>
+              <button type="button" @click="openOutputDir()">打开目录</button>
+              <button type="button" @click="cleanCache()">清理缓存</button>
             </div>
           </section>
           <section>
             <h2>参数</h2>
             <label>模型
               <select name="model">
-                <option value="doubao-seedance-2-0-260128">doubao-seedance-2-0-260128</option>
-                <option value="doubao-seedance-2-0-fast-260128">doubao-seedance-2-0-fast-260128</option>
+                <option v-for="m in models" :value="m.id">{{ m.label || m.id }}</option>
               </select>
             </label>
             <div class="grid2">
@@ -91,17 +89,21 @@
               <label>并发数<input name="concurrency" type="number" min="1" max="20" value="1"></label>
             </div>
           </section>
-          <button id="sd-submitBtn" type="submit">开始生成</button>
+          <button type="submit" :disabled="submitting">{{ submitting ? '生成中' : '开始生成' }}</button>
           <section class="archiveBox">
             <h2>存档</h2>
             <label>存档名<input name="archive_name" placeholder="存档名称"></label>
-            <label>读取存档<select id="sd-archiveSelect"></select></label>
+            <label>读取存档
+              <select v-model="selectedArchive">
+                <option v-for="a in archives" :value="a.name">{{ a.name }}</option>
+              </select>
+            </label>
             <div class="rowButtons archiveActions">
-              <button id="sd-savePresetBtn" type="button">保存</button>
-              <button id="sd-loadArchiveBtn" type="button">读取</button>
-              <button id="sd-deleteArchiveBtn" type="button">删除</button>
+              <button type="button" @click="saveArchive()">保存</button>
+              <button type="button" @click="loadArchive()">读取</button>
+              <button type="button" @click="deleteArchive()">删除</button>
             </div>
-            <p id="sd-presetHint" class="hint"></p>
+            <p class="hint">{{ archiveHint }}</p>
           </section>
         </form>
       </aside>
@@ -124,42 +126,74 @@
           <div class="uploadGrid three" id="sd-audioRefs"></div>
         </div>
         <div class="panel">
-          <div class="resultHeader">
-            <h2>结果</h2>
-            <span id="sd-statusText">空闲</span>
+          <div class="sub-tabs" style="margin-bottom:10px">
+            <button type="button" class="sub-tab" :class="{ isActive: wsTab === 'jobs' }" @click="wsTab='jobs'">任务</button>
+            <button type="button" class="sub-tab" :class="{ isActive: wsTab === 'activity' }" @click="wsTab='activity'; loadActivity()">活动</button>
           </div>
-          <div id="sd-results" class="results"></div>
-          <pre id="sd-events"></pre>
+          <div v-show="wsTab==='jobs'">
+            <div class="resultHeader"><h2>结果</h2><span>{{ statusText }}</span></div>
+            <div class="results" id="sd-results"></div>
+            <pre id="sd-events">{{ eventsText }}</pre>
+          </div>
+          <div v-show="wsTab==='activity'" class="activity-panel-inner">
+            <div v-if="!activityDetail">
+              <div class="activity-counts" v-if="activityCounts">
+                <span>共 {{ activityCounts.total }} 条</span>
+                <span class="act-ok">成功 {{ activityCounts.succeeded }}</span>
+                <span class="act-fail">失败 {{ activityCounts.failed }}</span>
+              </div>
+              <div class="activity-records">
+                <div v-for="r in activityRecords" :key="r.id" class="act-item" @click="showDetail(r.id)">
+                  <span class="act-status" :class="r.status">{{ r.status }}</span>
+                  <span class="act-time">{{ (r.created_at||'').slice(5,16) }}</span>
+                  <span class="act-title">{{ r.title }}</span>
+                </div>
+                <div v-if="!activityRecords.length" style="color:#697386;font-size:12px">暂无活动记录</div>
+              </div>
+            </div>
+            <div v-else class="act-detail">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+                <button type="button" class="btn-small" @click="activityDetail=null">← 返回列表</button>
+                <button type="button" class="btn-small" style="background:#17191f;color:#fff" @click="restoreActivity()">恢复参数</button>
+              </div>
+              <div class="act-detail-meta">
+                <span :class="activityDetail.status">{{ activityDetail.status }}</span> · {{ activityDetail.created_at }}
+              </div>
+              <h3 style="margin:8px 0 4px;font-size:13px">请求参数</h3>
+              <pre style="font-size:11px;max-height:200px">{{ JSON.stringify(activityDetail.restore?.values || activityDetail.request, null, 2) }}</pre>
+              <h3 style="margin:8px 0 4px;font-size:13px" v-if="activityDetail.result">结果</h3>
+              <pre v-if="activityDetail.result" style="font-size:11px;max-height:150px">{{ JSON.stringify(activityDetail.result, null, 2) }}</pre>
+            </div>
+          </div>
         </div>
       </section>
     </main>
   </div>
 
-  <!-- ═══════════════ NANO BANANA ═══════════════ -->
-  <div class="tab-panel" id="tab-nb">
+  <!-- NANO BANANA -->
+  <div class="tab-panel" id="tab-nb" v-scope="NanoBananaApp()" @vue:mounted="init()">
     <main class="app">
       <aside class="sidebar">
-        <h1>Nano Banana <span class="app-status-dot" id="nb-dot"></span></h1>
-        <form id="nb-form">
+        <h1>Nano Banana <span class="app-status-dot" :class="appStatus"></span></h1>
+        <form id="nb-form" ref="form" @submit.prevent="submit()">
           <section>
             <h2>接口</h2>
             <label>API Key<input name="api_key" type="password" autocomplete="off" placeholder="留空使用本地配置"></label>
-            <p id="nb-keyHint" class="hint"></p>
+            <p class="hint">{{ keyHint }}</p>
             <label>供应商
-              <select name="provider">
-                <option value="t8star">T8Star Images API</option>
-                <option value="gemini">Chiyun</option>
+              <select name="provider" @change="applyProvider($event.target.value)">
+                <option v-for="(cfg, key) in providers" :value="key">{{ cfg.label || key }}</option>
               </select>
             </label>
-            <label>Base URL<input name="base_url" value="https://ai.t8star.cn"></label>
-            <p id="nb-providerHint" class="hint"></p>
-            <label>输出目录<input name="output_dir" placeholder="留空则保存到 outputs 文件夹"></label>
+            <label>Base URL<input name="base_url" v-model="baseUrl"></label>
+            <p class="hint">{{ providerHint }}</p>
+            <label>输出目录<input name="output_dir" v-model="outputDir" placeholder="留空则保存到 outputs 文件夹"></label>
             <div class="rowButtons outputDirBtns">
-              <button id="nb-chooseOutputBtn" type="button">选择目录</button>
-              <button id="nb-appOutputBtn" type="button">程序 outputs</button>
-              <button id="nb-desktopOutputBtn" type="button">桌面 outputs</button>
-              <button id="nb-openOutputBtn" type="button">打开目录</button>
-              <button id="nb-cleanCacheBtn" type="button">清理缓存</button>
+              <button type="button" @click="chooseOutputDir()">选择目录</button>
+              <button type="button" @click="outputDir=''">程序 outputs</button>
+              <button type="button" @click="desktopOutput()">桌面 outputs</button>
+              <button type="button" @click="openOutputDir()">打开目录</button>
+              <button type="button" @click="cleanCache()">清理缓存</button>
             </div>
           </section>
           <section>
@@ -172,8 +206,7 @@
             </label>
             <label>模型
               <select name="model">
-                <option value="nano-banana-2">nano-banana-2</option>
-                <option value="gemini-3.1-flash-image-preview">gemini-3.1-flash-image-preview</option>
+                <option v-for="m in models" :value="m.id">{{ m.label || m.id }}</option>
               </select>
             </label>
             <div class="grid2">
@@ -211,17 +244,21 @@
               <label>并发数<input name="concurrency" type="number" min="1" max="20" value="1"></label>
             </div>
           </section>
-          <button id="nb-submitBtn" type="submit">开始生成</button>
+          <button type="submit" :disabled="submitting">{{ submitting ? '生成中' : '开始生成' }}</button>
           <section class="archiveBox">
             <h2>存档</h2>
             <label>存档名<input name="archive_name" placeholder="存档名称"></label>
-            <label>读取存档<select id="nb-archiveSelect"></select></label>
+            <label>读取存档
+              <select v-model="selectedArchive">
+                <option v-for="a in archives" :value="a.name">{{ a.name }}</option>
+              </select>
+            </label>
             <div class="rowButtons archiveActions">
-              <button id="nb-savePresetBtn" type="button">保存</button>
-              <button id="nb-loadArchiveBtn" type="button">读取</button>
-              <button id="nb-deleteArchiveBtn" type="button">删除</button>
+              <button type="button" @click="saveArchive()">保存</button>
+              <button type="button" @click="loadArchive()">读取</button>
+              <button type="button" @click="deleteArchive()">删除</button>
             </div>
-            <p id="nb-presetHint" class="hint"></p>
+            <p class="hint">{{ archiveHint }}</p>
           </section>
         </form>
       </aside>
@@ -235,84 +272,117 @@
           <div class="uploadGrid refs" id="nb-imageRefs"></div>
         </div>
         <div class="panel">
-          <div class="resultHeader">
-            <h2>结果</h2>
-            <span id="nb-statusText">空闲</span>
+          <div class="sub-tabs" style="margin-bottom:10px">
+            <button type="button" class="sub-tab" :class="{ isActive: wsTab === 'jobs' }" @click="wsTab='jobs'">任务</button>
+            <button type="button" class="sub-tab" :class="{ isActive: wsTab === 'activity' }" @click="wsTab='activity'; loadActivity()">活动</button>
           </div>
-          <div id="nb-results" class="results"></div>
-          <pre id="nb-events"></pre>
+          <div v-show="wsTab==='jobs'">
+            <div class="resultHeader"><h2>结果</h2><span>{{ statusText }}</span></div>
+            <div class="results" id="nb-results"></div>
+            <pre id="nb-events">{{ eventsText }}</pre>
+          </div>
+          <div v-show="wsTab==='activity'" class="activity-panel-inner">
+            <div v-if="!activityDetail">
+              <div class="activity-counts" v-if="activityCounts">
+                <span>共 {{ activityCounts.total }} 条</span>
+                <span class="act-ok">成功 {{ activityCounts.succeeded }}</span>
+                <span class="act-fail">失败 {{ activityCounts.failed }}</span>
+              </div>
+              <div class="activity-records">
+                <div v-for="r in activityRecords" :key="r.id" class="act-item" @click="showDetail(r.id)">
+                  <span class="act-status" :class="r.status">{{ r.status }}</span>
+                  <span class="act-time">{{ (r.created_at||'').slice(5,16) }}</span>
+                  <span class="act-title">{{ r.title }}</span>
+                </div>
+                <div v-if="!activityRecords.length" style="color:#697386;font-size:12px">暂无活动记录</div>
+              </div>
+            </div>
+            <div v-else class="act-detail">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+                <button type="button" class="btn-small" @click="activityDetail=null">← 返回列表</button>
+                <button type="button" class="btn-small" style="background:#17191f;color:#fff" @click="restoreActivity()">恢复参数</button>
+              </div>
+              <div class="act-detail-meta">
+                <span :class="activityDetail.status">{{ activityDetail.status }}</span> · {{ activityDetail.created_at }}
+              </div>
+              <h3 style="margin:8px 0 4px;font-size:13px">请求参数</h3>
+              <pre style="font-size:11px;max-height:200px">{{ JSON.stringify(activityDetail.restore?.values || activityDetail.request, null, 2) }}</pre>
+              <h3 style="margin:8px 0 4px;font-size:13px" v-if="activityDetail.result">结果</h3>
+              <pre v-if="activityDetail.result" style="font-size:11px;max-height:150px">{{ JSON.stringify(activityDetail.result, null, 2) }}</pre>
+            </div>
+          </div>
         </div>
       </section>
     </main>
   </div>
 
-  <!-- ═══════════════ DREAMINA ═══════════════ -->
-  <div class="tab-panel" id="tab-dreamina">
-    <div id="dm-setupView" class="setup-view">
+  <!-- DREAMINA -->
+  <div class="tab-panel" id="tab-dreamina" v-scope="DreaminaApp()" @vue:mounted="init()">
+    <div v-if="setupMode" class="setup-view">
       <div class="setup-card">
-        <h2 id="dm-setupTitle">环境检测中...</h2>
-        <p id="dm-setupDesc"></p>
-        <button id="dm-setupBtn" class="hidden" type="button">一键安装</button>
-        <button id="dm-loginBtn" class="hidden" type="button">登录即梦账号</button>
-        <button id="dm-loginCancelBtn" class="hidden" type="button">取消登录</button>
-        <pre id="dm-setupLog" class="setup-log hidden"></pre>
-        <div id="dm-setupSpinner" class="spinner hidden"></div>
+        <h2>{{ setupTitle }}</h2>
+        <p v-html="setupDesc"></p>
+        <button v-if="setupMode==='install'" type="button" @click="installCli()">一键安装</button>
+        <button v-if="setupMode==='login'" type="button" @click="startLogin()">登录即梦账号</button>
+        <button v-if="loginInProgress" type="button" @click="cancelLogin()">取消登录</button>
+        <pre v-if="setupLog" class="setup-log">{{ setupLog }}</pre>
+        <div v-if="setupSpinner" class="spinner"></div>
       </div>
     </div>
-    <main id="dm-mainView" class="app hidden">
+    <main v-else class="app">
       <aside class="sidebar">
         <div class="sidebar-header">
-          <h1>Dreamina <span class="app-status-dot" id="dm-dot"></span></h1>
+          <h1>Dreamina <span class="app-status-dot" :class="appStatus"></span></h1>
           <div>
-            <span id="dm-statusText" class="status-badge">检测中...</span>
-            <span id="dm-creditText" class="credit"></span>
+            <span class="status-badge" :class="{ ok: loggedIn }">{{ loggedIn ? '已登录' : '未登录' }}</span>
+            <span class="credit" v-if="credit">{{ credit }}</span>
           </div>
         </div>
         <div class="rowButtons" style="margin-bottom:14px">
-          <button id="dm-switchAccountBtn" type="button">切换账号</button>
-          <button id="dm-updateCliBtn" type="button">更新 CLI</button>
+          <button type="button" @click="switchAccount()">切换账号</button>
+          <button type="button" @click="updateCli()">更新 CLI</button>
         </div>
         <section style="margin-bottom:14px">
-          <label style="font-size:12px;font-weight:650;color:#4b5565">输出目录<input type="text" id="dm-outputDir" placeholder="留空则保存到 outputs 文件夹"></label>
+          <label style="font-size:12px;font-weight:650;color:#4b5565">输出目录<input type="text" v-model="outputDir" placeholder="留空则保存到 outputs 文件夹"></label>
           <div class="rowButtons outputDirBtns">
-            <button id="dm-chooseOutputBtn" type="button">选择目录</button>
-            <button id="dm-appOutputBtn" type="button">程序 outputs</button>
-            <button id="dm-desktopOutputBtn" type="button">桌面 outputs</button>
-            <button id="dm-openOutputBtn" type="button">打开目录</button>
-            <button id="dm-cleanCacheBtn" type="button">清理缓存</button>
+            <button type="button" @click="chooseOutputDir()">选择目录</button>
+            <button type="button" @click="outputDir=''">程序 outputs</button>
+            <button type="button" @click="desktopOutput()">桌面 outputs</button>
+            <button type="button" @click="openOutputDir()">打开目录</button>
+            <button type="button" @click="cleanCache()">清理缓存</button>
           </div>
         </section>
         <div class="tabs major-tabs" style="margin-bottom:12px">
-          <button class="tabBtn isActive" data-major="image" type="button">图片</button>
-          <button class="tabBtn" data-major="video" type="button">视频</button>
+          <button class="tabBtn" :class="{ isActive: major==='image' }" type="button" @click="major='image'; mode=imageSub">图片</button>
+          <button class="tabBtn" :class="{ isActive: major==='video' }" type="button" @click="major='video'; mode=videoSub">视频</button>
         </div>
-        <form id="dm-form">
-          <div id="dm-imageModeSection">
+        <form id="dm-form" ref="form" @submit.prevent="submit()">
+          <div v-show="major==='image'">
             <div class="sub-tabs" style="display:flex;gap:6px;margin-bottom:12px">
-              <button type="button" class="tabBtn isActive sub-tab" data-mode="text2image">文生图</button>
-              <button type="button" class="tabBtn sub-tab" data-mode="image2image">图生图</button>
+              <button type="button" class="tabBtn sub-tab" :class="{ isActive: mode==='text2image' }" @click="mode='text2image'; imageSub='text2image'">文生图</button>
+              <button type="button" class="tabBtn sub-tab" :class="{ isActive: mode==='image2image' }" @click="mode='image2image'; imageSub='image2image'">图生图</button>
             </div>
           </div>
-          <div id="dm-videoModeSection" class="hidden">
+          <div v-show="major==='video'">
             <div class="sub-tabs" style="display:flex;gap:6px;margin-bottom:12px">
-              <button type="button" class="tabBtn isActive sub-tab" data-mode="frames2video">首尾帧</button>
-              <button type="button" class="tabBtn sub-tab" data-mode="multimodal2video">全能参考</button>
-              <button type="button" class="tabBtn sub-tab" data-mode="multiframe2video">多帧</button>
+              <button type="button" class="tabBtn sub-tab" :class="{ isActive: mode==='frames2video' }" @click="mode='frames2video'; videoSub='frames2video'">首尾帧</button>
+              <button type="button" class="tabBtn sub-tab" :class="{ isActive: mode==='multimodal2video' }" @click="mode='multimodal2video'; videoSub='multimodal2video'">全能参考</button>
+              <button type="button" class="tabBtn sub-tab" :class="{ isActive: mode==='multiframe2video' }" @click="mode='multiframe2video'; videoSub='multiframe2video'">多帧</button>
             </div>
           </div>
           <label>Prompt<textarea name="prompt" rows="4" placeholder="描述你想生成的内容..."></textarea></label>
-          <div id="dm-multiRefSection" class="hidden">
+          <div v-show="mode==='image2image'">
             <label>参考图 (最多 9 张)</label>
             <div class="uploadGrid refs" id="dm-imageRefs"></div>
           </div>
-          <div id="dm-framesSection" class="hidden">
+          <div v-show="mode==='frames2video'">
             <label>首尾帧</label>
             <div class="uploadGrid two">
               <label class="drop">首帧<input type="file" name="first_frame" accept="image/*"><span>未上传</span></label>
               <label class="drop">尾帧<input type="file" name="last_frame" accept="image/*"><span>未上传</span></label>
             </div>
           </div>
-          <div id="dm-multimodalSection" class="hidden">
+          <div v-show="mode==='multimodal2video'">
             <label>参考图</label>
             <div class="uploadGrid refs" id="dm-mmImageRefs"></div>
             <label>参考视频</label>
@@ -320,13 +390,13 @@
             <label>参考音频</label>
             <div class="uploadGrid three" id="dm-mmAudioRefs"></div>
           </div>
-          <div id="dm-multiframeSection" class="hidden">
+          <div v-show="mode==='multiframe2video'">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
               <label style="margin:0">关键帧 (2-9 帧)</label>
               <div style="display:flex;align-items:center;gap:6px">
-                <button type="button" id="dm-removeFrameBtn" class="btn-icon">−</button>
-                <span id="dm-frameCount">2</span>
-                <button type="button" id="dm-addFrameBtn" class="btn-icon">+</button>
+                <button type="button" class="btn-icon" @click="removeFrame()">−</button>
+                <span>{{ frameCount }}</span>
+                <button type="button" class="btn-icon" @click="addFrame()">+</button>
               </div>
             </div>
             <div id="dm-framesContainer"></div>
@@ -335,8 +405,7 @@
             <label>比例
               <select name="ratio">
                 <option value="1:1">1:1</option><option value="16:9">16:9</option>
-                <option value="9:16">9:16</option><option value="4:3">4:3</option>
-                <option value="3:4">3:4</option>
+                <option value="9:16">9:16</option><option value="4:3">4:3</option><option value="3:4">3:4</option>
               </select>
             </label>
             <label>分辨率
@@ -345,7 +414,7 @@
               </select>
             </label>
           </div>
-          <div id="dm-videoParams" class="hidden">
+          <div v-show="major==='video'">
             <div class="grid2">
               <label>时长
                 <select name="duration">
@@ -359,7 +428,7 @@
                 </select>
               </label>
             </div>
-            <label id="dm-modelVersionGroup">模型版本
+            <label>模型版本
               <select name="model_version">
                 <option value="seedance2.0fast">Seedance 2.0 Fast</option>
                 <option value="seedance2.0">Seedance 2.0</option>
@@ -381,63 +450,89 @@
               </select>
             </label>
           </div>
-          <button id="dm-submitBtn" type="submit">开始生成</button>
+          <button type="submit" :disabled="submitting">{{ submitting ? '生成中' : '开始生成' }}</button>
         </form>
         <div class="archiveBox">
           <h2>存档</h2>
-          <label>存档名<input type="text" id="dm-archiveName" placeholder="存档名称..."></label>
+          <label>存档名<input type="text" v-model="archiveName" placeholder="存档名称..."></label>
           <div style="display:flex;gap:6px;margin-bottom:8px">
-            <select id="dm-archiveSelect" style="flex:1"></select>
-            <button id="dm-archiveLoadBtn" class="btn-small" type="button">读取</button>
-            <button id="dm-archiveDeleteBtn" class="btn-small" type="button">删除</button>
+            <select v-model="selectedArchive" style="flex:1">
+              <option v-for="a in archives" :value="a.name">{{ a.name }}</option>
+            </select>
+            <button class="btn-small" type="button" @click="loadArchive()">读取</button>
+            <button class="btn-small" type="button" @click="deleteArchive()">删除</button>
           </div>
-          <button id="dm-archiveSaveBtn" type="button">保存存档</button>
+          <button type="button" @click="saveArchive()">保存存档</button>
         </div>
       </aside>
       <section class="workspace">
         <div class="panel">
-          <div class="resultHeader">
-            <h2>任务</h2>
-            <span id="dm-runningCount" class="running-count"></span>
+          <div class="sub-tabs" style="margin-bottom:10px">
+            <button type="button" class="sub-tab" :class="{ isActive: wsTab==='jobs' }" @click="wsTab='jobs'">任务</button>
+            <button type="button" class="sub-tab" :class="{ isActive: wsTab==='history' }" @click="wsTab='history'; loadHistory()">历史</button>
           </div>
-          <div id="dm-jobsList" class="jobs-list"></div>
-        </div>
-        <div class="panel">
-          <div class="resultHeader">
-            <h2>历史记录</h2>
-            <div class="filter-bar">
-              <button class="filter-btn active" data-filter="all" type="button">全部</button>
-              <button class="filter-btn" data-filter="image" type="button">图片</button>
-              <button class="filter-btn" data-filter="video" type="button">视频</button>
+          <div v-show="wsTab==='jobs'">
+            <div class="resultHeader"><h2>任务</h2><span class="running-count">{{ runningCount ? runningCount + ' 进行中' : '' }}</span></div>
+            <div class="results" id="dm-jobsList"></div>
+          </div>
+          <div v-show="wsTab==='history'">
+            <div class="resultHeader">
+              <h2>历史记录</h2>
+              <div class="filter-bar">
+                <button type="button" class="filter-btn" :class="{ active: historyFilter==='all' }" @click="historyFilter='all'; loadHistory()">全部</button>
+                <button type="button" class="filter-btn" :class="{ active: historyFilter==='image' }" @click="historyFilter='image'; loadHistory()">图片</button>
+                <button type="button" class="filter-btn" :class="{ active: historyFilter==='video' }" @click="historyFilter='video'; loadHistory()">视频</button>
+              </div>
             </div>
+            <div id="dm-historyList"></div>
           </div>
-          <div id="dm-historyList" class="history-list"></div>
         </div>
       </section>
     </main>
   </div>
 
-  <!-- ═══════════════ STATS ═══════════════ -->
-  <div class="tab-panel" id="tab-stats">
+  <!-- STATS -->
+  <div class="tab-panel" id="tab-stats" v-scope="StatsApp()" @vue:mounted="init()">
     <div class="portal-content">
       <section class="stats-panel">
         <h2>今日用量</h2>
-        <div class="stats-row" id="statsRow">
-          <div class="stat-card"><div class="stat-value" id="todayJobs">-</div><div class="stat-label">Today Jobs</div></div>
-          <div class="stat-card"><div class="stat-value" id="todayRequests">-</div><div class="stat-label">Today Requests</div></div>
+        <div class="stats-row">
+          <div class="stat-card"><div class="stat-value">{{ todayJobs }}</div><div class="stat-label">Today Jobs</div></div>
+          <div class="stat-card"><div class="stat-value">{{ todayRequests }}</div><div class="stat-label">Today Requests</div></div>
         </div>
-        <div class="stats-by-app" id="statsByApp"></div>
+        <div class="stats-by-app">
+          <div v-for="(s, name) in byApp" class="app-stat-item">
+            <span class="name">{{ name }}</span>
+            <span class="count">{{ s.jobs||0 }} jobs / {{ s.requests||0 }} req</span>
+          </div>
+        </div>
       </section>
       <section class="stats-panel">
         <h2>按用户统计（实际生成数）</h2>
-        <table class="ip-stats-table" id="ipStatsTable">
+        <table class="ip-stats-table">
           <thead><tr><th>IP</th><th>Seedance</th><th>Nano Banana</th><th>Dreamina</th><th>合计</th></tr></thead>
-          <tbody></tbody>
+          <tbody>
+            <tr v-for="(stats, ip) in byIp">
+              <td>{{ ip }}</td>
+              <td>{{ stats.seedance || 0 }}</td>
+              <td>{{ stats['nano-banana'] || 0 }}</td>
+              <td>{{ stats.dreamina || 0 }}</td>
+              <td><strong>{{ (stats.seedance||0) + (stats['nano-banana']||0) + (stats.dreamina||0) }}</strong></td>
+            </tr>
+            <tr v-if="!Object.keys(byIp).length"><td colspan="5" style="color:#697386;text-align:center">暂无数据（任务完成后更新）</td></tr>
+          </tbody>
         </table>
       </section>
       <section class="activity-panel">
         <h2>最近活动</h2>
-        <div class="activity-list" id="activityList"></div>
+        <div class="activity-list">
+          <div v-for="item in recentActivity" class="activity-item">
+            <span class="activity-time">{{ (item.created_at||item.time||'').slice(11,19) }}</span>
+            <span class="activity-app">{{ item._app || '?' }}</span>
+            <span class="activity-detail">{{ item.prompt || item.task_type || item.method || '' }}</span>
+          </div>
+          <div v-if="!recentActivity.length" style="color:#697386;font-size:13px">暂无活动</div>
+        </div>
       </section>
     </div>
   </div>
@@ -447,6 +542,7 @@
     <div id="previewDialogBody"></div>
   </dialog>
 
+  <script src="https://unpkg.com/petite-vue@0.4.1/dist/petite-vue.iife.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

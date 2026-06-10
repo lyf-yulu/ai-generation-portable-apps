@@ -161,6 +161,24 @@ pre { min-height: 80px; max-height: 200px; overflow: auto; margin: 0; padding: 1
 .filter-btn.active { border-color: #2673e8; color: #2673e8; }
 .running-count { font-size: 12px; color: #697386; }
 
+/* === Activity Panel === */
+.activity-panel-inner { min-height: 200px; }
+.activity-counts { display: flex; gap: 12px; font-size: 12px; margin-bottom: 10px; color: #4b5565; }
+.activity-counts .act-ok { color: #10b981; font-weight: 600; }
+.activity-counts .act-fail { color: #ef4444; font-weight: 600; }
+.activity-records { max-height: 400px; overflow-y: auto; }
+.act-item { display: grid; grid-template-columns: 70px 90px 1fr; gap: 8px; padding: 8px 6px; border-bottom: 1px solid #f1f3f7; font-size: 12px; cursor: pointer; align-items: center; border-radius: 4px; }
+.act-item:hover { background: #f8fafc; }
+.act-status { font-weight: 600; font-size: 11px; padding: 2px 6px; border-radius: 4px; text-align: center; }
+.act-status.succeeded { background: #d1fae5; color: #065f46; }
+.act-status.failed { background: #fee2e2; color: #991b1b; }
+.act-status.running { background: #e0f2fe; color: #0369a1; }
+.act-time { color: #697386; font-size: 11px; }
+.act-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #293244; }
+.act-detail { padding: 4px 0; }
+.act-detail-meta { font-size: 12px; color: #4b5565; margin-bottom: 8px; }
+.act-detail pre { background: #101828; color: #d1e0ff; padding: 10px; border-radius: 7px; font-size: 11px; overflow: auto; }
+
 /* === Responsive === */
 @media (max-width: 960px) { .app { grid-template-columns: 1fr; } .sidebar { max-height: none; position: static; border-right: 0; border-bottom: 1px solid #dde1e8; } }
 @media (max-width: 680px) { .grid2, .rowButtons, .uploadGrid.two, .uploadGrid.three, .uploadGrid.refs, .toggles { grid-template-columns: 1fr; } .app-tabs-bar { overflow-x: auto; } }

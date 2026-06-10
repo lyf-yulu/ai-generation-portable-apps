@@ -1316,7 +1316,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             self.send_response(200)
             self.send_header("Content-Type", "video/mp4")
-            self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
+            self.send_header("Content-Disposition", f'inline; filename="{path.name}"')
             self.send_header("Content-Length", str(path.stat().st_size))
             self.end_headers()
             self.wfile.write(path.read_bytes())

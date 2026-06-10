@@ -313,6 +313,7 @@ class Handler(SimpleHTTPRequestHandler):
                 val = self.headers.get(key)
                 if val:
                     headers[key] = val
+            headers["X-Forwarded-For"] = client_ip
 
             conn.request(method, target_path, body=body, headers=headers)
             resp = conn.getresponse()

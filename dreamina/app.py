@@ -503,6 +503,12 @@ class Handler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def _client_ip(self) -> str:
+        forwarded = self.headers.get("X-Forwarded-For")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+        return self.client_address[0]
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
@@ -804,6 +810,7 @@ class Handler(SimpleHTTPRequestHandler):
             "done": 0,
             "concurrency": concurrency_val,
             "output_name": fields.get("output_name", ""),
+            "client_ip": self._client_ip(),
             "events": [],
             "results": [],
             "errors": [],
@@ -919,8 +926,9 @@ class Handler(SimpleHTTPRequestHandler):
         json_response(self, 200, {"ok": True, "job_id": new_job_id})
 
     def handle_jobs_list(self):
+        ip = self._client_ip()
         with LOCK:
-            jobs = list(JOBS.values())
+            jobs = [j for j in JOBS.values() if j.get("client_ip", "") in ("", ip)]
         json_response(self, 200, {"ok": True, "jobs": jobs})
 
     def handle_job_status(self, job_id: str):
@@ -932,8 +940,10 @@ class Handler(SimpleHTTPRequestHandler):
         json_response(self, 200, {"ok": True, "job": job})
 
     def handle_history(self):
+        ip = self._client_ip()
         items = read_history()
-        json_response(self, 200, {"ok": True, "history": items[-100:]})
+        filtered = [i for i in items if i.get("client_ip", "") in ("", ip)]
+        json_response(self, 200, {"ok": True, "history": filtered[-100:]})
 
     def handle_cache_clean(self):
         removed_uploads = 0
