@@ -305,9 +305,12 @@ function GenApp(prefix, appPath, mediaType) {
       if (!this.selectedArchive) return;
       const data = new FormData(); data.set('archive_name', this.selectedArchive);
       const res = await api(`${appPath}/api/archive/load`, 'POST', data);
+      if (!res) return;
+      const formId = `${prefix}-form`;
       if (res?.values) {
         for (const [k, v] of Object.entries(res.values)) {
-          const el = document.querySelector(`#${prefix}-form [name="${k}"]`);
+          // Element may be inside the form or linked via form= attribute
+          const el = document.querySelector(`#${formId} [name="${k}"]`) || document.querySelector(`[form="${formId}"][name="${k}"]`) || document.querySelector(`[name="${k}"]`);
           if (el && el.type !== 'file') {
             if (el.type === 'checkbox') el.checked = ['on', 'true', '1'].includes(v);
             else el.value = v;
@@ -317,7 +320,7 @@ function GenApp(prefix, appPath, mediaType) {
       if (res?.media) {
         this.savedMedia = res.media;
         for (const [name, item] of Object.entries(res.media)) {
-          const el = document.querySelector(`#${prefix}-form [name="${name}"]`);
+          const el = document.querySelector(`[form="${formId}"][name="${name}"]`) || document.querySelector(`#${formId} [name="${name}"]`) || document.querySelector(`[name="${name}"]`);
           const drop = el?.closest('.drop');
           if (drop && item.url) {
             showPreview(drop, name, item.url, item.filename);
@@ -348,9 +351,10 @@ function GenApp(prefix, appPath, mediaType) {
     restoreActivity() {
       const r = this.activityDetail?.restore;
       if (!r) { alert('该记录无法恢复'); return; }
+      const formId = `${prefix}-form`;
       for (const [k, v] of Object.entries(r.values || {})) {
         if (k === 'output_dir') { this.outputDir = v; continue; }
-        const el = document.querySelector(`#${prefix}-form [name="${k}"]`);
+        const el = document.querySelector(`#${formId} [name="${k}"]`) || document.querySelector(`[form="${formId}"][name="${k}"]`) || document.querySelector(`[name="${k}"]`);
         if (el && el.type !== 'file') {
           if (el.type === 'checkbox') el.checked = ['on', 'true', '1'].includes(v);
           else el.value = v;
@@ -361,7 +365,7 @@ function GenApp(prefix, appPath, mediaType) {
       if (r.media) {
         this.savedMedia = r.media;
         for (const [name, item] of Object.entries(r.media)) {
-          const el = document.querySelector(`#${prefix}-form [name="${name}"]`);
+          const el = document.querySelector(`[form="${formId}"][name="${name}"]`) || document.querySelector(`#${formId} [name="${name}"]`) || document.querySelector(`[name="${name}"]`);
           const drop = el?.closest('.drop');
           if (drop && item.url) {
             showPreview(drop, name, item.url, item.filename);
