@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -22,6 +23,11 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
+
+# Windows: suppress console windows for spawned subprocesses
+_POPEN_EXTRA: dict[str, Any] = {}
+if hasattr(subprocess, "CREATE_NO_WINDOW"):
+    _POPEN_EXTRA["creationflags"] = subprocess.CREATE_NO_WINDOW
 OUTPUT_DIR = ROOT / "outputs"
 UPLOAD_DIR = ROOT / "uploads"
 LOG_DIR = ROOT / "logs"
@@ -1031,6 +1037,7 @@ class Handler(SimpleHTTPRequestHandler):
                     ["dreamina", "login"],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, start_new_session=True, env=proc_env,
+                    **_POPEN_EXTRA,
                 )
             except FileNotFoundError:
                 json_response(self, 400, {"ok": False, "error": "dreamina not found"})
@@ -1168,7 +1175,8 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             proc = subprocess.Popen(
                 ["bash", "-c", "curl -fsSL https://jimeng.jianying.com/cli | bash"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                **_POPEN_EXTRA,
             )
             for line in proc.stdout:
                 send_event(json.dumps({"type": "log", "text": line.rstrip()}))
@@ -1191,6 +1199,7 @@ class Handler(SimpleHTTPRequestHandler):
                     ["dreamina", "login"],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, start_new_session=True,
+                    **_POPEN_EXTRA,
                 )
             except FileNotFoundError:
                 json_response(self, 400, {"ok": False, "error": "dreamina not found"})
@@ -1241,6 +1250,7 @@ class Handler(SimpleHTTPRequestHandler):
                     ["dreamina", "login"],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, start_new_session=True,
+                    **_POPEN_EXTRA,
                 )
             except FileNotFoundError:
                 json_response(self, 400, {"ok": False, "error": "dreamina not found"})
@@ -1713,6 +1723,18 @@ def main():
 
     if not os.environ.get("CORS"):
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+
+    def shutdown_handler(*args):
+        print("\nShutting down...")
+        server.shutdown()
+        EXECUTOR.shutdown(wait=False)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown_handler)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, shutdown_handler)
+    elif hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, shutdown_handler)
 
     try:
         server.serve_forever()

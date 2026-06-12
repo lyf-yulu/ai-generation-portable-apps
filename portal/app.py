@@ -21,6 +21,11 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
+
+# Windows: suppress console windows for spawned subprocesses
+_POPEN_EXTRA: dict[str, Any] = {}
+if hasattr(subprocess, "CREATE_NO_WINDOW"):
+    _POPEN_EXTRA["creationflags"] = subprocess.CREATE_NO_WINDOW
 STATE_DIR = ROOT / "state"
 USAGE_PATH = STATE_DIR / "usage.json"
 
@@ -132,6 +137,7 @@ class AppManager:
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            **_POPEN_EXTRA,
         )
         self.processes[name] = proc
         self.status[name] = {"status": "starting", "port": config["port"], "pid": proc.pid}

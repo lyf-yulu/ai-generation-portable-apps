@@ -96,6 +96,7 @@ function GenApp(prefix, appPath, mediaType) {
     archives: [],
     selectedArchive: '',
     archiveHint: '',
+    savedMedia: {},
     wsTab: 'jobs',
     activityRecords: [],
     activityCounts: null,
@@ -292,8 +293,12 @@ function GenApp(prefix, appPath, mediaType) {
     },
     async saveArchive() {
       const data = new FormData(document.getElementById(`${prefix}-form`));
+      if (this.savedMedia && Object.keys(this.savedMedia).length) {
+        data.set('saved_media', JSON.stringify(this.savedMedia));
+      }
       const res = await api(`${appPath}/api/preset`, 'POST', data);
       this.archiveHint = res?.archive ? `已保存: ${res.archive}` : (res?.error || '保存失败');
+      if (res?.media) this.savedMedia = res.media;
       this.loadArchives();
     },
     async loadArchive() {
@@ -308,6 +313,18 @@ function GenApp(prefix, appPath, mediaType) {
             else el.value = v;
           }
         }
+      }
+      if (res?.media) {
+        this.savedMedia = res.media;
+        for (const [name, item] of Object.entries(res.media)) {
+          const el = document.querySelector(`#${prefix}-form [name="${name}"]`);
+          const drop = el?.closest('.drop');
+          if (drop && item.url) {
+            showPreview(drop, name, item.url, item.filename);
+          }
+        }
+      } else {
+        this.savedMedia = {};
       }
       this.archiveHint = `已读取: ${this.selectedArchive}`;
     },
@@ -341,6 +358,16 @@ function GenApp(prefix, appPath, mediaType) {
       }
       if (r.values?.provider) this.applyProvider(r.values.provider);
       if (r.values?.base_url) this.baseUrl = r.values.base_url;
+      if (r.media) {
+        this.savedMedia = r.media;
+        for (const [name, item] of Object.entries(r.media)) {
+          const el = document.querySelector(`#${prefix}-form [name="${name}"]`);
+          const drop = el?.closest('.drop');
+          if (drop && item.url) {
+            showPreview(drop, name, item.url, item.filename);
+          }
+        }
+      }
       this.wsTab = 'jobs';
     },
 

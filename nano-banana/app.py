@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -543,6 +544,10 @@ def collect_media_from_form(form: cgi.FieldStorage) -> dict[str, Any]:
         stored = f"{uuid.uuid4().hex}_{key}{suffix}"
         (MEDIA_DIR / stored).write_bytes(blob)
         media[key] = {"filename": filename, "stored": stored, "mime": mimetypes.guess_type(filename)[0] or "image/png"}
+    # Preserve existing media for any fields not explicitly set
+    for key in FILE_FIELDS:
+        if key not in media and key in active_media:
+            media[key] = active_media[key]
     return media
 
 
@@ -1469,7 +1474,24 @@ def main() -> None:
     host = os.environ.get("HOST", "127.0.0.1")
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"Nano Banana GUI running at http://{host}:{port}")
-    server.serve_forever()
+    print("Press Ctrl+C to stop")
+
+    def shutdown_handler(*args):
+        print("\nShutting down...")
+        server.shutdown()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown_handler)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, shutdown_handler)
+    elif hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, shutdown_handler)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        server.shutdown()
 
 
 if __name__ == "__main__":
