@@ -1163,8 +1163,8 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
             if state in {"success", "succeeded", "completed", "done", "finished"} or (isinstance(data, dict) and data.get("data")):
                 final = data
                 break
-            if state in {"failed", "failure", "error"}:
-                raise RuntimeError(f"Task {task_id} failed: {status}")
+            if state in {"failed", "failure", "error", "cancelled", "canceled"}:
+                raise RuntimeError(f"Task {task_id} ended as {state}: {status}")
 
     items = extract_items(final)
     if not items:

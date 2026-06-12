@@ -386,6 +386,7 @@ def execute_task(job_id: str, task_type: str, args: list[str], params: dict[str,
             if submit_id:
                 dl = download_if_needed(submit_id, data, task_type, job_id,
                                         output_name=job.get("output_name", ""),
+                                        output_dir=job.get("output_dir", ""),
                                         sub_index=index, total=total,
                                         env_override=env_override)
                 if dl:
@@ -528,21 +529,22 @@ def cleanup_cache(media_days: int = 30, log_days: int = 14) -> dict[str, Any]:
     return stats
 
 
-def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str, output_name: str = "", sub_index: int = 1, total: int = 1, env_override: dict | None = None) -> dict | None:
+def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str, output_name: str = "", output_dir: str = "", sub_index: int = 1, total: int = 1, env_override: dict | None = None) -> dict | None:
     if not submit_id:
         return None
+    base_dir = resolve_output_dir(output_dir) if output_dir else OUTPUT_DIR
     ts = time.strftime("%Y%m%d_%H%M%S")
     short_id = job_id[:8]
     custom_name = (output_name or "").strip()
     if custom_name:
         if total > 1:
-            dl_dir = OUTPUT_DIR / f"{custom_name}-{sub_index}"
+            dl_dir = base_dir / f"{custom_name}-{sub_index}"
         else:
-            dl_dir = OUTPUT_DIR / custom_name
+            dl_dir = base_dir / custom_name
         if dl_dir.exists():
-            dl_dir = OUTPUT_DIR / f"{custom_name}-{sub_index}_{ts}"
+            dl_dir = base_dir / f"{custom_name}-{sub_index}_{ts}"
     else:
-        dl_dir = OUTPUT_DIR / f"{ts}_{task_type}_{short_id}"
+        dl_dir = base_dir / f"{ts}_{task_type}_{short_id}"
     dl_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = load_config()
@@ -1259,6 +1261,7 @@ class Handler(SimpleHTTPRequestHandler):
             "done": 0,
             "concurrency": concurrency_val,
             "output_name": fields.get("output_name", ""),
+            "output_dir": fields.get("output_dir", ""),
             "client_ip": self._client_ip(),
             "events": [],
             "results": [],
@@ -1404,6 +1407,7 @@ class Handler(SimpleHTTPRequestHandler):
             "done": 0,
             "concurrency": concurrency_val,
             "output_name": fields.get("output_name", ""),
+            "output_dir": fields.get("output_dir", ""),
             "client_ip": job.get("client_ip", ""),
             "events": [],
             "results": [],

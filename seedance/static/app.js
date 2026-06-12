@@ -39,7 +39,7 @@ let savedMedia = {};
 let workspaceSaveTimer = 0;
 let providerDefaults = {
   t8star: {
-    baseUrl: "https://ai.t8star.cn",
+    baseUrl: "https://ai.t8star.org",
     models: [
       ["doubao-seedance-2-0-260128", "doubao-seedance-2-0-260128"],
       ["doubao-seedance-2-0-fast-260128", "doubao-seedance-2-0-fast-260128"],
@@ -52,7 +52,7 @@ let providerDefaults = {
       ["doubao-seedance-2-0-260128", "doubao-seedance-2-0-260128"],
       ["doubao-seedance-2-0-fast-260128", "doubao-seedance-2-0-fast-260128"],
     ],
-    hint: "使用豆包官方火山方舟 API。首尾帧模式不能与参考素材混用；本地素材会以 data URL 发送。",
+    hint: "使用豆包官方火山方舟 API。首尾帧模式不能与参考素材混用；素材会先上传再引用。",
   },
 };
 

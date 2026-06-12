@@ -202,8 +202,10 @@ class UsageTracker:
             day_stats = self._data["daily"].setdefault(today, {})
             app_stats = day_stats.setdefault(app, {"requests": 0, "jobs": 0})
             app_stats["requests"] += 1
-            if self._is_job_request(method, path):
-                app_stats["jobs"] += 1
+            # Jobs are counted later by register_job → _add_ip_jobs when the
+            # task reaches a terminal status.  Do NOT increment jobs here or
+            # each submission will be counted twice (once on submit + once on
+            # completion with the actual total).
             self._save()
 
     def register_job(self, app: str, job_id: str, client_ip: str):
@@ -232,7 +234,8 @@ class UsageTracker:
                         status = data.get("status", "")
                         terminal = status in ("succeeded", "failed", "completed")
                         if terminal:
-                            actual = data.get("total", 1)
+                            # Count actual completed sub-tasks, not requested total
+                            actual = max(1, int(data.get("done") or 0))
                             self._add_ip_jobs(job["date"], job["ip"], job["app"], actual)
                             done_ids.append(job["job_id"])
                     conn.close()

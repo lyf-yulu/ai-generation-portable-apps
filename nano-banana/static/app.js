@@ -37,7 +37,7 @@ const workspaceId = urlParams.get("ws") || "default";
 const workspaceKey = `nano-banana.workspace.${workspaceId}`;
 let providerModels = {
   t8star: {
-    baseUrl: "https://ai.t8star.cn",
+    baseUrl: "https://ai.t8star.org",
     models: ["nano-banana-2", "gemini-3.1-flash-image-preview"],
   },
   gemini: {

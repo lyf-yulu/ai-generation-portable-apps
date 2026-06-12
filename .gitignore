@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .venv/
 .portable_python/
+.superpowers/
 
 # Runtime data — never track generated outputs, uploads, state, or logs
 outputs/
