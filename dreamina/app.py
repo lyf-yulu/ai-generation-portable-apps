@@ -139,14 +139,78 @@ ROUND_ROBIN_INDEX = 0
 def load_accounts() -> dict[str, Any]:
     if ACCOUNTS_PATH.exists():
         try:
-            return json.loads(ACCOUNTS_PATH.read_text("utf-8"))
+            data = json.loads(ACCOUNTS_PATH.read_text("utf-8"))
+            if isinstance(data.get("accounts"), list):
+                # Auto-recovery: if accounts.json is empty but account dirs exist on disk,
+                # scan them back — prevent silent data loss from corrupted saves.
+                if not data["accounts"] and ACCOUNTS_DIR.exists():
+                    disk_ids = [d.name for d in ACCOUNTS_DIR.iterdir()
+                                if d.is_dir() and d.name.startswith("acc_")]
+                    if disk_ids:
+                        recovered = _rebuild_accounts_from_disk(disk_ids)
+                        if recovered:
+                            return recovered
+                return data
         except Exception:
             pass
+    # If file doesn't exist but account dirs do, rebuild
+    if ACCOUNTS_DIR.exists():
+        disk_ids = [d.name for d in ACCOUNTS_DIR.iterdir()
+                    if d.is_dir() and d.name.startswith("acc_")]
+        if disk_ids:
+            recovered = _rebuild_accounts_from_disk(disk_ids)
+            if recovered:
+                return recovered
     return {"accounts": [], "active_account": None, "dispatch_mode": "manual"}
 
 
-def save_accounts(data: dict[str, Any]):
+def _rebuild_accounts_from_disk(account_ids: list[str]) -> dict[str, Any] | None:
+    """Scan account directories and rebuild accounts.json after data loss."""
+    accounts = []
+    for acc_id in sorted(account_ids):
+        home = get_account_home(acc_id)
+        cli_dir = home / ".dreamina_cli"
+        has_session = cli_dir.exists()
+        accounts.append({
+            "id": acc_id,
+            "name": f"账号{len(accounts) + 1}",
+            "uid": None,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "home_dir": str(home),
+            "is_system_home": False,
+            "logged_in": has_session,
+            "credit": None,
+            "_login_verified_at": time.time() if has_session else 0,
+        })
+    if not accounts:
+        return None
+    data = {
+        "accounts": accounts,
+        "active_account": accounts[0]["id"],
+        "dispatch_mode": "manual",
+    }
+    # Persist the recovered data so next load is fast
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = ACCOUNTS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+    tmp.replace(ACCOUNTS_PATH)
+    return data
+
+
+def save_accounts(data: dict[str, Any]):
+    # Defensive: refuse to overwrite existing non-empty accounts with an empty list.
+    # This guards against buggy code paths that might pass a fresh empty dict.
+    if isinstance(data.get("accounts"), list) and not data["accounts"]:
+        if ACCOUNTS_PATH.exists():
+            try:
+                existing = json.loads(ACCOUNTS_PATH.read_text("utf-8"))
+                if isinstance(existing.get("accounts"), list) and existing["accounts"]:
+                    print(f"  [WARN] save_accounts refused to overwrite {len(existing['accounts'])} accounts with empty list")
+                    return
+            except Exception:
+                pass
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    # Write to temp file + atomic rename
     tmp = ACCOUNTS_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
     tmp.replace(ACCOUNTS_PATH)
@@ -231,14 +295,19 @@ def pick_account_for_job() -> dict[str, Any] | None:
     data = load_accounts()
     accounts = data["accounts"]
 
-    # Only trust login status verified within the last 10 minutes;
-    # stale "logged_in" may mean the session expired without notice.
+    # Only trust login status verified within the last 30 minutes.
+    # Missing _login_verified_at (legacy accounts) is treated as "recently verified"
+    # to maintain backward compatibility.
     now = time.time()
-    max_staleness = 600  # 10 minutes
+    max_staleness = 1800  # 30 minutes
     logged_in = [
         a for a in accounts
         if a.get("logged_in")
-        and (now - a.get("_login_verified_at", 0)) < max_staleness
+    ]
+    # Filter out accounts whose login status is too stale (skip if field missing)
+    logged_in = [
+        a for a in logged_in
+        if "_login_verified_at" not in a or (now - a["_login_verified_at"]) < max_staleness
     ]
     if not logged_in:
         return None
