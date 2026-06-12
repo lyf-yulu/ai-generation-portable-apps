@@ -547,7 +547,7 @@ def parse_saved_media(form: cgi.FieldStorage | dict[str, Any]) -> dict[str, Any]
         return {}
 
 
-def get_file_or_saved(form: cgi.FieldStorage | dict[str, Any], name: str) -> tuple[str, bytes] | None:
+def get_file_or_saved(form: cgi.FieldStorage | dict[str, Any], name: str, ws_id: str = "localhost") -> tuple[str, bytes] | None:
     uploaded = get_file(form, name)
     if uploaded:
         return uploaded
@@ -936,7 +936,7 @@ def values_files_from_json(payload: dict[str, Any]) -> tuple[dict[str, Any], dic
     return values, files
 
 
-def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], source: str, request_kind: str, request_data: dict[str, Any]) -> str:
+def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], source: str, request_kind: str, request_data: dict[str, Any], ws_id: str = "localhost") -> str:
     job_id = uuid.uuid4().hex
     activity_id = uuid.uuid4().hex
     with LOCK:
@@ -951,7 +951,7 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
         "title": str(values.get("prompt") or "")[:80] or "Nano Banana task",
         "request": request_data,
         "response": response,
-        "restore": copy_files_to_restore(values, files, activity_id),
+        "restore": copy_files_to_restore(values, files, activity_id, ws_id),
     })
     threading.Thread(target=run_job, args=(job_id, values, files, activity_id), daemon=True).start()
     return job_id
@@ -1077,7 +1077,7 @@ def truthy(value: Any) -> bool:
     return str(value or "").strip().lower() in {"on", "true", "1", "yes"}
 
 
-def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tuple[str, bytes]]) -> dict[str, Any]:
+def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tuple[str, bytes]], ws_id: str = "localhost") -> dict[str, Any]:
     form = build_form(values, files)
     api_key = str(values["api_key"]).strip()
     base_url = str(values.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
@@ -1110,7 +1110,7 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
             content: list[dict[str, Any]] = [{"type": "text", "text": common["prompt"]}]
             if mode != "text2img":
                 for i in range(1, 15):
-                    file_data = get_file_or_saved(form, f"image_{i}")
+                    file_data = get_file_or_saved(form, f"image_{i}", ws_id)
                     if not file_data:
                         continue
                     filename, blob = file_data
@@ -1151,7 +1151,7 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
         parts: list[dict[str, Any]] = [{"text": common["prompt"]}]
         if mode != "text2img":
             for i in range(1, 15):
-                file_data = get_file_or_saved(form, f"image_{i}")
+                file_data = get_file_or_saved(form, f"image_{i}", ws_id)
                 if not file_data:
                     continue
                 filename, blob = file_data
@@ -1211,7 +1211,7 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
         files_payload = []
         image_count = 0
         for i in range(1, 15):
-            file_data = get_file_or_saved(form, f"image_{i}")
+            file_data = get_file_or_saved(form, f"image_{i}", ws_id)
             if not file_data:
                 continue
             filename, blob = file_data
@@ -1270,7 +1270,7 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
     return {"index": index, "task_id": task_id, "status": "succeeded", "seed": seed or None, "images": file_token_results}
 
 
-def run_job(job_id: str, values: dict[str, Any], files: dict[str, tuple[str, bytes]], activity_id: str | None = None) -> None:
+def run_job(job_id: str, values: dict[str, Any], files: dict[str, tuple[str, bytes]], activity_id: str | None = None, ws_id: str = "localhost") -> None:
     try:
         requested_count = max(1, min(50, int(values.get("repeat_count") or 1)))
         requested_concurrency = max(1, min(20, int(values.get("concurrency") or 1)))
@@ -1500,8 +1500,10 @@ class Handler(SimpleHTTPRequestHandler):
             if not _is_local(self):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
-            if STATE_DIR.exists():
-                shutil.rmtree(STATE_DIR)
+            ws = _workspace_id(self)
+            ws_dir = STATE_DIR / "workspaces" / ws
+            if ws_dir.exists():
+                shutil.rmtree(ws_dir)
             json_response(self, 200, {"ok": True})
             return
         if self.path == "/api/jobs/json":
@@ -1532,7 +1534,8 @@ class Handler(SimpleHTTPRequestHandler):
                     json_response(self, 200, response)
                     return
                 request_data = {"raw": summarize_payload(payload), "parsed": summarize_values_files(values, files)}
-                job_id = create_job(values, files, "api", "json", request_data)
+                ws = _workspace_id(self)
+                job_id = create_job(values, files, "api", "json", request_data, ws)
                 json_response(self, 200, job_id_response(job_id))
             except Exception as exc:
                 json_response(self, 400, api_error("invalid_request", str(exc)))
@@ -1555,7 +1558,8 @@ class Handler(SimpleHTTPRequestHandler):
                 if blob:
                     files[key] = (Path(item.filename).name, blob)
         request_data = summarize_values_files(values, files)
-        job_id = create_job(values, files, "page", "multipart", request_data)
+        ws = _workspace_id(self)
+        job_id = create_job(values, files, "page", "multipart", request_data, ws)
         json_response(self, 200, job_id_response(job_id))
 
 

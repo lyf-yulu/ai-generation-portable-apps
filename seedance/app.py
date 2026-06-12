@@ -242,6 +242,11 @@ def write_activity_log(items: list[dict[str, Any]]) -> None:
     ACTIVITY_PATH.write_text(json.dumps(items[-ACTIVITY_LIMIT:], ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _filter_activity_by_ws(items: list[dict], ws_id: str) -> list[dict]:
+    """Filter activity list to only show records for a workspace."""
+    return [item for item in items if item.get("workspace_id") == ws_id]
+
+
 def summarize_payload(value: Any) -> Any:
     if isinstance(value, dict):
         result = {}
@@ -280,11 +285,12 @@ def summarize_values_files(values: dict[str, Any], files: dict[str, tuple[str, b
     }
 
 
-def record_activity(record: dict[str, Any]) -> None:
+def record_activity(record: dict[str, Any], ws_id: str = "localhost") -> None:
     items = read_activity_log()
     record.setdefault("id", uuid.uuid4().hex)
     record.setdefault("created_at", now_text())
     record.setdefault("updated_at", record["created_at"])
+    record["workspace_id"] = ws_id
     items.append(record)
     write_activity_log(items)
 
@@ -301,8 +307,10 @@ def update_activity(activity_id: str | None, **updates: Any) -> None:
             return
 
 
-def activity_list() -> dict[str, Any]:
+def activity_list(ws_id: str = "localhost", show_all: bool = False) -> dict[str, Any]:
     items = read_activity_log()
+    if not show_all:
+        items = _filter_activity_by_ws(items, ws_id)
     summary = []
     counts = {"total": len(items), "page": 0, "api": 0, "succeeded": 0, "failed": 0, "running": 0}
     for item in items:
@@ -837,7 +845,7 @@ def parse_saved_media(form: cgi.FieldStorage) -> dict[str, Any]:
         return {}
 
 
-def get_file_or_saved(form: cgi.FieldStorage, name: str) -> tuple[str, bytes] | None:
+def get_file_or_saved(form: cgi.FieldStorage, name: str, ws_id: str = "localhost") -> tuple[str, bytes] | None:
     uploaded = get_file(form, name)
     if uploaded:
         return uploaded
@@ -846,14 +854,14 @@ def get_file_or_saved(form: cgi.FieldStorage, name: str) -> tuple[str, bytes] | 
         return None
     stored = Path(str(saved.get("stored", ""))).name
     if stored:
-        path = MEDIA_DIR / stored
+        path = _ws_media_dir(ws_id) / stored
         if path.exists():
             return saved.get("filename", path.name), path.read_bytes()
-    preset = read_preset()
+    preset = read_preset(ws_id)
     item = preset.get("media", {}).get(name)
     if not item:
         return None
-    path = MEDIA_DIR / item.get("stored", "")
+    path = _ws_media_dir(ws_id) / item.get("stored", "")
     if not path.exists():
         return None
     return item.get("filename", path.name), path.read_bytes()
@@ -863,7 +871,7 @@ def replace_refs(prompt: str) -> str:
     return re.sub(r"@ref_image(\d+)", r"Image \1", prompt)
 
 
-def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index: int) -> dict[str, Any]:
+def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index: int, ws_id: str = "localhost") -> dict[str, Any]:
     provider = get_field(form, "provider", "t8star")
     prompt = replace_refs(get_field(form, "prompt").strip())
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
@@ -871,7 +879,7 @@ def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index
     has_reference_input = False
     has_visual_reference = False
 
-    first = get_file_or_saved(form, "first_frame")
+    first = get_file_or_saved(form, "first_frame", ws_id)
     if first:
         has_frame_input = True
         filename, blob = first
@@ -879,7 +887,7 @@ def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index
         ref = media_reference(provider, base_url, api_key, blob, filename, mime)
         content.append({"type": "image_url", "image_url": ref, "role": "first_frame"})
 
-    last = get_file_or_saved(form, "last_frame")
+    last = get_file_or_saved(form, "last_frame", ws_id)
     if last:
         has_frame_input = True
         filename, blob = last
@@ -888,7 +896,7 @@ def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index
         content.append({"type": "image_url", "image_url": ref, "role": "last_frame"})
 
     for i in range(1, 10):
-        file_data = get_file_or_saved(form, f"ref_image_{i}")
+        file_data = get_file_or_saved(form, f"ref_image_{i}", ws_id)
         if not file_data:
             continue
         has_reference_input = True
@@ -899,7 +907,7 @@ def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index
         content.append({"type": "image_url", "image_url": ref, "role": "reference_image"})
 
     for i in range(1, 4):
-        file_data = get_file_or_saved(form, f"ref_video_{i}")
+        file_data = get_file_or_saved(form, f"ref_video_{i}", ws_id)
         if not file_data:
             continue
         has_reference_input = True
@@ -910,7 +918,7 @@ def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index
         content.append({"type": "video_url", "video_url": ref, "role": "reference_video"})
 
     for i in range(1, 4):
-        file_data = get_file_or_saved(form, f"ref_audio_{i}")
+        file_data = get_file_or_saved(form, f"ref_audio_{i}", ws_id)
         if not file_data:
             continue
         has_reference_input = True
@@ -1174,7 +1182,7 @@ def values_files_from_json(payload: dict[str, Any]) -> tuple[dict[str, Any], dic
     return values, files
 
 
-def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], source: str, request_kind: str, request_data: dict[str, Any]) -> str:
+def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], source: str, request_kind: str, request_data: dict[str, Any], ws_id: str = "localhost") -> str:
     job_id = uuid.uuid4().hex
     activity_id = uuid.uuid4().hex
     with JOBS_LOCK:
@@ -1189,14 +1197,14 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
         "title": str(values.get("prompt") or "")[:80] or "Seedance task",
         "request": request_data,
         "response": response,
-        "restore": copy_files_to_restore(values, files, activity_id),
+        "restore": copy_files_to_restore(values, files, activity_id, ws_id, ws_id),
     })
     thread = threading.Thread(target=run_job, args=(job_id, values, files, activity_id), daemon=True)
     thread.start()
     return job_id
 
 
-def run_one(job_id: str, index: int, form_values: dict[str, Any], form_files: dict[str, tuple[str, bytes]]) -> dict[str, Any]:
+def run_one(job_id: str, index: int, form_values: dict[str, Any], form_files: dict[str, tuple[str, bytes]], ws_id: str = "localhost") -> dict[str, Any]:
     class MemoryForm(dict):
         pass
 
@@ -1267,7 +1275,7 @@ def run_one(job_id: str, index: int, form_values: dict[str, Any], form_files: di
         }
 
 
-def run_job(job_id: str, form_values: dict[str, Any], form_files: dict[str, tuple[str, bytes]], activity_id: str | None = None) -> None:
+def run_job(job_id: str, form_values: dict[str, Any], form_files: dict[str, tuple[str, bytes]], activity_id: str | None = None, ws_id: str = "localhost") -> None:
     try:
         requested_count = max(1, min(20, int(form_values.get("repeat_count") or 1)))
         requested_concurrency = max(1, min(20, int(form_values.get("concurrency") or 1)))
@@ -1347,11 +1355,16 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, 200, api_schema())
             return
         if self.path == "/api/activity":
-            json_response(self, 200, activity_list())
+            ws = _workspace_id(self)
+            show_all = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("all") == ["1"]
+            json_response(self, 200, activity_list(ws, show_all=show_all))
             return
         if self.path.startswith("/api/activity/"):
             activity_id = self.path.rsplit("/", 1)[-1]
+            ws = _workspace_id(self)
             record = next((item for item in read_activity_log() if item.get("id") == activity_id), None)
+            if record and record.get("workspace_id") != ws and not _is_local(self):
+                record = None
             json_response(self, 200 if record else 404, activity_record_for_client(record) or {"error": "activity not found"})
             return
         if self.path == "/api/default-output-dir":
@@ -1507,8 +1520,10 @@ class Handler(SimpleHTTPRequestHandler):
             if not _is_local(self):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
-            if STATE_DIR.exists():
-                shutil.rmtree(STATE_DIR)
+            ws = _workspace_id(self)
+            ws_dir = _ws_dir(ws)
+            if ws_dir.exists():
+                shutil.rmtree(ws_dir)
             json_response(self, 200, {"ok": True})
             return
         if self.path == "/api/jobs/json":
@@ -1539,7 +1554,8 @@ class Handler(SimpleHTTPRequestHandler):
                     json_response(self, 200, response)
                     return
                 request_data = {"raw": summarize_payload(payload), "parsed": summarize_values_files(values, files)}
-                job_id = create_job(values, files, "api", "json", request_data)
+                ws = _workspace_id(self)
+                job_id = create_job(values, files, "api", "json", request_data, ws)
                 json_response(self, 200, job_id_response(job_id))
             except Exception as exc:
                 json_response(self, 400, api_error("invalid_request", str(exc)))
@@ -1564,7 +1580,8 @@ class Handler(SimpleHTTPRequestHandler):
                     form_files[key] = (Path(item.filename).name, blob)
 
         request_data = summarize_values_files(form_values, form_files)
-        job_id = create_job(form_values, form_files, "page", "multipart", request_data)
+        ws = _workspace_id(self)
+        job_id = create_job(form_values, form_files, "page", "multipart", request_data, ws)
         json_response(self, 200, job_id_response(job_id))
 
 
