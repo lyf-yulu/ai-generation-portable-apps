@@ -51,6 +51,21 @@ def _is_local(handler: SimpleHTTPRequestHandler) -> bool:
     return ip in ("127.0.0.1", "::1", "localhost")
 
 
+def _workspace_id(handler) -> str:
+    ws = (handler.headers.get("X-Workspace-Id") or "").strip()
+    if ws:
+        return re.sub(r"[^a-zA-Z0-9_\-]", "_", ws)[:64]
+    return "localhost"
+
+
+def _ws_media_dir(ws_id: str) -> Path:
+    return STATE_DIR / "workspaces" / ws_id / "media"
+
+
+def _ws_preset_path(ws_id: str) -> Path:
+    return STATE_DIR / "workspaces" / ws_id / "preset.json"
+
+
 OUTPUT_DIR = ROOT / "outputs"
 UPLOAD_DIR = ROOT / "uploads"
 LOG_DIR = ROOT / "logs"
@@ -768,24 +783,29 @@ def sanitize_archive_name(name: str) -> str:
     return clean or time.strftime("%Y%m%d_%H%M%S")
 
 
-def read_preset() -> dict[str, Any]:
-    if not PRESET_PATH.exists():
+def read_preset(ws_id: str = "localhost") -> dict[str, Any]:
+    path = _ws_preset_path(ws_id)
+    if not path.exists():
         return {"values": {}, "media": {}}
     try:
-        return json.loads(PRESET_PATH.read_text("utf-8"))
+        return json.loads(path.read_text("utf-8"))
     except Exception:
         return {"values": {}, "media": {}}
 
 
-def write_preset(data: dict[str, Any]):
-    PRESET_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+def write_preset(data: dict[str, Any], ws_id: str = "localhost"):
+    ws_dir = _ws_preset_path(ws_id).parent
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    _ws_preset_path(ws_id).write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
 
 
 def preset_for_client(handler: SimpleHTTPRequestHandler | None = None) -> dict[str, Any]:
-    data = read_preset()
+    ws = _workspace_id(handler) if handler else "localhost"
+    data = read_preset(ws)
     media = {}
+    ws_media = _ws_media_dir(ws)
     for field, item in data.get("media", {}).items():
-        path = MEDIA_DIR / item.get("stored", "")
+        path = ws_media / item.get("stored", "")
         if path.exists():
             media[field] = {
                 "filename": item.get("filename", path.name),
@@ -813,10 +833,12 @@ def save_archive(name: str, preset: dict[str, Any], handler: SimpleHTTPRequestHa
     safe_preset = dict(preset)
     safe_preset["values"] = {k: v for k, v in safe_preset.get("values", {}).items()
                              if k not in ("api_key", "api_key_override")}
+    ws = _workspace_id(handler) if handler else "localhost"
+    ws_media = _ws_media_dir(ws)
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("preset.json", json.dumps(safe_preset, ensure_ascii=False, indent=2))
         for field, item in preset.get("media", {}).items():
-            src = MEDIA_DIR / item.get("stored", "")
+            src = ws_media / item.get("stored", "")
             if src.exists():
                 zf.write(src, f"media/{item['stored']}")
     return safe_name
@@ -832,15 +854,17 @@ def load_archive(name: str, handler: SimpleHTTPRequestHandler | None = None) -> 
             path = legacy
         else:
             return None
-    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    ws = _workspace_id(handler) if handler else "localhost"
+    ws_media = _ws_media_dir(ws)
+    ws_media.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "r") as zf:
         preset = json.loads(zf.read("preset.json").decode("utf-8"))
         for info in zf.infolist():
             if info.filename.startswith("media/") and not info.is_dir():
                 stored_name = info.filename[len("media/"):]
-                target = MEDIA_DIR / stored_name
+                target = ws_media / stored_name
                 target.write_bytes(zf.read(info.filename))
-    write_preset(preset)
+    write_preset(preset, ws)
     # Migrate legacy to IP-scoped
     if handler is not None and path.parent != dir_path:
         save_archive(name, preset, handler)
@@ -1655,17 +1679,20 @@ class Handler(SimpleHTTPRequestHandler):
             if k not in ("archive_name",):
                 values[k] = v
 
+        ws = _workspace_id(self)
+        ws_media = _ws_media_dir(ws)
+        ws_media.mkdir(parents=True, exist_ok=True)
         media_info = {}
         for key, (filename, blob) in files.items():
             suffix = Path(filename).suffix or ".bin"
             stored_name = f"{key}{suffix}"
-            (MEDIA_DIR / stored_name).write_bytes(blob)
+            (ws_media / stored_name).write_bytes(blob)
             media_info[key] = {"filename": filename, "stored": stored_name, "mime": mimetypes.guess_type(filename)[0] or "application/octet-stream"}
 
-        preset = read_preset()
+        preset = read_preset(ws)
         preset["values"] = values
         preset["media"].update(media_info)
-        write_preset(preset)
+        write_preset(preset, ws)
 
         archive_name = fields.get("archive_name", "").strip()
         if archive_name:
@@ -1674,19 +1701,23 @@ class Handler(SimpleHTTPRequestHandler):
         json_response(self, 200, {"ok": True, **preset_for_client(self)})
 
     def handle_preset_clear(self):
-        if MEDIA_DIR.exists():
-            shutil.rmtree(MEDIA_DIR)
-        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-        write_preset({"values": {}, "media": {}})
+        ws = _workspace_id(self)
+        ws_media = _ws_media_dir(ws)
+        if ws_media.exists():
+            shutil.rmtree(ws_media)
+        ws_media.mkdir(parents=True, exist_ok=True)
+        write_preset({"values": {}, "media": {}}, ws)
         json_response(self, 200, {"ok": True})
 
     def handle_preset_media(self, field: str):
-        preset = read_preset()
+        ws = _workspace_id(self)
+        preset = read_preset(ws)
         item = preset.get("media", {}).get(field)
         if not item:
             self.send_error(404)
             return
-        path = MEDIA_DIR / item["stored"]
+        ws = _workspace_id(self)
+        path = _ws_media_dir(ws) / item["stored"]
         if not path.exists():
             self.send_error(404)
             return

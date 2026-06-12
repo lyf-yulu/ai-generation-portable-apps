@@ -420,13 +420,14 @@ def preset_for_client(ws_id: str = "localhost") -> dict[str, Any]:
     return preset_to_client(read_preset(ws_id), ws_id)
 
 
-def copy_files_to_restore(values: dict[str, Any], files: dict[str, tuple[str, bytes]], prefix: str) -> dict[str, Any]:
+def copy_files_to_restore(values: dict[str, Any], files: dict[str, tuple[str, bytes]], prefix: str, ws_id: str = "localhost") -> dict[str, Any]:
     safe_values = {
         key: value for key, value in values.items()
         if key not in {"saved_media", "api_key", "api_key_override"}
     }
     media: dict[str, Any] = {}
-    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    media_dir = _ws_media_dir(ws_id)
+    media_dir.mkdir(parents=True, exist_ok=True)
     try:
         saved_media = json.loads(str(values.get("saved_media") or "{}"))
     except Exception:
@@ -561,7 +562,7 @@ def collect_media_from_form(form: cgi.FieldStorage, ws_id: str = "localhost") ->
             }
         elif key in active_media:
             media[key] = active_media[key]
-    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    media_dir.mkdir(parents=True, exist_ok=True)
     for key in FILE_FIELDS:
         file_data = get_file(form, key)
         if not file_data:
@@ -569,7 +570,7 @@ def collect_media_from_form(form: cgi.FieldStorage, ws_id: str = "localhost") ->
         filename, blob = file_data
         suffix = Path(filename).suffix or mimetypes.guess_extension(mimetypes.guess_type(filename)[0] or "") or ".bin"
         stored = f"{uuid.uuid4().hex}_{key}{suffix}"
-        path = MEDIA_DIR / stored
+        path = media_dir / stored
         path.write_bytes(blob)
         media[key] = {
             "filename": filename,
@@ -599,7 +600,7 @@ def write_active_preset(preset: dict[str, Any], ws_id: str) -> None:
     _ws_preset_path(ws_id).write_text(json.dumps(preset, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def save_archive_file(name: str, preset: dict[str, Any], handler: SimpleHTTPRequestHandler | None = None) -> Path:
+def save_archive_file(name: str, preset: dict[str, Any], handler: SimpleHTTPRequestHandler | None = None, ws_id: str = "localhost") -> Path:
     dir_path = _archive_dir_for(handler) if handler else ARCHIVE_DIR
     dir_path.mkdir(parents=True, exist_ok=True)
     path = archive_path(name, handler)
@@ -607,11 +608,12 @@ def save_archive_file(name: str, preset: dict[str, Any], handler: SimpleHTTPRequ
     safe_preset = dict(preset)
     safe_preset["values"] = {k: v for k, v in safe_preset.get("values", {}).items()
                              if k not in ("api_key", "api_key_override")}
+    ws_media = _ws_media_dir(ws_id)
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("preset.json", json.dumps(safe_preset, ensure_ascii=False, indent=2))
         for field, item in preset.get("media", {}).items():
             stored = item.get("stored", "")
-            src = MEDIA_DIR / stored
+            src = ws_media / stored
             if src.exists():
                 zf.write(src, f"media/{stored}")
     return path
@@ -620,6 +622,7 @@ def save_archive_file(name: str, preset: dict[str, Any], handler: SimpleHTTPRequ
 def load_archive_file(name: str, handler: SimpleHTTPRequestHandler | None = None) -> dict[str, Any]:
     path = archive_path(name, handler)
     migrated = False
+    ws = _workspace_id(handler) if handler else "localhost"
     if not path.exists():
         # Fallback: try legacy top-level location, then migrate to IP-scoped
         legacy = ARCHIVE_DIR / f"{safe_archive_name(name)}.seedance"
@@ -629,7 +632,8 @@ def load_archive_file(name: str, handler: SimpleHTTPRequestHandler | None = None
                 migrated = True
         else:
             raise FileNotFoundError(f"Archive not found: {name}")
-    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    ws_media = _ws_media_dir(ws)
+    ws_media.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "r") as zf:
         preset = json.loads(zf.read("preset.json").decode("utf-8"))
         names = set(zf.namelist())
@@ -639,14 +643,14 @@ def load_archive_file(name: str, handler: SimpleHTTPRequestHandler | None = None
             if archive_name not in names:
                 continue
             target_name = f"{uuid.uuid4().hex}_{original}"
-            target = MEDIA_DIR / target_name
+            target = ws_media / target_name
             target.write_bytes(zf.read(archive_name))
             item["stored"] = target_name
-    write_active_preset(preset)
+    write_active_preset(preset, ws)
     # Migrate legacy archive to IP-scoped directory on first load
     if migrated and handler is not None:
-        save_archive_file(name, preset, handler)
-    return preset_for_client()
+        save_archive_file(name, preset, handler, ws)
+    return preset_for_client(ws)
 
 
 def choose_output_dir() -> str:
@@ -1387,7 +1391,8 @@ class Handler(SimpleHTTPRequestHandler):
         if urllib.parse.urlparse(self.path).path.startswith("/api/media/"):
             raw_name = urllib.parse.urlparse(self.path).path.rsplit("/", 1)[-1]
             stored = Path(urllib.parse.unquote(raw_name)).name
-            path = MEDIA_DIR / stored
+            ws = _workspace_id(self)
+            path = _ws_media_dir(ws) / stored
             if not path.exists():
                 json_response(self, 404, {"error": "media not found"})
                 return
@@ -1479,7 +1484,7 @@ class Handler(SimpleHTTPRequestHandler):
             archive_name = get_field(form, "archive_name")
             archive = None
             if archive_name.strip():
-                archive = save_archive_file(archive_name, preset, self).name
+                archive = save_archive_file(archive_name, preset, self, ws).name
             response = preset_for_client(ws)
             response["archive"] = archive
             response["archives"] = list_archives(self)
