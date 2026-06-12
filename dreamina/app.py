@@ -45,6 +45,12 @@ def _archive_dir_for(handler_or_ip: Any) -> Path:
     if isinstance(handler_or_ip, str):
         return ARCHIVE_DIR / handler_or_ip
     return ARCHIVE_DIR / _client_ip(handler_or_ip)
+def _is_local(handler: SimpleHTTPRequestHandler) -> bool:
+    """Only allow access from localhost."""
+    ip = (handler.headers.get("X-Forwarded-For") or handler.client_address[0] or "").strip()
+    return ip in ("127.0.0.1", "::1", "localhost")
+
+
 OUTPUT_DIR = ROOT / "outputs"
 UPLOAD_DIR = ROOT / "uploads"
 LOG_DIR = ROOT / "logs"
@@ -804,8 +810,11 @@ def save_archive(name: str, preset: dict[str, Any], handler: SimpleHTTPRequestHa
     dir_path = _archive_dir_for(handler) if handler else ARCHIVE_DIR
     dir_path.mkdir(parents=True, exist_ok=True)
     path = dir_path / f"{safe_name}.dreamina"
+    safe_preset = dict(preset)
+    safe_preset["values"] = {k: v for k, v in safe_preset.get("values", {}).items()
+                             if k not in ("api_key", "api_key_override")}
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("preset.json", json.dumps(preset, ensure_ascii=False, indent=2))
+        zf.writestr("preset.json", json.dumps(safe_preset, ensure_ascii=False, indent=2))
         for field, item in preset.get("media", {}).items():
             src = MEDIA_DIR / item.get("stored", "")
             if src.exists():
@@ -922,8 +931,14 @@ class Handler(SimpleHTTPRequestHandler):
         elif path == "/api/env/update-cli":
             self.handle_install_cli()
         elif path == "/api/accounts":
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
             self.handle_account_create()
         elif path.startswith("/api/accounts/") and path.endswith("/login"):
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
             acc_id = path.split("/api/accounts/")[1].split("/")[0]
             self.handle_account_login(acc_id)
         elif path.startswith("/api/accounts/") and path.endswith("/logout"):
@@ -933,11 +948,20 @@ class Handler(SimpleHTTPRequestHandler):
             acc_id = path.split("/api/accounts/")[1].split("/")[0]
             self.handle_account_refresh(acc_id)
         elif path.startswith("/api/accounts/") and path.endswith("/delete"):
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
             acc_id = path.split("/api/accounts/")[1].split("/")[0]
             self.handle_account_delete(acc_id)
         elif path == "/api/accounts/active":
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
             self.handle_set_active_account()
         elif path == "/api/dispatch-mode":
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
             self.handle_set_dispatch_mode()
         elif path == "/api/text2image":
             self.handle_generate("text2image")
@@ -957,6 +981,10 @@ class Handler(SimpleHTTPRequestHandler):
             job_id = path.split("/api/jobs/")[1].split("/")[0]
             self.handle_retry(job_id)
         elif path == "/api/cache/clean":
+            client_ip = self.headers.get("X-Forwarded-For") or self.client_address[0]
+            if client_ip not in ("127.0.0.1", "::1", "localhost"):
+                json_response(self, 200, {"remote": True})
+                return
             self.handle_cache_clean()
         elif path == "/api/choose-output-dir":
             client_ip = self.headers.get("X-Forwarded-For") or self.client_address[0]
@@ -968,6 +996,10 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 json_response(self, 500, {"ok": False, "error": str(exc)})
         elif path == "/api/open-output-dir":
+            client_ip = self.headers.get("X-Forwarded-For") or self.client_address[0]
+            if client_ip not in ("127.0.0.1", "::1", "localhost"):
+                json_response(self, 200, {"remote": True})
+                return
             try:
                 ct = self.headers.get("Content-Type", "")
                 output_dir = None
@@ -987,6 +1019,9 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 json_response(self, 500, {"ok": False, "error": str(exc)})
         elif path == "/api/cleanup-cache":
+            if not _is_local(self):
+                json_response(self, 200, {"remote": True})
+                return
             try:
                 json_response(self, 200, cleanup_cache())
             except Exception as exc:
@@ -994,12 +1029,21 @@ class Handler(SimpleHTTPRequestHandler):
         elif path == "/api/preset":
             self.handle_preset_save()
         elif path == "/api/preset/clear":
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
             self.handle_preset_clear()
         elif path == "/api/archive/load":
             self.handle_archive_load()
         elif path == "/api/archive/delete":
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
             self.handle_archive_delete()
         elif path == "/api/archive/from-history":
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
             self.handle_archive_from_history()
         else:
             json_response(self, 404, {"ok": False, "error": "not found"})

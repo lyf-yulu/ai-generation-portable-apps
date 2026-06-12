@@ -34,6 +34,11 @@ PRESET_PATH = STATE_DIR / "preset.json"
 ACTIVITY_PATH = STATE_DIR / "activity_log.json"
 ARCHIVE_DIR = ROOT / "archives"
 PROVIDERS_PATH = ROOT / "providers.json"
+
+
+def _is_local(handler: SimpleHTTPRequestHandler) -> bool:
+    ip = (handler.headers.get("X-Forwarded-For") or handler.client_address[0] or "").strip()
+    return ip in ("127.0.0.1", "::1", "localhost")
 DEFAULT_BASE_URL = "https://ai.t8star.org"
 DEFAULT_CONFIG = Path.home() / "ComfyUI/custom_nodes/Comfyui-zhenzhen/Comflyapi.json"
 MAX_SEED = 2147483647
@@ -606,8 +611,11 @@ def save_archive_file(name: str, preset: dict[str, Any], handler: SimpleHTTPRequ
     dir_path = _archive_dir_for(handler) if handler else ARCHIVE_DIR
     dir_path.mkdir(parents=True, exist_ok=True)
     path = archive_path(name, handler)
+    safe_preset = dict(preset)
+    safe_preset["values"] = {k: v for k, v in safe_preset.get("values", {}).items()
+                             if k not in ("api_key", "api_key_override")}
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("preset.json", json.dumps(preset, ensure_ascii=False, indent=2))
+        zf.writestr("preset.json", json.dumps(safe_preset, ensure_ascii=False, indent=2))
         for _, item in preset.get("media", {}).items():
             src = MEDIA_DIR / item.get("stored", "")
             if src.exists():
@@ -1393,6 +1401,10 @@ class Handler(SimpleHTTPRequestHandler):
                 json_response(self, 500, {"error": str(exc)})
             return
         if self.path == "/api/open-output-dir":
+            client_ip = self.headers.get("X-Forwarded-For") or self.client_address[0]
+            if client_ip not in ("127.0.0.1", "::1", "localhost"):
+                json_response(self, 200, {"remote": True})
+                return
             form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
             try:
                 json_response(self, 200, {"ok": True, "path": open_output_dir(get_field(form, "output_dir"))})
@@ -1400,6 +1412,10 @@ class Handler(SimpleHTTPRequestHandler):
                 json_response(self, 500, api_error("open_output_dir_failed", "打开输出目录失败", str(exc)))
             return
         if self.path == "/api/cleanup-cache":
+            client_ip = self.headers.get("X-Forwarded-For") or self.client_address[0]
+            if client_ip not in ("127.0.0.1", "::1", "localhost"):
+                json_response(self, 200, {"remote": True})
+                return
             try:
                 json_response(self, 200, cleanup_cache())
             except Exception as exc:
@@ -1433,6 +1449,9 @@ class Handler(SimpleHTTPRequestHandler):
                 json_response(self, 400, {"error": str(exc)})
             return
         if self.path == "/api/archive/delete":
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
             form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
             path = archive_path(get_field(form, "archive_name"), self)
             if path.exists():
@@ -1440,6 +1459,9 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, 200, {"archives": list_archives(self)})
             return
         if self.path == "/api/preset/clear":
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
             if STATE_DIR.exists():
                 shutil.rmtree(STATE_DIR)
             json_response(self, 200, {"ok": True})
