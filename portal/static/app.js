@@ -109,10 +109,11 @@ function GenApp(prefix, appPath, mediaType) {
     activityDetail: null,
 
     async init() {
-      await this.loadConfig();
-      this.loadArchives();
+      // Build upload slots FIRST (synchronous DOM), then load config
       this.buildUploadSlots();
       this.wireDrops();
+      try { await this.loadConfig(); } catch (e) { console.warn('loadConfig failed:', e); }
+      try { this.loadArchives(); } catch (e) { console.warn('loadArchives failed:', e); }
     },
 
     async loadConfig() {
