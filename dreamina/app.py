@@ -99,9 +99,18 @@ DEFAULT_CONFIG = {
 
 JOBS: dict[str, dict[str, Any]] = {}
 LOCK = threading.Lock()
+STATE_LOCK = threading.Lock()
 LOGIN_PROC: subprocess.Popen | None = None
 LOGIN_LOCK = threading.Lock()
 EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def _atomic_write(path: Path, content: str):
+    """Thread-safe atomic write: tmp → rename."""
+    with STATE_LOCK:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(path)
 
 
 def load_config() -> dict[str, Any]:
@@ -415,7 +424,8 @@ def read_history() -> list[dict[str, Any]]:
 
 def write_history(items: list[dict[str, Any]]):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    HISTORY_PATH.write_text(json.dumps(items[-500:], ensure_ascii=False, indent=2), "utf-8")
+    content = json.dumps(items[-500:], ensure_ascii=False, indent=2)
+    _atomic_write(HISTORY_PATH, content)
 
 
 def record_job(job: dict[str, Any]):
@@ -802,7 +812,8 @@ def read_preset(ws_id: str = "localhost") -> dict[str, Any]:
 def write_preset(data: dict[str, Any], ws_id: str = "localhost"):
     ws_dir = _ws_preset_path(ws_id).parent
     ws_dir.mkdir(parents=True, exist_ok=True)
-    _ws_preset_path(ws_id).write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+    content = json.dumps(data, ensure_ascii=False, indent=2)
+    _atomic_write(_ws_preset_path(ws_id), content)
 
 
 def preset_for_client(handler: SimpleHTTPRequestHandler | None = None) -> dict[str, Any]:

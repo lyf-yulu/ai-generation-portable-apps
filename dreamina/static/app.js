@@ -4,6 +4,21 @@
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
 
+// ---- Workspace identity ----
+function workspaceId() {
+  const qs = new URLSearchParams(window.location.search);
+  if (qs.get("ws")) return qs.get("ws");
+  let id = localStorage.getItem("workspace_id");
+  if (!id) { id = crypto.randomUUID(); localStorage.setItem("workspace_id", id); }
+  return id;
+}
+function apiFetch(url, opts) {
+  opts = opts || {};
+  opts.headers = opts.headers || {};
+  opts.headers["X-Workspace-Id"] = workspaceId();
+  return fetch(url, opts);
+}
+
 let currentMajor = 'image';
 let currentMode = 'text2image';
 let frameCount = 2;
@@ -321,7 +336,7 @@ async function submitJob() {
       collectTransitionPrompts(formData);
     }
 
-    const response = await fetch(`/api/${currentMode}`, { method: 'POST', body: formData });
+    const response = await apiFetch(`/api/${currentMode}`, { method: 'POST', body: formData });
     const res = await response.json();
 
     if (res.ok) {

@@ -69,7 +69,16 @@ TERMINAL_STATUSES = {"succeeded", "success", "failed", "fail", "failure", "cance
 JOBS: dict[str, dict[str, Any]] = {}
 FILES: dict[str, Path] = {}
 JOBS_LOCK = threading.Lock()
+STATE_LOCK = threading.Lock()
 ACTIVITY_LIMIT = 300
+
+
+def _atomic_write(path: Path, content: str):
+    """Thread-safe atomic write: tmp → rename."""
+    with STATE_LOCK:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(path)
 
 # ---- Client IP helpers ----
 
@@ -239,7 +248,8 @@ def read_activity_log() -> list[dict[str, Any]]:
 
 def write_activity_log(items: list[dict[str, Any]]) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    ACTIVITY_PATH.write_text(json.dumps(items[-ACTIVITY_LIMIT:], ensure_ascii=False, indent=2), encoding="utf-8")
+    content = json.dumps(items[-ACTIVITY_LIMIT:], ensure_ascii=False, indent=2)
+    _atomic_write(ACTIVITY_PATH, content)
 
 
 def _filter_activity_by_ws(items: list[dict], ws_id: str) -> list[dict]:
@@ -589,7 +599,8 @@ def write_active_preset(preset: dict[str, Any], ws_id: str) -> None:
     ws_dir = _ws_preset_path(ws_id).parent
     ws_dir.mkdir(parents=True, exist_ok=True)
     _ws_media_dir(ws_id).mkdir(parents=True, exist_ok=True)
-    _ws_preset_path(ws_id).write_text(json.dumps(preset, ensure_ascii=False, indent=2), encoding="utf-8")
+    content = json.dumps(preset, ensure_ascii=False, indent=2)
+    _atomic_write(_ws_preset_path(ws_id), content)
 
 
 def save_archive_file(name: str, preset: dict[str, Any], ws_id: str = "localhost", handler: SimpleHTTPRequestHandler | None = None) -> Path:

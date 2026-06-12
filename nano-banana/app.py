@@ -69,7 +69,16 @@ MAX_SEED = 2147483647
 JOBS: dict[str, dict[str, Any]] = {}
 FILES: dict[str, Path] = {}
 LOCK = threading.Lock()
+STATE_LOCK = threading.Lock()
 ACTIVITY_LIMIT = 300
+
+
+def _atomic_write(path: Path, content: str):
+    """Thread-safe atomic write: tmp → rename."""
+    with STATE_LOCK:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(path)
 
 # ---- Client IP helpers ----
 
@@ -197,7 +206,8 @@ def read_activity_log() -> list[dict[str, Any]]:
 
 def write_activity_log(items: list[dict[str, Any]]) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    ACTIVITY_PATH.write_text(json.dumps(items[-ACTIVITY_LIMIT:], ensure_ascii=False, indent=2), encoding="utf-8")
+    content = json.dumps(items[-ACTIVITY_LIMIT:], ensure_ascii=False, indent=2)
+    _atomic_write(ACTIVITY_PATH, content)
 
 
 def summarize_media_item(item: Any) -> Any:
@@ -556,13 +566,13 @@ def get_file_or_saved(form: cgi.FieldStorage | dict[str, Any], name: str, ws_id:
         return None
     stored = Path(str(saved.get("stored", ""))).name
     if stored:
-        path = MEDIA_DIR / stored
+        path = _ws_media_dir(ws_id) / stored
         if path.exists():
             return (saved.get("filename", path.name), path.read_bytes())
-    item = read_preset().get("media", {}).get(name)
+    item = read_preset(ws_id).get("media", {}).get(name)
     if not item:
         return None
-    path = MEDIA_DIR / item.get("stored", "")
+    path = _ws_media_dir(ws_id) / item.get("stored", "")
     return (item.get("filename", path.name), path.read_bytes()) if path.exists() else None
 
 
@@ -614,7 +624,8 @@ def write_active_preset(preset: dict[str, Any], ws_id: str) -> None:
     ws_dir = _ws_preset_path(ws_id).parent
     ws_dir.mkdir(parents=True, exist_ok=True)
     _ws_media_dir(ws_id).mkdir(parents=True, exist_ok=True)
-    _ws_preset_path(ws_id).write_text(json.dumps(preset, ensure_ascii=False, indent=2), encoding="utf-8")
+    content = json.dumps(preset, ensure_ascii=False, indent=2)
+    _atomic_write(_ws_preset_path(ws_id), content)
 
 
 def safe_archive_name(raw: str) -> str:
