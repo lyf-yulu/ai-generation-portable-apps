@@ -35,12 +35,21 @@ PORTAL_PORT = 9090
 
 def get_lan_ip() -> str:
     try:
-        out = subprocess.check_output(["ifconfig"], text=True, stderr=subprocess.DEVNULL)
-        for line in out.splitlines():
-            if "inet " in line and "127.0.0.1" not in line:
-                ip = line.strip().split()[1]
-                if ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172."):
-                    return ip
+        if sys.platform == "win32":
+            out = subprocess.check_output(["ipconfig"], text=True, stderr=subprocess.DEVNULL, encoding="gbk", errors="replace")
+            for line in out.splitlines():
+                line = line.strip()
+                if "IPv4" in line and "127.0.0.1" not in line:
+                    ip = line.rsplit(":", 1)[-1].strip()
+                    if ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172."):
+                        return ip
+        else:
+            out = subprocess.check_output(["ifconfig"], text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                if "inet " in line and "127.0.0.1" not in line:
+                    ip = line.strip().split()[1]
+                    if ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172."):
+                        return ip
     except Exception:
         pass
     try:
@@ -486,7 +495,11 @@ def main():
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, shutdown_handler)
+    # Windows: SIGBREAK is the closest equivalent to SIGTERM
+    elif hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, shutdown_handler)
 
     try:
         server.serve_forever()
