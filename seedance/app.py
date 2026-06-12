@@ -41,10 +41,15 @@ def _is_local(handler: SimpleHTTPRequestHandler) -> bool:
 
 
 def _workspace_id(handler) -> str:
-    """Extract workspace_id from X-Workspace-Id header."""
+    """Extract workspace_id: 1) X-Workspace-Id header  2) ?ws= query  3) localhost."""
     ws = (handler.headers.get("X-Workspace-Id") or "").strip()
     if ws:
         return re.sub(r"[^a-zA-Z0-9_\-]", "_", ws)[:64]
+    # Fallback to query parameter
+    qs = urllib.parse.urlparse(handler.path).query
+    params = urllib.parse.parse_qs(qs)
+    if "ws" in params:
+        return re.sub(r"[^a-zA-Z0-9_\-]", "_", str(params["ws"][0]))[:64]
     return "localhost"
 
 
@@ -502,36 +507,15 @@ def safe_archive_name(raw: str) -> str:
     return name[:80] or time.strftime("seedance_%Y%m%d_%H%M%S")
 
 
-def archive_path(name: str, handler_or_ip: Any = None) -> Path:
-    if handler_or_ip is None:
-        dir_path = ARCHIVE_DIR
-    else:
-        dir_path = _archive_dir_for(handler_or_ip)
-    return dir_path / f"{safe_archive_name(name)}.seedance"
-
-
-def _all_archive_paths(name: str) -> list[Path]:
-    """Find all archive files matching name across all IP directories (for migration/cleanup)."""
-    clean = safe_archive_name(name)
-    results = []
-    if ARCHIVE_DIR.exists():
-        for ip_dir in ARCHIVE_DIR.iterdir():
-            if ip_dir.is_dir():
-                p = ip_dir / f"{clean}.seedance"
-                if p.exists():
-                    results.append(p)
-        # Also check legacy top-level archives
-        p = ARCHIVE_DIR / f"{clean}.seedance"
-        if p.exists():
-            results.append(p)
-    return results
+def archive_path(name: str, ws_id: str = "localhost") -> Path:
+    return _ws_dir(ws_id) / "archives" / f"{safe_archive_name(name)}.seedance"
 
 
 def list_archives(handler: SimpleHTTPRequestHandler | None = None) -> list[dict[str, Any]]:
-    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    items = []
-    dir_path = _archive_dir_for(handler) if handler else ARCHIVE_DIR
+    ws = _workspace_id(handler) if handler else "localhost"
+    dir_path = _ws_dir(ws) / "archives"
     dir_path.mkdir(parents=True, exist_ok=True)
+    items = []
     for path in sorted(dir_path.glob("*.seedance"), key=lambda p: p.stat().st_mtime, reverse=True):
         items.append(
             {
@@ -600,10 +584,9 @@ def write_active_preset(preset: dict[str, Any], ws_id: str) -> None:
     _ws_preset_path(ws_id).write_text(json.dumps(preset, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def save_archive_file(name: str, preset: dict[str, Any], handler: SimpleHTTPRequestHandler | None = None, ws_id: str = "localhost") -> Path:
-    dir_path = _archive_dir_for(handler) if handler else ARCHIVE_DIR
-    dir_path.mkdir(parents=True, exist_ok=True)
-    path = archive_path(name, handler)
+def save_archive_file(name: str, preset: dict[str, Any], ws_id: str = "localhost", handler: SimpleHTTPRequestHandler | None = None) -> Path:
+    path = archive_path(name, ws_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
     # Strip secrets before persisting
     safe_preset = dict(preset)
     safe_preset["values"] = {k: v for k, v in safe_preset.get("values", {}).items()
@@ -620,17 +603,23 @@ def save_archive_file(name: str, preset: dict[str, Any], handler: SimpleHTTPRequ
 
 
 def load_archive_file(name: str, handler: SimpleHTTPRequestHandler | None = None) -> dict[str, Any]:
-    path = archive_path(name, handler)
-    migrated = False
     ws = _workspace_id(handler) if handler else "localhost"
+    path = archive_path(name, ws)
     if not path.exists():
-        # Fallback: try legacy top-level location, then migrate to IP-scoped
-        legacy = ARCHIVE_DIR / f"{safe_archive_name(name)}.seedance"
-        if legacy.exists():
-            path = legacy
-            if handler is not None:
-                migrated = True
-        else:
+        # Legacy fallback — try top-level, then IP-scoped
+        for legacy in [ARCHIVE_DIR / f"{safe_archive_name(name)}.seedance"]:
+            if legacy.exists():
+                path = legacy
+                break
+        # Also check old IP directories
+        if not path.exists() and ARCHIVE_DIR.exists():
+            for ip_dir in sorted(ARCHIVE_DIR.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True):
+                if ip_dir.is_dir():
+                    p = ip_dir / f"{safe_archive_name(name)}.seedance"
+                    if p.exists():
+                        path = p
+                        break
+        if not path.exists():
             raise FileNotFoundError(f"Archive not found: {name}")
     ws_media = _ws_media_dir(ws)
     ws_media.mkdir(parents=True, exist_ok=True)
@@ -647,9 +636,6 @@ def load_archive_file(name: str, handler: SimpleHTTPRequestHandler | None = None
             target.write_bytes(zf.read(archive_name))
             item["stored"] = target_name
     write_active_preset(preset, ws)
-    # Migrate legacy archive to IP-scoped directory on first load
-    if migrated and handler is not None:
-        save_archive_file(name, preset, handler, ws)
     return preset_for_client(ws)
 
 
@@ -1484,7 +1470,7 @@ class Handler(SimpleHTTPRequestHandler):
             archive_name = get_field(form, "archive_name")
             archive = None
             if archive_name.strip():
-                archive = save_archive_file(archive_name, preset, self, ws).name
+                archive = save_archive_file(archive_name, preset, ws).name
             response = preset_for_client(ws)
             response["archive"] = archive
             response["archives"] = list_archives(self)
@@ -1512,7 +1498,7 @@ class Handler(SimpleHTTPRequestHandler):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
             form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
-            path = archive_path(get_field(form, "archive_name"), self)
+            path = archive_path(get_field(form, "archive_name"), _workspace_id(self))
             if path.exists():
                 path.unlink()
             json_response(self, 200, {"archives": list_archives(self)})

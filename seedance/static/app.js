@@ -33,8 +33,19 @@ const duplicateWorkspaceBtn = document.querySelector("#duplicateWorkspaceBtn");
 const saveWorkspaceBtn = document.querySelector("#saveWorkspaceBtn");
 const workspaceHint = document.querySelector("#workspaceHint");
 const urlParams = new URLSearchParams(window.location.search);
-const workspaceId = urlParams.get("ws") || "default";
+let workspaceId = urlParams.get("ws");
+if (!workspaceId) {
+  workspaceId = localStorage.getItem("workspace_id");
+  if (!workspaceId) { workspaceId = crypto.randomUUID(); localStorage.setItem("workspace_id", workspaceId); }
+}
 const workspaceKey = `seedance.workspace.${workspaceId}`;
+
+async function apiFetch(url, opts) {
+  opts = opts || {};
+  opts.headers = opts.headers || {};
+  opts.headers["X-Workspace-Id"] = workspaceId;
+  return fetch(url, opts);
+}
 let savedMedia = {};
 let workspaceSaveTimer = 0;
 let providerDefaults = {
@@ -129,7 +140,7 @@ function localWorkspaceSnapshot() {
 
 async function workspaceSnapshot(options = {}) {
   if (!options.persistMedia) return localWorkspaceSnapshot();
-  const res = await fetch("/api/workspace/snapshot", { method: "POST", body: formDataWithSavedMedia() });
+  const res = await apiFetch("/api/workspace/snapshot", { method: "POST", body: formDataWithSavedMedia() });
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || "保存主题素材失败");
   applyPreset(data);
@@ -341,7 +352,7 @@ for (let i = 1; i <= 3; i += 1) {
 document.querySelectorAll('.drop input[type="file"]').forEach(ensureDropControls);
 
 async function loadConfig() {
-  const res = await fetch("/api/config");
+  const res = await apiFetch("/api/config");
   const data = await res.json();
   keyHint.textContent = data.has_key ? `已检测到本地 key：${data.masked_key}` : "未检测到本地 key，请手动填写";
   if (data.config_error) {
@@ -407,7 +418,7 @@ function renderArchives(archives) {
 }
 
 async function loadArchives() {
-  const res = await fetch("/api/archives");
+  const res = await apiFetch("/api/archives");
   if (!res.ok) return;
   renderArchives((await res.json()).archives);
 }
@@ -419,7 +430,7 @@ async function loadPreset() {
     return;
   }
   workspaceName.value = "默认主题";
-  const res = await fetch("/api/preset");
+  const res = await apiFetch("/api/preset");
   if (!res.ok) return;
   applyPreset(await res.json());
 }
@@ -433,7 +444,7 @@ function formDataWithSavedMedia() {
 async function savePreset() {
   presetHint.textContent = "保存中...";
   saveWorkspaceDraft();
-  const res = await fetch("/api/preset", { method: "POST", body: formDataWithSavedMedia() });
+  const res = await apiFetch("/api/preset", { method: "POST", body: formDataWithSavedMedia() });
   const data = await res.json();
   if (!res.ok) {
     presetHint.textContent = data.error || "保存失败";
@@ -451,7 +462,7 @@ async function loadArchive() {
   }
   const data = new FormData();
   data.set("archive_name", name);
-  const res = await fetch("/api/archive/load", { method: "POST", body: data });
+  const res = await apiFetch("/api/archive/load", { method: "POST", body: data });
   const payload = await res.json();
   if (!res.ok) {
     presetHint.textContent = payload.error || "读取失败";
@@ -470,7 +481,7 @@ async function deleteArchive() {
   }
   const data = new FormData();
   data.set("archive_name", name);
-  const res = await fetch("/api/archive/delete", { method: "POST", body: data });
+  const res = await apiFetch("/api/archive/delete", { method: "POST", body: data });
   const payload = await res.json();
   if (res.ok) {
     renderArchives(payload.archives);
@@ -479,7 +490,7 @@ async function deleteArchive() {
 }
 
 async function clearPreset() {
-  const res = await fetch("/api/preset/clear", { method: "POST" });
+  const res = await apiFetch("/api/preset/clear", { method: "POST" });
   if (!res.ok) return;
   savedMedia = {};
   document.querySelectorAll(".drop").forEach(clearPreview);
@@ -564,7 +575,7 @@ function renderActivityList(records) {
 }
 
 async function loadActivity() {
-  const res = await fetch("/api/activity");
+  const res = await apiFetch("/api/activity");
   const data = await res.json();
   if (!res.ok) {
     activityDetail.textContent = data.error || "读取后台记录失败";
@@ -577,7 +588,7 @@ async function loadActivity() {
 async function loadActivityDetail(id, activeButton) {
   activityList.querySelectorAll(".activityItem").forEach((item) => item.classList.remove("isActive"));
   activeButton?.classList.add("isActive");
-  const res = await fetch(`/api/activity/${id}`);
+  const res = await apiFetch(`/api/activity/${id}`);
   const data = await res.json();
   activityDetail.innerHTML = "";
   const actions = document.createElement("div");
@@ -607,7 +618,7 @@ async function loadActivityDetail(id, activeButton) {
 
 async function poll(jobId) {
   while (true) {
-    const res = await fetch(`/api/jobs/${jobId}`);
+    const res = await apiFetch(`/api/jobs/${jobId}`);
     const job = await res.json();
     renderJob(job);
     if (["succeeded", "failed"].includes(job.status)) {
@@ -629,7 +640,7 @@ form.addEventListener("submit", async (event) => {
   resultsEl.innerHTML = "";
   eventsEl.textContent = "";
 
-  const res = await fetch("/api/jobs", { method: "POST", body: formDataWithSavedMedia() });
+  const res = await apiFetch("/api/jobs", { method: "POST", body: formDataWithSavedMedia() });
   const payload = await res.json();
   if (!res.ok) {
     submitBtn.disabled = false;
@@ -679,7 +690,7 @@ previewDialog.addEventListener("click", (event) => {
 chooseOutputBtn.addEventListener("click", async () => {
   chooseOutputBtn.disabled = true;
   try {
-    const res = await fetch("/api/choose-output-dir", { method: "POST" });
+    const res = await apiFetch("/api/choose-output-dir", { method: "POST" });
     const data = await res.json();
     if (res.ok && data.path) field("output_dir").value = data.path;
     else presetHint.textContent = data.error || "未选择目录";
@@ -693,7 +704,7 @@ appOutputBtn.addEventListener("click", () => {
 });
 
 desktopOutputBtn.addEventListener("click", async () => {
-  const res = await fetch("/api/default-output-dir");
+  const res = await apiFetch("/api/default-output-dir");
   const data = await res.json();
   if (res.ok && data.path) field("output_dir").value = data.path;
 });
@@ -703,7 +714,7 @@ openOutputBtn.addEventListener("click", async () => {
   try {
     const data = new FormData();
     data.set("output_dir", field("output_dir").value);
-    const res = await fetch("/api/open-output-dir", { method: "POST", body: data });
+    const res = await apiFetch("/api/open-output-dir", { method: "POST", body: data });
     const payload = await res.json();
     presetHint.textContent = res.ok ? `已打开输出目录：${payload.path}` : (payload.error || "打开输出目录失败");
   } finally {
@@ -714,7 +725,7 @@ openOutputBtn.addEventListener("click", async () => {
 cleanCacheBtn.addEventListener("click", async () => {
   cleanCacheBtn.disabled = true;
   try {
-    const res = await fetch("/api/cleanup-cache", { method: "POST" });
+    const res = await apiFetch("/api/cleanup-cache", { method: "POST" });
     const data = await res.json();
     if (res.ok) {
       presetHint.textContent = `已清理缓存：素材 ${data.media_deleted || 0} 个，日志 ${data.logs_deleted || 0} 个`;

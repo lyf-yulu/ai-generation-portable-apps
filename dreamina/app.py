@@ -52,9 +52,15 @@ def _is_local(handler: SimpleHTTPRequestHandler) -> bool:
 
 
 def _workspace_id(handler) -> str:
+    """Extract workspace_id: 1) X-Workspace-Id header  2) ?ws= query  3) localhost."""
     ws = (handler.headers.get("X-Workspace-Id") or "").strip()
     if ws:
         return re.sub(r"[^a-zA-Z0-9_\-]", "_", ws)[:64]
+    # Fallback to query parameter
+    qs = urllib.parse.urlparse(handler.path).query
+    params = urllib.parse.parse_qs(qs)
+    if "ws" in params:
+        return re.sub(r"[^a-zA-Z0-9_\-]", "_", str(params["ws"][0]))[:64]
     return "localhost"
 
 

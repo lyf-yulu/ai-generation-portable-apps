@@ -42,9 +42,15 @@ def _is_local(handler: SimpleHTTPRequestHandler) -> bool:
 
 
 def _workspace_id(handler) -> str:
+    """Extract workspace_id: 1) X-Workspace-Id header  2) ?ws= query  3) localhost."""
     ws = (handler.headers.get("X-Workspace-Id") or "").strip()
     if ws:
         return re.sub(r"[^a-zA-Z0-9_\-]", "_", ws)[:64]
+    # Fallback to query parameter
+    qs = urllib.parse.urlparse(handler.path).query
+    params = urllib.parse.parse_qs(qs)
+    if "ws" in params:
+        return re.sub(r"[^a-zA-Z0-9_\-]", "_", str(params["ws"][0]))[:64]
     return "localhost"
 
 
@@ -616,24 +622,21 @@ def safe_archive_name(raw: str) -> str:
     return name[:80] or time.strftime("nano_banana_%Y%m%d_%H%M%S")
 
 
-def archive_path(name: str, handler_or_ip: Any = None) -> Path:
-    if handler_or_ip is None:
-        return ARCHIVE_DIR / f"{safe_archive_name(name)}.nanobanana"
-    return _archive_dir_for(handler_or_ip) / f"{safe_archive_name(name)}.nanobanana"
+def archive_path(name: str, ws_id: str = "localhost") -> Path:
+    return STATE_DIR / "workspaces" / ws_id / "archives" / f"{safe_archive_name(name)}.nanobanana"
 
 
 def list_archives(handler: SimpleHTTPRequestHandler | None = None) -> list[dict[str, Any]]:
-    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    dir_path = _archive_dir_for(handler) if handler else ARCHIVE_DIR
+    ws = _workspace_id(handler) if handler else "localhost"
+    dir_path = STATE_DIR / "workspaces" / ws / "archives"
     dir_path.mkdir(parents=True, exist_ok=True)
     return [{"name": p.stem, "filename": p.name, "size": p.stat().st_size, "updated_at": int(p.stat().st_mtime)}
             for p in sorted(dir_path.glob("*.nanobanana"), key=lambda x: x.stat().st_mtime, reverse=True)]
 
 
-def save_archive_file(name: str, preset: dict[str, Any], handler: SimpleHTTPRequestHandler | None = None, ws_id: str = "localhost") -> Path:
-    dir_path = _archive_dir_for(handler) if handler else ARCHIVE_DIR
-    dir_path.mkdir(parents=True, exist_ok=True)
-    path = archive_path(name, handler)
+def save_archive_file(name: str, preset: dict[str, Any], ws_id: str = "localhost", handler: SimpleHTTPRequestHandler | None = None) -> Path:
+    path = archive_path(name, ws_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
     safe_preset = dict(preset)
     safe_preset["values"] = {k: v for k, v in safe_preset.get("values", {}).items()
                              if k not in ("api_key", "api_key_override")}
@@ -648,16 +651,21 @@ def save_archive_file(name: str, preset: dict[str, Any], handler: SimpleHTTPRequ
 
 
 def load_archive_file(name: str, handler: SimpleHTTPRequestHandler | None = None) -> dict[str, Any]:
-    path = archive_path(name, handler)
-    migrated = False
     ws = _workspace_id(handler) if handler else "localhost"
+    path = archive_path(name, ws)
     if not path.exists():
+        # Legacy fallback: try top-level + IP directories
         legacy = ARCHIVE_DIR / f"{safe_archive_name(name)}.nanobanana"
         if legacy.exists():
             path = legacy
-            if handler is not None:
-                migrated = True
-        else:
+        if not path.exists() and ARCHIVE_DIR.exists():
+            for ip_dir in sorted(ARCHIVE_DIR.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True):
+                if ip_dir.is_dir():
+                    p = ip_dir / f"{safe_archive_name(name)}.nanobanana"
+                    if p.exists():
+                        path = p
+                        break
+        if not path.exists():
             raise FileNotFoundError(f"Archive not found: {name}")
     ws_media = _ws_media_dir(ws)
     ws_media.mkdir(parents=True, exist_ok=True)
@@ -674,7 +682,7 @@ def load_archive_file(name: str, handler: SimpleHTTPRequestHandler | None = None
             item["stored"] = target_name
     write_active_preset(preset, ws)
     if migrated and handler is not None:
-        save_archive_file(name, preset, handler, ws)
+        save_archive_file(name, preset, ws)
     return preset_for_client(ws)
 
 
@@ -1463,7 +1471,7 @@ class Handler(SimpleHTTPRequestHandler):
             preset = collect_preset_from_form(form, ws)
             write_active_preset(preset, ws)
             archive_name = get_field(form, "archive_name")
-            archive = save_archive_file(archive_name, preset, self, ws).name if archive_name.strip() else None
+            archive = save_archive_file(archive_name, preset, ws).name if archive_name.strip() else None
             data = preset_for_client(ws)
             data["archive"] = archive
             data["archives"] = list_archives(self)
@@ -1483,7 +1491,7 @@ class Handler(SimpleHTTPRequestHandler):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
             form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
-            path = archive_path(get_field(form, "archive_name"), self)
+            path = archive_path(get_field(form, "archive_name"), _workspace_id(self))
             if path.exists():
                 path.unlink()
             json_response(self, 200, {"archives": list_archives(self)})
