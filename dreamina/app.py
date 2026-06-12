@@ -28,6 +28,23 @@ STATIC_DIR = ROOT / "static"
 _POPEN_EXTRA: dict[str, Any] = {}
 if hasattr(subprocess, "CREATE_NO_WINDOW"):
     _POPEN_EXTRA["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+# ---- Client IP helpers ----
+
+def _client_ip(handler: SimpleHTTPRequestHandler) -> str:
+    xff = handler.headers.get("X-Forwarded-For", "").strip()
+    if xff:
+        ip = xff.split(",")[0].strip()
+        if ip:
+            return re.sub(r"[^0-9a-fA-F.:]+", "_", ip)
+    addr = handler.client_address[0] if handler.client_address else "127.0.0.1"
+    return re.sub(r"[^0-9a-fA-F.:]+", "_", addr)
+
+
+def _archive_dir_for(handler_or_ip: Any) -> Path:
+    if isinstance(handler_or_ip, str):
+        return ARCHIVE_DIR / handler_or_ip
+    return ARCHIVE_DIR / _client_ip(handler_or_ip)
 OUTPUT_DIR = ROOT / "outputs"
 UPLOAD_DIR = ROOT / "uploads"
 LOG_DIR = ROOT / "logs"
@@ -758,7 +775,7 @@ def write_preset(data: dict[str, Any]):
     PRESET_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
 
 
-def preset_for_client() -> dict[str, Any]:
+def preset_for_client(handler: SimpleHTTPRequestHandler | None = None) -> dict[str, Any]:
     data = read_preset()
     media = {}
     for field, item in data.get("media", {}).items():
@@ -768,22 +785,25 @@ def preset_for_client() -> dict[str, Any]:
                 "filename": item.get("filename", path.name),
                 "url": f"/api/preset-media/{field}",
             }
-    return {"values": data.get("values", {}), "media": media, "archives": list_archives()}
+    return {"values": data.get("values", {}), "media": media, "archives": list_archives(handler)}
 
 
-def list_archives() -> list[dict[str, Any]]:
-    if not ARCHIVE_DIR.exists():
-        return []
+def list_archives(handler: SimpleHTTPRequestHandler | None = None) -> list[dict[str, Any]]:
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    dir_path = _archive_dir_for(handler) if handler else ARCHIVE_DIR
+    dir_path.mkdir(parents=True, exist_ok=True)
     archives = []
-    for f in sorted(ARCHIVE_DIR.iterdir()):
+    for f in sorted(dir_path.iterdir()):
         if f.suffix == ".dreamina" and f.is_file():
             archives.append({"name": f.stem, "size": f.stat().st_size, "mtime": f.stat().st_mtime})
     return archives
 
 
-def save_archive(name: str, preset: dict[str, Any]):
+def save_archive(name: str, preset: dict[str, Any], handler: SimpleHTTPRequestHandler | None = None):
     safe_name = sanitize_archive_name(name)
-    path = ARCHIVE_DIR / f"{safe_name}.dreamina"
+    dir_path = _archive_dir_for(handler) if handler else ARCHIVE_DIR
+    dir_path.mkdir(parents=True, exist_ok=True)
+    path = dir_path / f"{safe_name}.dreamina"
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("preset.json", json.dumps(preset, ensure_ascii=False, indent=2))
         for field, item in preset.get("media", {}).items():
@@ -793,10 +813,16 @@ def save_archive(name: str, preset: dict[str, Any]):
     return safe_name
 
 
-def load_archive(name: str) -> dict[str, Any] | None:
-    path = ARCHIVE_DIR / f"{name}.dreamina"
+def load_archive(name: str, handler: SimpleHTTPRequestHandler | None = None) -> dict[str, Any] | None:
+    dir_path = _archive_dir_for(handler) if handler else ARCHIVE_DIR
+    path = dir_path / f"{name}.dreamina"
     if not path.exists():
-        return None
+        # Fallback to legacy top-level location + migrate
+        legacy = ARCHIVE_DIR / f"{name}.dreamina"
+        if legacy.exists():
+            path = legacy
+        else:
+            return None
     if MEDIA_DIR.exists():
         shutil.rmtree(MEDIA_DIR)
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -808,11 +834,15 @@ def load_archive(name: str) -> dict[str, Any] | None:
                 target = MEDIA_DIR / stored_name
                 target.write_bytes(zf.read(info.filename))
     write_preset(preset)
-    return preset_for_client()
+    # Migrate legacy to IP-scoped
+    if handler is not None and path.parent != dir_path:
+        save_archive(name, preset, handler)
+    return preset_for_client(handler)
 
 
-def delete_archive(name: str) -> bool:
-    path = ARCHIVE_DIR / f"{name}.dreamina"
+def delete_archive(name: str, handler: SimpleHTTPRequestHandler | None = None) -> bool:
+    dir_path = _archive_dir_for(handler) if handler else ARCHIVE_DIR
+    path = dir_path / f"{name}.dreamina"
     if path.exists():
         path.unlink()
         return True
@@ -850,9 +880,9 @@ class Handler(SimpleHTTPRequestHandler):
         elif path == "/api/history":
             self.handle_history()
         elif path == "/api/preset":
-            json_response(self, 200, {"ok": True, **preset_for_client()})
+            json_response(self, 200, {"ok": True, **preset_for_client(self)})
         elif path == "/api/archives":
-            json_response(self, 200, {"ok": True, "archives": list_archives()})
+            json_response(self, 200, {"ok": True, "archives": list_archives(self)})
         elif path.startswith("/api/preset-media/"):
             field = path[len("/api/preset-media/"):]
             self.handle_preset_media(field)
@@ -1576,9 +1606,9 @@ class Handler(SimpleHTTPRequestHandler):
 
         archive_name = fields.get("archive_name", "").strip()
         if archive_name:
-            save_archive(archive_name, preset)
+            save_archive(archive_name, preset, self)
 
-        json_response(self, 200, {"ok": True, **preset_for_client()})
+        json_response(self, 200, {"ok": True, **preset_for_client(self)})
 
     def handle_preset_clear(self):
         if MEDIA_DIR.exists():
@@ -1612,7 +1642,7 @@ class Handler(SimpleHTTPRequestHandler):
         if not name:
             json_response(self, 400, {"ok": False, "error": "name required"})
             return
-        result = load_archive(name)
+        result = load_archive(name, self)
         if result is None:
             json_response(self, 404, {"ok": False, "error": "archive not found"})
             return
@@ -1624,7 +1654,7 @@ class Handler(SimpleHTTPRequestHandler):
         if not name:
             json_response(self, 400, {"ok": False, "error": "name required"})
             return
-        if delete_archive(name):
+        if delete_archive(name, self):
             json_response(self, 200, {"ok": True})
         else:
             json_response(self, 404, {"ok": False, "error": "archive not found"})
@@ -1660,8 +1690,8 @@ class Handler(SimpleHTTPRequestHandler):
 
         values = {k: v for k, v in params.items() if not k.startswith(("ref_image_", "ref_video_", "ref_audio_", "frame_", "first_frame", "last_frame"))}
         preset = {"values": values, "media": media_info}
-        save_archive(archive_name, preset)
-        json_response(self, 200, {"ok": True, "archive_name": sanitize_archive_name(archive_name), "archives": list_archives()})
+        save_archive(archive_name, preset, self)
+        json_response(self, 200, {"ok": True, "archive_name": sanitize_archive_name(archive_name), "archives": list_archives(self)})
 
     def handle_meta(self):
         cfg = load_config()
