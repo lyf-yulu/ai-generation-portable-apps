@@ -53,12 +53,16 @@ def _workspace_id(handler) -> str:
     return "localhost"
 
 
+def _ws_dir(ws_id: str) -> Path:
+    return STATE_DIR / "workspaces" / ws_id
+
+
 def _ws_media_dir(ws_id: str) -> Path:
-    return STATE_DIR / "workspaces" / ws_id / "media"
+    return _ws_dir(ws_id) / "media"
 
 
 def _ws_preset_path(ws_id: str) -> Path:
-    return STATE_DIR / "workspaces" / ws_id / "preset.json"
+    return _ws_dir(ws_id) / "preset.json"
 
 
 DEFAULT_BASE_URL = "https://ai.t8star.org"
