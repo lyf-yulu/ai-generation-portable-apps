@@ -360,13 +360,9 @@ class Handler(SimpleHTTPRequestHandler):
         return False
 
     def _proxy(self, app_name: str, port: int, method: str, target_path: str):
-        # Prefer existing X-Forwarded-For (e.g. from upstream proxy),
-        # otherwise use the direct client IP
-        xff = self.headers.get("X-Forwarded-For", "").strip()
-        if xff:
-            client_ip = xff.split(",")[0].strip()
-        else:
-            client_ip = self.client_address[0]
+        # NEVER trust client-provided X-Forwarded-For — use real TCP address.
+        # Portal is the edge; sub-apps trust X-Forwarded-For from Portal only.
+        client_ip = self.client_address[0]
         is_job = tracker._is_job_request(method, target_path)
         tracker.record(app_name, client_ip, method, target_path)
 
@@ -379,7 +375,7 @@ class Handler(SimpleHTTPRequestHandler):
 
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=300)
             headers = {}
-            for key in ("Content-Type", "Content-Length", "Accept", "Accept-Encoding"):
+            for key in ("Content-Type", "Content-Length", "Accept", "Accept-Encoding", "X-Workspace-Id"):
                 val = self.headers.get(key)
                 if val:
                     headers[key] = val

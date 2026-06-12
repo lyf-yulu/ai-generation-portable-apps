@@ -1,9 +1,15 @@
 'use strict';
 
 // === Utilities ===
+function workspaceId() {
+  let id = localStorage.getItem('workspace_id');
+  if (!id) { id = crypto.randomUUID(); localStorage.setItem('workspace_id', id); }
+  return id;
+}
+
 async function api(url, method, body) {
   try {
-    const opts = { method: method || 'GET' };
+    const opts = { method: method || 'GET', headers: { 'X-Workspace-Id': workspaceId() } };
     if (body) opts.body = body;
     const res = await fetch(url, opts);
     return await res.json();

@@ -1,10 +1,18 @@
 #!/bin/bash
 cd "$(dirname "$0")/portal"
 
-echo "Stopping existing processes on ports 8787-9090..."
+echo "Stopping previous instances (projects ports only)..."
 for port in 8787 8797 8888 9089 9090; do
   pid=$(lsof -ti :$port 2>/dev/null)
-  [ -n "$pid" ] && kill -9 $pid 2>/dev/null && echo "  Freed port $port (pid $pid)"
+  if [ -n "$pid" ]; then
+    # Only kill if it's our Python app.py process
+    cmd=$(ps -p "$pid" -o command= 2>/dev/null)
+    if echo "$cmd" | grep -q "app.py"; then
+      kill "$pid" 2>/dev/null && echo "  Stopped app.py on port $port (pid $pid)"
+    else
+      echo "  [WARN] Port $port occupied by non-project process (pid $pid), skipping"
+    fi
+  fi
 done
 sleep 1
 

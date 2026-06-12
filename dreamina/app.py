@@ -832,8 +832,6 @@ def load_archive(name: str, handler: SimpleHTTPRequestHandler | None = None) -> 
             path = legacy
         else:
             return None
-    if MEDIA_DIR.exists():
-        shutil.rmtree(MEDIA_DIR)
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "r") as zf:
         preset = json.loads(zf.read("preset.json").decode("utf-8"))
@@ -921,14 +919,29 @@ class Handler(SimpleHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
 
         if path == "/api/env/install-cli":
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
             self.handle_install_cli()
         elif path == "/api/env/login":
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
             self.handle_login()
         elif path == "/api/env/login-cancel":
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
             self.handle_login_cancel()
         elif path == "/api/env/switch-account":
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
             self.handle_switch_account()
         elif path == "/api/env/update-cli":
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
             self.handle_install_cli()
         elif path == "/api/accounts":
             if not _is_local(self):
@@ -942,9 +955,15 @@ class Handler(SimpleHTTPRequestHandler):
             acc_id = path.split("/api/accounts/")[1].split("/")[0]
             self.handle_account_login(acc_id)
         elif path.startswith("/api/accounts/") and path.endswith("/logout"):
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
             acc_id = path.split("/api/accounts/")[1].split("/")[0]
             self.handle_account_logout(acc_id)
         elif path.startswith("/api/accounts/") and path.endswith("/refresh"):
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
             acc_id = path.split("/api/accounts/")[1].split("/")[0]
             self.handle_account_refresh(acc_id)
         elif path.startswith("/api/accounts/") and path.endswith("/delete"):

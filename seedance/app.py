@@ -38,6 +38,24 @@ PROVIDERS_PATH = ROOT / "providers.json"
 def _is_local(handler: SimpleHTTPRequestHandler) -> bool:
     ip = (handler.headers.get("X-Forwarded-For") or handler.client_address[0] or "").strip()
     return ip in ("127.0.0.1", "::1", "localhost")
+
+
+def _workspace_id(handler) -> str:
+    """Extract workspace_id from X-Workspace-Id header."""
+    ws = (handler.headers.get("X-Workspace-Id") or "").strip()
+    if ws:
+        return re.sub(r"[^a-zA-Z0-9_\-]", "_", ws)[:64]
+    return "localhost"
+
+
+def _ws_media_dir(ws_id: str) -> Path:
+    return STATE_DIR / "workspaces" / ws_id / "media"
+
+
+def _ws_preset_path(ws_id: str) -> Path:
+    return STATE_DIR / "workspaces" / ws_id / "preset.json"
+
+
 DEFAULT_BASE_URL = "https://ai.t8star.org"
 OFFICIAL_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_CONFIG = Path.home() / "ComfyUI/custom_nodes/Comfyui-zhenzhen/Comflyapi.json"
@@ -367,11 +385,12 @@ def job_id_response(job_id: str) -> dict[str, Any]:
     return {"ok": True, "job_id": job_id, "status_url": f"/api/jobs/{job_id}"}
 
 
-def read_preset() -> dict[str, Any]:
-    if not PRESET_PATH.exists():
+def read_preset(ws_id: str = "localhost") -> dict[str, Any]:
+    path = _ws_preset_path(ws_id)
+    if not path.exists():
         return {"values": {}, "media": {}}
     try:
-        data = json.loads(PRESET_PATH.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             data.setdefault("values", {})
             data.setdefault("media", {})
@@ -381,10 +400,11 @@ def read_preset() -> dict[str, Any]:
     return {"values": {}, "media": {}}
 
 
-def preset_to_client(data: dict[str, Any]) -> dict[str, Any]:
+def preset_to_client(data: dict[str, Any], ws_id: str = "localhost") -> dict[str, Any]:
     media = {}
+    media_dir = _ws_media_dir(ws_id)
     for field, item in data.get("media", {}).items():
-        path = MEDIA_DIR / item.get("stored", "")
+        path = media_dir / item.get("stored", "")
         if path.exists():
             stored = path.name
             media[field] = {
@@ -396,8 +416,8 @@ def preset_to_client(data: dict[str, Any]) -> dict[str, Any]:
     return {"values": data.get("values", {}), "media": media}
 
 
-def preset_for_client() -> dict[str, Any]:
-    return preset_to_client(read_preset())
+def preset_for_client(ws_id: str = "localhost") -> dict[str, Any]:
+    return preset_to_client(read_preset(ws_id), ws_id)
 
 
 def copy_files_to_restore(values: dict[str, Any], files: dict[str, tuple[str, bytes]], prefix: str) -> dict[str, Any]:
@@ -416,7 +436,7 @@ def copy_files_to_restore(values: dict[str, Any], files: dict[str, tuple[str, by
             if key not in FILE_FIELDS or not isinstance(item, dict):
                 continue
             stored = Path(str(item.get("stored", ""))).name
-            if stored and (MEDIA_DIR / stored).exists():
+            if stored and (media_dir / stored).exists():
                 media[key] = {
                     "filename": item.get("filename", stored),
                     "stored": stored,
@@ -430,7 +450,7 @@ def copy_files_to_restore(values: dict[str, Any], files: dict[str, tuple[str, by
             continue
         suffix = Path(filename).suffix or mimetypes.guess_extension(mimetypes.guess_type(filename)[0] or "") or ".bin"
         stored = f"{prefix}_{uuid.uuid4().hex}_{key}{suffix}"
-        (MEDIA_DIR / stored).write_bytes(blob)
+        (media_dir / stored).write_bytes(blob)
         media[key] = {
             "filename": filename,
             "stored": stored,
@@ -459,7 +479,7 @@ def activity_record_for_client(record: dict[str, Any] | None) -> dict[str, Any] 
                 if key not in FILE_FIELDS or not isinstance(item, dict):
                     continue
                 stored = Path(str(item.get("stored", ""))).name
-                if stored and (MEDIA_DIR / stored).exists():
+                if stored and (media_dir / stored).exists():
                     media[key] = {
                         "filename": item.get("filename", stored),
                         "stored": stored,
@@ -523,16 +543,17 @@ def list_archives(handler: SimpleHTTPRequestHandler | None = None) -> list[dict[
     return items
 
 
-def collect_media_from_form(form: cgi.FieldStorage) -> dict[str, Any]:
-    preset = read_preset()
+def collect_media_from_form(form: cgi.FieldStorage, ws_id: str = "localhost") -> dict[str, Any]:
+    preset = read_preset(ws_id)
     active_media = preset.get("media", {})
     saved_media = parse_saved_media(form)
     media = {}
+    media_dir = _ws_media_dir(ws_id)
     for key, item in saved_media.items():
         if not isinstance(item, dict):
             continue
         stored = Path(str(item.get("stored", ""))).name
-        if stored and (MEDIA_DIR / stored).exists():
+        if stored and (media_dir / stored).exists():
             media[key] = {
                 "filename": item.get("filename", stored),
                 "stored": stored,
@@ -562,19 +583,20 @@ def collect_media_from_form(form: cgi.FieldStorage) -> dict[str, Any]:
     return media
 
 
-def collect_workspace_snapshot_from_form(form: cgi.FieldStorage) -> dict[str, Any]:
+def collect_workspace_snapshot_from_form(form: cgi.FieldStorage, ws_id: str = "localhost") -> dict[str, Any]:
     values = {key: get_field(form, key) for key in VALUE_FIELDS if key in form and not getattr(form[key], "filename", None)}
-    return {"values": values, "media": collect_media_from_form(form)}
+    return {"values": values, "media": collect_media_from_form(form, ws_id)}
 
 
-def collect_preset_from_form(form: cgi.FieldStorage) -> dict[str, Any]:
-    return collect_workspace_snapshot_from_form(form)
+def collect_preset_from_form(form: cgi.FieldStorage, ws_id: str = "localhost") -> dict[str, Any]:
+    return collect_workspace_snapshot_from_form(form, ws_id)
 
 
-def write_active_preset(preset: dict[str, Any]) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-    PRESET_PATH.write_text(json.dumps(preset, ensure_ascii=False, indent=2), encoding="utf-8")
+def write_active_preset(preset: dict[str, Any], ws_id: str) -> None:
+    ws_dir = _ws_preset_path(ws_id).parent
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    _ws_media_dir(ws_id).mkdir(parents=True, exist_ok=True)
+    _ws_preset_path(ws_id).write_text(json.dumps(preset, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def save_archive_file(name: str, preset: dict[str, Any], handler: SimpleHTTPRequestHandler | None = None) -> Path:
@@ -1326,7 +1348,7 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, 200, request_template())
             return
         if self.path == "/api/preset":
-            json_response(self, 200, preset_for_client())
+            json_response(self, 200, preset_for_client(_workspace_id(self)))
             return
         if self.path == "/api/archives":
             json_response(self, 200, {"archives": list_archives(self)})
@@ -1347,9 +1369,10 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if self.path.startswith("/api/preset-media/"):
             field = self.path.rsplit("/", 1)[-1]
-            preset = read_preset()
+            ws = _workspace_id(self)
+            preset = read_preset(ws)
             item = preset.get("media", {}).get(field)
-            path = MEDIA_DIR / item.get("stored", "") if item else None
+            path = _ws_media_dir(ws) / item.get("stored", "") if item else None
             if not item or not path or not path.exists():
                 json_response(self, 404, {"error": "media not found"})
                 return
@@ -1443,19 +1466,21 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path == "/api/workspace/snapshot":
             form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
             try:
-                json_response(self, 200, preset_to_client(collect_workspace_snapshot_from_form(form)))
+                ws = _workspace_id(self)
+                json_response(self, 200, preset_to_client(collect_workspace_snapshot_from_form(form, ws), ws))
             except Exception as exc:
                 json_response(self, 500, {"error": str(exc)})
             return
         if self.path == "/api/preset":
             form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
-            preset = collect_preset_from_form(form)
-            write_active_preset(preset)
+            ws = _workspace_id(self)
+            preset = collect_preset_from_form(form, ws)
+            write_active_preset(preset, ws)
             archive_name = get_field(form, "archive_name")
             archive = None
             if archive_name.strip():
                 archive = save_archive_file(archive_name, preset, self).name
-            response = preset_for_client()
+            response = preset_for_client(ws)
             response["archive"] = archive
             response["archives"] = list_archives(self)
             json_response(self, 200, response)
@@ -1465,6 +1490,14 @@ class Handler(SimpleHTTPRequestHandler):
             try:
                 data = load_archive_file(get_field(form, "archive_name"), self)
                 data["archives"] = list_archives(self)
+                # Merge archive data into current workspace media state
+                ws = _workspace_id(self)
+                media_dir = _ws_media_dir(ws)
+                for item in (data.get("media") or {}).values():
+                    stored = item.get("stored", "")
+                    if stored and not (media_dir / stored).exists():
+                        # Already extracted by load_archive_file
+                        pass
                 json_response(self, 200, data)
             except Exception as exc:
                 json_response(self, 400, {"error": str(exc)})
