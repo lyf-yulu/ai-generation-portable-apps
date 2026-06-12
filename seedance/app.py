@@ -32,7 +32,7 @@ PRESET_PATH = STATE_DIR / "preset.json"
 ACTIVITY_PATH = STATE_DIR / "activity_log.json"
 ARCHIVE_DIR = ROOT / "archives"
 PROVIDERS_PATH = ROOT / "providers.json"
-DEFAULT_BASE_URL = "https://ai.t8star.cn"
+DEFAULT_BASE_URL = "https://ai.t8star.org"
 OFFICIAL_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_CONFIG = Path.home() / "ComfyUI/custom_nodes/Comfyui-zhenzhen/Comflyapi.json"
 TERMINAL_STATUSES = {"succeeded", "success", "failed", "fail", "failure", "cancelled", "canceled"}
@@ -90,7 +90,7 @@ FALLBACK_PROVIDERS = {
             "label": "豆包官方 / 火山方舟",
             "base_url": OFFICIAL_ARK_BASE_URL,
             "api_style": "ark_seedance",
-            "hint": "使用豆包官方火山方舟 API。首尾帧模式不能与参考素材混用；本地素材会以 data URL 发送。",
+            "hint": "使用豆包官方火山方舟 API。首尾帧模式不能与参考素材混用；素材会先上传再引用。",
             "defaults": {"model": "doubao-seedance-2-0-260128", "duration": 12, "resolution": "720p", "ratio": "16:9", "repeat_count": 1, "concurrency": 1, "poll_interval": 10, "timeout": 3600, "vary_seed": True},
             "models": [{"id": "doubao-seedance-2-0-260128", "label": "doubao-seedance-2-0-260128"}, {"id": "doubao-seedance-2-0-fast-260128", "label": "doubao-seedance-2-0-fast-260128"}],
         },
@@ -326,7 +326,7 @@ def media_item_to_file(field: str, item: Any) -> tuple[str, bytes] | None:
             url,
             headers={"User-Agent": "Mozilla/5.0"},
         )
-        with urllib.request.urlopen(req, timeout=180) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             blob = resp.read()
             mime = resp.headers.get_content_type() or mimetypes.guess_type(url)[0] or "application/octet-stream"
         if not blob:
@@ -375,7 +375,7 @@ def preset_for_client() -> dict[str, Any]:
 def copy_files_to_restore(values: dict[str, Any], files: dict[str, tuple[str, bytes]], prefix: str) -> dict[str, Any]:
     safe_values = {
         key: value for key, value in values.items()
-        if key not in {"api_key", "saved_media"}
+        if key not in {"saved_media"}
     }
     media: dict[str, Any] = {}
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -560,7 +560,7 @@ def choose_output_dir() -> str:
     prompt = "选择 Seedance 输出目录"
     if sys.platform == "darwin":
         script = f'POSIX path of (choose folder with prompt "{prompt}")'
-        result = subprocess.run(["osascript", "-e", script], check=True, capture_output=True, text=True)
+        result = subprocess.run(["osascript", "-e", script], check=True, capture_output=True, text=True, timeout=60)
         return result.stdout.strip().rstrip("/")
     if sys.platform.startswith("win"):
         ps = (
@@ -609,7 +609,7 @@ def normalize_status(value: str | None) -> str:
     return status
 
 
-def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | None = None, timeout: int = 180) -> dict[str, Any]:
+def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | None = None, timeout: int = 600) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {api_key}"}
     data = None
     if body is not None:
@@ -623,9 +623,13 @@ def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | Non
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {exc.code}: {raw}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"API 请求超时或连接失败 ({exc.__class__.__name__}: {exc})") from exc
 
 
-def upload_file(base_url: str, api_key: str, blob: bytes, filename: str, content_type: str) -> str:
+def upload_file(upload_url: str, api_key: str, blob: bytes, filename: str, content_type: str) -> dict[str, str]:
+    """Upload a file and return the reference dict for use in content items.
+    Returns {"url": "..."} for t8star, {"file_id": "..."} for volcengine Ark."""
     boundary = f"----seedance{uuid.uuid4().hex}"
     body = bytearray()
     body.extend(f"--{boundary}\r\n".encode())
@@ -639,7 +643,7 @@ def upload_file(base_url: str, api_key: str, blob: bytes, filename: str, content
     body.extend(f"\r\n--{boundary}--\r\n".encode())
 
     req = urllib.request.Request(
-        f"{base_url}/v1/files",
+        upload_url,
         data=bytes(body),
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -649,20 +653,20 @@ def upload_file(base_url: str, api_key: str, blob: bytes, filename: str, content
     )
     with urllib.request.urlopen(req, timeout=300) as resp:
         data = json.loads(resp.read().decode("utf-8", errors="replace"))
-    if not data.get("url"):
-        raise RuntimeError(f"Upload did not return url: {data}")
-    return str(data["url"])
+    if data.get("url"):
+        return {"url": str(data["url"])}
+    if data.get("id"):
+        return {"file_id": str(data["id"])}
+    raise RuntimeError(f"Upload did not return url or id: {data}")
 
 
-def media_reference(provider: str, base_url: str, api_key: str, blob: bytes, filename: str, mime: str) -> str:
+def media_reference(provider: str, base_url: str, api_key: str, blob: bytes, filename: str, mime: str) -> dict[str, str]:
     if provider == "volcengine":
-        return to_data_url(blob, filename, mime)
-    return upload_file(base_url, api_key, blob, filename, mime)
+        upload_url = f"{base_url}/files"
+    else:
+        upload_url = f"{base_url}/v1/files"
+    return upload_file(upload_url, api_key, blob, filename, mime)
 
-
-def to_data_url(blob: bytes, filename: str, fallback: str) -> str:
-    mime = mimetypes.guess_type(filename)[0] or fallback
-    return f"data:{mime};base64,{base64.b64encode(blob).decode('ascii')}"
 
 
 def extract_video_url(data: dict[str, Any]) -> str | None:
@@ -789,16 +793,16 @@ def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index
         has_frame_input = True
         filename, blob = first
         mime = mimetypes.guess_type(filename)[0] or "image/png"
-        url = media_reference(provider, base_url, api_key, blob, filename, mime)
-        content.append({"type": "image_url", "image_url": {"url": url}, "role": "first_frame"})
+        ref = media_reference(provider, base_url, api_key, blob, filename, mime)
+        content.append({"type": "image_url", "image_url": ref, "role": "first_frame"})
 
     last = get_file_or_saved(form, "last_frame")
     if last:
         has_frame_input = True
         filename, blob = last
         mime = mimetypes.guess_type(filename)[0] or "image/png"
-        url = media_reference(provider, base_url, api_key, blob, filename, mime)
-        content.append({"type": "image_url", "image_url": {"url": url}, "role": "last_frame"})
+        ref = media_reference(provider, base_url, api_key, blob, filename, mime)
+        content.append({"type": "image_url", "image_url": ref, "role": "last_frame"})
 
     for i in range(1, 10):
         file_data = get_file_or_saved(form, f"ref_image_{i}")
@@ -808,8 +812,8 @@ def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index
         has_visual_reference = True
         filename, blob = file_data
         mime = mimetypes.guess_type(filename)[0] or "image/png"
-        url = media_reference(provider, base_url, api_key, blob, filename, mime)
-        content.append({"type": "image_url", "image_url": {"url": url}, "role": "reference_image"})
+        ref = media_reference(provider, base_url, api_key, blob, filename, mime)
+        content.append({"type": "image_url", "image_url": ref, "role": "reference_image"})
 
     for i in range(1, 4):
         file_data = get_file_or_saved(form, f"ref_video_{i}")
@@ -819,8 +823,8 @@ def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index
         has_visual_reference = True
         filename, blob = file_data
         mime = mimetypes.guess_type(filename)[0] or "video/mp4"
-        url = media_reference(provider, base_url, api_key, blob, filename, mime)
-        content.append({"type": "video_url", "video_url": {"url": url}, "role": "reference_video"})
+        ref = media_reference(provider, base_url, api_key, blob, filename, mime)
+        content.append({"type": "video_url", "video_url": ref, "role": "reference_video"})
 
     for i in range(1, 4):
         file_data = get_file_or_saved(form, f"ref_audio_{i}")
@@ -829,8 +833,8 @@ def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index
         has_reference_input = True
         filename, blob = file_data
         mime = mimetypes.guess_type(filename)[0] or "audio/wav"
-        url = media_reference(provider, base_url, api_key, blob, filename, mime)
-        content.append({"type": "audio_url", "audio_url": {"url": url}, "role": "reference_audio"})
+        ref = media_reference(provider, base_url, api_key, blob, filename, mime)
+        content.append({"type": "audio_url", "audio_url": ref, "role": "reference_audio"})
 
     seed_raw = get_field(form, "seed", "").strip()
     seed = int(seed_raw) if seed_raw else None
@@ -1335,6 +1339,10 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.path == "/api/choose-output-dir":
+            client_ip = self.headers.get("X-Forwarded-For") or self.client_address[0]
+            if client_ip not in ("127.0.0.1", "::1", "localhost"):
+                json_response(self, 200, {"remote": True})
+                return
             try:
                 json_response(self, 200, {"path": choose_output_dir()})
             except Exception as exc:

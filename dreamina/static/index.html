@@ -35,6 +35,16 @@
         <button id="updateCliBtn" class="btn-small">更新 CLI</button>
       </div>
 
+      <div class="output-section form-group">
+        <label>输出目录</label>
+        <input type="text" id="outputDir" placeholder="留空则保存到 outputs 文件夹">
+        <div class="row-buttons" style="display:flex;gap:4px;margin-top:4px">
+          <button type="button" id="chooseOutputBtn" class="btn-small">选择目录</button>
+          <button type="button" id="desktopOutputBtn" class="btn-small">桌面 outputs</button>
+          <button type="button" id="openOutputBtn" class="btn-small">打开目录</button>
+        </div>
+      </div>
+
       <div class="tabs major-tabs">
         <button class="tab-btn active" data-major="image">图片生成</button>
         <button class="tab-btn" data-major="video">视频生成</button>
@@ -142,10 +152,10 @@
           <div class="form-group" id="modelVersionGroup">
             <label for="model_version">模型版本</label>
             <select id="model_version" name="model_version">
+              <option value="seedance2.0fast_vip" selected>Seedance 2.0 Fast VIP</option>
+              <option value="seedance2.0_vip">Seedance 2.0 VIP</option>
               <option value="seedance2.0fast">Seedance 2.0 Fast</option>
               <option value="seedance2.0">Seedance 2.0</option>
-              <option value="seedance2.0_vip">Seedance 2.0 VIP</option>
-              <option value="seedance2.0fast_vip">Seedance 2.0 Fast VIP</option>
             </select>
           </div>
         </div>
@@ -176,6 +186,10 @@
           </div>
         </div>
 
+        <div class="form-group">
+          <label for="outputName">输出名</label>
+          <input type="text" id="outputName" name="output_name" placeholder="留空自动命名，多并发加 -1 -2...">
+        </div>
         <button id="submitBtn" type="submit" class="btn-primary">开始生成</button>
       </form>
 

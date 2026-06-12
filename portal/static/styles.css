@@ -78,12 +78,12 @@ button:disabled { opacity: 0.55; cursor: wait; }
 .uploadGrid { display: grid; gap: 8px; margin-bottom: 12px; }
 .uploadGrid.two { grid-template-columns: repeat(2, 1fr); }
 .uploadGrid.three, .uploadGrid.refs { grid-template-columns: repeat(3, 1fr); }
-.drop { min-height: 72px; margin: 0; padding: 10px; border: 1px dashed #aeb8c7; border-radius: 8px; background: #f8fafc; color: #344054; align-content: center; text-align: center; cursor: pointer; font-size: 12px; }
+.drop { min-height: 72px; margin: 0; padding: 10px; border: 1px dashed #aeb8c7; border-radius: 8px; background: #f8fafc; color: #344054; align-content: center; text-align: center; cursor: pointer; font-size: 12px; position: relative; }
 .drop.hasPreview { min-height: 110px; padding: 6px; }
 .drop.isDragging { border-color: #2673e8; background: #eef5ff; }
 .drop input { display: none; }
 .drop span { display: block; margin-top: 4px; color: #697386; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.removeMediaBtn { display: none; width: 100%; height: 24px; margin-top: 6px; border: 1px solid #d0d5dd; border-radius: 5px; background: #fff; color: #344054; font-size: 11px; }
+.removeMediaBtn { position: absolute; top: 4px; right: 4px; width: auto; height: 22px; padding: 0 6px; border: 1px solid #d0d5dd; border-radius: 4px; background: rgba(255,255,255,0.9); color: #ef4444; font-size: 10px; cursor: pointer; display: none; z-index: 2; }
 .drop.hasPreview .removeMediaBtn { display: block; }
 .preview { display: block; width: 100%; height: 72px; object-fit: contain; border-radius: 5px; margin-top: 4px; background: #e8edf4; cursor: zoom-in; }
 audio.preview { height: 32px; cursor: default; }
@@ -163,6 +163,22 @@ pre { min-height: 80px; max-height: 200px; overflow: auto; margin: 0; padding: 1
 
 /* === Activity Panel === */
 .activity-panel-inner { min-height: 200px; }
+
+/* === Accounts Section === */
+.accounts-section { margin-bottom: 14px; padding-bottom: 14px; border-bottom: 1px solid #dde1e8; }
+.accounts-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.dispatch-select { width: auto; padding: 4px 8px; font-size: 11px; border-radius: 5px; }
+.accounts-list { display: flex; flex-direction: column; gap: 4px; }
+.account-item { display: grid; grid-template-columns: 1fr auto; gap: 6px; align-items: center; padding: 6px 8px; border: 1px solid #e8edf4; border-radius: 6px; font-size: 12px; cursor: pointer; }
+.account-item.active { border-color: #2673e8; background: #f0f6ff; }
+.account-item:hover { background: #f8fafc; }
+.account-item.active:hover { background: #f0f6ff; }
+.account-info { display: flex; align-items: center; gap: 8px; }
+.account-name { font-weight: 600; }
+.account-credit { font-size: 11px; color: #2673e8; font-weight: 600; }
+.account-status { font-size: 10px; padding: 1px 5px; border-radius: 3px; background: #fee2e2; color: #991b1b; }
+.account-status.ok { background: #d1fae5; color: #065f46; }
+.account-actions { display: flex; gap: 3px; }
 .activity-counts { display: flex; gap: 12px; font-size: 12px; margin-bottom: 10px; color: #4b5565; }
 .activity-counts .act-ok { color: #10b981; font-weight: 600; }
 .activity-counts .act-fail { color: #ef4444; font-weight: 600; }

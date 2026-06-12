@@ -33,7 +33,7 @@
             <label>API Key<input name="api_key" type="password" autocomplete="off" placeholder="留空使用本地配置"></label>
             <p class="hint">{{ keyHint }}</p>
             <label>供应商
-              <select name="provider" @change="applyProvider($event.target.value)">
+              <select name="provider" v-model="provider" @change="applyProvider($event.target.value)">
                 <option v-for="(cfg, key) in providers" :value="key">{{ cfg.label || key }}</option>
               </select>
             </label>
@@ -181,7 +181,7 @@
             <label>API Key<input name="api_key" type="password" autocomplete="off" placeholder="留空使用本地配置"></label>
             <p class="hint">{{ keyHint }}</p>
             <label>供应商
-              <select name="provider" @change="applyProvider($event.target.value)">
+              <select name="provider" v-model="provider" @change="applyProvider($event.target.value)">
                 <option v-for="(cfg, key) in providers" :value="key">{{ cfg.label || key }}</option>
               </select>
             </label>
@@ -338,12 +338,47 @@
             <span class="credit" v-if="credit">{{ credit }}</span>
           </div>
         </div>
+
+        <!-- Account Management -->
+        <section class="accounts-section">
+          <div class="accounts-header">
+            <span style="font-size:12px;font-weight:650;color:#4b5565">账号管理</span>
+            <div style="display:flex;gap:4px">
+              <button type="button" class="btn-small" @click="addAccount(prompt('输入账号名称(可留空)'))">添加账号</button>
+              <select class="dispatch-select" :value="dispatchMode" @change="setDispatchMode($event.target.value)">
+                <option value="manual">手动</option>
+                <option value="round_robin">轮询</option>
+              </select>
+            </div>
+          </div>
+          <div class="accounts-list" v-if="accounts.length">
+            <div v-for="acc in accounts" class="account-item" :class="{ active: acc.id === activeAccount }">
+              <div class="account-info" @click="setActiveAccount(acc.id)">
+                <span class="account-name">{{ acc.name }}</span>
+                <span class="account-credit" v-if="acc.credit && acc.credit.total_credit != null">{{ acc.credit.total_credit }} 点</span>
+                <span class="account-status" :class="{ ok: acc.logged_in }">{{ acc.logged_in ? '在线' : '离线' }}</span>
+              </div>
+              <div class="account-actions">
+                <button v-if="!acc.logged_in" type="button" class="btn-icon" title="登录" @click="loginAccount(acc.id)">↗</button>
+                <button v-if="acc.logged_in" type="button" class="btn-icon" title="刷新余额" @click="refreshAccount(acc.id)">↻</button>
+                <button v-if="acc.logged_in" type="button" class="btn-icon" title="登出" @click="logoutAccount(acc.id)">⏻</button>
+                <button v-if="!acc.is_system_home" type="button" class="btn-icon" title="删除" @click="deleteAccount(acc.id)">✕</button>
+              </div>
+              <div v-if="accountLoginId === acc.id" style="grid-column:1/-1;font-size:11px;color:#0369a1">登录中...</div>
+              <div v-if="accountLoginUrl && accountLoginUrl.id === acc.id" style="grid-column:1/-1;padding:6px 0;">
+                <div style="font-size:11px;color:#991b1b;margin-bottom:4px;">请在无痕/隐私窗口中打开以下链接登录：</div>
+                <input type="text" :value="accountLoginUrl.url" readonly @click="$event.target.select()" style="font-size:11px;padding:4px 6px;background:#f8fafc;cursor:text;">
+              </div>
+            </div>
+          </div>
+          <div v-else style="font-size:12px;color:#697386;padding:6px 0">暂无账号，点击"添加账号"开始</div>
+        </section>
+
         <div class="rowButtons" style="margin-bottom:14px">
-          <button type="button" @click="switchAccount()">切换账号</button>
           <button type="button" @click="updateCli()">更新 CLI</button>
         </div>
         <section style="margin-bottom:14px">
-          <label style="font-size:12px;font-weight:650;color:#4b5565">输出目录<input type="text" v-model="outputDir" placeholder="留空则保存到 outputs 文件夹"></label>
+          <label style="font-size:12px;font-weight:650;color:#4b5565">输出目录<input type="text" name="output_dir" v-model="outputDir" placeholder="留空则保存到 outputs 文件夹"></label>
           <div class="rowButtons outputDirBtns">
             <button type="button" @click="chooseOutputDir()">选择目录</button>
             <button type="button" @click="outputDir=''">程序 outputs</button>
@@ -430,6 +465,8 @@
             </div>
             <label>模型版本
               <select name="model_version">
+                <option value="seedance2.0fast_vip" selected>Seedance 2.0 Fast VIP</option>
+                <option value="seedance2.0_vip">Seedance 2.0 VIP</option>
                 <option value="seedance2.0fast">Seedance 2.0 Fast</option>
                 <option value="seedance2.0">Seedance 2.0</option>
               </select>

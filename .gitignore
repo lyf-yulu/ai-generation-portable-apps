@@ -4,18 +4,19 @@ __pycache__/
 .venv/
 .portable_python/
 
-# Runtime data
-outputs/*
-archives/*
-state/*
-logs/*
-!outputs/.gitkeep
-!archives/.gitkeep
-!state/.gitkeep
-!state/media/.gitkeep
-!logs/.gitkeep
+# Runtime data — never track generated outputs, uploads, state, or logs
+outputs/
+uploads/
+archives/
+state/
+logs/
+accounts/
+certs/
 
 # Secrets and local configs
 *.seedance
 *.nanobanana
 *.env
+
+# Dreamina account session data (contains tokens)
+.dreamina_cli/

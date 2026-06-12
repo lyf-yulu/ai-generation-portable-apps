@@ -5,8 +5,10 @@ import http.client
 import json
 import mimetypes
 import os
+import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -49,6 +51,50 @@ def get_lan_ip() -> str:
         return ip
     except Exception:
         return "127.0.0.1"
+
+
+def _find_openssl() -> str | None:
+    """Find openssl binary. Returns path or None."""
+    import shutil
+    which = shutil.which("openssl")
+    if which:
+        return which
+    # Windows: check common Git/OpenSSL install paths
+    if sys.platform == "win32":
+        candidates = [
+            r"C:\Program Files\Git\usr\bin\openssl.exe",
+            r"C:\Program Files\OpenSSL\bin\openssl.exe",
+            r"C:\Program Files (x86)\Git\usr\bin\openssl.exe",
+        ]
+        for p in candidates:
+            if Path(p).exists():
+                return p
+    return None
+
+
+def ensure_certs(cert_dir: Path) -> tuple[Path, Path] | None:
+    cert_file = cert_dir / "cert.pem"
+    key_file = cert_dir / "key.pem"
+    if cert_file.exists() and key_file.exists():
+        return cert_file, key_file
+
+    openssl = _find_openssl()
+    if not openssl:
+        print("  [WARN] openssl not found — running in HTTP-only mode")
+        print("  Install OpenSSL (or Git for Windows) to enable HTTPS")
+        return None
+
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    lan_ip = get_lan_ip()
+    subprocess.run([
+        openssl, "req", "-x509", "-newkey", "rsa:2048",
+        "-keyout", str(key_file), "-out", str(cert_file),
+        "-days", "365", "-nodes",
+        "-subj", "/CN=AI Generation Portal",
+        "-addext", f"subjectAltName=DNS:localhost,IP:127.0.0.1,IP:{lan_ip}"
+    ], check=True, capture_output=True)
+    print(f"  Generated self-signed certificate (LAN IP: {lan_ip})")
+    return cert_file, key_file
 
 
 class AppManager:
@@ -339,8 +385,12 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(resp_body)
             conn.close()
-        except Exception as e:
-            self._json(502, {"ok": False, "error": f"proxy error: {e}"})
+        except Exception as exc:
+            # Truncate to avoid leaking backend response bodies (may contain API keys)
+            msg = str(exc)
+            if len(msg) > 300:
+                msg = msg[:300] + "..."
+            self._json(502, {"ok": False, "error": f"proxy error: {msg}"})
 
     def _serve_portal(self, path: str):
         if path == "/" or path == "":
@@ -384,15 +434,50 @@ def main():
     time.sleep(2)
 
     lan_ip = get_lan_ip()
+    certs = ensure_certs(ROOT / "certs")
+
     server = ThreadingHTTPServer(("0.0.0.0", PORTAL_PORT), Handler)
 
-    print(f"\n  AI Generation Portal running:")
-    print(f"    Local:   http://127.0.0.1:{PORTAL_PORT}")
-    print(f"    LAN:     http://{lan_ip}:{PORTAL_PORT}")
+    if certs:
+        cert_file, key_file = certs
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(cert_file), str(key_file))
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+
+        http_port = PORTAL_PORT - 1
+
+        class RedirectHandler(SimpleHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_GET(self):
+                host = self.headers.get("Host", "").split(":")[0] or lan_ip
+                self.send_response(301)
+                self.send_header("Location", f"https://{host}:{PORTAL_PORT}{self.path}")
+                self.end_headers()
+
+            do_POST = do_GET
+            do_OPTIONS = do_GET
+
+        redirect_server = ThreadingHTTPServer(("0.0.0.0", http_port), RedirectHandler)
+        threading.Thread(target=redirect_server.serve_forever, daemon=True).start()
+
+        print(f"\n  AI Generation Portal running (HTTPS):")
+        print(f"    Local:   https://127.0.0.1:{PORTAL_PORT}")
+        print(f"    LAN:     https://{lan_ip}:{PORTAL_PORT}")
+        print(f"    HTTP:    http://{lan_ip}:{http_port} (auto-redirects to HTTPS)")
+        print(f"\n  Note: First visit requires accepting the self-signed certificate")
+    else:
+        print(f"\n  AI Generation Portal running (HTTP-only):")
+        print(f"    Local:   http://127.0.0.1:{PORTAL_PORT}")
+        print(f"    LAN:     http://{lan_ip}:{PORTAL_PORT}")
+        print(f"\n  Note: Install openssl to enable HTTPS (e.g. Git for Windows)")
+        print(f"    File System Access API (select directory) will not work without HTTPS.")
+
     print(f"\n  Sub-apps:")
     for name, config in APPS.items():
         print(f"    {name:14s} -> http://127.0.0.1:{config['port']}")
-    print(f"\n  Press Ctrl+C to stop all services\n")
+    print(f"  Press Ctrl+C to stop all services\n")
 
     def shutdown_handler(sig, frame):
         print("\nShutting down...")

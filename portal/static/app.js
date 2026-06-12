@@ -82,11 +82,14 @@ function GenApp(prefix, appPath, mediaType) {
   return {
     appStatus: 'unknown',
     providers: {},
+    provider: 't8star',
     models: [],
-    baseUrl: '',
+    baseUrl: 'https://ai.t8star.org',
     providerHint: '',
     keyHint: '',
     outputDir: '',
+    dirHandle: null,
+    autoDownload: false,
     submitting: false,
     statusText: '空闲',
     eventsText: '',
@@ -109,19 +112,38 @@ function GenApp(prefix, appPath, mediaType) {
       const res = await api(`${appPath}/api/config`);
       if (!res?.providers) return;
       this.providers = res.providers;
-      const keys = Object.keys(res.providers);
-      const defaultP = res.default_provider || keys[0];
-      if (this.$refs.form?.elements.provider) this.$refs.form.elements.provider.value = defaultP;
+      const defaultP = res.default_provider || Object.keys(res.providers)[0];
       this.applyProvider(defaultP);
+      // PetiteVue may not sync v-model on <select> after dynamic options change — force it
+      const sel = document.querySelector(`#${prefix}-form select[name="provider"]`);
+      if (sel) {
+        if (sel.value !== defaultP) sel.value = defaultP;
+        // Also try after PetiteVue's next render cycle
+        setTimeout(() => { if (sel.value !== defaultP) sel.value = defaultP; }, 0);
+        setTimeout(() => { if (sel.value !== defaultP) sel.value = defaultP; }, 100);
+      }
       this.keyHint = res.has_key ? `已检测到 key: ${res.masked_key}` : '未检测到本地 key';
     },
 
     applyProvider(provider) {
       const cfg = this.providers[provider];
       if (!cfg) return;
+      this.provider = provider;
       this.baseUrl = cfg.base_url || '';
       this.providerHint = cfg.hint || '';
       this.models = cfg.models || [];
+      setTimeout(() => {
+        const defaults = cfg.defaults || {};
+        for (const [k, v] of Object.entries(defaults)) {
+          const el = document.querySelector(`#${prefix}-form [name="${k}"]`);
+          if (!el || el.type === 'file') continue;
+          if (el.type === 'checkbox') el.checked = !!v;
+          else if (el.tagName === 'SELECT') {
+            // Only set if the option exists (PetiteVue may not have rendered yet)
+            if ([...el.options].some(o => o.value === String(v))) el.value = v;
+          } else el.value = v;
+        }
+      });
     },
 
     async submit() {
@@ -131,7 +153,7 @@ function GenApp(prefix, appPath, mediaType) {
       const eventsEl = document.getElementById(`${prefix}-events`);
       if (resultsEl) resultsEl.innerHTML = '';
       if (eventsEl) eventsEl.textContent = '';
-      const data = new FormData(this.$refs.form);
+      const data = new FormData(document.getElementById(`${prefix}-form`));
       const res = await api(`${appPath}/api/jobs`, 'POST', data);
       if (!res || res.error) {
         this.submitting = false;
@@ -150,7 +172,11 @@ function GenApp(prefix, appPath, mediaType) {
         this.statusText = `${job.status} ${job.done || 0}/${job.total || 0}`;
         this.eventsText = (job.events || []).map(e => `[${e.time}] ${e.message}`).join('\n');
         if (resultsEl) {
-          resultsEl.innerHTML = '';
+          const eventsList = (job.events || []).slice(-8).map(e => `<div style="font-size:11px;color:#d1e0ff;padding:2px 0"><span style="color:#697386">${escHtml(e.time)}</span> ${escHtml(e.message)}</div>`).join('');
+          resultsEl.innerHTML = `<article class="result" style="border-color:#4f46e5;background:#101828;color:#e2e8f0;grid-column:1/-1">
+            <div class="meta" style="color:#818cf8;font-weight:600;margin-bottom:6px">${escHtml(job.status)} · ${job.done || 0}/${job.total || 0} ${escHtml(job.errors?.[0] || '')}</div>
+            ${eventsList || '<div style="color:#697386;font-size:11px">等待服务器响应...</div>'}
+          </article>`;
           if (mediaType === 'video') {
             for (const r of job.results || []) {
               const url = `${appPath}${r.download_url}`;
@@ -168,21 +194,90 @@ function GenApp(prefix, appPath, mediaType) {
             resultsEl.innerHTML += `<article class="result" style="color:#ef4444">${escHtml(err)}</article>`;
           }
         }
-        if (['succeeded', 'failed'].includes(job.status)) break;
+        if (['succeeded', 'failed'].includes(job.status)) {
+          if (job.status === 'succeeded' && this.dirHandle) {
+            await this.saveToClient(job, mediaType);
+          } else if (job.status === 'succeeded' && this.autoDownload) {
+            this.triggerDownloads(job, mediaType);
+          }
+          break;
+        }
         await new Promise(r => setTimeout(r, 2500));
       }
       this.statusText = '空闲';
     },
 
+    async saveToClient(job, type) {
+      try {
+        const files = [];
+        if (type === 'video') {
+          for (const r of job.results || []) {
+            if (r.download_url) files.push({ url: `${appPath}${r.download_url}`, filename: r.filename });
+          }
+        } else {
+          for (const r of job.results || []) {
+            for (const img of r.images || []) {
+              if (img.download_url) files.push({ url: `${appPath}${img.download_url}`, filename: img.filename });
+            }
+          }
+        }
+        for (const { url, filename } of files) {
+          const resp = await fetch(url);
+          const blob = await resp.blob();
+          const fh = await this.dirHandle.getFileHandle(filename, { create: true });
+          const w = await fh.createWritable();
+          await w.write(blob);
+          await w.close();
+        }
+        if (files.length) this.statusText = `已保存 ${files.length} 个文件到 ${this.outputDir}`;
+      } catch (e) {
+        console.warn('saveToClient failed:', e);
+      }
+    },
+
+    triggerDownloads(job, type) {
+      const urls = [];
+      if (type === 'video') {
+        for (const r of job.results || []) {
+          if (r.download_url) urls.push({ url: `${appPath}${r.download_url}`, filename: r.filename });
+        }
+      } else {
+        for (const r of job.results || []) {
+          for (const img of r.images || []) {
+            if (img.download_url) urls.push({ url: `${appPath}${img.download_url}`, filename: img.filename });
+          }
+        }
+      }
+      for (const { url, filename } of urls) {
+        const a = document.createElement('a');
+        a.href = url; a.download = filename; a.style.display = 'none';
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      }
+      if (urls.length) this.statusText = `已下载 ${urls.length} 个文件`;
+    },
+
     async chooseOutputDir() {
+      // 1. 后端系统原生目录选择器 — 返回真实路径，支持"打开目录"
       const res = await api(`${appPath}/api/choose-output-dir`, 'POST');
-      if (res?.path) this.outputDir = res.path;
+      if (res?.path) { this.outputDir = res.path; return; }
+      // 2. 浏览器 File System Access API（Chrome, 不带真实路径, 不支持打开目录）
+      if (window.showDirectoryPicker) {
+        try {
+          this.dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+          this.outputDir = this.dirHandle.name;
+          return;
+        } catch (e) { /* user cancelled */ }
+      }
+      // 3. 兜底：浏览器下载
+      this.autoDownload = true;
+      this.outputDir = '浏览器下载';
     },
     async desktopOutput() {
       const res = await api(`${appPath}/api/default-output-dir`);
       if (res?.path) this.outputDir = res.path;
     },
     async openOutputDir() {
+      if (this.dirHandle && !this.outputDir.includes('/')) return;  // FSA API 无真实路径，无法打开
       const data = new FormData(); data.set('output_dir', this.outputDir);
       await api(`${appPath}/api/open-output-dir`, 'POST', data);
     },
@@ -196,7 +291,7 @@ function GenApp(prefix, appPath, mediaType) {
       this.archives = res?.archives || [];
     },
     async saveArchive() {
-      const data = new FormData(this.$refs.form);
+      const data = new FormData(document.getElementById(`${prefix}-form`));
       const res = await api(`${appPath}/api/preset`, 'POST', data);
       this.archiveHint = res?.archive ? `已保存: ${res.archive}` : (res?.error || '保存失败');
       this.loadArchives();
@@ -207,7 +302,7 @@ function GenApp(prefix, appPath, mediaType) {
       const res = await api(`${appPath}/api/archive/load`, 'POST', data);
       if (res?.values) {
         for (const [k, v] of Object.entries(res.values)) {
-          const el = this.$refs.form.elements[k];
+          const el = document.querySelector(`#${prefix}-form [name="${k}"]`);
           if (el && el.type !== 'file') {
             if (el.type === 'checkbox') el.checked = ['on', 'true', '1'].includes(v);
             else el.value = v;
@@ -237,7 +332,8 @@ function GenApp(prefix, appPath, mediaType) {
       const r = this.activityDetail?.restore;
       if (!r) { alert('该记录无法恢复'); return; }
       for (const [k, v] of Object.entries(r.values || {})) {
-        const el = this.$refs.form.elements[k];
+        if (k === 'output_dir') { this.outputDir = v; continue; }
+        const el = document.querySelector(`#${prefix}-form [name="${k}"]`);
         if (el && el.type !== 'file') {
           if (el.type === 'checkbox') el.checked = ['on', 'true', '1'].includes(v);
           else el.value = v;
@@ -295,6 +391,8 @@ function DreaminaApp() {
     loggedIn: false,
     credit: '',
     outputDir: '',
+    dirHandle: null,
+    autoDownload: false,
     major: 'image',
     mode: 'text2image',
     imageSub: 'text2image',
@@ -307,11 +405,26 @@ function DreaminaApp() {
     archives: [],
     selectedArchive: '',
     archiveName: '',
+    accounts: [],
+    activeAccount: null,
+    dispatchMode: 'manual',
+    accountLoginId: null,
+    accountLoginUrl: null,
 
     async init() {
       window._dmRestore = (jobId) => this.restoreFromHistory(jobId);
       await this.checkEnv();
       this.buildSlots();
+      if (this.loggedIn && this.accounts.length) this.refreshAllAccounts();
+    },
+
+    async refreshAllAccounts() {
+      for (const acc of this.accounts) {
+        if (acc.logged_in) {
+          api(`/dreamina/api/accounts/${acc.id}/refresh`, 'POST');
+        }
+      }
+      setTimeout(() => this.loadAccounts(), 2000);
     },
 
     async checkEnv() {
@@ -323,7 +436,13 @@ function DreaminaApp() {
         if (res?.ok) {
           this.setupSpinner = false;
           if (!res.cli_installed) { this.setupMode = 'install'; this.setupTitle = '即梦 CLI 未安装'; return; }
-          if (!res.logged_in) { this.setupMode = 'login'; this.setupTitle = '需要登录即梦账号'; return; }
+          if (res.accounts) {
+            this.accounts = res.accounts.accounts || [];
+            this.activeAccount = res.accounts.active_account;
+            this.dispatchMode = res.accounts.dispatch_mode || 'manual';
+          }
+          const hasLoggedIn = this.accounts.some(a => a.logged_in);
+          if (!res.logged_in && !hasLoggedIn) { this.setupMode = 'login'; this.setupTitle = '需要登录即梦账号'; return; }
           this.setupMode = null;
           this.loggedIn = true;
           this.appStatus = 'ready';
@@ -392,6 +511,87 @@ function DreaminaApp() {
       this.startLogin();
     },
 
+    // === Account Management ===
+
+    async loadAccounts() {
+      const res = await api('/dreamina/api/accounts');
+      if (res?.ok) {
+        this.accounts = res.accounts || [];
+        this.activeAccount = res.active_account;
+        this.dispatchMode = res.dispatch_mode || 'manual';
+      }
+    },
+
+    async addAccount(name) {
+      const res = await api('/dreamina/api/accounts', 'POST', JSON.stringify({ name: name || '' }));
+      if (res?.ok) {
+        this.accounts.push(res.account);
+        if (!this.activeAccount) this.activeAccount = res.account.id;
+        this.loginAccount(res.account.id);
+      }
+    },
+
+    async loginAccount(accId) {
+      this.accountLoginId = accId;
+      const res = await api(`/dreamina/api/accounts/${accId}/login`, 'POST');
+      if (res?.auth_url) {
+        const acc = this.accounts.find(a => a.id === accId);
+        const name = acc?.name || accId;
+        this.accountLoginUrl = { id: accId, url: res.auth_url, name };
+      }
+      let elapsed = 0;
+      const poll = setInterval(async () => {
+        elapsed += 3;
+        if (elapsed > 120) { clearInterval(poll); this.accountLoginId = null; this.accountLoginUrl = null; return; }
+        const r = await api(`/dreamina/api/accounts/${accId}/login-poll`);
+        if (r?.logged_in) {
+          clearInterval(poll);
+          this.accountLoginId = null;
+          this.accountLoginUrl = null;
+          await this.loadAccounts();
+          if (!this.loggedIn) {
+            this.setupMode = null;
+            this.loggedIn = true;
+            this.appStatus = 'ready';
+            this.loadJobs();
+            this.loadHistory();
+            this.loadArchives();
+          }
+        }
+      }, 3000);
+    },
+
+    async logoutAccount(accId) {
+      await api(`/dreamina/api/accounts/${accId}/logout`, 'POST');
+      await this.loadAccounts();
+    },
+
+    async refreshAccount(accId) {
+      await api(`/dreamina/api/accounts/${accId}/refresh`, 'POST');
+      await this.loadAccounts();
+    },
+
+    async deleteAccount(accId) {
+      if (!confirm('确认删除该账号？')) return;
+      await api(`/dreamina/api/accounts/${accId}/delete`, 'POST');
+      await this.loadAccounts();
+    },
+
+    async setActiveAccount(accId) {
+      await api('/dreamina/api/accounts/active', 'POST', JSON.stringify({ account_id: accId }));
+      this.activeAccount = accId;
+    },
+
+    async setDispatchMode(mode) {
+      await api('/dreamina/api/dispatch-mode', 'POST', JSON.stringify({ mode }));
+      this.dispatchMode = mode;
+    },
+
+    getActiveAccountName() {
+      const acc = this.accounts.find(a => a.id === this.activeAccount);
+      return acc ? acc.name : '未选择';
+    },
+
     async updateCli() {
       this.setupMode = 'install';
       this.setupTitle = '更新中...';
@@ -400,7 +600,7 @@ function DreaminaApp() {
 
     async submit() {
       this.submitting = true;
-      const data = new FormData(this.$refs.form);
+      const data = new FormData(document.getElementById('dm-form'));
       data.set('mode', this.mode);
       const res = await api(`/dreamina/api/${this.mode}`, 'POST', data);
       if (!res || res.error) { this.submitting = false; alert(res?.error || '提交失败'); return; }
@@ -413,23 +613,69 @@ function DreaminaApp() {
       const el = document.getElementById('dm-jobsList');
       const card = document.createElement('div');
       card.className = 'result';
-      card.innerHTML = `<div class="meta">Job ${jobId.slice(0, 8)} - polling...</div>`;
+      const cardId = 'card-' + jobId.slice(0, 8);
+      card.id = cardId;
+      card.style.cssText = 'border-color:#4f46e5;background:#101828;color:#e2e8f0;grid-column:1/-1';
+      card.innerHTML = `<div class="meta">Job ${jobId.slice(0, 8)} - 提交中...</div>`;
       el.prepend(card);
       while (true) {
         const res = await api(`/dreamina/api/jobs/${jobId}`);
         if (!res) break;
         const job = res.job || res;
-        let html = `<div class="meta">${job.task_type || ''} · ${job.status || 'unknown'} · ${job.done || 0}/${job.total || 0}</div>`;
+        const events = (job.events || []).slice(-6).map(e => `<div style="font-size:11px;color:#d1e0ff;padding:2px 0"><span style="color:#697386">${escHtml(e.time)}</span> ${escHtml(e.message)}</div>`).join('');
+        let html = `<div class="meta" style="color:#818cf8;font-weight:600;margin-bottom:6px">${job.task_type || ''} · ${job.status || 'unknown'} · ${job.done || 0}/${job.total || 0}</div>`;
+        if (events) html += events;
+        else html += '<div style="color:#697386;font-size:11px">等待服务器响应...</div>';
         if (job.status === 'failed') html += `<div class="meta" style="color:#ef4444">${escHtml(job.error || '生成失败')}</div>`;
         const allFiles = [];
         for (const r of job.results || []) { if (r.files) allFiles.push(...r.files); }
         if (job.result?.files) allFiles.push(...job.result.files);
         html += this.renderFiles(allFiles);
         card.innerHTML = html;
-        if (['completed', 'failed'].includes(job.status)) break;
+        if (['completed', 'failed'].includes(job.status)) {
+          card.style.cssText = '';
+          card.id = '';
+          if (job.status === 'completed' && this.dirHandle && allFiles.length) {
+            await this.saveDreaminaToClient(allFiles);
+          } else if (job.status === 'completed' && this.autoDownload && allFiles.length) {
+            this.triggerDreaminaDownloads(allFiles);
+          }
+          break;
+        }
         await new Promise(r => setTimeout(r, 3000));
       }
       this.loadHistory();
+    },
+
+    async saveDreaminaToClient(files) {
+      try {
+        let saved = 0;
+        for (const f of files) {
+          const url = '/dreamina/' + f.replace(/^\//, '');
+          const filename = f.split('/').pop();
+          const resp = await fetch(url);
+          const blob = await resp.blob();
+          const fh = await this.dirHandle.getFileHandle(filename, { create: true });
+          const w = await fh.createWritable();
+          await w.write(blob);
+          await w.close();
+          saved++;
+        }
+        if (saved) this.statusText = `已保存 ${saved} 个文件到 ${this.outputDir}`;
+      } catch (e) {
+        console.warn('saveDreaminaToClient failed:', e);
+      }
+    },
+
+    triggerDreaminaDownloads(files) {
+      for (const f of files) {
+        const url = '/dreamina/' + f.replace(/^\//, '');
+        const filename = f.split('/').pop();
+        const a = document.createElement('a');
+        a.href = url; a.download = filename; a.style.display = 'none';
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      }
+      this.statusText = `已下载 ${files.length} 个文件`;
     },
 
     renderFiles(files) {
@@ -474,11 +720,24 @@ function DreaminaApp() {
           if (isVid) preview = `<video src="${thumb}" style="width:100%;max-height:120px;border-radius:5px;margin-top:4px" preload="metadata"></video>`;
           else preview = `<img src="${thumb}" style="width:100%;max-height:120px;object-fit:contain;border-radius:5px;margin-top:4px;cursor:zoom-in" onclick="event.stopPropagation();openPreview('image','${thumb}')">`;
         }
+        const logs = item.cli_logs || [];
+        const logId = 'cli-log-' + item.job_id;
+        let logSection = '';
+        if (logs.length) {
+          const logHtml = logs.map(l => {
+            const cmdDisp = escHtml(l.command || '');
+            const outDisp = escHtml((l.stdout || '').slice(0, 800));
+            const errDisp = l.stderr ? escHtml(l.stderr.slice(0, 300)) : '';
+            return `<div style="margin-bottom:6px"><div style="color:#a78bfa">$ ${cmdDisp}</div><div style="color:#6ee7b7">exitcode: ${l.returncode}</div>${outDisp ? `<div style="color:#e2e8f0;white-space:pre-wrap;word-break:break-all">${outDisp}</div>` : ''}${errDisp ? `<div style="color:#fca5a5">${errDisp}</div>` : ''}</div>`;
+          }).join('');
+          logSection = `<div style="margin-top:4px"><span class="meta" style="cursor:pointer;color:#818cf8;user-select:none" onclick="event.stopPropagation();var el=document.getElementById('${logId}');el.style.display=el.style.display==='none'?'block':'none'">CLI 详情 ▾</span><div id="${logId}" style="display:none;margin-top:4px;background:#1e1b2e;color:#e2e8f0;font-family:monospace;font-size:11px;padding:8px;border-radius:6px;max-height:240px;overflow:auto">${logHtml}</div></div>`;
+        }
         return `<div class="result" style="cursor:pointer" onclick="window._dmRestore('${item.job_id}')">
           <div class="meta"><span style="color:${statusColor}">${escHtml(status)}</span> · ${escHtml(item.task_type || '')} · ${escHtml((item.created_at || '').slice(5, 16))}</div>
           <div class="meta" style="margin-top:2px">${escHtml(prompt.slice(0, 60))}${prompt.length > 60 ? '...' : ''}</div>
           ${preview}
           ${files.length > 1 ? `<div class="meta" style="margin-top:2px">共 ${files.length} 个文件</div>` : ''}
+          ${logSection}
         </div>`;
       }).join('');
     },
@@ -498,7 +757,8 @@ function DreaminaApp() {
       }
       for (const [k, v] of Object.entries(params)) {
         if (k === 'mode') continue;
-        const el = this.$refs.form.elements[k];
+        if (k === 'output_dir') { this.outputDir = v; continue; }
+        const el = document.querySelector(`#dm-form [name="${k}"]`);
         if (el && el.type !== 'file') el.value = v || '';
       }
       this.wsTab = 'jobs';
@@ -506,13 +766,23 @@ function DreaminaApp() {
 
     async chooseOutputDir() {
       const res = await api('/dreamina/api/choose-output-dir', 'POST');
-      if (res?.path) this.outputDir = res.path;
+      if (res?.path) { this.outputDir = res.path; return; }
+      if (window.showDirectoryPicker) {
+        try {
+          this.dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+          this.outputDir = this.dirHandle.name;
+          return;
+        } catch (e) { /* user cancelled */ }
+      }
+      this.autoDownload = true;
+      this.outputDir = '浏览器下载';
     },
     async desktopOutput() {
       const res = await api('/dreamina/api/default-output-dir');
       if (res?.path) this.outputDir = res.path;
     },
     async openOutputDir() {
+      if (this.dirHandle && !this.outputDir.includes('/')) return;
       const data = new FormData(); data.set('output_dir', this.outputDir);
       await api('/dreamina/api/open-output-dir', 'POST', data);
     },
@@ -527,7 +797,7 @@ function DreaminaApp() {
     },
     async saveArchive() {
       if (!this.archiveName) return;
-      const data = new FormData(this.$refs.form);
+      const data = new FormData(document.getElementById('dm-form'));
       data.set('archive_name', this.archiveName);
       await api('/dreamina/api/preset', 'POST', data);
       this.loadArchives();
@@ -538,7 +808,7 @@ function DreaminaApp() {
       const res = await api('/dreamina/api/archive/load', 'POST', data);
       if (res?.values) {
         for (const [k, v] of Object.entries(res.values)) {
-          const el = this.$refs.form?.elements[k];
+          const el = document.querySelector(`#dm-form [name="${k}"]`);
           if (el && el.type !== 'file') el.value = v;
         }
       }

@@ -19,6 +19,7 @@ document.addEventListener('DOMContentLoaded', () => {
   bindFilter();
   bindPreview();
   bindArchive();
+  bindOutputDir();
   buildUploadSlots();
   buildMultiframeUI();
   bindMultiframeControls();
@@ -304,6 +305,8 @@ async function submitJob() {
     formData.append('model_version', $('#model_version').value);
     formData.append('repeat_count', $('#repeat_count').value);
     formData.append('concurrency', $('#concurrency').value);
+    formData.append('output_name', $('#outputName').value);
+    formData.append('output_dir', $('#outputDir').value);
 
     if (currentMode === 'image2image') {
       collectFiles(formData, '#imageRefs');
@@ -427,6 +430,18 @@ function renderJobCard(job) {
   if (job.status === 'completed') {
     templateBtn = `<div class="job-actions"><button class="btn-template" data-job="${job.job_id}">存为模板</button></div>`;
   }
+  let cliLogHtml = '';
+  const logs = job.cli_logs || [];
+  if (logs.length) {
+    const logId = 'cli-log-' + job.job_id;
+    const logBody = logs.map(l => {
+      const cmdDisp = escHtml(l.command || '');
+      const outDisp = escHtml((l.stdout || '').slice(0, 800));
+      const errDisp = l.stderr ? escHtml(l.stderr.slice(0, 300)) : '';
+      return `<div style="margin-bottom:6px"><div style="color:#a78bfa">$ ${cmdDisp}</div><div style="color:#6ee7b7">exitcode: ${l.returncode}</div>${outDisp ? `<div style="color:#e2e8f0;white-space:pre-wrap;word-break:break-all">${outDisp}</div>` : ''}${errDisp ? `<div style="color:#fca5a5">${errDisp}</div>` : ''}</div>`;
+    }).join('');
+    cliLogHtml = `<div style="margin-top:6px"><span style="cursor:pointer;color:#818cf8;user-select:none;font-size:12px" onclick="var el=document.getElementById('${logId}');el.style.display=el.style.display==='none'?'block':'none'">CLI 详情 ▾</span><div id="${logId}" style="display:none;margin-top:4px;background:#1e1b2e;color:#e2e8f0;font-family:monospace;font-size:11px;padding:8px;border-radius:6px;max-height:240px;overflow:auto">${logBody}</div></div>`;
+  }
   return `<div class="job-card">
     <div class="job-card-header">
       <span class="job-type">${typeLabel(job.task_type)}</span>
@@ -434,7 +449,7 @@ function renderJobCard(job) {
     </div>
     <div class="job-prompt">${escHtml(job.params?.prompt || '')}</div>
     <div class="job-time">${job.created_at || ''}</div>
-    ${progressHtml}${eventsHtml}${resultHtml}${errorHtml}${actionsHtml}${templateBtn}
+    ${progressHtml}${eventsHtml}${resultHtml}${errorHtml}${actionsHtml}${templateBtn}${cliLogHtml}
   </div>`;
 }
 
@@ -488,6 +503,24 @@ function bindFilter() {
       btn.classList.add('active');
       loadHistory();
     });
+  });
+}
+
+// === Output Dir ===
+function bindOutputDir() {
+  $('#chooseOutputBtn').addEventListener('click', async () => {
+    const res = await api('/api/choose-output-dir', 'POST');
+    if (res?.path) $('#outputDir').value = res.path;
+  });
+  $('#desktopOutputBtn').addEventListener('click', async () => {
+    const res = await api('/api/default-output-dir');
+    if (res?.path) $('#outputDir').value = res.path;
+  });
+  $('#openOutputBtn').addEventListener('click', async () => {
+    const dir = $('#outputDir').value.trim() || 'outputs';
+    await api('/api/open-output-dir', 'POST',
+      new URLSearchParams({ output_dir: dir }).toString(),
+      { 'Content-Type': 'application/x-www-form-urlencoded' });
   });
 }
 
@@ -633,13 +666,19 @@ function applyPreset(data) {
   if (values.model_version) $('#model_version').value = values.model_version;
   if (values.repeat_count) $('#repeat_count').value = values.repeat_count;
   if (values.concurrency) $('#concurrency').value = values.concurrency;
+  if (values.output_name) $('#outputName').value = values.output_name;
+  if (values.output_dir) $('#outputDir').value = values.output_dir;
 }
 
 // === Helpers ===
-async function api(url, method, body) {
+async function api(url, method, body, headers) {
   try {
     const opts = { method: method || 'GET' };
-    if (body) { opts.headers = { 'Content-Type': 'application/json' }; opts.body = JSON.stringify(body); }
+    if (body) {
+      if (typeof body === 'string') { opts.body = body; }
+      else { opts.headers = { 'Content-Type': 'application/json' }; opts.body = JSON.stringify(body); }
+    }
+    if (headers) Object.assign(opts.headers || (opts.headers = {}), headers);
     const res = await fetch(url, opts);
     return await res.json();
   } catch (e) { return { ok: false, error: e.message }; }

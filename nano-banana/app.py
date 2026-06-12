@@ -33,7 +33,7 @@ PRESET_PATH = STATE_DIR / "preset.json"
 ACTIVITY_PATH = STATE_DIR / "activity_log.json"
 ARCHIVE_DIR = ROOT / "archives"
 PROVIDERS_PATH = ROOT / "providers.json"
-DEFAULT_BASE_URL = "https://ai.t8star.cn"
+DEFAULT_BASE_URL = "https://ai.t8star.org"
 DEFAULT_CONFIG = Path.home() / "ComfyUI/custom_nodes/Comfyui-zhenzhen/Comflyapi.json"
 MAX_SEED = 2147483647
 
@@ -282,7 +282,7 @@ def media_item_to_file(field: str, item: Any) -> tuple[str, bytes] | None:
     if item.get("url"):
         url = str(item["url"])
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=180) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             blob = resp.read()
             mime = resp.headers.get_content_type() or mimetypes.guess_type(url)[0] or "image/png"
         if not blob:
@@ -312,7 +312,7 @@ def mask_key(key: str) -> str:
     return f"{key[:5]}...{key[-4:]}" if key and len(key) > 12 else ("***" if key else "")
 
 
-def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | None = None, timeout: int = 180) -> dict[str, Any]:
+def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | None = None, timeout: int = 600) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {api_key}"}
     data = None
     if body is not None:
@@ -326,6 +326,8 @@ def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | Non
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {exc.code}: {raw}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"API 请求超时或连接失败 ({exc.__class__.__name__}: {exc})") from exc
 
 
 def request_gemini_generate(url: str, api_key: str, payload: dict[str, Any], timeout: int = 300) -> dict[str, Any]:
@@ -414,7 +416,7 @@ def preset_for_client() -> dict[str, Any]:
 def copy_files_to_restore(values: dict[str, Any], files: dict[str, tuple[str, bytes]], prefix: str) -> dict[str, Any]:
     safe_values = {
         key: value for key, value in values.items()
-        if key not in {"api_key", "saved_media", "_auto_seed_base"}
+        if key not in {"saved_media", "_auto_seed_base"}
     }
     media: dict[str, Any] = {}
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -614,6 +616,7 @@ def choose_output_dir() -> str:
             check=True,
             capture_output=True,
             text=True,
+            timeout=60,
         )
         return result.stdout.strip().rstrip("/")
     if sys.platform.startswith("win"):
@@ -1168,7 +1171,12 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
         raise RuntimeError(f"No image result found: {final}")
     out_dir = resolve_output_dir(values.get("output_dir"))
     file_token_results = []
-    prefix = f"{time.strftime('%Y%m%d_%H%M%S')}_run{index}_{task_id}"
+    custom_name = values.get("output_name", "").strip()
+    if custom_name:
+        total = max(1, int(values.get("repeat_count") or 1), int(values.get("concurrency") or 1))
+        prefix = f"{custom_name}-{index}" if total > 1 else custom_name
+    else:
+        prefix = f"{time.strftime('%Y%m%d_%H%M%S')}_run{index}_{task_id}"
     for i, item in enumerate(items, 1):
         image_url, local_path = save_image_item(item, out_dir, prefix, i)
         token = uuid.uuid4().hex
@@ -1339,6 +1347,10 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.path == "/api/choose-output-dir":
+            client_ip = self.headers.get("X-Forwarded-For") or self.client_address[0]
+            if client_ip not in ("127.0.0.1", "::1", "localhost"):
+                json_response(self, 200, {"remote": True})
+                return
             try:
                 json_response(self, 200, {"path": choose_output_dir()})
             except Exception as exc:

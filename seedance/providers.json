@@ -5,7 +5,7 @@
   "providers": {
     "t8star": {
       "label": "T8Star 兼容接口",
-      "base_url": "https://ai.t8star.cn",
+      "base_url": "https://ai.t8star.org",
       "api_style": "t8star_seedance",
       "hint": "使用原有 T8Star 兼容接口，素材会先上传到 /v1/files。",
       "defaults": {

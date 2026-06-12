@@ -27,9 +27,11 @@ UPLOAD_DIR = ROOT / "uploads"
 LOG_DIR = ROOT / "logs"
 STATE_DIR = ROOT / "state"
 ARCHIVE_DIR = ROOT / "archives"
+ACCOUNTS_DIR = ROOT / "accounts"
 MEDIA_DIR = STATE_DIR / "media"
 PRESET_PATH = STATE_DIR / "preset.json"
 HISTORY_PATH = STATE_DIR / "history.json"
+ACCOUNTS_PATH = STATE_DIR / "accounts.json"
 CONFIG_PATH = ROOT / "config.json"
 
 APP_VERSION = "0.2.0"
@@ -64,7 +66,7 @@ def load_config() -> dict[str, Any]:
 
 
 def ensure_dirs():
-    for d in (OUTPUT_DIR, UPLOAD_DIR, LOG_DIR, STATE_DIR, ARCHIVE_DIR, MEDIA_DIR):
+    for d in (OUTPUT_DIR, UPLOAD_DIR, LOG_DIR, STATE_DIR, ARCHIVE_DIR, MEDIA_DIR, ACCOUNTS_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -90,10 +92,14 @@ def find_available_port(start: int) -> int:
     return start + 100
 
 
-def run_cmd(args: list[str], timeout: int = 30) -> dict[str, Any]:
+def run_cmd(args: list[str], timeout: int = 30, env_override: dict | None = None) -> dict[str, Any]:
     try:
+        env = None
+        if env_override:
+            env = os.environ.copy()
+            env.update(env_override)
         result = subprocess.run(
-            args, capture_output=True, text=True, timeout=timeout
+            args, capture_output=True, text=True, timeout=timeout, env=env
         )
         return {
             "returncode": result.returncode,
@@ -126,6 +132,159 @@ def check_login() -> dict[str, Any]:
         return {"logged_in": False, "credit": None, "raw": r["stdout"]}
 
 
+# === Accounts Module ===
+
+ROUND_ROBIN_INDEX = 0
+
+def load_accounts() -> dict[str, Any]:
+    if ACCOUNTS_PATH.exists():
+        try:
+            return json.loads(ACCOUNTS_PATH.read_text("utf-8"))
+        except Exception:
+            pass
+    return {"accounts": [], "active_account": None, "dispatch_mode": "manual"}
+
+
+def save_accounts(data: dict[str, Any]):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = ACCOUNTS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+    tmp.replace(ACCOUNTS_PATH)
+
+
+def get_account_home(account_id: str) -> Path:
+    return ACCOUNTS_DIR / account_id
+
+
+def ensure_account_home(account_id: str) -> Path:
+    home = get_account_home(account_id)
+    home.mkdir(parents=True, exist_ok=True)
+    # macOS: create isolated keychain so dreamina login creds don't conflict across accounts
+    if sys.platform == "darwin":
+        keychains_dir = home / "Library" / "Keychains"
+        keychain_file = keychains_dir / "login.keychain-db"
+        if not keychain_file.exists():
+            keychains_dir.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["security", "create-keychain", "-p", "", str(keychain_file)],
+                capture_output=True, timeout=10
+            )
+            subprocess.run(
+                ["security", "unlock-keychain", "-p", "", str(keychain_file)],
+                capture_output=True, timeout=10
+            )
+            subprocess.run(
+                ["security", "set-keychain-settings", str(keychain_file)],
+                capture_output=True, timeout=10
+            )
+            r = subprocess.run(
+                ["security", "list-keychains", "-d", "user"],
+                capture_output=True, text=True, timeout=10
+            )
+            existing = [l.strip().strip('"') for l in r.stdout.splitlines() if l.strip()]
+            existing.append(str(keychain_file))
+            subprocess.run(
+                ["security", "list-keychains", "-d", "user", "-s"] + existing,
+                capture_output=True, timeout=10
+            )
+    # Windows/Linux: dreamina stores session in $HOME/.dreamina_cli,
+    # get_account_env() sets HOME per-account for isolation
+    return home
+
+
+def get_account_env(account_id: str) -> dict[str, str] | None:
+    acc = get_account_by_id(account_id)
+    if acc and acc.get("is_system_home"):
+        return None
+    home = ensure_account_home(account_id)
+    return {"HOME": str(home)}
+
+
+def get_account_by_id(account_id: str) -> dict[str, Any] | None:
+    data = load_accounts()
+    for acc in data["accounts"]:
+        if acc["id"] == account_id:
+            return acc
+    return None
+
+
+def check_account_login(account_id: str) -> dict[str, Any]:
+    env = get_account_env(account_id)
+    return check_login_with_env(env)
+
+
+def check_login_with_env(env: dict | None = None) -> dict[str, Any]:
+    r = run_cmd(["dreamina", "user_credit"], timeout=15, env_override=env)
+    if r["returncode"] != 0:
+        return {"logged_in": False, "credit": None, "raw": r["stderr"]}
+    try:
+        data = json.loads(r["stdout"])
+        return {"logged_in": True, "credit": data}
+    except json.JSONDecodeError:
+        if "credit" in r["stdout"].lower() or "{" in r["stdout"]:
+            return {"logged_in": True, "credit": r["stdout"]}
+        return {"logged_in": False, "credit": None, "raw": r["stdout"]}
+
+
+def pick_account_for_job() -> dict[str, Any] | None:
+    global ROUND_ROBIN_INDEX
+    data = load_accounts()
+    accounts = data["accounts"]
+
+    # Only trust login status verified within the last 10 minutes;
+    # stale "logged_in" may mean the session expired without notice.
+    now = time.time()
+    max_staleness = 600  # 10 minutes
+    logged_in = [
+        a for a in accounts
+        if a.get("logged_in")
+        and (now - a.get("_login_verified_at", 0)) < max_staleness
+    ]
+    if not logged_in:
+        return None
+    mode = data.get("dispatch_mode", "manual")
+    if mode == "manual":
+        active_id = data.get("active_account")
+        for a in logged_in:
+            if a["id"] == active_id:
+                return a
+        return logged_in[0]
+    elif mode == "round_robin":
+        idx = ROUND_ROBIN_INDEX % len(logged_in)
+        ROUND_ROBIN_INDEX += 1
+        return logged_in[idx]
+    return logged_in[0]
+
+
+def migrate_default_account():
+    """First-run migration: if no accounts exist but ~/.dreamina_cli is logged in, create default account."""
+    data = load_accounts()
+    if data["accounts"]:
+        return
+    home = Path.home()
+    cli_dir = home / ".dreamina_cli"
+    if not cli_dir.exists():
+        return
+    status = check_login()
+    if not status.get("logged_in"):
+        return
+    acc_id = "acc_default"
+    acc = {
+        "id": acc_id,
+        "name": "默认账号",
+        "uid": None,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "home_dir": str(home),
+        "is_system_home": True,
+        "logged_in": True,
+        "credit": status.get("credit"),
+        "_login_verified_at": time.time(),
+    }
+    data["accounts"].append(acc)
+    data["active_account"] = acc_id
+    save_accounts(data)
+
+
 def read_history() -> list[dict[str, Any]]:
     if not HISTORY_PATH.exists():
         return []
@@ -155,6 +314,26 @@ def update_job_in_history(job_id: str, updates: dict[str, Any]):
     write_history(items)
 
 
+def parse_cli_json(stdout: str) -> dict[str, Any]:
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        pass
+    idx = stdout.find("\n{")
+    if idx >= 0:
+        try:
+            return json.loads(stdout[idx + 1:])
+        except json.JSONDecodeError:
+            pass
+    idx = stdout.rfind("{")
+    if idx >= 0:
+        try:
+            return json.loads(stdout[idx:])
+        except json.JSONDecodeError:
+            pass
+    return {"raw": stdout}
+
+
 def execute_task(job_id: str, task_type: str, args: list[str], params: dict[str, Any]):
     with LOCK:
         job = JOBS[job_id]
@@ -162,26 +341,53 @@ def execute_task(job_id: str, task_type: str, args: list[str], params: dict[str,
 
     total = job.get("total", 1)
     concurrency = job.get("concurrency", 1)
+    env_override = params.get("env_override")
 
     def add_event(msg: str):
         with LOCK:
             job["events"].append({"time": time.strftime("%H:%M:%S"), "message": msg})
 
+    def add_cli_log(cmd_args, result):
+        with LOCK:
+            if "cli_logs" not in job:
+                job["cli_logs"] = []
+            job["cli_logs"].append({
+                "time": time.strftime("%H:%M:%S"),
+                "command": " ".join(cmd_args),
+                "returncode": result["returncode"],
+                "stdout": result["stdout"][:2000],
+                "stderr": result["stderr"][:500],
+            })
+
     def run_one(index: int):
         add_event(f"子任务 {index}/{total} 开始")
-        result = run_cmd(args, timeout=params.get("timeout", 600))
+        max_retries = 10
+        retry_interval = 30
+        for attempt in range(max_retries):
+            result = run_cmd(args, timeout=params.get("timeout", 600), env_override=env_override)
+            add_cli_log(args, result)
+            stdout_text = result.get("stdout", "") + result.get("stderr", "")
+            if "ExceedConcurrencyLimit" in stdout_text or "ret=1310" in stdout_text:
+                add_event(f"子任务 {index}/{total} 并发限制，{retry_interval}秒后重试 ({attempt+1}/{max_retries})")
+                time.sleep(retry_interval)
+                continue
+            break
         with LOCK:
             job["done"] += 1
         if result["returncode"] == 0:
-            try:
-                data = json.loads(result["stdout"])
-            except json.JSONDecodeError:
-                data = {"raw": result["stdout"]}
+            data = parse_cli_json(result["stdout"])
+            if data.get("gen_status") == "fail":
+                reason = data.get("fail_reason") or "generation failed"
+                with LOCK:
+                    job["errors"].append(f"[{index}] {reason}")
+                add_event(f"子任务 {index}/{total} 失败: {reason[:80]}")
+                return
             submit_id = data.get("submit_id") or ""
             if submit_id:
                 dl = download_if_needed(submit_id, data, task_type, job_id,
                                         output_name=job.get("output_name", ""),
-                                        sub_index=index, total=total)
+                                        sub_index=index, total=total,
+                                        env_override=env_override)
                 if dl:
                     with LOCK:
                         job["results"].append(dl)
@@ -229,6 +435,7 @@ def execute_task(job_id: str, task_type: str, args: list[str], params: dict[str,
         "finished_at": final_job.get("finished_at"),
         "done": final_job.get("done"),
         "total": final_job.get("total"),
+        "cli_logs": final_job.get("cli_logs", []),
     })
 
 
@@ -321,7 +528,7 @@ def cleanup_cache(media_days: int = 30, log_days: int = 14) -> dict[str, Any]:
     return stats
 
 
-def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str, output_name: str = "", sub_index: int = 1, total: int = 1) -> dict | None:
+def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str, output_name: str = "", sub_index: int = 1, total: int = 1, env_override: dict | None = None) -> dict | None:
     if not submit_id:
         return None
     ts = time.strftime("%Y%m%d_%H%M%S")
@@ -338,11 +545,47 @@ def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str, 
         dl_dir = OUTPUT_DIR / f"{ts}_{task_type}_{short_id}"
     dl_dir.mkdir(parents=True, exist_ok=True)
 
-    r = run_cmd(["dreamina", "query_result", f"--submit_id={submit_id}", f"--download_dir={dl_dir}"], timeout=60)
-    if r["returncode"] == 0:
-        files = [str(f.relative_to(ROOT)) for f in dl_dir.iterdir() if f.is_file()]
-        return {"download_dir": str(dl_dir.relative_to(ROOT)), "files": files, "cli_output": r["stdout"]}
-    return {"download_dir": str(dl_dir.relative_to(ROOT)), "files": [], "cli_output": data}
+    cfg = load_config()
+    poll_timeout = cfg["poll_video"] if "video" in task_type else cfg["poll_image"]
+    deadline = time.time() + poll_timeout
+    interval = 10
+
+    while True:
+        r = run_cmd(["dreamina", "query_result", f"--submit_id={submit_id}",
+                     f"--download_dir={dl_dir}"], timeout=60, env_override=env_override)
+        if r["returncode"] != 0:
+            return {"download_dir": str(dl_dir.relative_to(ROOT)), "files": [],
+                    "error": r["stderr"] or "query_result failed"}
+
+        result_data = parse_cli_json(r["stdout"])
+        gs = result_data.get("gen_status", "")
+
+        if gs == "fail":
+            reason = result_data.get("fail_reason", "generation failed")
+            return {"download_dir": str(dl_dir.relative_to(ROOT)), "files": [],
+                    "error": reason, "gen_status": "fail"}
+
+        if gs != "querying":
+            files = [str(f.relative_to(ROOT)) for f in dl_dir.iterdir() if f.is_file()]
+            return {"download_dir": str(dl_dir.relative_to(ROOT)), "files": files,
+                    "cli_output": r["stdout"], "gen_status": gs}
+
+        # Report queue progress to job events
+        qi = result_data.get("queue_info", {})
+        with LOCK:
+            job = JOBS.get(job_id)
+            if job:
+                queue_msg = f"排队中"
+                if qi.get("queue_idx"):
+                    queue_msg += f" (第{qi['queue_idx']}位/共{qi.get('queue_length', '?')})"
+                job["events"].append({"time": time.strftime("%H:%M:%S"), "message": queue_msg})
+
+        if time.time() >= deadline:
+            return {"download_dir": str(dl_dir.relative_to(ROOT)), "files": [],
+                    "error": "poll timeout", "gen_status": "querying",
+                    "queue_info": qi}
+
+        time.sleep(interval)
 
 
 def json_response(handler, status: int, data: dict):
@@ -517,6 +760,11 @@ class Handler(SimpleHTTPRequestHandler):
             self.handle_env_check()
         elif path == "/api/env/login-poll":
             self.handle_login_poll()
+        elif path == "/api/accounts":
+            self.handle_accounts_list()
+        elif path.startswith("/api/accounts/") and path.endswith("/login-poll"):
+            acc_id = path.split("/api/accounts/")[1].split("/")[0]
+            self.handle_account_login_poll(acc_id)
         elif path == "/api/jobs":
             self.handle_jobs_list()
         elif path.startswith("/api/jobs/"):
@@ -566,6 +814,24 @@ class Handler(SimpleHTTPRequestHandler):
             self.handle_switch_account()
         elif path == "/api/env/update-cli":
             self.handle_install_cli()
+        elif path == "/api/accounts":
+            self.handle_account_create()
+        elif path.startswith("/api/accounts/") and path.endswith("/login"):
+            acc_id = path.split("/api/accounts/")[1].split("/")[0]
+            self.handle_account_login(acc_id)
+        elif path.startswith("/api/accounts/") and path.endswith("/logout"):
+            acc_id = path.split("/api/accounts/")[1].split("/")[0]
+            self.handle_account_logout(acc_id)
+        elif path.startswith("/api/accounts/") and path.endswith("/refresh"):
+            acc_id = path.split("/api/accounts/")[1].split("/")[0]
+            self.handle_account_refresh(acc_id)
+        elif path.startswith("/api/accounts/") and path.endswith("/delete"):
+            acc_id = path.split("/api/accounts/")[1].split("/")[0]
+            self.handle_account_delete(acc_id)
+        elif path == "/api/accounts/active":
+            self.handle_set_active_account()
+        elif path == "/api/dispatch-mode":
+            self.handle_set_dispatch_mode()
         elif path == "/api/text2image":
             self.handle_generate("text2image")
         elif path == "/api/image2image":
@@ -586,6 +852,10 @@ class Handler(SimpleHTTPRequestHandler):
         elif path == "/api/cache/clean":
             self.handle_cache_clean()
         elif path == "/api/choose-output-dir":
+            client_ip = self.headers.get("X-Forwarded-For") or self.client_address[0]
+            if client_ip not in ("127.0.0.1", "::1", "localhost"):
+                json_response(self, 200, {"remote": True})
+                return
             try:
                 json_response(self, 200, {"path": choose_output_dir()})
             except Exception as exc:
@@ -630,16 +900,188 @@ class Handler(SimpleHTTPRequestHandler):
     def handle_env_check(self):
         installed = check_cli_installed()
         login_info = check_login() if installed else {"logged_in": False, "credit": None}
+        accounts_data = load_accounts()
         json_response(self, 200, {
             "ok": True,
             "cli_installed": installed,
             "logged_in": login_info["logged_in"],
             "credit": login_info.get("credit"),
+            "accounts": accounts_data,
         })
 
     def handle_login_poll(self):
         info = check_login()
         json_response(self, 200, {"ok": True, **info})
+
+    # === Account Management Handlers ===
+
+    def handle_accounts_list(self):
+        data = load_accounts()
+        json_response(self, 200, {"ok": True, **data})
+
+    def handle_account_create(self):
+        body = read_json_body(self)
+        name = body.get("name", "").strip() or f"账号{len(load_accounts()['accounts']) + 1}"
+        acc_id = f"acc_{uuid.uuid4().hex[:8]}"
+        acc = {
+            "id": acc_id,
+            "name": name,
+            "uid": None,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "home_dir": str(get_account_home(acc_id)),
+            "is_system_home": False,
+            "logged_in": False,
+            "credit": None,
+        }
+        ensure_account_home(acc_id)
+        data = load_accounts()
+        data["accounts"].append(acc)
+        if not data["active_account"]:
+            data["active_account"] = acc_id
+        save_accounts(data)
+        json_response(self, 200, {"ok": True, "account": acc})
+
+    def handle_account_login(self, acc_id: str):
+        acc = get_account_by_id(acc_id)
+        if not acc:
+            json_response(self, 404, {"ok": False, "error": "account not found"})
+            return
+        env = get_account_env(acc_id)
+        global LOGIN_PROC
+        with LOGIN_LOCK:
+            if LOGIN_PROC and LOGIN_PROC.poll() is None:
+                json_response(self, 200, {"ok": True, "message": "login already in progress"})
+                return
+            try:
+                proc_env = os.environ.copy()
+                if env:
+                    proc_env.update(env)
+                LOGIN_PROC = subprocess.Popen(
+                    ["dreamina", "login"],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, start_new_session=True, env=proc_env,
+                )
+            except FileNotFoundError:
+                json_response(self, 400, {"ok": False, "error": "dreamina not found"})
+                return
+
+        cfg = load_config()
+        timeout = cfg.get("login_timeout", 120)
+        auth_url = ""
+
+        def read_output():
+            nonlocal auth_url
+            try:
+                for line in LOGIN_PROC.stdout:
+                    if "verification_uri:" in line:
+                        auth_url = line.split("verification_uri:", 1)[1].strip()
+                        break
+            except Exception:
+                pass
+
+        threading.Thread(target=read_output, daemon=True).start()
+
+        def kill_after_timeout():
+            time.sleep(timeout)
+            with LOGIN_LOCK:
+                if LOGIN_PROC and LOGIN_PROC.poll() is None:
+                    LOGIN_PROC.kill()
+
+        threading.Thread(target=kill_after_timeout, daemon=True).start()
+
+        time.sleep(2)
+        json_response(self, 200, {"ok": True, "message": "login started", "account_id": acc_id, "timeout": timeout, "auth_url": auth_url})
+
+    def handle_account_login_poll(self, acc_id: str):
+        acc = get_account_by_id(acc_id)
+        if not acc:
+            json_response(self, 404, {"ok": False, "error": "account not found"})
+            return
+        env = get_account_env(acc_id)
+        info = check_login_with_env(env)
+        if info["logged_in"]:
+            data = load_accounts()
+            for a in data["accounts"]:
+                if a["id"] == acc_id:
+                    a["logged_in"] = True
+                    a["credit"] = info.get("credit")
+                    a["_login_verified_at"] = time.time()
+                    break
+            save_accounts(data)
+        json_response(self, 200, {"ok": True, "account_id": acc_id, **info})
+
+    def handle_account_logout(self, acc_id: str):
+        acc = get_account_by_id(acc_id)
+        if not acc:
+            json_response(self, 404, {"ok": False, "error": "account not found"})
+            return
+        env = get_account_env(acc_id)
+        run_cmd(["dreamina", "logout"], timeout=10, env_override=env)
+        data = load_accounts()
+        for a in data["accounts"]:
+            if a["id"] == acc_id:
+                a["logged_in"] = False
+                a["credit"] = None
+                break
+        save_accounts(data)
+        json_response(self, 200, {"ok": True, "message": "logged out"})
+
+    def handle_account_refresh(self, acc_id: str):
+        acc = get_account_by_id(acc_id)
+        if not acc:
+            json_response(self, 404, {"ok": False, "error": "account not found"})
+            return
+        env = get_account_env(acc_id)
+        info = check_login_with_env(env)
+        data = load_accounts()
+        for a in data["accounts"]:
+            if a["id"] == acc_id:
+                a["logged_in"] = info["logged_in"]
+                a["credit"] = info.get("credit")
+                a["_login_verified_at"] = time.time()
+                break
+        save_accounts(data)
+        json_response(self, 200, {"ok": True, "account_id": acc_id, **info})
+
+    def handle_account_delete(self, acc_id: str):
+        acc = get_account_by_id(acc_id)
+        if not acc:
+            json_response(self, 404, {"ok": False, "error": "account not found"})
+            return
+        if acc.get("is_system_home"):
+            json_response(self, 400, {"ok": False, "error": "cannot delete system home account"})
+            return
+        home = get_account_home(acc_id)
+        if home.exists():
+            shutil.rmtree(home, ignore_errors=True)
+        data = load_accounts()
+        data["accounts"] = [a for a in data["accounts"] if a["id"] != acc_id]
+        if data["active_account"] == acc_id:
+            data["active_account"] = data["accounts"][0]["id"] if data["accounts"] else None
+        save_accounts(data)
+        json_response(self, 200, {"ok": True, "message": "account deleted"})
+
+    def handle_set_active_account(self):
+        body = read_json_body(self)
+        acc_id = body.get("account_id", "")
+        if not get_account_by_id(acc_id):
+            json_response(self, 404, {"ok": False, "error": "account not found"})
+            return
+        data = load_accounts()
+        data["active_account"] = acc_id
+        save_accounts(data)
+        json_response(self, 200, {"ok": True, "active_account": acc_id})
+
+    def handle_set_dispatch_mode(self):
+        body = read_json_body(self)
+        mode = body.get("mode", "manual")
+        if mode not in ("manual", "round_robin"):
+            json_response(self, 400, {"ok": False, "error": "invalid mode"})
+            return
+        data = load_accounts()
+        data["dispatch_mode"] = mode
+        save_accounts(data)
+        json_response(self, 200, {"ok": True, "dispatch_mode": mode})
 
     def handle_install_cli(self):
         self.send_response(200)
@@ -776,15 +1218,15 @@ class Handler(SimpleHTTPRequestHandler):
             files = {}
 
         prompt = fields.get("prompt", "")
-        if not prompt and task_type not in ("multimodal2video",):
+        if not prompt and task_type not in ("multimodal2video", "multiframe2video"):
             json_response(self, 400, {"ok": False, "error": "prompt is required"})
             return
 
         uploaded_paths = {}
         if files:
-            uploaded_paths["ref_image"] = save_uploaded_files(files, "ref_image_")
-            uploaded_paths["ref_video"] = save_uploaded_files(files, "ref_video_")
-            uploaded_paths["ref_audio"] = save_uploaded_files(files, "ref_audio_")
+            uploaded_paths["ref_image"] = save_uploaded_files(files, "ref_image_") + save_uploaded_files(files, "mm_image_")
+            uploaded_paths["ref_video"] = save_uploaded_files(files, "ref_video_") + save_uploaded_files(files, "mm_video_")
+            uploaded_paths["ref_audio"] = save_uploaded_files(files, "ref_audio_") + save_uploaded_files(files, "mm_audio_")
             uploaded_paths["first_frame"] = save_uploaded_files(files, "first_frame")
             uploaded_paths["last_frame"] = save_uploaded_files(files, "last_frame")
             uploaded_paths["frame_"] = save_uploaded_files(files, "frame_")
@@ -794,12 +1236,19 @@ class Handler(SimpleHTTPRequestHandler):
                     uploaded_paths["ref_image"] = legacy
 
         args = self.build_cli_args(task_type, fields, uploaded_paths, cfg)
-        poll_timeout = cfg["poll_video"] if "video" in task_type else cfg["poll_image"]
-        total_timeout = poll_timeout + 30
+        # Use poll timeout from config + 120s buffer for CLI command itself
+        is_video = "video" in task_type or "frame" in task_type
+        cli_timeout = max(120, cfg.get("poll_video" if is_video else "poll_image", 300))
 
         repeat_count = max(1, min(10, int(fields.get("repeat_count") or 1)))
-        concurrency_val = max(1, min(5, int(fields.get("concurrency") or 1)))
-        total = max(repeat_count, concurrency_val)
+        concurrency_val = 1  # Dreamina enforces per-account concurrency=1
+        total = repeat_count
+
+        # Store uploaded file paths as relative strings so retry can rebuild them
+        uploaded_paths_rel = {}
+        for k, paths in uploaded_paths.items():
+            if paths:
+                uploaded_paths_rel[k] = [str(p.relative_to(ROOT)) for p in paths]
 
         job_id = uuid.uuid4().hex
         job = {
@@ -815,6 +1264,7 @@ class Handler(SimpleHTTPRequestHandler):
             "results": [],
             "errors": [],
             "params": {k: v for k, v in fields.items()},
+            "uploaded_paths": uploaded_paths_rel,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "finished_at": None,
             "result": None,
@@ -826,47 +1276,53 @@ class Handler(SimpleHTTPRequestHandler):
             JOBS[job_id] = job
 
         record_job(job)
-        EXECUTOR.submit(execute_task, job_id, task_type, args, {"timeout": total_timeout})
 
-        json_response(self, 200, {"ok": True, "job_id": job_id})
+        account = pick_account_for_job()
+        env_override = get_account_env(account["id"]) if account else None
+        job["account_id"] = account["id"] if account else None
+
+        EXECUTOR.submit(execute_task, job_id, task_type, args, {"timeout": cli_timeout, "env_override": env_override})
+
+        json_response(self, 200, {"ok": True, "job_id": job_id, "account_id": job.get("account_id")})
 
     def build_cli_args(self, task_type: str, fields: dict, uploaded_paths: dict, cfg: dict) -> list[str]:
         prompt = fields.get("prompt", "")
         ratio = fields.get("ratio", "1:1")
         resolution = fields.get("resolution_type", "2k")
         duration = fields.get("duration", "5")
-        video_resolution = fields.get("video_resolution", "720P")
-        model_version = fields.get("model_version", "seedance2.0fast")
-        poll = cfg["poll_video"] if "video" in task_type else cfg["poll_image"]
+        video_resolution = fields.get("video_resolution", "720p").lower()
+        model_version = fields.get("model_version", "seedance2.0fast_vip")
 
         if task_type == "text2image":
-            return ["dreamina", "text2image", f"--prompt={prompt}", f"--ratio={ratio}", f"--resolution_type={resolution}", f"--poll={poll}"]
+            return ["dreamina", "text2image", f"--prompt={prompt}", f"--ratio={ratio}", f"--resolution_type={resolution}", "--poll=0"]
 
         elif task_type == "image2image":
             images = uploaded_paths.get("ref_image", [])
             img_str = ",".join(str(p) for p in images) if images else ""
-            return ["dreamina", "image2image", "--images", img_str, f"--prompt={prompt}", f"--ratio={ratio}", f"--resolution_type={resolution}", f"--poll={poll}"]
+            return ["dreamina", "image2image", "--images", img_str, f"--prompt={prompt}", f"--ratio={ratio}", f"--resolution_type={resolution}", "--poll=0"]
 
         elif task_type == "text2video":
-            return ["dreamina", "text2video", f"--prompt={prompt}", f"--duration={duration}", f"--ratio={ratio}", f"--video_resolution={video_resolution}", f"--poll={poll}"]
+            return ["dreamina", "text2video", f"--prompt={prompt}", f"--duration={duration}", f"--ratio={ratio}", f"--video_resolution={video_resolution}", f"--model_version={model_version}", "--poll=0"]
 
         elif task_type == "image2video":
             images = uploaded_paths.get("ref_image", [])
             img = str(images[0]) if images else ""
-            return ["dreamina", "image2video", "--image", img, f"--prompt={prompt}", f"--duration={duration}", f"--poll={poll}"]
+            return ["dreamina", "image2video", "--image", img, f"--prompt={prompt}", f"--duration={duration}", f"--video_resolution={video_resolution}", f"--model_version={model_version}", "--poll=0"]
 
         elif task_type == "frames2video":
             first_list = uploaded_paths.get("first_frame", [])
             last_list = uploaded_paths.get("last_frame", [])
             first = str(first_list[0]) if first_list else ""
             last = str(last_list[0]) if last_list else ""
-            args = ["dreamina", "frames2video", "--first", first, "--last", last, f"--prompt={prompt}", f"--duration={duration}", f"--video_resolution={video_resolution}", f"--poll={poll}"]
+            args = ["dreamina", "frames2video", "--first", first, "--last", last, f"--prompt={prompt}", f"--duration={duration}", f"--video_resolution={video_resolution}", "--poll=0"]
             if model_version:
                 args.append(f"--model_version={model_version}")
             return args
 
         elif task_type == "multimodal2video":
-            args = ["dreamina", "multimodal2video", f"--prompt={prompt}", f"--duration={duration}", f"--ratio={ratio}", f"--video_resolution={video_resolution}", f"--model_version={model_version}", f"--poll={poll}"]
+            args = ["dreamina", "multimodal2video", f"--duration={duration}", f"--ratio={ratio}", f"--video_resolution={video_resolution}", f"--model_version={model_version}", "--poll=0"]
+            if prompt:
+                args.append(f"--prompt={prompt}")
             for img in uploaded_paths.get("ref_image", []):
                 args.extend(["--image", str(img)])
             for vid in uploaded_paths.get("ref_video", []):
@@ -878,7 +1334,9 @@ class Handler(SimpleHTTPRequestHandler):
         elif task_type == "multiframe2video":
             frames = uploaded_paths.get("frame_", [])
             img_str = ",".join(str(p) for p in frames) if frames else ""
-            args = ["dreamina", "multiframe2video", "--images", img_str, f"--poll={poll}"]
+            args = ["dreamina", "multiframe2video", "--images", img_str, "--poll=0"]
+            if prompt:
+                args.extend(["--prompt", prompt])
             idx = 1
             while f"transition_prompt_{idx}" in fields:
                 args.extend(["--transition-prompt", fields[f"transition_prompt_{idx}"]])
@@ -904,15 +1362,54 @@ class Handler(SimpleHTTPRequestHandler):
         cfg = load_config()
         task_type = job["task_type"]
         fields = job.get("params", {})
-        args = self.build_cli_args(task_type, fields, None, cfg)
-        poll = cfg["poll_video"] if "video" in task_type else cfg["poll_image"]
+
+        # Rebuild uploaded_paths from stored relative paths; drop files that no longer exist
+        uploaded_paths: dict[str, list[Path]] = {}
+        missing_files: list[str] = []
+        saved = job.get("uploaded_paths") or {}
+        for key, rel_paths in saved.items():
+            resolved = []
+            for rel in rel_paths:
+                p = ROOT / rel
+                if p.is_file():
+                    resolved.append(p)
+                else:
+                    missing_files.append(rel)
+            if resolved:
+                uploaded_paths[key] = resolved
+
+        # Build CLI args with available files; build_cli_args handles empty lists gracefully
+        args = self.build_cli_args(task_type, fields, uploaded_paths, cfg)
+
+        is_video = "video" in task_type or "frame" in task_type
+        poll_timeout_s = cfg["poll_video"] if is_video else cfg["poll_image"]
+        cli_timeout = max(120, poll_timeout_s)
+
+        repeat_count = max(1, min(10, int(fields.get("repeat_count") or 1)))
+        concurrency_val = 1
+        total = repeat_count
+
+        # Convert resolved upload paths back to relative for the retry job record
+        uploaded_paths_rel = {}
+        for k, paths in uploaded_paths.items():
+            if paths:
+                uploaded_paths_rel[k] = [str(p.relative_to(ROOT)) for p in paths]
 
         new_job_id = uuid.uuid4().hex
         new_job = {
             "job_id": new_job_id,
             "task_type": task_type,
             "status": "pending",
+            "total": total,
+            "done": 0,
+            "concurrency": concurrency_val,
+            "output_name": fields.get("output_name", ""),
+            "client_ip": job.get("client_ip", ""),
+            "events": [],
+            "results": [],
+            "errors": [],
             "params": fields,
+            "uploaded_paths": uploaded_paths_rel,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "finished_at": None,
             "result": None,
@@ -922,8 +1419,23 @@ class Handler(SimpleHTTPRequestHandler):
         with LOCK:
             JOBS[new_job_id] = new_job
         record_job(new_job)
-        EXECUTOR.submit(execute_task, new_job_id, task_type, args, {"timeout": poll + 30})
-        json_response(self, 200, {"ok": True, "job_id": new_job_id})
+
+        account = pick_account_for_job()
+        env_override = get_account_env(account["id"]) if account else None
+        new_job["account_id"] = account["id"] if account else None
+
+        # Notify user when referenced files are gone (text-only modes still work)
+        if missing_files:
+            with LOCK:
+                new_job["events"].append({
+                    "time": time.strftime("%H:%M:%S"),
+                    "message": f"⚠ 部分素材已过期/丢失 ({len(missing_files)} 个)，仅使用可用素材重试",
+                })
+
+        EXECUTOR.submit(execute_task, new_job_id, task_type, args,
+                        {"timeout": cli_timeout, "env_override": env_override})
+        json_response(self, 200, {"ok": True, "job_id": new_job_id,
+                                   "missing_files": len(missing_files) if missing_files else 0})
 
     def handle_jobs_list(self):
         ip = self._client_ip()
@@ -1113,12 +1625,13 @@ def main():
     global EXECUTOR
     ensure_dirs()
     cleanup_old_uploads()
+    migrate_default_account()
 
     cfg = load_config()
     EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=cfg["max_concurrent"])
 
-    port = find_available_port(cfg["port"])
-    host = cfg.get("host", "127.0.0.1")
+    port = int(os.environ.get("PORT", 0)) or find_available_port(cfg["port"])
+    host = os.environ.get("HOST") or cfg.get("host", "127.0.0.1")
     server = ThreadingHTTPServer((host, port), Handler)
 
     url = f"http://127.0.0.1:{port}"
