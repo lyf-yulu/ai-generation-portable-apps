@@ -323,7 +323,9 @@ function GenApp(prefix, appPath, mediaType) {
           const el = document.querySelector(`[form="${formId}"][name="${name}"]`) || document.querySelector(`#${formId} [name="${name}"]`) || document.querySelector(`[name="${name}"]`);
           const drop = el?.closest('.drop');
           if (drop && item.url) {
-            showPreview(drop, name, item.url, item.filename);
+            // Backend returns /api/media/xxx, prefix with appPath for proxy routing
+            const mediaUrl = item.url.startsWith('/api/') ? `${appPath}${item.url}` : item.url;
+            showPreview(drop, name, mediaUrl, item.filename);
           }
         }
       } else {
@@ -368,7 +370,8 @@ function GenApp(prefix, appPath, mediaType) {
           const el = document.querySelector(`[form="${formId}"][name="${name}"]`) || document.querySelector(`#${formId} [name="${name}"]`) || document.querySelector(`[name="${name}"]`);
           const drop = el?.closest('.drop');
           if (drop && item.url) {
-            showPreview(drop, name, item.url, item.filename);
+            const mediaUrl = item.url.startsWith('/api/') ? `${appPath}${item.url}` : item.url;
+            showPreview(drop, name, mediaUrl, item.filename);
           }
         }
       }

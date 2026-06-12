@@ -43,6 +43,23 @@ FILES: dict[str, Path] = {}
 LOCK = threading.Lock()
 ACTIVITY_LIMIT = 300
 
+# ---- Client IP helpers ----
+
+def _client_ip(handler: SimpleHTTPRequestHandler) -> str:
+    xff = handler.headers.get("X-Forwarded-For", "").strip()
+    if xff:
+        ip = xff.split(",")[0].strip()
+        if ip:
+            return re.sub(r"[^0-9a-fA-F.:]+", "_", ip)
+    addr = handler.client_address[0] if handler.client_address else "127.0.0.1"
+    return re.sub(r"[^0-9a-fA-F.:]+", "_", addr)
+
+
+def _archive_dir_for(handler_or_ip: Any) -> Path:
+    if isinstance(handler_or_ip, str):
+        return ARCHIVE_DIR / handler_or_ip
+    return ARCHIVE_DIR / _client_ip(handler_or_ip)
+
 FILE_FIELDS = {f"image_{i}" for i in range(1, 15)}
 VALUE_FIELDS = {
     "api_key", "base_url", "output_dir", "provider", "mode", "model", "aspect_ratio", "image_size",
@@ -571,19 +588,24 @@ def safe_archive_name(raw: str) -> str:
     return name[:80] or time.strftime("nano_banana_%Y%m%d_%H%M%S")
 
 
-def archive_path(name: str) -> Path:
-    return ARCHIVE_DIR / f"{safe_archive_name(name)}.nanobanana"
+def archive_path(name: str, handler_or_ip: Any = None) -> Path:
+    if handler_or_ip is None:
+        return ARCHIVE_DIR / f"{safe_archive_name(name)}.nanobanana"
+    return _archive_dir_for(handler_or_ip) / f"{safe_archive_name(name)}.nanobanana"
 
 
-def list_archives() -> list[dict[str, Any]]:
+def list_archives(handler: SimpleHTTPRequestHandler | None = None) -> list[dict[str, Any]]:
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    dir_path = _archive_dir_for(handler) if handler else ARCHIVE_DIR
+    dir_path.mkdir(parents=True, exist_ok=True)
     return [{"name": p.stem, "filename": p.name, "size": p.stat().st_size, "updated_at": int(p.stat().st_mtime)}
-            for p in sorted(ARCHIVE_DIR.glob("*.nanobanana"), key=lambda x: x.stat().st_mtime, reverse=True)]
+            for p in sorted(dir_path.glob("*.nanobanana"), key=lambda x: x.stat().st_mtime, reverse=True)]
 
 
-def save_archive_file(name: str, preset: dict[str, Any]) -> Path:
-    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    path = archive_path(name)
+def save_archive_file(name: str, preset: dict[str, Any], handler: SimpleHTTPRequestHandler | None = None) -> Path:
+    dir_path = _archive_dir_for(handler) if handler else ARCHIVE_DIR
+    dir_path.mkdir(parents=True, exist_ok=True)
+    path = archive_path(name, handler)
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("preset.json", json.dumps(preset, ensure_ascii=False, indent=2))
         for _, item in preset.get("media", {}).items():
@@ -593,10 +615,17 @@ def save_archive_file(name: str, preset: dict[str, Any]) -> Path:
     return path
 
 
-def load_archive_file(name: str) -> dict[str, Any]:
-    path = archive_path(name)
+def load_archive_file(name: str, handler: SimpleHTTPRequestHandler | None = None) -> dict[str, Any]:
+    path = archive_path(name, handler)
+    migrated = False
     if not path.exists():
-        raise FileNotFoundError(f"Archive not found: {name}")
+        legacy = ARCHIVE_DIR / f"{safe_archive_name(name)}.nanobanana"
+        if legacy.exists():
+            path = legacy
+            if handler is not None:
+                migrated = True
+        else:
+            raise FileNotFoundError(f"Archive not found: {name}")
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "r") as zf:
         preset = json.loads(zf.read("preset.json").decode("utf-8"))
@@ -610,6 +639,8 @@ def load_archive_file(name: str) -> dict[str, Any]:
             (MEDIA_DIR / target_name).write_bytes(zf.read(archive_name))
             item["stored"] = target_name
     write_active_preset(preset)
+    if migrated and handler is not None:
+        save_archive_file(name, preset, handler)
     return preset_for_client()
 
 
@@ -1272,7 +1303,7 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, 200, preset_for_client())
             return
         if self.path == "/api/archives":
-            json_response(self, 200, {"archives": list_archives()})
+            json_response(self, 200, {"archives": list_archives(self)})
             return
         if self.path == "/api/schema":
             json_response(self, 200, api_schema())
@@ -1386,27 +1417,27 @@ class Handler(SimpleHTTPRequestHandler):
             preset = collect_preset_from_form(form)
             write_active_preset(preset)
             archive_name = get_field(form, "archive_name")
-            archive = save_archive_file(archive_name, preset).name if archive_name.strip() else None
+            archive = save_archive_file(archive_name, preset, self).name if archive_name.strip() else None
             data = preset_for_client()
             data["archive"] = archive
-            data["archives"] = list_archives()
+            data["archives"] = list_archives(self)
             json_response(self, 200, data)
             return
         if self.path == "/api/archive/load":
             form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
             try:
-                data = load_archive_file(get_field(form, "archive_name"))
-                data["archives"] = list_archives()
+                data = load_archive_file(get_field(form, "archive_name"), self)
+                data["archives"] = list_archives(self)
                 json_response(self, 200, data)
             except Exception as exc:
                 json_response(self, 400, {"error": str(exc)})
             return
         if self.path == "/api/archive/delete":
             form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
-            path = archive_path(get_field(form, "archive_name"))
+            path = archive_path(get_field(form, "archive_name"), self)
             if path.exists():
                 path.unlink()
-            json_response(self, 200, {"archives": list_archives()})
+            json_response(self, 200, {"archives": list_archives(self)})
             return
         if self.path == "/api/preset/clear":
             if STATE_DIR.exists():

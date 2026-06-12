@@ -43,6 +43,28 @@ FILES: dict[str, Path] = {}
 JOBS_LOCK = threading.Lock()
 ACTIVITY_LIMIT = 300
 
+# ---- Client IP helpers ----
+
+def _client_ip(handler: SimpleHTTPRequestHandler) -> str:
+    """Extract real client IP. Behind portal proxy, use X-Forwarded-For.
+    Otherwise use the direct connection address.
+    Returns a safe slug usable as a directory name."""
+    xff = handler.headers.get("X-Forwarded-For", "").strip()
+    if xff:
+        ip = xff.split(",")[0].strip()
+        if ip:
+            return re.sub(r"[^0-9a-fA-F.:]+", "_", ip)
+    addr = handler.client_address[0] if handler.client_address else "127.0.0.1"
+    return re.sub(r"[^0-9a-fA-F.:]+", "_", addr)
+
+def _archive_dir_for(handler_or_ip: Any) -> Path:
+    """Get the IP-scoped archive directory."""
+    if isinstance(handler_or_ip, str):
+        ip_slug = handler_or_ip
+    else:
+        ip_slug = _client_ip(handler_or_ip)
+    return ARCHIVE_DIR / ip_slug
+
 FILE_FIELDS = {
     "first_frame",
     "last_frame",
@@ -454,14 +476,37 @@ def safe_archive_name(raw: str) -> str:
     return name[:80] or time.strftime("seedance_%Y%m%d_%H%M%S")
 
 
-def archive_path(name: str) -> Path:
-    return ARCHIVE_DIR / f"{safe_archive_name(name)}.seedance"
+def archive_path(name: str, handler_or_ip: Any = None) -> Path:
+    if handler_or_ip is None:
+        dir_path = ARCHIVE_DIR
+    else:
+        dir_path = _archive_dir_for(handler_or_ip)
+    return dir_path / f"{safe_archive_name(name)}.seedance"
 
 
-def list_archives() -> list[dict[str, Any]]:
+def _all_archive_paths(name: str) -> list[Path]:
+    """Find all archive files matching name across all IP directories (for migration/cleanup)."""
+    clean = safe_archive_name(name)
+    results = []
+    if ARCHIVE_DIR.exists():
+        for ip_dir in ARCHIVE_DIR.iterdir():
+            if ip_dir.is_dir():
+                p = ip_dir / f"{clean}.seedance"
+                if p.exists():
+                    results.append(p)
+        # Also check legacy top-level archives
+        p = ARCHIVE_DIR / f"{clean}.seedance"
+        if p.exists():
+            results.append(p)
+    return results
+
+
+def list_archives(handler: SimpleHTTPRequestHandler | None = None) -> list[dict[str, Any]]:
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     items = []
-    for path in sorted(ARCHIVE_DIR.glob("*.seedance"), key=lambda p: p.stat().st_mtime, reverse=True):
+    dir_path = _archive_dir_for(handler) if handler else ARCHIVE_DIR
+    dir_path.mkdir(parents=True, exist_ok=True)
+    for path in sorted(dir_path.glob("*.seedance"), key=lambda p: p.stat().st_mtime, reverse=True):
         items.append(
             {
                 "name": path.stem,
@@ -527,9 +572,10 @@ def write_active_preset(preset: dict[str, Any]) -> None:
     PRESET_PATH.write_text(json.dumps(preset, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def save_archive_file(name: str, preset: dict[str, Any]) -> Path:
-    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    path = archive_path(name)
+def save_archive_file(name: str, preset: dict[str, Any], handler: SimpleHTTPRequestHandler | None = None) -> Path:
+    dir_path = _archive_dir_for(handler) if handler else ARCHIVE_DIR
+    dir_path.mkdir(parents=True, exist_ok=True)
+    path = archive_path(name, handler)
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("preset.json", json.dumps(preset, ensure_ascii=False, indent=2))
         for field, item in preset.get("media", {}).items():
@@ -540,10 +586,18 @@ def save_archive_file(name: str, preset: dict[str, Any]) -> Path:
     return path
 
 
-def load_archive_file(name: str) -> dict[str, Any]:
-    path = archive_path(name)
+def load_archive_file(name: str, handler: SimpleHTTPRequestHandler | None = None) -> dict[str, Any]:
+    path = archive_path(name, handler)
+    migrated = False
     if not path.exists():
-        raise FileNotFoundError(f"Archive not found: {name}")
+        # Fallback: try legacy top-level location, then migrate to IP-scoped
+        legacy = ARCHIVE_DIR / f"{safe_archive_name(name)}.seedance"
+        if legacy.exists():
+            path = legacy
+            if handler is not None:
+                migrated = True
+        else:
+            raise FileNotFoundError(f"Archive not found: {name}")
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "r") as zf:
         preset = json.loads(zf.read("preset.json").decode("utf-8"))
@@ -558,6 +612,9 @@ def load_archive_file(name: str) -> dict[str, Any]:
             target.write_bytes(zf.read(archive_name))
             item["stored"] = target_name
     write_active_preset(preset)
+    # Migrate legacy archive to IP-scoped directory on first load
+    if migrated and handler is not None:
+        save_archive_file(name, preset, handler)
     return preset_for_client()
 
 
@@ -1263,7 +1320,7 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, 200, preset_for_client())
             return
         if self.path == "/api/archives":
-            json_response(self, 200, {"archives": list_archives()})
+            json_response(self, 200, {"archives": list_archives(self)})
             return
         if self.path == "/api/schema":
             json_response(self, 200, api_schema())
@@ -1380,27 +1437,27 @@ class Handler(SimpleHTTPRequestHandler):
             archive_name = get_field(form, "archive_name")
             archive = None
             if archive_name.strip():
-                archive = save_archive_file(archive_name, preset).name
+                archive = save_archive_file(archive_name, preset, self).name
             response = preset_for_client()
             response["archive"] = archive
-            response["archives"] = list_archives()
+            response["archives"] = list_archives(self)
             json_response(self, 200, response)
             return
         if self.path == "/api/archive/load":
             form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
             try:
-                data = load_archive_file(get_field(form, "archive_name"))
-                data["archives"] = list_archives()
+                data = load_archive_file(get_field(form, "archive_name"), self)
+                data["archives"] = list_archives(self)
                 json_response(self, 200, data)
             except Exception as exc:
                 json_response(self, 400, {"error": str(exc)})
             return
         if self.path == "/api/archive/delete":
             form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
-            path = archive_path(get_field(form, "archive_name"))
+            path = archive_path(get_field(form, "archive_name"), self)
             if path.exists():
                 path.unlink()
-            json_response(self, 200, {"archives": list_archives()})
+            json_response(self, 200, {"archives": list_archives(self)})
             return
         if self.path == "/api/preset/clear":
             if STATE_DIR.exists():
