@@ -342,9 +342,14 @@ def media_item_to_file(field: str, item: Any) -> tuple[str, bytes] | None:
     if item.get("url"):
         url = str(item["url"])
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            blob = resp.read()
-            mime = resp.headers.get_content_type() or mimetypes.guess_type(url)[0] or "image/png"
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                blob = resp.read()
+                mime = resp.headers.get_content_type() or mimetypes.guess_type(url)[0] or "image/png"
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"参考素材下载失败 (HTTP {exc.code}): {url}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError(f"参考素材下载失败 (连接错误): {url} — {exc}") from exc
         if not blob:
             raise ValueError(f"media.{field} url returned empty content")
         return filename_from_media(field, item, mime), blob
@@ -424,7 +429,9 @@ def multipart_post(url: str, api_key: str, fields: dict[str, str], files: list[t
             return json.loads(resp.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code}: {raw}") from exc
+        raise RuntimeError(f"API 请求失败 (HTTP {exc.code}): {raw}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"API 请求超时或连接失败: {exc}") from exc
 
 
 def get_field(form: cgi.FieldStorage | dict[str, Any], name: str, default: str = "") -> str:
@@ -668,17 +675,20 @@ def save_archive_file(name: str, preset: dict[str, Any], ws_id: str = "localhost
 def load_archive_file(name: str, handler: SimpleHTTPRequestHandler | None = None) -> dict[str, Any]:
     ws = _workspace_id(handler) if handler else "localhost"
     path = archive_path(name, ws)
+    migrated = False
     if not path.exists():
         # Legacy fallback: try top-level + IP directories
         legacy = ARCHIVE_DIR / f"{safe_archive_name(name)}.nanobanana"
         if legacy.exists():
             path = legacy
+            migrated = True
         if not path.exists() and ARCHIVE_DIR.exists():
             for ip_dir in sorted(ARCHIVE_DIR.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True):
                 if ip_dir.is_dir():
                     p = ip_dir / f"{safe_archive_name(name)}.nanobanana"
                     if p.exists():
                         path = p
+                        migrated = True
                         break
         if not path.exists():
             raise FileNotFoundError(f"Archive not found: {name}")
@@ -966,9 +976,10 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
         "title": str(values.get("prompt") or "")[:80] or "Nano Banana task",
         "request": request_data,
         "response": response,
+        "workspace_id": ws_id,
         "restore": copy_files_to_restore(values, files, activity_id, ws_id),
     })
-    threading.Thread(target=run_job, args=(job_id, values, files, activity_id), daemon=True).start()
+    threading.Thread(target=run_job, args=(job_id, values, files, activity_id, ws_id), daemon=True).start()
     return job_id
 
 
@@ -987,8 +998,13 @@ def extract_items(result: dict[str, Any]) -> list[dict[str, Any]]:
 
 def download_url(url: str, out_path: Path) -> None:
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        out_path.write_bytes(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            out_path.write_bytes(resp.read())
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"生成结果下载失败 (HTTP {exc.code}): {url[:120]}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"生成结果下载失败 (连接错误): {url[:120]} — {exc}") from exc
 
 
 def save_image_item(item: dict[str, Any], out_dir: Path, prefix: str, idx: int) -> tuple[str, str]:
@@ -1297,7 +1313,7 @@ def run_job(job_id: str, values: dict[str, Any], files: dict[str, tuple[str, byt
         set_job(job_id, status="running", total=count, done=0, results=[], errors=[])
         add_event(job_id, f"Started {count} run(s), concurrency {concurrency}, key {mask_key(values.get('api_key', ''))}")
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = [pool.submit(run_one, job_id, i, values, files) for i in range(1, count + 1)]
+            futures = [pool.submit(run_one, job_id, i, values, files, ws_id) for i in range(1, count + 1)]
             for future in concurrent.futures.as_completed(futures):
                 try:
                     result = future.result()

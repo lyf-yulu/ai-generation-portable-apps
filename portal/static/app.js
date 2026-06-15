@@ -267,27 +267,36 @@ function GenApp(prefix, appPath, mediaType) {
     async chooseOutputDir() {
       // 1. 后端系统原生目录选择器 — 返回真实路径，支持"打开目录"
       const res = await api(`${appPath}/api/choose-output-dir`, 'POST');
-      if (res?.path) { this.outputDir = res.path; return; }
-      // 2. 浏览器 File System Access API（Chrome, 不带真实路径, 不支持打开目录）
+      if (res?.path) { this.outputDir = res.path; this.dirHandle = null; return; }
+      // 2. 浏览器 File System Access API（需 HTTPS 安全上下文）
       if (window.showDirectoryPicker) {
         try {
           this.dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
           this.outputDir = this.dirHandle.name;
+          this.statusText = `已选择: ${this.outputDir}`;
           return;
         } catch (e) { /* user cancelled */ }
       }
       // 3. 兜底：浏览器下载
       this.autoDownload = true;
       this.outputDir = '浏览器下载';
+      if (res?.remote && !window.isSecureContext) {
+        this.statusText = '提示：HTTPS 访问可启用目录选择功能';
+      }
     },
     async desktopOutput() {
       const res = await api(`${appPath}/api/default-output-dir`);
       if (res?.path) this.outputDir = res.path;
     },
     async openOutputDir() {
-      if (this.dirHandle && !this.outputDir.includes('/')) return;  // FSA API 无真实路径，无法打开
+      // FSA: 无真实路径，浏览器安全模型限制无法打开系统文件管理器
+      if (this.dirHandle && !this.outputDir.includes('/')) {
+        this.statusText = `文件将保存到 "${this.outputDir}"（浏览器限制无法代为打开）`;
+        return;
+      }
       const data = new FormData(); data.set('output_dir', this.outputDir);
-      await api(`${appPath}/api/open-output-dir`, 'POST', data);
+      const res = await api(`${appPath}/api/open-output-dir`, 'POST', data);
+      if (res?.remote) this.statusText = '远程客户端不支持打开服务端目录';
     },
     async cleanCache() {
       const res = await api(`${appPath}/api/cleanup-cache`, 'POST');
@@ -807,25 +816,34 @@ function DreaminaApp() {
 
     async chooseOutputDir() {
       const res = await api('/dreamina/api/choose-output-dir', 'POST');
-      if (res?.path) { this.outputDir = res.path; return; }
+      if (res?.path) { this.outputDir = res.path; this.dirHandle = null; return; }
       if (window.showDirectoryPicker) {
         try {
           this.dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
           this.outputDir = this.dirHandle.name;
+          this.statusText = `已选择: ${this.outputDir}`;
           return;
         } catch (e) { /* user cancelled */ }
       }
       this.autoDownload = true;
       this.outputDir = '浏览器下载';
+      if (res?.remote && !window.isSecureContext) {
+        this.statusText = '提示：HTTPS 访问可启用目录选择功能';
+      }
     },
     async desktopOutput() {
       const res = await api('/dreamina/api/default-output-dir');
       if (res?.path) this.outputDir = res.path;
     },
     async openOutputDir() {
-      if (this.dirHandle && !this.outputDir.includes('/')) return;
+      if (this.dirHandle && !this.outputDir.includes('/')) {
+        this.statusText = `文件将保存到 "${this.outputDir}"（浏览器限制无法代为打开）`;
+        return;
+      }
       const data = new FormData(); data.set('output_dir', this.outputDir);
-      await api('/dreamina/api/open-output-dir', 'POST', data);
+      const res = await api('/dreamina/api/open-output-dir', 'POST', data);
+      if (res?.remote) this.statusText = '远程客户端不支持打开服务端目录';
+    },
     },
     async cleanCache() {
       const res = await api('/dreamina/api/cleanup-cache', 'POST');

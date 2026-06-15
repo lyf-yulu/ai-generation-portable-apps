@@ -399,9 +399,14 @@ def media_item_to_file(field: str, item: Any) -> tuple[str, bytes] | None:
             url,
             headers={"User-Agent": "Mozilla/5.0"},
         )
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            blob = resp.read()
-            mime = resp.headers.get_content_type() or mimetypes.guess_type(url)[0] or "application/octet-stream"
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                blob = resp.read()
+                mime = resp.headers.get_content_type() or mimetypes.guess_type(url)[0] or "application/octet-stream"
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"参考素材下载失败 (HTTP {exc.code}): {url}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError(f"参考素材下载失败 (连接错误): {url} — {exc}") from exc
         if not blob:
             raise ValueError(f"media.{field} url returned empty content")
         return filename_from_media(field, item, mime), blob
@@ -762,8 +767,13 @@ def upload_file(upload_url: str, api_key: str, blob: bytes, filename: str, conte
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"文件上传失败 (HTTP {exc.code})") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"文件上传失败 (连接错误): {exc}") from exc
     if data.get("url"):
         return {"url": str(data["url"])}
     if data.get("id"):
@@ -821,8 +831,13 @@ def download_video(url: str, out_path: Path) -> None:
             )
         },
     )
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        out_path.write_bytes(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            out_path.write_bytes(resp.read())
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"视频下载失败 (HTTP {exc.code}): {url[:120]}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"视频下载失败 (连接错误): {url[:120]} — {exc}") from exc
 
 
 def set_job(job_id: str, **updates: Any) -> None:

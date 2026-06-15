@@ -23,6 +23,7 @@ let currentMajor = 'image';
 let currentMode = 'text2image';
 let frameCount = 2;
 let pollTimers = {};
+let dirHandle = null;  // File System Access API handle
 
 // === Init ===
 document.addEventListener('DOMContentLoaded', () => {
@@ -35,6 +36,7 @@ document.addEventListener('DOMContentLoaded', () => {
   bindPreview();
   bindArchive();
   bindOutputDir();
+  bindAccounts();
   buildUploadSlots();
   buildMultiframeUI();
   bindMultiframeControls();
@@ -68,7 +70,7 @@ async function installCli() {
   $('#setupLog').classList.remove('hidden');
   $('#setupSpinner').classList.remove('hidden');
   $('#setupLog').textContent = '';
-  const response = await fetch('/api/env/install-cli', { method: 'POST' });
+  const response = await apiFetch('/api/env/install-cli', { method: 'POST' });
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -130,6 +132,8 @@ function enterMain(envData) {
   $('#setupView').classList.add('hidden');
   $('#mainView').classList.remove('hidden');
   updateStatus(envData);
+  renderAccounts(envData.accounts || null);
+  loadAccounts();
   loadJobs();
   loadHistory();
 }
@@ -525,17 +529,32 @@ function bindFilter() {
 function bindOutputDir() {
   $('#chooseOutputBtn').addEventListener('click', async () => {
     const res = await api('/api/choose-output-dir', 'POST');
-    if (res?.path) $('#outputDir').value = res.path;
+    if (res?.path) { $('#outputDir').value = res.path; return; }
+    if (res?.remote) {
+      // 远程客户端：尝试浏览器 File System Access API
+      if (window.showDirectoryPicker) {
+        try {
+          const dh = await window.showDirectoryPicker({ mode: 'readwrite' });
+          dirHandle = dh;
+          $('#outputDir').value = dh.name;
+          return;
+        } catch (e) { /* cancelled */ }
+      }
+      alert('远程客户端不支持服务端目录选择。\n请将文件下载到本地后手动管理。');
+      return;
+    }
   });
   $('#desktopOutputBtn').addEventListener('click', async () => {
     const res = await api('/api/default-output-dir');
     if (res?.path) $('#outputDir').value = res.path;
   });
   $('#openOutputBtn').addEventListener('click', async () => {
+    if (dirHandle) { alert(`文件将保存到 "${$('#outputDir').value.trim()}" 目录`); return; }
     const dir = $('#outputDir').value.trim() || 'outputs';
-    await api('/api/open-output-dir', 'POST',
+    const res = await api('/api/open-output-dir', 'POST',
       new URLSearchParams({ output_dir: dir }).toString(),
       { 'Content-Type': 'application/x-www-form-urlencoded' });
+    if (res?.remote) alert('远程客户端不支持打开服务端目录');
   });
 }
 
@@ -581,7 +600,7 @@ function bindTopbar() {
     $('#setupLog').classList.remove('hidden');
     $('#setupSpinner').classList.remove('hidden');
     $('#setupLog').textContent = '';
-    const response = await fetch('/api/env/update-cli', { method: 'POST' });
+    const response = await apiFetch('/api/env/update-cli', { method: 'POST' });
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -604,6 +623,151 @@ function bindTopbar() {
       }
     }
   });
+}
+
+// === Accounts ===
+function bindAccounts() {
+  $('#repairAllAccountsBtn')?.addEventListener('click', async () => {
+    const btn = $('#repairAllAccountsBtn');
+    btn.disabled = true;
+    btn.textContent = '体检中';
+    const res = await api('/api/accounts/repair-all', 'POST');
+    btn.disabled = false;
+    btn.textContent = '体检全部';
+    if (res && res.ok) renderAccounts(res.accounts);
+    else alert(res?.error || '账号体检失败');
+  });
+}
+
+async function loadAccounts() {
+  const res = await api('/api/accounts');
+  if (res && res.ok) renderAccounts(res);
+}
+
+function renderAccounts(data) {
+  const list = $('#accountList');
+  if (!list || !data) return;
+  const accounts = Array.isArray(data.accounts) ? data.accounts : (data.accounts?.accounts || []);
+  const active = data.active_account || data.accounts?.active_account;
+  if (!accounts.length) {
+    list.innerHTML = '<div class="account-empty">暂无账号</div>';
+    return;
+  }
+  list.innerHTML = accounts.map(acc => {
+    const state = accountState(acc);
+    const credit = accountCreditText(acc);
+    const detail = acc.last_error_detail ? escHtml(String(acc.last_error_detail).slice(0, 96)) : '';
+    const activeMark = acc.id === active ? '<span class="account-active">当前</span>' : '';
+    const loginBtn = !acc.is_system_home && !acc.logged_in
+      ? `<button type="button" class="btn-small account-login" data-account-id="${escHtml(acc.id)}">登录</button>`
+      : '';
+    const activateBtn = acc.logged_in && acc.id !== active
+      ? `<button type="button" class="btn-small account-activate" data-account-id="${escHtml(acc.id)}">设为当前</button>`
+      : '';
+    return `
+      <div class="account-row ${state.className}">
+        <div class="account-main">
+          <div class="account-title">
+            <span>${escHtml(acc.name || acc.id)}</span>
+            ${activeMark}
+          </div>
+          <div class="account-meta">${escHtml(credit)}</div>
+          ${detail ? `<div class="account-error">${detail}</div>` : ''}
+        </div>
+        <div class="account-actions">
+          <span class="account-status">${state.label}</span>
+          <button type="button" class="btn-small account-check" data-account-id="${escHtml(acc.id)}">检查</button>
+          ${loginBtn}
+          ${activateBtn}
+        </div>
+      </div>`;
+  }).join('');
+  $$('.account-check').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      btn.textContent = '检查中';
+      const id = btn.dataset.accountId;
+      const res = await api(`/api/accounts/${encodeURIComponent(id)}/refresh`, 'POST');
+      btn.disabled = false;
+      btn.textContent = '检查';
+      if (res && res.ok) loadAccounts();
+      else alert(res?.error || '检查失败');
+    });
+  });
+  $$('.account-login').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      btn.textContent = '登录中';
+      const id = btn.dataset.accountId;
+      const res = await api(`/api/accounts/${encodeURIComponent(id)}/login`, 'POST');
+      if (res && res.auth_url) window.open(res.auth_url, '_blank');
+      if (!res || !res.ok) {
+        btn.disabled = false;
+        btn.textContent = '登录';
+        alert(res?.error || '登录启动失败');
+        return;
+      }
+      pollAccountLogin(id, btn);
+    });
+  });
+  $$('.account-activate').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      const id = btn.dataset.accountId;
+      const res = await api('/api/accounts/active', 'POST', { account_id: id });
+      btn.disabled = false;
+      if (res && res.ok) loadAccounts();
+      else alert(res?.error || '切换当前账号失败');
+    });
+  });
+}
+
+function pollAccountLogin(id, btn) {
+  let elapsed = 0;
+  const timer = setInterval(async () => {
+    elapsed += 3;
+    const res = await api(`/api/accounts/${encodeURIComponent(id)}/login-poll`);
+    if (res && res.logged_in) {
+      clearInterval(timer);
+      btn.disabled = false;
+      btn.textContent = '登录';
+      loadAccounts();
+    } else if (elapsed >= 120) {
+      clearInterval(timer);
+      btn.disabled = false;
+      btn.textContent = '登录';
+      loadAccounts();
+      alert('账号登录超时，请重新发起登录');
+    }
+  }, 3000);
+}
+
+function accountState(acc) {
+  if (acc.logged_in && !acc.quarantined && !acc.last_error_code) return { label: '在线', className: 'online' };
+  if (acc.last_error_code === 'timeout') return { label: '超时', className: 'timeout' };
+  if (acc.last_error_code === 'not_logged_in') return { label: '需登录', className: 'need-login' };
+  if (acc.last_error_code === 'missing_keychain' || acc.last_error_code === 'keychain_recovery_failed') {
+    return { label: '需修复', className: 'need-repair' };
+  }
+  if (acc.last_error_code) return { label: '异常', className: 'error' };
+  return { label: acc.logged_in ? '在线' : '未知', className: acc.logged_in ? 'online' : 'unknown' };
+}
+
+function accountCreditText(acc) {
+  if (acc.credit && typeof acc.credit === 'object') {
+    const uid = acc.credit.user_id || acc.uid || '';
+    const total = acc.credit.total_credit;
+    return [uid ? `ID ${uid}` : '', total !== undefined ? `余额 ${total}` : ''].filter(Boolean).join(' · ') || '已登录';
+  }
+  if (acc.credit) return String(acc.credit).slice(0, 80);
+  if (acc.last_check_at) return `上次检查 ${formatTime(acc.last_check_at)}`;
+  return acc.is_system_home ? '系统共享账号' : '未检查';
+}
+
+function formatTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
 // === Preview Dialog ===
@@ -632,7 +796,7 @@ function bindArchive() {
     if (!name) { alert('请输入存档名称'); return; }
     const formData = new FormData($('#genForm'));
     formData.append('archive_name', name);
-    const response = await fetch('/api/preset', { method: 'POST', body: formData });
+    const response = await apiFetch('/api/preset', { method: 'POST', body: formData });
     const res = await response.json();
     if (res.ok) { refreshArchiveList(); $('#archiveName').value = ''; }
     else alert(res.error || '保存失败');
@@ -694,7 +858,7 @@ async function api(url, method, body, headers) {
       else { opts.headers = { 'Content-Type': 'application/json' }; opts.body = JSON.stringify(body); }
     }
     if (headers) Object.assign(opts.headers || (opts.headers = {}), headers);
-    const res = await fetch(url, opts);
+    const res = await apiFetch(url, opts);
     return await res.json();
   } catch (e) { return { ok: false, error: e.message }; }
 }
@@ -710,7 +874,7 @@ function statusLabel(s) {
 }
 
 function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 })();

@@ -36,6 +36,34 @@ APPS = {
 }
 
 PORTAL_PORT = 9090
+REDIRECT_PORT = 9089  # fallback HTTP-only redirect, kept for compatibility
+
+
+class DualProtocolServer(ThreadingHTTPServer):
+    """Handle both TLS and plain HTTP on the same port.
+    Detects TLS ClientHello (0x16) and wraps accordingly; plain HTTP
+    connections are flagged so the handler can 301-redirect to HTTPS."""
+
+    ssl_context: ssl.SSLContext | None = None
+
+    def get_request(self):
+        while True:
+            sock, addr = super().get_request()
+            sock.settimeout(5)
+            if self.ssl_context:
+                try:
+                    first = sock.recv(1, socket.MSG_PEEK)
+                    if first and len(first) == 1 and first[0] == 0x16:
+                        try:
+                            tls = self.ssl_context.wrap_socket(sock, server_side=True)
+                            return tls, addr
+                        except ssl.SSLError:
+                            sock.close()
+                            continue
+                except (socket.timeout, ConnectionError, OSError):
+                    pass
+            sock.settimeout(None)
+            return sock, addr
 
 
 def get_lan_ip() -> str:
@@ -114,6 +142,7 @@ def ensure_certs(cert_dir: Path) -> tuple[Path, Path] | None:
 class AppManager:
     def __init__(self):
         self.processes: dict[str, subprocess.Popen] = {}
+        self.log_handles: dict[str, Any] = {}
         self.status: dict[str, dict[str, Any]] = {}
         self._stop_event = threading.Event()
 
@@ -131,14 +160,29 @@ class AppManager:
         env["PORT"] = str(config["port"])
         env["HOST"] = "127.0.0.1"
         env["CORS"] = "1"
-        proc = subprocess.Popen(
-            [sys.executable, "app.py"],
-            cwd=str(app_dir),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            **_POPEN_EXTRA,
-        )
+        old_log = self.log_handles.pop(name, None)
+        if old_log:
+            try:
+                old_log.close()
+            except Exception:
+                pass
+        log_dir = STATE_DIR / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = (log_dir / f"{name}.log").open("ab", buffering=0)
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "app.py"],
+                cwd=str(app_dir),
+                env=env,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                **_POPEN_EXTRA,
+            )
+        except Exception as exc:
+            log_file.close()
+            self.status[name] = {"status": "crashed", "error": str(exc), "port": config["port"]}
+            return
+        self.log_handles[name] = log_file
         self.processes[name] = proc
         self.status[name] = {"status": "starting", "port": config["port"], "pid": proc.pid}
 
@@ -177,6 +221,12 @@ class AppManager:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        for handle in self.log_handles.values():
+            try:
+                handle.close()
+            except Exception:
+                pass
+        self.log_handles.clear()
 
 
 class UsageTracker:
@@ -293,6 +343,48 @@ tracker = UsageTracker()
 class Handler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
+
+    def handle(self):
+        """Detect plain-HTTP on a TLS-enabled server and redirect to HTTPS."""
+        if not isinstance(self.connection, ssl.SSLSocket) and getattr(self.server, "ssl_context", None):
+            self._redirect_https()
+            return
+        super().handle()
+
+    def _redirect_https(self):
+        try:
+            raw = self.rfile.readline(65537)
+            if not raw:
+                return
+            line = raw.decode("utf-8", errors="replace").strip()
+            parts = line.split()
+            if len(parts) < 2:
+                return
+            path = parts[1]
+            host = ""
+            while True:
+                hdr = self.rfile.readline(65537)
+                if not hdr or hdr in (b"\r\n", b"\n", b"\r"):
+                    break
+                decoded = hdr.decode("utf-8", errors="replace")
+                if decoded.lower().startswith("host:"):
+                    host = decoded.split(":", 1)[1].strip().rsplit(":", 1)[0]
+            target = host or get_lan_ip()
+            location = f"https://{target}:{PORTAL_PORT}{path}"
+            body = (
+                f'<!DOCTYPE html><meta charset="utf-8">'
+                f'<meta http-equiv="refresh" content="0;url={location}">'
+                f'<p>Redirecting to <a href="{location}">HTTPS</a>…</p>'
+            ).encode("utf-8")
+            self.send_response(301)
+            self.send_header("Location", location)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception:
+            pass
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
@@ -449,22 +541,17 @@ class Handler(SimpleHTTPRequestHandler):
 def main():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("Starting sub-applications...")
-    manager.start_all()
-    time.sleep(2)
-
     lan_ip = get_lan_ip()
     certs = ensure_certs(ROOT / "certs")
 
-    server = ThreadingHTTPServer(("0.0.0.0", PORTAL_PORT), Handler)
+    server = DualProtocolServer(("0.0.0.0", PORTAL_PORT), Handler)
+    redirect_server = None
 
     if certs:
         cert_file, key_file = certs
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(str(cert_file), str(key_file))
-        server.socket = ctx.wrap_socket(server.socket, server_side=True)
-
-        http_port = PORTAL_PORT - 1
+        server.ssl_context = ctx
 
         class RedirectHandler(SimpleHTTPRequestHandler):
             def log_message(self, format, *args):
@@ -474,18 +561,20 @@ def main():
                 host = self.headers.get("Host", "").split(":")[0] or lan_ip
                 self.send_response(301)
                 self.send_header("Location", f"https://{host}:{PORTAL_PORT}{self.path}")
+                self.send_header("Connection", "close")
                 self.end_headers()
 
             do_POST = do_GET
             do_OPTIONS = do_GET
 
-        redirect_server = ThreadingHTTPServer(("0.0.0.0", http_port), RedirectHandler)
-        threading.Thread(target=redirect_server.serve_forever, daemon=True).start()
+        redirect_server = ThreadingHTTPServer(("0.0.0.0", REDIRECT_PORT), RedirectHandler)
 
-        print(f"\n  AI Generation Portal running (HTTPS):")
+        print(f"\n  AI Generation Portal running (HTTPS + HTTP redirect):")
         print(f"    Local:   https://127.0.0.1:{PORTAL_PORT}")
         print(f"    LAN:     https://{lan_ip}:{PORTAL_PORT}")
-        print(f"    HTTP:    http://{lan_ip}:{http_port} (auto-redirects to HTTPS)")
+        print(f"    HTTP → HTTPS auto-redirect:")
+        print(f"             http://{lan_ip}:{PORTAL_PORT}  →  https://{lan_ip}:{PORTAL_PORT}")
+        print(f"             http://{lan_ip}:{REDIRECT_PORT}  →  https://{lan_ip}:{PORTAL_PORT}")
         print(f"\n  Note: First visit requires accepting the self-signed certificate")
     else:
         print(f"\n  AI Generation Portal running (HTTP-only):")
@@ -494,16 +583,19 @@ def main():
         print(f"\n  Note: Install openssl to enable HTTPS (e.g. Git for Windows)")
         print(f"    File System Access API (select directory) will not work without HTTPS.")
 
+    print("Starting sub-applications...")
+    manager.start_all()
+    time.sleep(2)
+    if redirect_server:
+        threading.Thread(target=redirect_server.serve_forever, daemon=True).start()
+
     print(f"\n  Sub-apps:")
     for name, config in APPS.items():
         print(f"    {name:14s} -> http://127.0.0.1:{config['port']}")
     print(f"  Press Ctrl+C to stop all services\n")
 
     def shutdown_handler(sig, frame):
-        print("\nShutting down...")
-        manager.shutdown()
-        server.shutdown()
-        sys.exit(0)
+        raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, shutdown_handler)
     if hasattr(signal, "SIGTERM"):
@@ -518,6 +610,9 @@ def main():
         pass
     finally:
         manager.shutdown()
+        if redirect_server:
+            redirect_server.shutdown()
+        server.server_close()
 
 
 if __name__ == "__main__":
