@@ -531,7 +531,6 @@ function bindOutputDir() {
     const res = await api('/api/choose-output-dir', 'POST');
     if (res?.path) { $('#outputDir').value = res.path; return; }
     if (res?.remote) {
-      // 远程客户端：尝试浏览器 File System Access API
       if (window.showDirectoryPicker) {
         try {
           const dh = await window.showDirectoryPicker({ mode: 'readwrite' });
@@ -540,7 +539,7 @@ function bindOutputDir() {
           return;
         } catch (e) { /* cancelled */ }
       }
-      alert('远程客户端不支持服务端目录选择。\n请将文件下载到本地后手动管理。');
+      $('#outputDir').value = '浏览器下载';
       return;
     }
   });
@@ -549,12 +548,11 @@ function bindOutputDir() {
     if (res?.path) $('#outputDir').value = res.path;
   });
   $('#openOutputBtn').addEventListener('click', async () => {
-    if (dirHandle) { alert(`文件将保存到 "${$('#outputDir').value.trim()}" 目录`); return; }
+    if (dirHandle) { return; }
     const dir = $('#outputDir').value.trim() || 'outputs';
     const res = await api('/api/open-output-dir', 'POST',
       new URLSearchParams({ output_dir: dir }).toString(),
       { 'Content-Type': 'application/x-www-form-urlencoded' });
-    if (res?.remote) alert('远程客户端不支持打开服务端目录');
   });
 }
 

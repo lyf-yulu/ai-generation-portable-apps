@@ -63,8 +63,8 @@ if [ -z "$PYTHON" ]; then
 fi
 echo "Using: $PYTHON ($($PYTHON --version))"
 
-echo "Starting AI Generation Portal on port 9090 (HTTPS + HTTP redirect)..."
+echo "Starting AI Generation Portal on port 9090 (HTTPS)..."
 echo "  Local:  https://127.0.0.1:9090"
-echo "  HTTP redirect also on port 9090 (auto → HTTPS)"
+echo "  HTTP → HTTPS:  http://127.0.0.1:9089"
 sleep 2 && open "https://127.0.0.1:9090" &
 $PYTHON app.py

@@ -36,34 +36,7 @@ APPS = {
 }
 
 PORTAL_PORT = 9090
-REDIRECT_PORT = 9089  # fallback HTTP-only redirect, kept for compatibility
-
-
-class DualProtocolServer(ThreadingHTTPServer):
-    """Handle both TLS and plain HTTP on the same port.
-    Detects TLS ClientHello (0x16) and wraps accordingly; plain HTTP
-    connections are flagged so the handler can 301-redirect to HTTPS."""
-
-    ssl_context: ssl.SSLContext | None = None
-
-    def get_request(self):
-        while True:
-            sock, addr = super().get_request()
-            sock.settimeout(5)
-            if self.ssl_context:
-                try:
-                    first = sock.recv(1, socket.MSG_PEEK)
-                    if first and len(first) == 1 and first[0] == 0x16:
-                        try:
-                            tls = self.ssl_context.wrap_socket(sock, server_side=True)
-                            return tls, addr
-                        except ssl.SSLError:
-                            sock.close()
-                            continue
-                except (socket.timeout, ConnectionError, OSError):
-                    pass
-            sock.settimeout(None)
-            return sock, addr
+REDIRECT_PORT = 9089  # HTTP → HTTPS redirect port
 
 
 def get_lan_ip() -> str:
@@ -344,48 +317,6 @@ class Handler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-    def handle(self):
-        """Detect plain-HTTP on a TLS-enabled server and redirect to HTTPS."""
-        if not isinstance(self.connection, ssl.SSLSocket) and getattr(self.server, "ssl_context", None):
-            self._redirect_https()
-            return
-        super().handle()
-
-    def _redirect_https(self):
-        try:
-            raw = self.rfile.readline(65537)
-            if not raw:
-                return
-            line = raw.decode("utf-8", errors="replace").strip()
-            parts = line.split()
-            if len(parts) < 2:
-                return
-            path = parts[1]
-            host = ""
-            while True:
-                hdr = self.rfile.readline(65537)
-                if not hdr or hdr in (b"\r\n", b"\n", b"\r"):
-                    break
-                decoded = hdr.decode("utf-8", errors="replace")
-                if decoded.lower().startswith("host:"):
-                    host = decoded.split(":", 1)[1].strip().rsplit(":", 1)[0]
-            target = host or get_lan_ip()
-            location = f"https://{target}:{PORTAL_PORT}{path}"
-            body = (
-                f'<!DOCTYPE html><meta charset="utf-8">'
-                f'<meta http-equiv="refresh" content="0;url={location}">'
-                f'<p>Redirecting to <a href="{location}">HTTPS</a>…</p>'
-            ).encode("utf-8")
-            self.send_response(301)
-            self.send_header("Location", location)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(body)
-        except Exception:
-            pass
-
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
 
@@ -544,14 +475,14 @@ def main():
     lan_ip = get_lan_ip()
     certs = ensure_certs(ROOT / "certs")
 
-    server = DualProtocolServer(("0.0.0.0", PORTAL_PORT), Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", PORTAL_PORT), Handler)
     redirect_server = None
 
     if certs:
         cert_file, key_file = certs
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(str(cert_file), str(key_file))
-        server.ssl_context = ctx
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
 
         class RedirectHandler(SimpleHTTPRequestHandler):
             def log_message(self, format, *args):
@@ -569,12 +500,10 @@ def main():
 
         redirect_server = ThreadingHTTPServer(("0.0.0.0", REDIRECT_PORT), RedirectHandler)
 
-        print(f"\n  AI Generation Portal running (HTTPS + HTTP redirect):")
+        print(f"\n  AI Generation Portal running (HTTPS):")
         print(f"    Local:   https://127.0.0.1:{PORTAL_PORT}")
         print(f"    LAN:     https://{lan_ip}:{PORTAL_PORT}")
-        print(f"    HTTP → HTTPS auto-redirect:")
-        print(f"             http://{lan_ip}:{PORTAL_PORT}  →  https://{lan_ip}:{PORTAL_PORT}")
-        print(f"             http://{lan_ip}:{REDIRECT_PORT}  →  https://{lan_ip}:{PORTAL_PORT}")
+        print(f"    HTTP redirect: http://{lan_ip}:{REDIRECT_PORT} → https://{lan_ip}:{PORTAL_PORT}")
         print(f"\n  Note: First visit requires accepting the self-signed certificate")
     else:
         print(f"\n  AI Generation Portal running (HTTP-only):")

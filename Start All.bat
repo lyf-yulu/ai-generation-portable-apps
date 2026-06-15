@@ -45,9 +45,9 @@ echo.
 
 start "AI Portal Server" /B "%PYTHON%" "app.py"
 
-:: Wait for portal to be ready (HTTPS on 9090, HTTP→HTTPS auto-redirect also on 9090)
+:: Wait for portal to be ready (HTTPS on 9090, HTTP redirect on 9089)
 set "PORTAL_URL=https://127.0.0.1:9090"
-set "PORTAL_FALLBACK=http://127.0.0.1:9090"
+set "PORTAL_FALLBACK=http://127.0.0.1:9089"
 echo Waiting for portal to start...
 for /l %%I in (1,1,60) do (
   :: Try HTTPS first
@@ -56,10 +56,10 @@ for /l %%I in (1,1,60) do (
     echo Portal ready.
     goto :opened
   )
-  :: Try HTTP (will auto-redirect to HTTPS, or serve HTTP-only)
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 '%PORTAL_FALLBACK%/api/platform/status'; if ($r.StatusCode -eq 200) { exit 0 } } catch { }" >nul 2>nul
+  :: Try HTTP redirect port
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 '%PORTAL_FALLBACK%/api/platform/status'; if ($r.StatusCode -eq 200 -or $r.StatusCode -eq 301) { exit 0 } } catch { }" >nul 2>nul
   if not errorlevel 1 (
-    echo Portal ready ^(HTTP-only mode^).
+    echo Portal ready ^(HTTP redirect port^).
     set "PORTAL_URL=%PORTAL_FALLBACK%"
     goto :opened
   )
