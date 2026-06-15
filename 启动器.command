@@ -1,238 +1,176 @@
-#!/usr/bin/env python3
-"""AI Generation Portal — macOS 启动器 (tkinter GUI)
-双点 .command 文件或终端执行 python3 启动器.command
-"""
-from __future__ import annotations
-import json
-import os
-import signal
-import subprocess
-import sys
-import threading
-import time
-import tkinter as tk
-from pathlib import Path
-from tkinter import messagebox, scrolledtext
+#!/bin/bash
+# ============================================================
+# AI Generation Portal — macOS 启动器
+# 双击运行或终端执行: ./启动器.command
+# ============================================================
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PORTAL_DIR="$SCRIPT_DIR/portal"
+PID_FILE="$PORTAL_DIR/.launcher_pid.json"
+PORTS=(8787 8797 8888 9089 9090)
+PYTHON=""
 
-ROOT = Path(__file__).resolve().parent
-PORTAL_DIR = ROOT / "portal"
-PID_FILE = PORTAL_DIR / ".launcher_pid.json"
-PORTS = [8787, 8797, 8888, 9089, 9090]
+# ---- 颜色 ----
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
+BOLD='\033[1m'
 
-# ---------- process helpers ----------
+# ---- 查找 Python ----
+find_python() {
+    for c in /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+        if [ -x "$c" ]; then
+            PYTHON="$c"
+            return 0
+        fi
+    done
+    return 1
+}
 
-def find_python() -> str | None:
-    for candidate in ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]:
-        if Path(candidate).exists():
-            return candidate
-    return None
+# ---- PID 管理 ----
+load_pids() { [ -f "$PID_FILE" ] && python3 -c "import json;print(json.dumps(json.load(open('$PID_FILE'))))" 2>/dev/null || echo "{}"; }
+save_pids() { mkdir -p "$PORTAL_DIR"; echo "$1" > "$PID_FILE"; }
 
-def _pids() -> dict[str, int]:
-    if PID_FILE.exists():
-        try:
-            return json.loads(PID_FILE.read_text())
-        except Exception:
-            pass
-    return {}
+is_alive() { kill -0 "$1" 2>/dev/null; }
 
-def _save_pids(data: dict[str, int]):
-    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(json.dumps(data))
+collect_child_pids() {
+    local data="{}"
+    for port in "${PORTS[@]}"; do
+        local pids
+        pids=$(lsof -ti ":$port" 2>/dev/null | tr '\n' ' ' || true)
+        for pid in $pids; do
+            local cmd cwd name
+            cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+            cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' || true)
+            if echo "$cmd" | grep -q "app.py" && echo "$cwd" | grep -q "$SCRIPT_DIR"; then
+                case "$cwd" in
+                    */portal)   name="portal(9090)" ;;
+                    */seedance) name="seedance(8787)" ;;
+                    */nano-banana) name="nano-banana(8797)" ;;
+                    */dreamina) name="dreamina(8888)" ;;
+                    *) name="app($port)" ;;
+                esac
+                data=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); d['$name']=$pid; print(json.dumps(d))")
+            fi
+        done
+    done
+    echo "$data"
+}
 
-def _is_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+status_text() {
+    local pids alive=() names=()
+    pids=$(load_pids)
+    for name in portal\(9090\) seedance\(8787\) nano-banana\(8797\) dreamina\(8888\); do
+        local pid
+        pid=$(echo "$pids" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('$name',''))" 2>/dev/null || true)
+        [ -n "$pid" ] && is_alive "$pid" && alive+=("$name:$pid")
+    done
+    if [ ${#alive[@]} -eq 0 ]; then
+        echo "●  未运行"
+    else
+        local joined
+        joined=$(printf ", %s" "${alive[@]}")
+        echo "●  运行中 — ${joined:2}"
+    fi
+}
 
-def status_text() -> str:
-    pids = _pids()
-    if not pids:
-        return "未运行"
-    alive = {k: v for k, v in pids.items() if _is_alive(v)}
-    if not alive:
-        return "未运行（上次异常退出）"
-    port_info = ", ".join(f"{k}:{v}" for k, v in sorted(alive.items()))
-    return f"运行中 — {port_info}"
+# ---- 停止 ----
+do_stop() {
+    echo -e "${YELLOW}正在停止...${NC}"
+    local pids
+    pids=$(load_pids)
+    for pid in $(echo "$pids" | python3 -c "import sys,json; d=json.load(sys.stdin); [print(v) for v in d.values()]" 2>/dev/null); do
+        is_alive "$pid" && kill "$pid" 2>/dev/null && echo "  已发送终止信号 → pid $pid"
+    done
+    sleep 3
+    for pid in $(echo "$pids" | python3 -c "import sys,json; d=json.load(sys.stdin); [print(v) for v in d.values()]" 2>/dev/null); do
+        is_alive "$pid" && kill -9 "$pid" 2>/dev/null && echo "  强制终止 → pid $pid"
+    done
+    for port in "${PORTS[@]}"; do
+        lsof -ti ":$port" 2>/dev/null | while read -r pid; do
+            local cmd
+            cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+            if echo "$cmd" | grep -q "app.py"; then
+                kill -9 "$pid" 2>/dev/null
+                echo "  清理端口 $port → pid $pid"
+            fi
+        done
+    done
+    rm -f "$PID_FILE"
+    echo -e "${GREEN}已停止。${NC}"
+}
 
-def stop_all(log_cb=None):
-    """Graceful stop first, then force-kill remaining."""
-    pids = _pids()
-    stopped = []
-    for name, pid in list(pids.items()):
-        if _is_alive(pid):
-            try:
-                os.kill(pid, signal.SIGTERM)
-                if log_cb:
-                    log_cb(f"  发送 SIGTERM → {name} (pid {pid})")
-            except OSError:
-                pass
-    time.sleep(2)
-    for name, pid in list(pids.items()):
-        if _is_alive(pid):
-            try:
-                os.kill(pid, signal.SIGKILL)
-                if log_cb:
-                    log_cb(f"  强制终止 → {name} (pid {pid})")
-            except OSError:
-                pass
-    # Also clean up any orphans on project ports
-    for port in PORTS:
-        try:
-            out = subprocess.check_output(["lsof", "-ti", f":{port}"], text=True).strip()
-            for line in out.splitlines():
-                pid = int(line.strip())
-                os.kill(pid, signal.SIGKILL)
-                if log_cb:
-                    log_cb(f"  清理端口 {port} (pid {pid})")
-        except Exception:
-            pass
-    _save_pids({})
-    if PID_FILE.exists():
-        PID_FILE.unlink(missing_ok=True)
+# ---- 启动 ----
+do_start() {
+    if ! find_python; then
+        osascript -e 'display dialog "未找到 Python 3.9+。请安装:" & return & "brew install python@3.12" buttons {"OK"} default button "OK" with icon stop'
+        return 1
+    fi
+    echo -e "${BLUE}Python: $PYTHON${NC}"
+    echo -e "${BLUE}启动 Portal + 子应用...${NC}"
+    cd "$PORTAL_DIR"
+    "$PYTHON" app.py &
+    local portal_pid=$!
+    echo -e "  Portal PID: $portal_pid"
+    # 等待子应用启动
+    sleep 6
+    # 收集子进程 PID
+    local data
+    data=$(collect_child_pids)
+    echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); [print(f'  {k}: {v}') for k,v in sorted(d.items())]"
+    save_pids "$data"
+    echo -e "${GREEN}启动完成。${NC}"
+}
 
-def record_child_pid(name: str):
-    pids = _pids()
-    found = None
-    for port in PORTS:
-        if not found:
-            try:
-                out = subprocess.check_output(["lsof", "-ti", f":{port}"], text=True).strip()
-                for line in out.splitlines():
-                    pid = int(line.strip())
-                    found = (name, pid)
-                    break
-            except Exception:
-                pass
-    if found:
-        pids[found[0]] = found[1]
-        _save_pids(pids)
+# ---- 主菜单 ----
+show_menu() {
+    clear
+    echo ""
+    echo -e "${BOLD}${CYAN}╔══════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║   AI Generation Portal 启动器    ║${NC}"
+    echo -e "${BOLD}${CYAN}╚══════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  $(status_text)"
+    echo ""
+    echo -e "  ${BOLD}[1]${NC} 启动"
+    echo -e "  ${BOLD}[2]${NC} 重启"
+    echo -e "  ${BOLD}[3]${NC} 停止"
+    echo -e "  ${BOLD}[4]${NC} 打开网关  ${CYAN}https://127.0.0.1:9090${NC}"
+    echo -e "  ${BOLD}[5]${NC} 查看日志"
+    echo -e "  ${BOLD}[q]${NC} 退出"
+    echo ""
+    read -r -p "  选择 [1-5/q]: " CHOICE
+    case "$CHOICE" in
+        1) do_start ;;
+        2) do_stop; sleep 1; do_start ;;
+        3) do_stop ;;
+        4) open "https://127.0.0.1:9090" ;;
+        5) view_logs ;;
+        q|Q) do_stop; echo "再见."; exit 0 ;;
+        *) ;;
+    esac
+    echo ""
+    read -r -p "  按回车继续..."
+}
 
-# ---------- GUI ----------
+view_logs() {
+    local log_dir="$PORTAL_DIR/state/logs"
+    if [ -d "$log_dir" ]; then
+        echo -e "${CYAN}最近的日志 (按 q 退出):${NC}"
+        echo ""
+        for f in "$log_dir"/*.log; do
+            [ -f "$f" ] || continue
+            local name; name=$(basename "$f" .log)
+            echo -e "${BOLD}─── $name ───${NC}"
+            tail -8 "$f" 2>/dev/null || echo "  (空)"
+            echo ""
+        done
+    else
+        echo "日志目录不存在"
+    fi
+}
 
-class LauncherApp:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("AI Generation Portal 启动器")
-        self.root.geometry("500x420")
-        self.root.resizable(True, True)
-        self.running = False
-        self.process: subprocess.Popen | None = None
-
-        # --- top bar ---
-        top = tk.Frame(root)
-        top.pack(fill=tk.X, padx=12, pady=(12, 4))
-        tk.Label(top, text="AI Generation Portal", font=("Helvetica", 16, "bold")).pack(side=tk.LEFT)
-        self.status_label = tk.Label(top, text=status_text(), fg="gray")
-        self.status_label.pack(side=tk.RIGHT)
-
-        # --- buttons ---
-        btn_frame = tk.Frame(root)
-        btn_frame.pack(fill=tk.X, padx=12, pady=4)
-        self.start_btn = tk.Button(btn_frame, text="启动", command=self.start, width=10, bg="#4CAF50", fg="white")
-        self.start_btn.pack(side=tk.LEFT, padx=(0, 4))
-        self.restart_btn = tk.Button(btn_frame, text="重启", command=self.restart, width=10)
-        self.restart_btn.pack(side=tk.LEFT, padx=4)
-        self.stop_btn = tk.Button(btn_frame, text="停止", command=self.stop, width=10, bg="#f44336", fg="white")
-        self.stop_btn.pack(side=tk.LEFT, padx=4)
-        tk.Button(btn_frame, text="打开网关", command=self.open_browser, width=10).pack(side=tk.RIGHT)
-
-        # --- log ---
-        tk.Label(root, text="日志", anchor="w").pack(fill=tk.X, padx=12, pady=(8, 0))
-        self.log = scrolledtext.ScrolledText(root, height=14, font=("Menlo", 10), bg="#1e1e1e", fg="#d4d4d4", insertbackground="white")
-        self.log.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
-        self.log.insert(tk.END, "就绪。点击「启动」开始所有服务。\n")
-        self.log.see(tk.END)
-
-        self._update_status()
-        self.root.after(3000, self._poll_status)
-
-    def _log(self, msg: str):
-        ts = time.strftime("%H:%M:%S")
-        self.log.insert(tk.END, f"[{ts}] {msg}\n")
-        self.log.see(tk.END)
-
-    def _update_status(self):
-        self.status_label.config(text=status_text())
-        alive = bool(_pids())
-        if self.running or alive:
-            self.start_btn.config(state=tk.DISABLED)
-            self.stop_btn.config(state=tk.NORMAL)
-            self.restart_btn.config(state=tk.NORMAL)
-        else:
-            self.start_btn.config(state=tk.NORMAL)
-            self.stop_btn.config(state=tk.DISABLED)
-            self.restart_btn.config(state=tk.DISABLED)
-
-    def _poll_status(self):
-        self._update_status()
-        self.root.after(3000, self._poll_status)
-
-    def start(self):
-        python = find_python()
-        if not python:
-            messagebox.showerror("错误", "未找到 Python 3。请安装 Homebrew Python:\n  brew install python@3.12")
-            return
-        self._log(f"Python: {python}")
-        self._log("启动 Portal + 子应用...")
-        self.running = True
-        self._update_status()
-        threading.Thread(target=self._run, args=(python,), daemon=True).start()
-
-    def _run(self, python: str):
-        try:
-            self.process = subprocess.Popen(
-                [python, "app.py"],
-                cwd=str(PORTAL_DIR),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            # Give Portal time to spawn sub-apps, then capture their PIDs
-            time.sleep(4)
-            record_child_pid("portal(9090)")
-            record_child_pid("seedance(8787)")
-            record_child_pid("nano-banana(8797)")
-            record_child_pid("dreamina(8888)")
-            self.root.after(0, lambda: self._log(f"  已启动，PID: {_pids()}"))
-            self.root.after(0, self._update_status)
-            for line in self.process.stdout:
-                stripped = line.rstrip()
-                if stripped:
-                    self.root.after(0, lambda s=stripped: self._log(s))
-        except Exception as e:
-            self.root.after(0, lambda: self._log(f"错误: {e}"))
-        finally:
-            self.running = False
-            self.root.after(0, self._update_status)
-
-    def stop(self):
-        self._log("正在停止所有服务...")
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-        stop_all(log_cb=self._log)
-        self.process = None
-        self.running = False
-        self._log("已停止。")
-        self._update_status()
-
-    def restart(self):
-        self._log("重启中...")
-        self.stop()
-        self.root.after(1500, self.start)
-
-    def open_browser(self):
-        import webbrowser
-        webbrowser.open("https://127.0.0.1:9090")
-        self._log("已打开浏览器: https://127.0.0.1:9090")
-
-
-def main():
-    root = tk.Tk()
-    LauncherApp(root)
-    root.mainloop()
-
-
-if __name__ == "__main__":
-    main()
+# ---- 入口 ----
+cd "$SCRIPT_DIR"
+while true; do
+    show_menu
+done
