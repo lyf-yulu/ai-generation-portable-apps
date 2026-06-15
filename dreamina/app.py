@@ -100,6 +100,7 @@ DEFAULT_CONFIG = {
 JOBS: dict[str, dict[str, Any]] = {}
 LOCK = threading.Lock()
 STATE_LOCK = threading.Lock()
+ACCOUNTS_LOCK = threading.Lock()  # protects accounts.json read/write
 LOGIN_PROC: subprocess.Popen | None = None
 LOGIN_LOCK = threading.Lock()
 EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
@@ -196,57 +197,73 @@ def check_login() -> dict[str, Any]:
 ROUND_ROBIN_INDEX = 0
 
 def load_accounts() -> dict[str, Any]:
-    if ACCOUNTS_PATH.exists():
-        try:
-            data = json.loads(ACCOUNTS_PATH.read_text("utf-8"))
-            if isinstance(data.get("accounts"), list):
-                # Auto-recovery: if accounts.json is empty but account dirs exist on disk,
-                # scan them back — prevent silent data loss from corrupted saves.
-                if not data["accounts"] and ACCOUNTS_DIR.exists():
-                    disk_ids = [d.name for d in ACCOUNTS_DIR.iterdir()
-                                if d.is_dir() and d.name.startswith("acc_")]
-                    if disk_ids:
-                        recovered = _rebuild_accounts_from_disk(disk_ids)
-                        if recovered:
-                            return recovered
-                return data
-        except Exception:
-            pass
-    # If file doesn't exist but account dirs do, rebuild
-    if ACCOUNTS_DIR.exists():
-        disk_ids = [d.name for d in ACCOUNTS_DIR.iterdir()
-                    if d.is_dir() and d.name.startswith("acc_")]
-        if disk_ids:
-            recovered = _rebuild_accounts_from_disk(disk_ids)
-            if recovered:
-                return recovered
-    return {"accounts": [], "active_account": None, "dispatch_mode": "manual"}
+    with ACCOUNTS_LOCK:
+        if ACCOUNTS_PATH.exists():
+            try:
+                data = json.loads(ACCOUNTS_PATH.read_text("utf-8"))
+                if isinstance(data.get("accounts"), list):
+                    # Auto-recovery: if accounts.json is empty but account dirs exist on disk,
+                    # scan them back — prevent silent data loss from corrupted saves.
+                    if not data["accounts"] and ACCOUNTS_DIR.exists():
+                        disk_ids = [d.name for d in ACCOUNTS_DIR.iterdir()
+                                    if d.is_dir() and d.name.startswith("acc_")]
+                        if disk_ids:
+                            recovered = _rebuild_accounts_from_disk(disk_ids, data)
+                            if recovered:
+                                return recovered
+                    return data
+            except Exception:
+                pass
+        # If file doesn't exist but account dirs do, rebuild
+        if ACCOUNTS_DIR.exists():
+            disk_ids = [d.name for d in ACCOUNTS_DIR.iterdir()
+                        if d.is_dir() and d.name.startswith("acc_")]
+            if disk_ids:
+                recovered = _rebuild_accounts_from_disk(disk_ids, None)
+                if recovered:
+                    return recovered
+        return {"accounts": [], "active_account": None, "dispatch_mode": "manual"}
 
 
-def _rebuild_accounts_from_disk(account_ids: list[str]) -> dict[str, Any] | None:
-    """Scan account directories and rebuild accounts.json after data loss."""
+def _rebuild_accounts_from_disk(account_ids: list[str], old_data: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """Scan account directories and rebuild accounts.json after data loss.
+    If old_data is provided, try to preserve names and metadata from it."""
+    # Build a lookup of any partial data we can salvage from old/corrupted accounts.json
+    old_by_id: dict[str, dict[str, Any]] = {}
+    if old_data and isinstance(old_data.get("accounts"), list):
+        for a in old_data["accounts"]:
+            if isinstance(a, dict) and a.get("id"):
+                old_by_id[a["id"]] = a
+
     accounts = []
     for acc_id in sorted(account_ids):
         home = get_account_home(acc_id)
         cli_dir = home / ".dreamina_cli"
         has_session = cli_dir.exists()
+        # Try to salvage original name and metadata from old data
+        old = old_by_id.get(acc_id, {})
         accounts.append({
             "id": acc_id,
-            "name": f"账号{len(accounts) + 1}",
-            "uid": None,
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "name": old.get("name") or f"账号{len(accounts) + 1}",
+            "uid": old.get("uid"),
+            "created_at": old.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%S"),
             "home_dir": str(home),
-            "is_system_home": False,
-            "logged_in": has_session,
-            "credit": None,
-            "_login_verified_at": time.time() if has_session else 0,
+            "is_system_home": old.get("is_system_home", False),
+            "logged_in": bool(old.get("logged_in")) or has_session,
+            "credit": old.get("credit"),
+            "_login_verified_at": old.get("_login_verified_at") or (time.time() if has_session else 0),
+            "last_check_at": old.get("last_check_at"),
+            "last_ok_at": old.get("last_ok_at"),
+            "last_error_code": old.get("last_error_code"),
+            "last_error_detail": old.get("last_error_detail"),
+            "quarantined": old.get("quarantined", False),
         })
     if not accounts:
         return None
     data = {
         "accounts": accounts,
-        "active_account": accounts[0]["id"],
-        "dispatch_mode": "manual",
+        "active_account": old_data.get("active_account") if old_data else accounts[0]["id"],
+        "dispatch_mode": old_data.get("dispatch_mode", "manual") if old_data else "manual",
     }
     # Persist the recovered data so next load is fast
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -257,22 +274,32 @@ def _rebuild_accounts_from_disk(account_ids: list[str]) -> dict[str, Any] | None
 
 
 def save_accounts(data: dict[str, Any]):
-    # Defensive: refuse to overwrite existing non-empty accounts with an empty list.
-    # This guards against buggy code paths that might pass a fresh empty dict.
-    if isinstance(data.get("accounts"), list) and not data["accounts"]:
-        if ACCOUNTS_PATH.exists():
+    with ACCOUNTS_LOCK:
+        # Defensive: refuse to overwrite existing non-empty accounts with an empty list.
+        if isinstance(data.get("accounts"), list) and not data["accounts"]:
+            if ACCOUNTS_PATH.exists():
+                try:
+                    existing = json.loads(ACCOUNTS_PATH.read_text("utf-8"))
+                    if isinstance(existing.get("accounts"), list) and existing["accounts"]:
+                        print(f"  [WARN] save_accounts refused to overwrite {len(existing['accounts'])} accounts with empty list")
+                        return
+                except Exception:
+                    pass
+        # Ensure parent dir exists (may have been deleted by cleanup)
+        ACCOUNTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        content = json.dumps(data, ensure_ascii=False, indent=2)
+        # Atomic write: write to tmp then rename
+        tmp = ACCOUNTS_PATH.with_suffix(ACCOUNTS_PATH.suffix + ".tmp")
+        try:
+            tmp.write_text(content, encoding="utf-8")
+            tmp.replace(ACCOUNTS_PATH)
+        except Exception as exc:
+            print(f"  [ERROR] save_accounts failed: {exc}")
+            # Best-effort: try writing directly
             try:
-                existing = json.loads(ACCOUNTS_PATH.read_text("utf-8"))
-                if isinstance(existing.get("accounts"), list) and existing["accounts"]:
-                    print(f"  [WARN] save_accounts refused to overwrite {len(existing['accounts'])} accounts with empty list")
-                    return
+                ACCOUNTS_PATH.write_text(content, encoding="utf-8")
             except Exception:
                 pass
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    # Write to temp file + atomic rename
-    tmp = ACCOUNTS_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
-    tmp.replace(ACCOUNTS_PATH)
 
 
 def get_account_home(account_id: str) -> Path:
@@ -1313,6 +1340,12 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             acc_id = path.split("/api/accounts/")[1].split("/")[0]
             self.handle_account_delete(acc_id)
+        elif path.startswith("/api/accounts/") and path.endswith("/rename"):
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
+            acc_id = path.split("/api/accounts/")[1].split("/")[0]
+            self.handle_account_rename(acc_id)
         elif path == "/api/accounts/active":
             if not _is_local(self):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
@@ -1559,6 +1592,25 @@ class Handler(SimpleHTTPRequestHandler):
             data["active_account"] = data["accounts"][0]["id"] if data["accounts"] else None
         save_accounts(data)
         json_response(self, 200, {"ok": True, "message": "account deleted"})
+
+    def handle_account_rename(self, acc_id: str):
+        acc = get_account_by_id(acc_id)
+        if not acc:
+            json_response(self, 404, {"ok": False, "error": "account not found"})
+            return
+        body = read_json_body(self)
+        new_name = body.get("name", "").strip()
+        if not new_name:
+            json_response(self, 400, {"ok": False, "error": "name is required"})
+            return
+        acc["name"] = new_name
+        data = load_accounts()
+        for a in data["accounts"]:
+            if a["id"] == acc_id:
+                a["name"] = new_name
+                break
+        save_accounts(data)
+        json_response(self, 200, {"ok": True, "name": new_name})
 
     def handle_set_active_account(self):
         body = read_json_body(self)

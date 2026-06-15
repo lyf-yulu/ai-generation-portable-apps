@@ -362,6 +362,7 @@
                 <button v-if="!acc.logged_in" type="button" class="btn-icon" title="登录" @click="loginAccount(acc.id)">↗</button>
                 <button v-if="acc.logged_in" type="button" class="btn-icon" title="刷新余额" @click="refreshAccount(acc.id)">↻</button>
                 <button v-if="acc.logged_in" type="button" class="btn-icon" title="登出" @click="logoutAccount(acc.id)">⏻</button>
+                <button type="button" class="btn-icon" title="重命名" @click="renameAccount(acc.id)">✎</button>
                 <button v-if="!acc.is_system_home" type="button" class="btn-icon" title="删除" @click="deleteAccount(acc.id)">✕</button>
               </div>
               <div v-if="accountLoginId === acc.id" style="grid-column:1/-1;font-size:11px;color:#0369a1">登录中...</div>

@@ -621,6 +621,14 @@ function DreaminaApp() {
       await this.loadAccounts();
     },
 
+    async renameAccount(accId) {
+      const acc = this.accounts.find(a => a.id === accId);
+      const name = prompt('输入新名称', acc?.name || '');
+      if (!name || !name.trim()) return;
+      const res = await api(`/dreamina/api/accounts/${accId}/rename`, 'POST', JSON.stringify({ name: name.trim() }));
+      if (res?.ok) await this.loadAccounts();
+    },
+
     async deleteAccount(accId) {
       if (!confirm('确认删除该账号？')) return;
       await api(`/dreamina/api/accounts/${accId}/delete`, 'POST');
