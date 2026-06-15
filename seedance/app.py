@@ -628,11 +628,13 @@ def save_archive_file(name: str, preset: dict[str, Any], ws_id: str = "localhost
 def load_archive_file(name: str, handler: SimpleHTTPRequestHandler | None = None) -> dict[str, Any]:
     ws = _workspace_id(handler) if handler else "localhost"
     path = archive_path(name, ws)
+    migrated = False
     if not path.exists():
         # Legacy fallback — try top-level, then IP-scoped
         for legacy in [ARCHIVE_DIR / f"{safe_archive_name(name)}.seedance"]:
             if legacy.exists():
                 path = legacy
+                migrated = True
                 break
         # Also check old IP directories
         if not path.exists() and ARCHIVE_DIR.exists():
@@ -641,6 +643,7 @@ def load_archive_file(name: str, handler: SimpleHTTPRequestHandler | None = None
                     p = ip_dir / f"{safe_archive_name(name)}.seedance"
                     if p.exists():
                         path = p
+                        migrated = True
                         break
         if not path.exists():
             raise FileNotFoundError(f"Archive not found: {name}")
@@ -659,6 +662,8 @@ def load_archive_file(name: str, handler: SimpleHTTPRequestHandler | None = None
             target.write_bytes(zf.read(archive_name))
             item["stored"] = target_name
     write_active_preset(preset, ws)
+    if migrated and handler is not None:
+        save_archive_file(name, preset, ws)
     return preset_for_client(ws)
 
 
@@ -1212,9 +1217,10 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
         "title": str(values.get("prompt") or "")[:80] or "Seedance task",
         "request": request_data,
         "response": response,
-        "restore": copy_files_to_restore(values, files, activity_id, ws_id, ws_id),
+        "workspace_id": ws_id,
+        "restore": copy_files_to_restore(values, files, activity_id, ws_id),
     })
-    thread = threading.Thread(target=run_job, args=(job_id, values, files, activity_id), daemon=True)
+    thread = threading.Thread(target=run_job, args=(job_id, values, files, activity_id, ws_id), daemon=True)
     thread.start()
     return job_id
 
@@ -1235,7 +1241,7 @@ def run_one(job_id: str, index: int, form_values: dict[str, Any], form_files: di
     base_url = str(form_values.get("base_url") or default_base).rstrip("/")
     create_url = f"{base_url}/contents/generations/tasks" if provider == "volcengine" else f"{base_url}/seedance/v3/contents/generations/tasks"
     add_event(job_id, f"Run {index}: preparing payload")
-    payload = build_payload(form, api_key, base_url, index - 1)
+    payload = build_payload(form, api_key, base_url, index - 1, ws_id)
     add_event(job_id, f"Run {index}: creating task ({content_counts(payload)})")
     create_result = request_json("POST", create_url, api_key, payload)
     task_id = create_result.get("id") or create_result.get("task_id")
@@ -1299,7 +1305,7 @@ def run_job(job_id: str, form_values: dict[str, Any], form_files: dict[str, tupl
         set_job(job_id, status="running", total=count, done=0, results=[], errors=[])
         add_event(job_id, f"Started {count} run(s), concurrency {concurrency}, key {mask_key(form_values.get('api_key', ''))}")
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = [pool.submit(run_one, job_id, i, form_values, form_files) for i in range(1, count + 1)]
+            futures = [pool.submit(run_one, job_id, i, form_values, form_files, ws_id) for i in range(1, count + 1)]
             for future in concurrent.futures.as_completed(futures):
                 try:
                     result = future.result()
@@ -1433,7 +1439,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             self.send_response(200)
             self.send_header("Content-Type", "video/mp4")
-            self.send_header("Content-Disposition", f'inline; filename="{path.name}"')
+            self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
             self.send_header("Content-Length", str(path.stat().st_size))
             self.end_headers()
             self.wfile.write(path.read_bytes())
