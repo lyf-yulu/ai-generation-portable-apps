@@ -196,33 +196,36 @@ def check_login() -> dict[str, Any]:
 
 ROUND_ROBIN_INDEX = 0
 
+
+def _load_accounts() -> dict[str, Any]:
+    """Internal: read accounts without acquiring lock (caller must hold ACCOUNTS_LOCK)."""
+    if ACCOUNTS_PATH.exists():
+        try:
+            data = json.loads(ACCOUNTS_PATH.read_text("utf-8"))
+            if isinstance(data.get("accounts"), list):
+                if not data["accounts"] and ACCOUNTS_DIR.exists():
+                    disk_ids = [d.name for d in ACCOUNTS_DIR.iterdir()
+                                if d.is_dir() and d.name.startswith("acc_")]
+                    if disk_ids:
+                        recovered = _rebuild_accounts_from_disk(disk_ids, data)
+                        if recovered:
+                            return recovered
+                return data
+        except Exception:
+            pass
+    if ACCOUNTS_DIR.exists():
+        disk_ids = [d.name for d in ACCOUNTS_DIR.iterdir()
+                    if d.is_dir() and d.name.startswith("acc_")]
+        if disk_ids:
+            recovered = _rebuild_accounts_from_disk(disk_ids, None)
+            if recovered:
+                return recovered
+    return {"accounts": [], "active_account": None, "dispatch_mode": "manual"}
+
+
 def load_accounts() -> dict[str, Any]:
     with ACCOUNTS_LOCK:
-        if ACCOUNTS_PATH.exists():
-            try:
-                data = json.loads(ACCOUNTS_PATH.read_text("utf-8"))
-                if isinstance(data.get("accounts"), list):
-                    # Auto-recovery: if accounts.json is empty but account dirs exist on disk,
-                    # scan them back — prevent silent data loss from corrupted saves.
-                    if not data["accounts"] and ACCOUNTS_DIR.exists():
-                        disk_ids = [d.name for d in ACCOUNTS_DIR.iterdir()
-                                    if d.is_dir() and d.name.startswith("acc_")]
-                        if disk_ids:
-                            recovered = _rebuild_accounts_from_disk(disk_ids, data)
-                            if recovered:
-                                return recovered
-                    return data
-            except Exception:
-                pass
-        # If file doesn't exist but account dirs do, rebuild
-        if ACCOUNTS_DIR.exists():
-            disk_ids = [d.name for d in ACCOUNTS_DIR.iterdir()
-                        if d.is_dir() and d.name.startswith("acc_")]
-            if disk_ids:
-                recovered = _rebuild_accounts_from_disk(disk_ids, None)
-                if recovered:
-                    return recovered
-        return {"accounts": [], "active_account": None, "dispatch_mode": "manual"}
+        return _load_accounts()
 
 
 def _rebuild_accounts_from_disk(account_ids: list[str], old_data: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -273,33 +276,34 @@ def _rebuild_accounts_from_disk(account_ids: list[str], old_data: dict[str, Any]
     return data
 
 
-def save_accounts(data: dict[str, Any]):
-    with ACCOUNTS_LOCK:
-        # Defensive: refuse to overwrite existing non-empty accounts with an empty list.
-        if isinstance(data.get("accounts"), list) and not data["accounts"]:
-            if ACCOUNTS_PATH.exists():
-                try:
-                    existing = json.loads(ACCOUNTS_PATH.read_text("utf-8"))
-                    if isinstance(existing.get("accounts"), list) and existing["accounts"]:
-                        print(f"  [WARN] save_accounts refused to overwrite {len(existing['accounts'])} accounts with empty list")
-                        return
-                except Exception:
-                    pass
-        # Ensure parent dir exists (may have been deleted by cleanup)
-        ACCOUNTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        content = json.dumps(data, ensure_ascii=False, indent=2)
-        # Atomic write: write to tmp then rename
-        tmp = ACCOUNTS_PATH.with_suffix(ACCOUNTS_PATH.suffix + ".tmp")
-        try:
-            tmp.write_text(content, encoding="utf-8")
-            tmp.replace(ACCOUNTS_PATH)
-        except Exception as exc:
-            print(f"  [ERROR] save_accounts failed: {exc}")
-            # Best-effort: try writing directly
+def _save_accounts(data: dict[str, Any]):
+    """Internal: write accounts without acquiring lock (caller must hold ACCOUNTS_LOCK)."""
+    if isinstance(data.get("accounts"), list) and not data["accounts"]:
+        if ACCOUNTS_PATH.exists():
             try:
-                ACCOUNTS_PATH.write_text(content, encoding="utf-8")
+                existing = json.loads(ACCOUNTS_PATH.read_text("utf-8"))
+                if isinstance(existing.get("accounts"), list) and existing["accounts"]:
+                    print(f"  [WARN] save_accounts refused to overwrite {len(existing['accounts'])} accounts with empty list")
+                    return
             except Exception:
                 pass
+    ACCOUNTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    content = json.dumps(data, ensure_ascii=False, indent=2)
+    tmp = ACCOUNTS_PATH.with_suffix(ACCOUNTS_PATH.suffix + ".tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(ACCOUNTS_PATH)
+    except Exception as exc:
+        print(f"  [ERROR] save_accounts failed: {exc}")
+        try:
+            ACCOUNTS_PATH.write_text(content, encoding="utf-8")
+        except Exception:
+            pass
+
+
+def save_accounts(data: dict[str, Any]):
+    with ACCOUNTS_LOCK:
+        _save_accounts(data)
 
 
 def get_account_home(account_id: str) -> Path:
@@ -478,29 +482,30 @@ def classify_account_command_error(result: dict[str, Any]) -> str:
 
 
 def apply_account_health(account_id: str, info: dict[str, Any]) -> None:
-    data = load_accounts()
-    now = time.time()
-    for account in data["accounts"]:
-        if account["id"] != account_id:
-            continue
-        account["last_check_at"] = now
-        account["repair_attempted_at"] = now
-        account["logged_in"] = bool(info.get("logged_in"))
-        account["credit"] = info.get("credit") if info.get("logged_in") else None
-        account["_login_verified_at"] = now
-        if info.get("logged_in"):
-            credit = info.get("credit")
-            account["uid"] = credit.get("user_id") if isinstance(credit, dict) else account.get("uid")
-            account["last_ok_at"] = now
-            account["last_error_code"] = None
-            account["last_error_detail"] = None
-            account["quarantined"] = False
-        else:
-            account["last_error_code"] = info.get("error_code") or "cli_error"
-            account["last_error_detail"] = info.get("error_detail") or info.get("raw") or "account check failed"
-            account["quarantined"] = True
-        break
-    save_accounts(data)
+    with ACCOUNTS_LOCK:
+        data = _load_accounts()
+        now = time.time()
+        for account in data["accounts"]:
+            if account["id"] != account_id:
+                continue
+            account["last_check_at"] = now
+            account["repair_attempted_at"] = now
+            account["logged_in"] = bool(info.get("logged_in"))
+            account["credit"] = info.get("credit") if info.get("logged_in") else None
+            account["_login_verified_at"] = now
+            if info.get("logged_in"):
+                credit = info.get("credit")
+                account["uid"] = credit.get("user_id") if isinstance(credit, dict) else account.get("uid")
+                account["last_ok_at"] = now
+                account["last_error_code"] = None
+                account["last_error_detail"] = None
+                account["quarantined"] = False
+            else:
+                account["last_error_code"] = info.get("error_code") or "cli_error"
+                account["last_error_detail"] = info.get("error_detail") or info.get("raw") or "account check failed"
+                account["quarantined"] = True
+            break
+        _save_accounts(data)
 
 
 def check_account_health(account_id: str) -> dict[str, Any]:
@@ -638,47 +643,48 @@ def account_login_status_is_fresh(account: dict[str, Any] | None) -> bool:
 
 def sync_system_home_account(status: dict[str, Any]) -> dict[str, Any]:
     """Expose the macOS user's normal Dreamina login as the shared server account."""
-    data = load_accounts()
-    if not status.get("logged_in"):
-        return data
+    with ACCOUNTS_LOCK:
+        data = _load_accounts()
+        if not status.get("logged_in"):
+            return data
 
-    now = time.time()
-    credit = status.get("credit")
-    uid = credit.get("user_id") if isinstance(credit, dict) else None
-    home = Path.home()
-    system_account = next((a for a in data["accounts"] if a.get("is_system_home")), None)
+        now = time.time()
+        credit = status.get("credit")
+        uid = credit.get("user_id") if isinstance(credit, dict) else None
+        home = Path.home()
+        system_account = next((a for a in data["accounts"] if a.get("is_system_home")), None)
 
-    if not system_account:
-        acc_id = "acc_default"
-        if any(a.get("id") == acc_id for a in data["accounts"]):
-            acc_id = f"acc_system_{uuid.uuid4().hex[:8]}"
-        system_account = {
-            "id": acc_id,
-            "name": "共享系统账号",
+        if not system_account:
+            acc_id = "acc_default"
+            if any(a.get("id") == acc_id for a in data["accounts"]):
+                acc_id = f"acc_system_{uuid.uuid4().hex[:8]}"
+            system_account = {
+                "id": acc_id,
+                "name": "共享系统账号",
+                "uid": uid,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "home_dir": str(home),
+                "is_system_home": True,
+            }
+            data["accounts"].append(system_account)
+
+        system_account.update({
             "uid": uid,
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "home_dir": str(home),
             "is_system_home": True,
-        }
-        data["accounts"].append(system_account)
+            "logged_in": True,
+            "credit": credit,
+            "_login_verified_at": now,
+        })
+        system_account.setdefault("name", "共享系统账号")
+        system_account.setdefault("created_at", time.strftime("%Y-%m-%dT%H:%M:%S"))
 
-    system_account.update({
-        "uid": uid,
-        "home_dir": str(home),
-        "is_system_home": True,
-        "logged_in": True,
-        "credit": credit,
-        "_login_verified_at": now,
-    })
-    system_account.setdefault("name", "共享系统账号")
-    system_account.setdefault("created_at", time.strftime("%Y-%m-%dT%H:%M:%S"))
+        active = next((a for a in data["accounts"] if a.get("id") == data.get("active_account")), None)
+        if not account_login_status_is_fresh(active):
+            data["active_account"] = system_account["id"]
 
-    active = next((a for a in data["accounts"] if a.get("id") == data.get("active_account")), None)
-    if not account_login_status_is_fresh(active):
-        data["active_account"] = system_account["id"]
-
-    save_accounts(data)
-    return data
+        _save_accounts(data)
+        return data
 
 
 def pick_account_for_job() -> dict[str, Any] | None:
@@ -1467,24 +1473,26 @@ class Handler(SimpleHTTPRequestHandler):
 
     def handle_account_create(self):
         body = read_json_body(self)
-        name = body.get("name", "").strip() or f"账号{len(load_accounts()['accounts']) + 1}"
         acc_id = f"acc_{uuid.uuid4().hex[:8]}"
-        acc = {
-            "id": acc_id,
-            "name": name,
-            "uid": None,
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "home_dir": str(get_account_home(acc_id)),
-            "is_system_home": False,
-            "logged_in": False,
-            "credit": None,
-        }
-        ensure_account_home(acc_id)
-        data = load_accounts()
-        data["accounts"].append(acc)
-        if not data["active_account"]:
-            data["active_account"] = acc_id
-        save_accounts(data)
+        # Hold lock across load-modify-save to prevent races with health checks
+        with ACCOUNTS_LOCK:
+            data = _load_accounts()
+            name = body.get("name", "").strip() or f"账号{len(data['accounts']) + 1}"
+            acc = {
+                "id": acc_id,
+                "name": name,
+                "uid": None,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "home_dir": str(get_account_home(acc_id)),
+                "is_system_home": False,
+                "logged_in": False,
+                "credit": None,
+            }
+            ensure_account_home(acc_id)
+            data["accounts"].append(acc)
+            if not data["active_account"]:
+                data["active_account"] = acc_id
+            _save_accounts(data)
         json_response(self, 200, {"ok": True, "account": acc})
 
     def handle_account_login(self, acc_id: str):
@@ -1554,13 +1562,14 @@ class Handler(SimpleHTTPRequestHandler):
             return
         env = get_account_env(acc_id)
         run_cmd(["dreamina", "logout"], timeout=10, env_override=env)
-        data = load_accounts()
-        for a in data["accounts"]:
-            if a["id"] == acc_id:
-                a["logged_in"] = False
-                a["credit"] = None
-                break
-        save_accounts(data)
+        with ACCOUNTS_LOCK:
+            data = _load_accounts()
+            for a in data["accounts"]:
+                if a["id"] == acc_id:
+                    a["logged_in"] = False
+                    a["credit"] = None
+                    break
+            _save_accounts(data)
         json_response(self, 200, {"ok": True, "message": "logged out"})
 
     def handle_account_refresh(self, acc_id: str):
@@ -1586,11 +1595,12 @@ class Handler(SimpleHTTPRequestHandler):
         home = get_account_home(acc_id)
         if home.exists():
             shutil.rmtree(home, ignore_errors=True)
-        data = load_accounts()
-        data["accounts"] = [a for a in data["accounts"] if a["id"] != acc_id]
-        if data["active_account"] == acc_id:
-            data["active_account"] = data["accounts"][0]["id"] if data["accounts"] else None
-        save_accounts(data)
+        with ACCOUNTS_LOCK:
+            data = _load_accounts()
+            data["accounts"] = [a for a in data["accounts"] if a["id"] != acc_id]
+            if data["active_account"] == acc_id:
+                data["active_account"] = data["accounts"][0]["id"] if data["accounts"] else None
+            _save_accounts(data)
         json_response(self, 200, {"ok": True, "message": "account deleted"})
 
     def handle_account_rename(self, acc_id: str):
@@ -1603,13 +1613,13 @@ class Handler(SimpleHTTPRequestHandler):
         if not new_name:
             json_response(self, 400, {"ok": False, "error": "name is required"})
             return
-        acc["name"] = new_name
-        data = load_accounts()
-        for a in data["accounts"]:
-            if a["id"] == acc_id:
-                a["name"] = new_name
-                break
-        save_accounts(data)
+        with ACCOUNTS_LOCK:
+            data = _load_accounts()
+            for a in data["accounts"]:
+                if a["id"] == acc_id:
+                    a["name"] = new_name
+                    break
+            _save_accounts(data)
         json_response(self, 200, {"ok": True, "name": new_name})
 
     def handle_set_active_account(self):
@@ -1618,9 +1628,10 @@ class Handler(SimpleHTTPRequestHandler):
         if not get_account_by_id(acc_id):
             json_response(self, 404, {"ok": False, "error": "account not found"})
             return
-        data = load_accounts()
-        data["active_account"] = acc_id
-        save_accounts(data)
+        with ACCOUNTS_LOCK:
+            data = _load_accounts()
+            data["active_account"] = acc_id
+            _save_accounts(data)
         json_response(self, 200, {"ok": True, "active_account": acc_id})
 
     def handle_set_dispatch_mode(self):
@@ -1629,9 +1640,10 @@ class Handler(SimpleHTTPRequestHandler):
         if mode not in ("manual", "round_robin"):
             json_response(self, 400, {"ok": False, "error": "invalid mode"})
             return
-        data = load_accounts()
-        data["dispatch_mode"] = mode
-        save_accounts(data)
+        with ACCOUNTS_LOCK:
+            data = _load_accounts()
+            data["dispatch_mode"] = mode
+            _save_accounts(data)
         json_response(self, 200, {"ok": True, "dispatch_mode": mode})
 
     def handle_install_cli(self):
