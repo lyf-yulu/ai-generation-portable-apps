@@ -875,6 +875,102 @@ button:active:not(:disabled) { transform: translateY(1px); }
 .job-status.running,
 .job-status.querying { background: #e0f2fe; color: #0369a1; }
 .job-status.pending { background: #fef3c7; color: #92400e; }
+.account-panel {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  background: #f8fafc;
+}
+.account-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.account-panel-head label {
+  color: #465267;
+  font-size: 13px;
+  font-weight: 650;
+}
+.account-list {
+  display: grid;
+  gap: 7px;
+  max-height: 260px;
+  overflow: auto;
+}
+.account-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: start;
+  border: 1px solid var(--border);
+  border-left: 3px solid #aeb8c7;
+  border-radius: 7px;
+  padding: 8px;
+  background: #fff;
+}
+.account-row.online { border-left-color: #10b981; }
+.account-row.timeout,
+.account-row.need-repair { border-left-color: #f59e0b; }
+.account-row.need-login,
+.account-row.error { border-left-color: #ef4444; }
+.account-main {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+.account-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+}
+.account-title > span:first-child,
+.account-meta,
+.account-error {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+.account-error {
+  color: #b91c1c;
+  font-size: 12px;
+}
+.account-actions {
+  display: grid;
+  gap: 5px;
+  justify-items: end;
+}
+.account-status,
+.account-active {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 650;
+  background: #edf2f8;
+  color: #465267;
+}
+.account-row.online .account-status { background: #dcfce7; color: #047857; }
+.account-row.timeout .account-status,
+.account-row.need-repair .account-status { background: #fef3c7; color: #92400e; }
+.account-row.need-login .account-status,
+.account-row.error .account-status { background: #fee2e2; color: #b91c1c; }
+.account-active { background: #e0f2fe; color: #0369a1; }
+.account-empty {
+  color: var(--muted);
+  font-size: 12px;
+}
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #c8d2df; border-radius: 999px; }

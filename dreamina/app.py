@@ -331,6 +331,257 @@ def get_account_by_id(account_id: str) -> dict[str, Any] | None:
     return None
 
 
+def project_account_home(account_id: str) -> Path:
+    home = get_account_home(account_id).resolve()
+    base = ACCOUNTS_DIR.resolve()
+    if home == base or base not in home.parents:
+        raise ValueError("account home outside project accounts directory")
+    return home
+
+
+def account_runtime_error(code: str, detail: str) -> dict[str, Any]:
+    return {"ok": False, "error_code": code, "error_detail": detail}
+
+
+def run_security_command(args: list[str], timeout: int = 10) -> dict[str, Any]:
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return {
+            "ok": result.returncode == 0,
+            "returncode": result.returncode,
+            "stdout": result.stdout or "",
+            "stderr": result.stderr or "",
+            "timed_out": False,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "returncode": -1,
+            "stdout": "",
+            "stderr": "timeout",
+            "timed_out": True,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "returncode": -1,
+            "stdout": "",
+            "stderr": str(exc),
+            "timed_out": False,
+        }
+
+
+def parse_keychain_list(output: str) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    for line in output.splitlines():
+        path = line.strip().strip('"')
+        if path and path not in seen:
+            paths.append(path)
+            seen.add(path)
+    return paths
+
+
+def ensure_keychain_in_search_list(keychain_file: Path) -> dict[str, Any]:
+    listed = run_security_command(["security", "list-keychains", "-d", "user"])
+    if listed.get("timed_out"):
+        return account_runtime_error("keychain_recovery_failed", "security list-keychains timed out")
+    if not listed.get("ok"):
+        detail = (listed.get("stderr") or listed.get("stdout") or "security list-keychains failed").strip()
+        return account_runtime_error("keychain_recovery_failed", detail)
+
+    keychain_path = str(keychain_file)
+    paths = parse_keychain_list(listed.get("stdout", ""))
+    if keychain_path not in paths:
+        paths.append(keychain_path)
+    updated = run_security_command(["security", "list-keychains", "-d", "user", "-s"] + paths)
+    if updated.get("timed_out"):
+        return account_runtime_error("keychain_recovery_failed", "security list-keychains -s timed out")
+    if not updated.get("ok"):
+        detail = (updated.get("stderr") or updated.get("stdout") or "security list-keychains -s failed").strip()
+        return account_runtime_error("keychain_recovery_failed", detail)
+    return {"ok": True}
+
+
+def preflight_account_runtime(account_id: str) -> dict[str, Any]:
+    try:
+        home = project_account_home(account_id)
+    except ValueError as exc:
+        return account_runtime_error("missing_home", str(exc))
+    if not home.exists():
+        return account_runtime_error("missing_home", str(home))
+    if sys.platform != "darwin":
+        return {"ok": True, "home": str(home)}
+
+    keychain_file = home / "Library" / "Keychains" / "login.keychain-db"
+    if not keychain_file.exists():
+        return account_runtime_error("missing_keychain", str(keychain_file))
+
+    unlocked = run_security_command(["security", "unlock-keychain", "-p", "", str(keychain_file)])
+    if unlocked.get("timed_out"):
+        return account_runtime_error("keychain_recovery_failed", "security unlock-keychain timed out")
+    if not unlocked.get("ok"):
+        detail = (unlocked.get("stderr") or unlocked.get("stdout") or "security unlock-keychain failed").strip()
+        return account_runtime_error("keychain_recovery_failed", detail)
+
+    settings = run_security_command(["security", "set-keychain-settings", str(keychain_file)])
+    if settings.get("timed_out"):
+        return account_runtime_error("keychain_recovery_failed", "security set-keychain-settings timed out")
+    if not settings.get("ok"):
+        detail = (settings.get("stderr") or settings.get("stdout") or "security set-keychain-settings failed").strip()
+        return account_runtime_error("keychain_recovery_failed", detail)
+
+    search = ensure_keychain_in_search_list(keychain_file)
+    if not search.get("ok"):
+        return search
+    return {"ok": True, "home": str(home), "keychain": str(keychain_file)}
+
+
+def classify_account_command_error(result: dict[str, Any]) -> str:
+    stderr = str(result.get("stderr") or "")
+    stdout = str(result.get("stdout") or "")
+    text = f"{stderr}\n{stdout}".lower()
+    if "timeout" in text:
+        return "timeout"
+    if "not found in keyring" in text or "secret not found" in text or "no keyring" in text:
+        return "not_logged_in"
+    if "not logged" in text or "login" in text and "dreamina" in text:
+        return "not_logged_in"
+    return "cli_error"
+
+
+def apply_account_health(account_id: str, info: dict[str, Any]) -> None:
+    data = load_accounts()
+    now = time.time()
+    for account in data["accounts"]:
+        if account["id"] != account_id:
+            continue
+        account["last_check_at"] = now
+        account["repair_attempted_at"] = now
+        account["logged_in"] = bool(info.get("logged_in"))
+        account["credit"] = info.get("credit") if info.get("logged_in") else None
+        account["_login_verified_at"] = now
+        if info.get("logged_in"):
+            credit = info.get("credit")
+            account["uid"] = credit.get("user_id") if isinstance(credit, dict) else account.get("uid")
+            account["last_ok_at"] = now
+            account["last_error_code"] = None
+            account["last_error_detail"] = None
+            account["quarantined"] = False
+        else:
+            account["last_error_code"] = info.get("error_code") or "cli_error"
+            account["last_error_detail"] = info.get("error_detail") or info.get("raw") or "account check failed"
+            account["quarantined"] = True
+        break
+    save_accounts(data)
+
+
+def check_account_health(account_id: str) -> dict[str, Any]:
+    account = get_account_by_id(account_id)
+    if not account:
+        return {"logged_in": False, "credit": None, "error_code": "missing_account", "error_detail": "account not found"}
+
+    if account.get("is_system_home"):
+        info = check_login()
+        if info.get("logged_in"):
+            info["error_code"] = None
+            info["error_detail"] = None
+        else:
+            info["error_code"] = classify_account_command_error({"stderr": info.get("raw", "")})
+            info["error_detail"] = info.get("raw") or "system account check failed"
+        apply_account_health(account_id, info)
+        return info
+
+    preflight = preflight_account_runtime(account_id)
+    if not preflight.get("ok"):
+        info = {
+            "logged_in": False,
+            "credit": None,
+            "error_code": preflight.get("error_code"),
+            "error_detail": preflight.get("error_detail"),
+        }
+        apply_account_health(account_id, info)
+        return info
+
+    env = get_account_env(account_id)
+    result = run_cmd(["dreamina", "user_credit"], timeout=20, env_override=env)
+    if result["returncode"] != 0:
+        code = classify_account_command_error(result)
+        detail = result.get("stderr") or result.get("stdout")
+        if not detail:
+            detail = f"dreamina user_credit exited with code {result['returncode']} and no output"
+        info = {
+            "logged_in": False,
+            "credit": None,
+            "error_code": code,
+            "error_detail": detail,
+            "raw": result.get("stderr") or result.get("stdout"),
+        }
+        apply_account_health(account_id, info)
+        return info
+
+    try:
+        credit = json.loads(result["stdout"])
+    except json.JSONDecodeError:
+        info = {
+            "logged_in": False,
+            "credit": None,
+            "error_code": "parse_error",
+            "error_detail": result["stdout"][:500],
+            "raw": result["stdout"],
+        }
+        apply_account_health(account_id, info)
+        return info
+
+    info = {"logged_in": True, "credit": credit, "error_code": None, "error_detail": None}
+    apply_account_health(account_id, info)
+    return info
+
+
+def repair_saved_accounts() -> list[dict[str, Any]]:
+    data = load_accounts()
+    results = []
+    for account in data["accounts"]:
+        if account.get("is_system_home"):
+            continue
+        account_id = account["id"]
+        info = check_account_health(account_id)
+        results.append({"account_id": account_id, "name": account.get("name"), **info})
+    return results
+
+
+def prepare_account_for_job(account: dict[str, Any] | None) -> dict[str, Any]:
+    if not account:
+        return {"ok": False, "error": "no available account", "env_override": None}
+    if account.get("is_system_home"):
+        return {"ok": True, "env_override": None}
+    preflight = preflight_account_runtime(account["id"])
+    if not preflight.get("ok"):
+        apply_account_health(account["id"], {
+            "logged_in": False,
+            "credit": None,
+            "error_code": preflight.get("error_code"),
+            "error_detail": preflight.get("error_detail"),
+        })
+        return {"ok": False, "error": preflight.get("error_detail"), "error_code": preflight.get("error_code"), "env_override": None}
+    return {"ok": True, "env_override": get_account_env(account["id"])}
+
+
+def select_prepared_account_for_job() -> dict[str, Any]:
+    data = load_accounts()
+    max_attempts = max(1, len(data.get("accounts", [])))
+    last_error = "no available account"
+    last_error_code = "no_account"
+    for _ in range(max_attempts):
+        account = pick_account_for_job()
+        prepared = prepare_account_for_job(account)
+        if prepared.get("ok"):
+            return {"ok": True, "account": account, "env_override": prepared.get("env_override")}
+        last_error = prepared.get("error") or last_error
+        last_error_code = prepared.get("error_code") or last_error_code
+    return {"ok": False, "account": None, "env_override": None, "error": last_error, "error_code": last_error_code}
+
+
 def check_account_login(account_id: str) -> dict[str, Any]:
     env = get_account_env(account_id)
     return check_login_with_env(env)
@@ -347,6 +598,60 @@ def check_login_with_env(env: dict | None = None) -> dict[str, Any]:
         if "credit" in r["stdout"].lower() or "{" in r["stdout"]:
             return {"logged_in": True, "credit": r["stdout"]}
         return {"logged_in": False, "credit": None, "raw": r["stdout"]}
+
+
+def account_login_status_is_fresh(account: dict[str, Any] | None) -> bool:
+    if not account or not account.get("logged_in"):
+        return False
+    verified_at = account.get("_login_verified_at")
+    if not isinstance(verified_at, (int, float)):
+        return True
+    return (time.time() - verified_at) < 1800
+
+
+def sync_system_home_account(status: dict[str, Any]) -> dict[str, Any]:
+    """Expose the macOS user's normal Dreamina login as the shared server account."""
+    data = load_accounts()
+    if not status.get("logged_in"):
+        return data
+
+    now = time.time()
+    credit = status.get("credit")
+    uid = credit.get("user_id") if isinstance(credit, dict) else None
+    home = Path.home()
+    system_account = next((a for a in data["accounts"] if a.get("is_system_home")), None)
+
+    if not system_account:
+        acc_id = "acc_default"
+        if any(a.get("id") == acc_id for a in data["accounts"]):
+            acc_id = f"acc_system_{uuid.uuid4().hex[:8]}"
+        system_account = {
+            "id": acc_id,
+            "name": "共享系统账号",
+            "uid": uid,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "home_dir": str(home),
+            "is_system_home": True,
+        }
+        data["accounts"].append(system_account)
+
+    system_account.update({
+        "uid": uid,
+        "home_dir": str(home),
+        "is_system_home": True,
+        "logged_in": True,
+        "credit": credit,
+        "_login_verified_at": now,
+    })
+    system_account.setdefault("name", "共享系统账号")
+    system_account.setdefault("created_at", time.strftime("%Y-%m-%dT%H:%M:%S"))
+
+    active = next((a for a in data["accounts"] if a.get("id") == data.get("active_account")), None)
+    if not account_login_status_is_fresh(active):
+        data["active_account"] = system_account["id"]
+
+    save_accounts(data)
+    return data
 
 
 def pick_account_for_job() -> dict[str, Any] | None:
@@ -367,6 +672,10 @@ def pick_account_for_job() -> dict[str, Any] | None:
     logged_in = [
         a for a in logged_in
         if "_login_verified_at" not in a or (now - a["_login_verified_at"]) < max_staleness
+    ]
+    logged_in = [
+        a for a in logged_in
+        if not a.get("quarantined") and not a.get("last_error_code")
     ]
     if not logged_in:
         return None
@@ -396,21 +705,7 @@ def migrate_default_account():
     status = check_login()
     if not status.get("logged_in"):
         return
-    acc_id = "acc_default"
-    acc = {
-        "id": acc_id,
-        "name": "默认账号",
-        "uid": None,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "home_dir": str(home),
-        "is_system_home": True,
-        "logged_in": True,
-        "credit": status.get("credit"),
-        "_login_verified_at": time.time(),
-    }
-    data["accounts"].append(acc)
-    data["active_account"] = acc_id
-    save_accounts(data)
+    sync_system_home_account(status)
 
 
 def read_history() -> list[dict[str, Any]]:
@@ -989,6 +1284,11 @@ class Handler(SimpleHTTPRequestHandler):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
             self.handle_account_create()
+        elif path == "/api/accounts/repair-all":
+            if not _is_local(self):
+                json_response(self, 403, {"ok": False, "error": "admin only"})
+                return
+            self.handle_accounts_repair_all()
         elif path.startswith("/api/accounts/") and path.endswith("/login"):
             if not _is_local(self):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
@@ -1111,7 +1411,7 @@ class Handler(SimpleHTTPRequestHandler):
     def handle_env_check(self):
         installed = check_cli_installed()
         login_info = check_login() if installed else {"logged_in": False, "credit": None}
-        accounts_data = load_accounts()
+        accounts_data = sync_system_home_account(login_info) if login_info.get("logged_in") else load_accounts()
         json_response(self, 200, {
             "ok": True,
             "cli_installed": installed,
@@ -1122,6 +1422,8 @@ class Handler(SimpleHTTPRequestHandler):
 
     def handle_login_poll(self):
         info = check_login()
+        if info.get("logged_in"):
+            sync_system_home_account(info)
         json_response(self, 200, {"ok": True, **info})
 
     # === Account Management Handlers ===
@@ -1209,17 +1511,7 @@ class Handler(SimpleHTTPRequestHandler):
         if not acc:
             json_response(self, 404, {"ok": False, "error": "account not found"})
             return
-        env = get_account_env(acc_id)
-        info = check_login_with_env(env)
-        if info["logged_in"]:
-            data = load_accounts()
-            for a in data["accounts"]:
-                if a["id"] == acc_id:
-                    a["logged_in"] = True
-                    a["credit"] = info.get("credit")
-                    a["_login_verified_at"] = time.time()
-                    break
-            save_accounts(data)
+        info = check_account_health(acc_id)
         json_response(self, 200, {"ok": True, "account_id": acc_id, **info})
 
     def handle_account_logout(self, acc_id: str):
@@ -1243,17 +1535,12 @@ class Handler(SimpleHTTPRequestHandler):
         if not acc:
             json_response(self, 404, {"ok": False, "error": "account not found"})
             return
-        env = get_account_env(acc_id)
-        info = check_login_with_env(env)
-        data = load_accounts()
-        for a in data["accounts"]:
-            if a["id"] == acc_id:
-                a["logged_in"] = info["logged_in"]
-                a["credit"] = info.get("credit")
-                a["_login_verified_at"] = time.time()
-                break
-        save_accounts(data)
+        info = check_account_health(acc_id)
         json_response(self, 200, {"ok": True, "account_id": acc_id, **info})
+
+    def handle_accounts_repair_all(self):
+        results = repair_saved_accounts()
+        json_response(self, 200, {"ok": True, "results": results, "accounts": load_accounts()})
 
     def handle_account_delete(self, acc_id: str):
         acc = get_account_by_id(acc_id)
@@ -1465,6 +1752,17 @@ class Handler(SimpleHTTPRequestHandler):
             if paths:
                 uploaded_paths_rel[k] = [str(p.relative_to(ROOT)) for p in paths]
 
+        selected = select_prepared_account_for_job()
+        if not selected.get("ok"):
+            json_response(self, 409, {
+                "ok": False,
+                "error": selected.get("error") or "no available Dreamina account",
+                "error_code": selected.get("error_code"),
+            })
+            return
+        account = selected.get("account")
+        env_override = selected.get("env_override")
+
         job_id = uuid.uuid4().hex
         job = {
             "job_id": job_id,
@@ -1486,16 +1784,13 @@ class Handler(SimpleHTTPRequestHandler):
             "result": None,
             "error": None,
             "retryable": False,
+            "account_id": account["id"] if account else None,
         }
 
         with LOCK:
             JOBS[job_id] = job
 
         record_job(job)
-
-        account = pick_account_for_job()
-        env_override = get_account_env(account["id"]) if account else None
-        job["account_id"] = account["id"] if account else None
 
         EXECUTOR.submit(execute_task, job_id, task_type, args, {"timeout": cli_timeout, "env_override": env_override})
 
@@ -1611,6 +1906,17 @@ class Handler(SimpleHTTPRequestHandler):
             if paths:
                 uploaded_paths_rel[k] = [str(p.relative_to(ROOT)) for p in paths]
 
+        selected = select_prepared_account_for_job()
+        if not selected.get("ok"):
+            json_response(self, 409, {
+                "ok": False,
+                "error": selected.get("error") or "no available Dreamina account",
+                "error_code": selected.get("error_code"),
+            })
+            return
+        account = selected.get("account")
+        env_override = selected.get("env_override")
+
         new_job_id = uuid.uuid4().hex
         new_job = {
             "job_id": new_job_id,
@@ -1632,14 +1938,11 @@ class Handler(SimpleHTTPRequestHandler):
             "result": None,
             "error": None,
             "retryable": False,
+            "account_id": account["id"] if account else None,
         }
         with LOCK:
             JOBS[new_job_id] = new_job
         record_job(new_job)
-
-        account = pick_account_for_job()
-        env_override = get_account_env(account["id"]) if account else None
-        new_job["account_id"] = account["id"] if account else None
 
         # Notify user when referenced files are gone (text-only modes still work)
         if missing_files:

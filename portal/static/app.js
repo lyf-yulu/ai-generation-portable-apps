@@ -844,7 +844,6 @@ function DreaminaApp() {
       const res = await api('/dreamina/api/open-output-dir', 'POST', data);
       if (res?.remote) this.statusText = '远程客户端不支持打开服务端目录';
     },
-    },
     async cleanCache() {
       const res = await api('/dreamina/api/cleanup-cache', 'POST');
       if (res) alert(`清理完成：素材 ${res.media_deleted || 0} 个，日志 ${res.logs_deleted || 0} 个`);

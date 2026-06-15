@@ -398,7 +398,7 @@ function appendDisabledResizeValues(data) {
 }
 
 async function imageUrlToFile(url, filename) {
-  const res = await fetch(url);
+  const res = await apiFetch(url);
   const blob = await res.blob();
   return new File([blob], filename || "image.png", { type: blob.type || "image/png" });
 }
