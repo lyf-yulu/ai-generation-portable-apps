@@ -18,6 +18,7 @@ certs/
 *.seedance
 *.nanobanana
 *.env
+volcengine-portrait/config.json
 
 # Dreamina account session data (contains tokens)
 .dreamina_cli/

@@ -1,0 +1,1289 @@
+#!/usr/bin/env python3
+"""Volcengine Portrait — 真人人像 & 虚拟人像 独立子应用"""
+from __future__ import annotations
+
+import base64
+import cgi
+import concurrent.futures
+import hashlib
+import hmac
+import json
+import mimetypes
+import os
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import datetime, timezone
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent
+_DATA_BASE = Path(os.environ.get("DATA_DIR", str(ROOT)))
+STATIC_DIR = ROOT / "static"
+OUTPUT_DIR = _DATA_BASE / "outputs"
+STATE_DIR = _DATA_BASE / "state"
+LOG_DIR = _DATA_BASE / "logs"
+UPLOAD_DIR = _DATA_BASE / "uploads"
+
+for d in [OUTPUT_DIR, STATE_DIR, LOG_DIR, UPLOAD_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+HOST = os.environ.get("HOST", "127.0.0.1")
+PORT = int(os.environ.get("PORT", "8891"))
+CORS = os.environ.get("CORS") == "1"
+
+MAX_CONCURRENT = 2
+ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+API_KEY = ""
+ACCESS_KEY = ""
+SECRET_KEY = ""  # raw form (decoded from base64 if needed)
+
+
+def load_config():
+    global MAX_CONCURRENT, ARK_BASE_URL, API_KEY, ACCESS_KEY, SECRET_KEY, OUTPUT_DIR
+    cfg_path = ROOT / "config.json"
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text("utf-8"))
+            MAX_CONCURRENT = cfg.get("max_concurrent", 2)
+            ARK_BASE_URL = cfg.get("base_url", ARK_BASE_URL)
+            API_KEY = cfg.get("api_key", "")
+            ACCESS_KEY = cfg.get("access_key", "")
+            raw_sk = cfg.get("secret_key", "")
+            if raw_sk:
+                SECRET_KEY = raw_sk
+            if cfg.get("output_dir"):
+                p = Path(cfg["output_dir"])
+                p.mkdir(parents=True, exist_ok=True)
+                OUTPUT_DIR = p
+        except Exception:
+            pass
+
+
+def save_config(updates: dict):
+    """Save partial config updates to config.json, reload affected globals."""
+    global OUTPUT_DIR
+    cfg_path = ROOT / "config.json"
+    cfg = {}
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text("utf-8"))
+        except Exception:
+            pass
+    cfg.update(updates)
+    cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), "utf-8")
+    if "output_dir" in updates:
+        p = Path(updates["output_dir"])
+        p.mkdir(parents=True, exist_ok=True)
+        OUTPUT_DIR = p
+
+
+def choose_output_dir() -> str:
+    """Open a native OS directory picker, return selected path."""
+    prompt = "选择人像生成输出目录"
+    if sys.platform == "darwin":
+        script = f'POSIX path of (choose folder with prompt "{prompt}")'
+        result = subprocess.run(["osascript", "-e", script], check=True, capture_output=True, text=True, timeout=60)
+        return result.stdout.strip().rstrip("/")
+    if sys.platform.startswith("win"):
+        ps = (
+            "$folder = (New-Object -ComObject Shell.Application)."
+            f"BrowseForFolder(0, '{prompt}', 0, 0); "
+            "if ($folder) { [Console]::OutputEncoding = [Text.UTF8Encoding]::UTF8; "
+            "Write-Output $folder.Self.Path }"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        selected = result.stdout.strip()
+        if selected:
+            return selected
+        raise RuntimeError("未选择输出目录")
+    # Linux / other: tkinter fallback
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        selected = filedialog.askdirectory(title=prompt)
+    finally:
+        root.destroy()
+    if selected:
+        return selected
+    raise RuntimeError("未选择输出目录")
+
+
+# === Data models (in-memory) ===
+GROUPS: dict[str, dict] = {}
+ASSETS: dict[str, dict] = {}
+JOBS: dict[str, dict] = {}
+FILES: dict[str, Path] = {}
+FILES_MAP_PATH = STATE_DIR / "download_files.json"
+
+JOBS_LOCK = threading.Lock()
+GROUP_LOCK = threading.Lock()
+ASSET_LOCK = threading.Lock()
+FILES_LOCK = threading.Lock()
+
+
+def load_files_map() -> dict[str, Path]:
+    """Load persisted download-token → file-path mapping from disk."""
+    try:
+        if FILES_MAP_PATH.exists():
+            data = json.loads(FILES_MAP_PATH.read_text("utf-8"))
+            result: dict[str, Path] = {}
+            for token, path_str in data.items():
+                p = Path(path_str)
+                if p.exists():
+                    result[token] = p
+            return result
+    except Exception:
+        pass
+    return {}
+
+
+def save_files_map() -> None:
+    """Persist the current FILES mapping to disk atomically."""
+    try:
+        with FILES_LOCK:
+            data = {token: str(p) for token, p in FILES.items()}
+        tmp = FILES_MAP_PATH.with_suffix(FILES_MAP_PATH.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+        tmp.replace(FILES_MAP_PATH)
+    except Exception:
+        pass
+
+
+load_config()
+FILES.update(load_files_map())
+
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT)
+
+
+def handle_config_post(handler):
+    """Update runtime config (output_dir etc.)."""
+    data = read_json_body(handler)
+    updates = {}
+    if "output_dir" in data:
+        p = (data["output_dir"] or "").strip()
+        if not p:
+            json_response(handler, 400, {"ok": False, "error": "output_dir cannot be empty"})
+            return
+        updates["output_dir"] = p
+    if not updates:
+        json_response(handler, 400, {"ok": False, "error": "no valid config fields"})
+        return
+    save_config(updates)
+    json_response(handler, 200, {"ok": True, "output_dir": str(OUTPUT_DIR)})
+
+
+def _public(d):
+    """Return a copy of dict without internal fields."""
+    return {k: v for k, v in d.items() if k not in ("api_key", "access_key", "secret_key")}
+
+
+def json_response(handler, status, data):
+    raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(raw)))
+    if CORS:
+        handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.end_headers()
+    try:
+        handler.wfile.write(raw)
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        pass
+
+
+def read_json_body(handler):
+    length = int(handler.headers.get("Content-Length") or "0")
+    if length == 0:
+        return {}
+    try:
+        return json.loads(handler.rfile.read(length))
+    except Exception:
+        return {}
+
+
+# === Volcengine SigV4 signing for OpenAPI (Asset API) ===
+
+def _sign(key, msg):
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+
+def _sha256_hex(s):
+    if isinstance(s, str):
+        s = s.encode("utf-8")
+    return hashlib.sha256(s).hexdigest()
+
+
+def _openapi_v4_sign(ak, sk, method, host, uri, query, headers, payload):
+    """Return (Authorization header value, X-Date value)."""
+    amz_date = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = amz_date[:8]
+    region = "cn-beijing"
+    service = "ark"
+
+    payload_hash = _sha256_hex(payload or "")
+
+    headers["Host"] = host
+    headers["X-Date"] = amz_date
+    headers["X-Content-Sha256"] = payload_hash
+    if payload:
+        headers["Content-Type"] = "application/json"
+
+    # Canonical headers (sorted by header name, case-insensitive)
+    canonical_headers = ""
+    signed_headers_list = []
+    for k in sorted(headers.keys(), key=str.lower):
+        kl = k.lower()
+        canonical_headers += f"{kl}:{headers[k].strip()}\n"
+        signed_headers_list.append(kl)
+    signed_headers = ";".join(signed_headers_list)
+
+    canonical_request = (
+        f"{method}\n{uri}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    )
+
+    credential_scope = f"{date_stamp}/{region}/{service}/request"
+    string_to_sign = (
+        f"HMAC-SHA256\n{amz_date}\n{credential_scope}\n{_sha256_hex(canonical_request)}"
+    )
+
+    k_date = _sign(sk.encode("utf-8"), date_stamp)
+    k_region = _sign(k_date, region)
+    k_service = _sign(k_region, service)
+    k_signing = _sign(k_service, "request")
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    authorization = (
+        f"HMAC-SHA256 Credential={ak}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    return authorization, amz_date
+
+
+PROJECT_NAME = "Seedance2.0"
+
+
+def openapi_call(action, body, ak=None, sk=None, timeout=120):
+    """Call Volcengine OpenAPI (Asset API) with AK/SK SigV4 signing."""
+    ak = ak or ACCESS_KEY
+    sk = sk or SECRET_KEY
+    if not ak or not sk:
+        return {"error": "Missing AK/SK"}
+
+    method = "POST"
+    host = "ark.cn-beijing.volcengineapi.com"
+    uri = "/"
+    query = f"Action={action}&Version=2024-01-01"
+
+    payload_str = json.dumps(body) if body else ""
+    headers = {}
+    authorization, amz_date = _openapi_v4_sign(ak, sk, method, host, uri, query, headers, payload_str)
+    headers["Authorization"] = authorization
+
+    url = f"https://{host}/?{query}"
+    data = payload_str.encode("utf-8") if payload_str else None
+    # Pass headers via constructor so urllib doesn't auto-inject a conflicting Content-Type
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    # Debug: log the signing details
+    print(f"[openapi_call] Action={action} AK={ak[:8]}... SK[0:4]={sk[:4]}... SK len={len(sk)}", flush=True)
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            result = json.loads(resp.read())
+            print(f"[openapi_call] SUCCESS Action={action}", flush=True)
+            return result
+    except urllib.error.HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read().decode(errors="replace")[:800]
+        except Exception:
+            pass
+        print(f"[openapi_call] FAIL Action={action} HTTP={e.code} detail={err_body}", flush=True)
+        return {"error": f"HTTP {e.code}", "detail": err_body}
+    except Exception as e:
+        print(f"[openapi_call] EXCEPTION Action={action}: {e}", flush=True)
+        return {"error": str(e)}
+
+
+def openapi_result(response):
+    """Return the business Result object from a Volcengine OpenAPI response."""
+    if isinstance(response, dict) and isinstance(response.get("Result"), dict):
+        return response["Result"]
+    return response if isinstance(response, dict) else {}
+
+
+# === Ark API v3 calls (Bearer token) for video generation ===
+
+def ark_v3_call(method, path, body=None, timeout=120, api_key=None):
+    """Call Ark API v3 (video generation, files) with Bearer token."""
+    url = f"{ARK_BASE_URL}{path}"
+    data = json.dumps(body).encode("utf-8") if body else None
+    headers = {"Authorization": f"Bearer {api_key or API_KEY}"}
+    if data:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read().decode(errors="replace")[:500]
+        except Exception:
+            pass
+        return {"error": f"HTTP {e.code}", "detail": err_body}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def upload_file_to_ark(file_data, filename, mime_type, api_key=None):
+    """Upload a file to Ark Files API, return (file_id, file_url) or (None, None)."""
+    boundary = uuid.uuid4().hex
+    body = b""
+    # purpose field
+    body += f"--{boundary}\r\n".encode()
+    body += b'Content-Disposition: form-data; name="purpose"\r\n\r\n'
+    body += b"user_data\r\n"
+    # file field
+    body += f"--{boundary}\r\n".encode()
+    body += f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode()
+    body += f"Content-Type: {mime_type}\r\n\r\n".encode()
+    body += file_data + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+
+    url = f"{ARK_BASE_URL}/files"
+    headers = {
+        "Authorization": f"Bearer {api_key or API_KEY}",
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+    }
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read())
+            fid = result.get("id") or result.get("file_id", "")
+            fname = result.get("filename", filename)
+            return fid, fname
+    except urllib.error.HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read().decode(errors="replace")[:500]
+        except Exception:
+            pass
+        print(f"  [ERROR] upload_file_to_ark: HTTP {e.code}: {err_body}")
+        return None, None
+    except Exception as e:
+        print(f"  [ERROR] upload_file_to_ark: {e}")
+        return None, None
+
+
+# === Background: Asset Status Polling ===
+
+def poll_asset_status(asset_id, ak=None, sk=None):
+    """Poll asset status via GetAsset action until Active/Failed."""
+
+    for _ in range(120):
+        time.sleep(5)
+        result = openapi_call("GetAsset", {"Id": asset_id, "ProjectName": PROJECT_NAME}, ak=ak, sk=sk)
+        if "error" in result:
+            with ASSET_LOCK:
+                if asset_id in ASSETS:
+                    ASSETS[asset_id]["status"] = "error"
+                    ASSETS[asset_id]["error"] = result["error"]
+            return
+        item = openapi_result(result)
+        status = (item.get("Status") or "").lower()
+        with ASSET_LOCK:
+            if asset_id in ASSETS:
+                ASSETS[asset_id]["status"] = status
+                ASSETS[asset_id]["raw_latest"] = result
+        if status == "active":
+            return
+        if status in ("failed", "error"):
+            return
+
+
+# === Download helper ===
+
+def download_video(video_url, job_id, idx):
+    try:
+        req = urllib.request.Request(video_url)
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            ext = mimetypes.guess_extension(resp.headers.get("Content-Type", "video/mp4")) or ".mp4"
+            fname = f"{job_id}_{idx}{ext}"
+            fpath = OUTPUT_DIR / fname
+            fpath.write_bytes(resp.read())
+            return fpath
+    except Exception as e:
+        print(f"  [ERROR] download_video: {e}")
+        return None
+
+
+def extract_video_url(data: dict[str, Any]) -> str | None:
+    """Extract video URL from Ark API task result (handles multiple response shapes)."""
+    content = data.get("content")
+    if isinstance(content, dict):
+        url = content.get("video_url") or content.get("videoUrl")
+        if url:
+            return str(url)
+    nested = data.get("data")
+    if isinstance(nested, dict):
+        url = extract_video_url(nested)
+        if url:
+            return url
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "video_url":
+                value = item.get("video_url")
+                if isinstance(value, dict) and value.get("url"):
+                    return str(value["url"])
+                if isinstance(value, str):
+                    return value
+    for key in ("video_url", "videoUrl"):
+        val = data.get(key)
+        if isinstance(val, str):
+            return val
+    output = data.get("output")
+    if isinstance(output, dict):
+        url = output.get("video_url") or output.get("videoUrl")
+        if url:
+            return str(url)
+    results = data.get("results")
+    if isinstance(results, list):
+        for item in results:
+            if isinstance(item, dict) and item.get("url"):
+                return str(item["url"])
+    return None
+
+
+# === Virtual Portrait Handlers ===
+
+def handle_virtual_groups_post(handler):
+    data = read_json_body(handler)
+    name = (data.get("name") or "").strip() or f"group-{time.strftime('%Y%m%d-%H%M%S')}"
+    description = (data.get("description") or "").strip()
+    ak = handler.headers.get("X-Access-Key", "") or None
+    sk = handler.headers.get("X-Secret-Key", "") or None
+
+    body = {"Name": name, "ProjectName": PROJECT_NAME, "GroupType": "AIGC"}
+    if description:
+        body["Description"] = description
+    result = openapi_call("CreateAssetGroup", body, ak=ak, sk=sk)
+    if "error" in result:
+        code = 401 if "Missing AK/SK" in result.get("error", "") else 502
+        json_response(handler, code, {"ok": False, "error": result["error"], "detail": result.get("detail")})
+        return
+
+    item = openapi_result(result)
+    gid = item.get("Id") or item.get("GroupId", "")
+    if not gid:
+        json_response(handler, 502, {"ok": False, "error": "no Id in response", "detail": str(result)[:200]})
+        return
+    with GROUP_LOCK:
+        GROUPS[gid] = {
+            "group_id": gid,
+            "name": name,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "raw": result,
+        }
+    json_response(handler, 200, {"ok": True, "group_id": gid})
+
+
+def handle_virtual_groups_get(handler):
+    """List asset groups via ListAssetGroups."""
+    ak = handler.headers.get("X-Access-Key", "") or None
+    sk = handler.headers.get("X-Secret-Key", "") or None
+
+    parsed_url = urllib.parse.urlparse(handler.path)
+    query_params = urllib.parse.parse_qs(parsed_url.query)
+    filter_body = {"GroupType": "AIGC"}
+    if "name" in query_params and query_params["name"][0].strip():
+        filter_body["Name"] = query_params["name"][0].strip()
+    if "group_ids" in query_params and query_params["group_ids"][0].strip():
+        filter_body["GroupIds"] = [g.strip() for g in query_params["group_ids"][0].split(",") if g.strip()]
+
+    result = openapi_call("ListAssetGroups", {
+        "Filter": filter_body,
+        "PageNumber": int(query_params.get("page", ["1"])[0]),
+        "PageSize": int(query_params.get("page_size", ["50"])[0]),
+        "ProjectName": PROJECT_NAME,
+    }, ak=ak, sk=sk)
+    if "error" in result:
+        code = 401 if "Missing AK/SK" in result.get("error", "") else 502
+        json_response(handler, code, {"ok": False, "error": result["error"], "detail": result.get("detail")})
+        return
+
+    items = openapi_result(result).get("Items") or []
+    groups = []
+    for item in items:
+        groups.append({
+            "group_id": item.get("Id", ""),
+            "name": item.get("Name", ""),
+            "description": item.get("Description", ""),
+            "project_name": item.get("ProjectName", ""),
+            "created_at": item.get("CreateTime", ""),
+        })
+    # Also merge with local cache
+    with GROUP_LOCK:
+        for gid, g in GROUPS.items():
+            if not any(x["group_id"] == gid for x in groups):
+                groups.append(g)
+    json_response(handler, 200, {"ok": True, "groups": groups})
+
+
+def _upload_to_public_host(file_data, filename, mime_type):
+    """Upload a file to a public host to get an HTTP URL accessible by CreateAsset.
+    Tries multiple free hosts, returns the public URL or None."""
+    boundary = uuid.uuid4().hex
+    body = b""
+    body += f"--{boundary}\r\n".encode()
+    body += f'Content-Disposition: form-data; name="files[]"; filename="{filename}"\r\n'.encode()
+    body += f"Content-Type: {mime_type}\r\n\r\n".encode()
+    body += file_data + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+
+    # Try uguu.se first (returns direct URL)
+    try:
+        req = urllib.request.Request(
+            "https://uguu.se/upload.php",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+        files = result.get("files") or []
+        if files and files[0].get("url"):
+            url = files[0]["url"]
+            print(f"  [public_upload] uguu.se OK → {url}", flush=True)
+            return url
+    except Exception as e:
+        print(f"  [public_upload] uguu.se FAIL: {e}", flush=True)
+
+    return None
+
+
+def handle_virtual_assets_post(handler):
+    content_type = handler.headers.get("Content-Type", "")
+    if "multipart" not in content_type:
+        json_response(handler, 400, {"ok": False, "error": "multipart required"})
+        return
+    cl = handler.headers.get("Content-Length", "0")
+    form = cgi.FieldStorage(fp=handler.rfile, headers=handler.headers,
+                            environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type, "CONTENT_LENGTH": cl})
+    group_id = form.getfirst("group_id", "")
+    if not group_id:
+        json_response(handler, 400, {"ok": False, "error": "group_id required"})
+        return
+
+    files = []
+    for key in form.keys():
+        item = form[key]
+        if item.filename:
+            files.append((item.filename, item.file.read(), item.type or "application/octet-stream"))
+
+    if not files:
+        json_response(handler, 400, {"ok": False, "error": "no files uploaded"})
+        return
+
+    ak = handler.headers.get("X-Access-Key", "") or None
+    sk = handler.headers.get("X-Secret-Key", "") or None
+    api_key = handler.headers.get("X-Api-Key", "") or None
+
+    fname, fdata, fmime = files[0]
+
+    # Determine asset type
+    asset_type = "Image"
+    if fmime.startswith("video/"):
+        asset_type = "Video"
+    elif fmime.startswith("audio/"):
+        asset_type = "Audio"
+
+    # Upload to a public host to get an accessible URL for CreateAsset
+    source_url = _upload_to_public_host(fdata, fname, fmime)
+    if not source_url:
+        json_response(handler, 502, {"ok": False, "error": "failed to get public URL for file"})
+        return
+
+    # Call CreateAsset via OpenAPI
+    create_body = {
+        "GroupId": group_id,
+        "URL": source_url,
+        "AssetType": asset_type,
+        "ProjectName": PROJECT_NAME,
+    }
+    if data_name := (form.getfirst("name") or "").strip():
+        create_body["Name"] = data_name
+
+    result = openapi_call("CreateAsset", create_body, ak=ak, sk=sk)
+    if "error" in result:
+        code = 401 if "Missing AK/SK" in result.get("error", "") else 502
+        json_response(handler, code, {"ok": False, "error": result["error"], "detail": result.get("detail")})
+        return
+
+    item = openapi_result(result)
+    asset_id = item.get("Id") or item.get("AssetId", "")
+    if not asset_id:
+        json_response(handler, 502, {"ok": False, "error": "no Id in CreateAsset response", "detail": str(result)[:200]})
+        return
+
+    with ASSET_LOCK:
+        ASSETS[asset_id] = {
+            "asset_id": asset_id,
+            "group_id": group_id,
+            "status": "processing",
+            "file_name": fname,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "raw": result,
+            "access_key": ak,
+            "secret_key": sk,
+        }
+    threading.Thread(target=poll_asset_status, args=(asset_id, ak, sk), daemon=True).start()
+    json_response(handler, 200, {"ok": True, "asset_id": asset_id})
+
+
+def handle_virtual_assets_get(handler, asset_id=None):
+    ak = handler.headers.get("X-Access-Key", "") or None
+    sk = handler.headers.get("X-Secret-Key", "") or None
+
+    if asset_id:
+        with ASSET_LOCK:
+            local = ASSETS.get(asset_id)
+        # Fetch latest from API
+        result = openapi_call("GetAsset", {"Id": asset_id, "ProjectName": PROJECT_NAME}, ak=ak, sk=sk)
+        if "error" not in result:
+            item = openapi_result(result)
+            with ASSET_LOCK:
+                if asset_id in ASSETS:
+                    ASSETS[asset_id]["status"] = (item.get("Status") or "").lower()
+                    ASSETS[asset_id]["url"] = item.get("URL", "")
+                    ASSETS[asset_id]["raw_latest"] = result
+        if local:
+            json_response(handler, 200, {"ok": True, **_public(local)})
+        else:
+            json_response(handler, 404, {"ok": False, "error": "asset not found"})
+    else:
+        # Fetch assets from Volcengine ListAssets API
+        api_assets = []
+        parsed_url = urllib.parse.urlparse(handler.path)
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+        filter_body = {"GroupType": "AIGC", "Statuses": ["Active", "Processing", "Failed"]}
+        if "group_ids" in query_params and query_params["group_ids"][0].strip():
+            filter_body["GroupIds"] = [g.strip() for g in query_params["group_ids"][0].split(",") if g.strip()]
+        if "name" in query_params and query_params["name"][0].strip():
+            filter_body["Name"] = query_params["name"][0].strip()
+        list_assets_body = {
+            "Filter": filter_body,
+            "PageNumber": int(query_params.get("page", ["1"])[0]),
+            "PageSize": int(query_params.get("page_size", ["50"])[0]),
+            "ProjectName": PROJECT_NAME,
+        }
+        if "sort_by" in query_params and query_params["sort_by"][0].strip():
+            list_assets_body["SortBy"] = query_params["sort_by"][0].strip()
+        if "sort_order" in query_params and query_params["sort_order"][0].strip():
+            list_assets_body["SortOrder"] = query_params["sort_order"][0].strip()
+        result = openapi_call("ListAssets", list_assets_body, ak=ak, sk=sk)
+        if "error" not in result:
+            for item in openapi_result(result).get("Items") or []:
+                aid = item.get("Id") or item.get("AssetId", "")
+                api_assets.append({
+                    "asset_id": aid,
+                    "group_id": item.get("GroupId", ""),
+                    "file_name": item.get("Name") or item.get("FileName", ""),
+                    "status": (item.get("Status") or "unknown").lower(),
+                    "created_at": item.get("CreateTime", ""),
+                    "asset_type": item.get("AssetType", "Image"),
+                    "url": item.get("URL", ""),
+                })
+                # Update in-memory cache
+                with ASSET_LOCK:
+                    if aid and aid not in ASSETS:
+                        ASSETS[aid] = api_assets[-1]
+        # Merge with local cache
+        with ASSET_LOCK:
+            local = [_public(a) for a in ASSETS.values()]
+        # Merge: API results first, then local items not in API results
+        api_ids = {a["asset_id"] for a in api_assets}
+        merged = api_assets.copy()
+        for a in local:
+            if a.get("asset_id") not in api_ids:
+                merged.append(a)
+        merged.sort(key=lambda a: a.get("created_at", ""), reverse=True)
+        json_response(handler, 200, {"ok": True, "assets": merged})
+
+
+def handle_virtual_assets_delete(handler, asset_id):
+    ak = handler.headers.get("X-Access-Key", "") or None
+    sk = handler.headers.get("X-Secret-Key", "") or None
+
+    with ASSET_LOCK:
+        asset = ASSETS.pop(asset_id, None)
+    if asset:
+        ak = ak or asset.get("access_key")
+        sk = sk or asset.get("secret_key")
+    if not ak or not sk:
+        json_response(handler, 401, {"ok": False, "error": "Missing AK/SK — 请在页面顶部设置 Access Key 和 Secret Key"})
+        return
+    result = openapi_call("DeleteAsset", {"Id": asset_id, "ProjectName": PROJECT_NAME}, ak=ak, sk=sk)
+    if "error" in result:
+        code = 401 if "Missing AK/SK" in result.get("error", "") else 502
+        json_response(handler, code, {"ok": False, "error": result["error"], "detail": result.get("detail")})
+        return
+    json_response(handler, 200, {"ok": True})
+
+
+def handle_virtual_group_get(handler, group_id):
+    """Get a single asset group via GetAssetGroup."""
+    ak = handler.headers.get("X-Access-Key", "") or None
+    sk = handler.headers.get("X-Secret-Key", "") or None
+
+    result = openapi_call("GetAssetGroup", {"Id": group_id, "ProjectName": PROJECT_NAME}, ak=ak, sk=sk)
+    if "error" in result:
+        code = 401 if "Missing AK/SK" in result.get("error", "") else 502
+        json_response(handler, code, {"ok": False, "error": result["error"], "detail": result.get("detail")})
+        return
+
+    item = openapi_result(result)
+    group = {
+        "group_id": item.get("Id", ""),
+        "name": item.get("Name", ""),
+        "description": item.get("Description", ""),
+        "project_name": item.get("ProjectName", ""),
+        "group_type": item.get("GroupType", ""),
+        "created_at": item.get("CreateTime", ""),
+        "updated_at": item.get("UpdateTime", ""),
+    }
+    json_response(handler, 200, {"ok": True, "group": group})
+
+
+def handle_virtual_group_update(handler, group_id):
+    """Update an asset group via UpdateAssetGroup."""
+    data = read_json_body(handler)
+    name = (data.get("name") or "").strip()
+    description = (data.get("description") or "").strip()
+    ak = handler.headers.get("X-Access-Key", "") or None
+    sk = handler.headers.get("X-Secret-Key", "") or None
+
+    if not name:
+        json_response(handler, 400, {"ok": False, "error": "name is required"})
+        return
+
+    body = {"Id": group_id, "Name": name, "ProjectName": PROJECT_NAME}
+    if description:
+        body["Description"] = description
+    result = openapi_call("UpdateAssetGroup", body, ak=ak, sk=sk)
+    if "error" in result:
+        code = 401 if "Missing AK/SK" in result.get("error", "") else 502
+        json_response(handler, code, {"ok": False, "error": result["error"], "detail": result.get("detail")})
+        return
+
+    with GROUP_LOCK:
+        if group_id in GROUPS:
+            GROUPS[group_id]["name"] = name
+            if description:
+                GROUPS[group_id]["description"] = description
+    json_response(handler, 200, {"ok": True, "group_id": group_id})
+
+
+def handle_virtual_asset_update(handler, asset_id):
+    """Update an asset name via UpdateAsset."""
+    data = read_json_body(handler)
+    name = (data.get("name") or "").strip()
+    ak = handler.headers.get("X-Access-Key", "") or None
+    sk = handler.headers.get("X-Secret-Key", "") or None
+
+    if not name:
+        json_response(handler, 400, {"ok": False, "error": "name is required"})
+        return
+
+    result = openapi_call("UpdateAsset", {"Id": asset_id, "Name": name, "ProjectName": PROJECT_NAME}, ak=ak, sk=sk)
+    if "error" in result:
+        code = 401 if "Missing AK/SK" in result.get("error", "") else 502
+        json_response(handler, code, {"ok": False, "error": result["error"], "detail": result.get("detail")})
+        return
+
+    with ASSET_LOCK:
+        if asset_id in ASSETS:
+            ASSETS[asset_id]["file_name"] = name
+    json_response(handler, 200, {"ok": True, "asset_id": asset_id})
+
+
+def handle_virtual_group_delete(handler, group_id):
+    """Delete an asset group via DeleteAssetGroup."""
+    ak = handler.headers.get("X-Access-Key", "") or None
+    sk = handler.headers.get("X-Secret-Key", "") or None
+
+    result = openapi_call("DeleteAssetGroup", {"Id": group_id, "ProjectName": PROJECT_NAME}, ak=ak, sk=sk)
+    if "error" in result:
+        code = 401 if "Missing AK/SK" in result.get("error", "") else 502
+        json_response(handler, code, {"ok": False, "error": result["error"], "detail": result.get("detail")})
+        return
+
+    with GROUP_LOCK:
+        GROUPS.pop(group_id, None)
+    json_response(handler, 200, {"ok": True})
+
+
+def handle_virtual_jobs_post(handler):
+    content_type = handler.headers.get("Content-Type", "")
+
+    if "multipart" in content_type:
+        # Multipart mode: form fields + optional extra image files
+        cl = handler.headers.get("Content-Length", "0")
+        form = cgi.FieldStorage(fp=handler.rfile, headers=handler.headers,
+                                environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type, "CONTENT_LENGTH": cl})
+        asset_id = form.getfirst("asset_id", "")
+        asset_id_2 = form.getfirst("asset_id_2", "")
+        prompt = form.getfirst("prompt", "")
+        model = form.getfirst("model", "doubao-seedance-2-0-260128")
+        duration = int(form.getfirst("duration", "12"))
+        resolution = form.getfirst("resolution", "720p")
+        ratio = form.getfirst("ratio", "16:9")
+        repeat_count = int(form.getfirst("repeat_count", "1"))
+
+        extra_files = []
+        for key in form.keys():
+            item = form[key]
+            if item.filename:
+                extra_files.append({
+                    "filename": item.filename,
+                    "data": item.file.read(),
+                    "mime_type": item.type or "application/octet-stream",
+                })
+    else:
+        # JSON mode (backward compatible)
+        data = read_json_body(handler)
+        asset_id = data.get("asset_id", "")
+        asset_id_2 = data.get("asset_id_2", "")
+        prompt = data.get("prompt", "")
+        model = data.get("model", "doubao-seedance-2-0-260128")
+        duration = int(data.get("duration", 12))
+        resolution = data.get("resolution", "720p")
+        ratio = data.get("ratio", "16:9")
+        repeat_count = int(data.get("repeat_count", 1))
+        extra_files = []
+
+    if not asset_id or not prompt:
+        json_response(handler, 400, {"ok": False, "error": "asset_id and prompt required"})
+        return
+
+    api_key = handler.headers.get("X-Api-Key", "") or None
+
+    # Upload extra files to Ark Files API immediately (in handler, not background)
+    extra_image_urls = []
+    if extra_files:
+        for ef in extra_files:
+            fid, fname = upload_file_to_ark(ef["data"], ef["filename"], ef["mime_type"], api_key=api_key)
+            if fid:
+                extra_image_urls.append({
+                    "url": f"https://ark.cn-beijing.volces.com/api/v3/files/{fid}/content",
+                    "filename": ef["filename"],
+                })
+            else:
+                # Fallback: save locally
+                local_fname = f"{uuid.uuid4().hex[:8]}_{ef['filename']}"
+                (UPLOAD_DIR / local_fname).write_bytes(ef["data"])
+                extra_image_urls.append({
+                    "url": f"http://{HOST}:{PORT}/uploads/{local_fname}",
+                    "filename": ef["filename"],
+                })
+
+    job_id = uuid.uuid4().hex[:12]
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "job_id": job_id,
+            "asset_id": asset_id,
+            "asset_id_2": asset_id_2,
+            "prompt": prompt,
+            "model": model,
+            "duration": duration,
+            "resolution": resolution,
+            "ratio": ratio,
+            "status": "queued",
+            "total": repeat_count,
+            "done": 0,
+            "results": [],
+            "errors": [],
+            "extra_image_urls": extra_image_urls,
+            "events": [{"time": time.strftime("%H:%M:%S"), "message": "任务已创建"}],
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "api_key": api_key,
+        }
+    _executor.submit(run_virtual_job, job_id)
+    json_response(handler, 201, {"ok": True, "job_id": job_id})
+
+
+def handle_virtual_jobs_get(handler, job_id=None):
+    if job_id:
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            data = _public(json.loads(json.dumps(job))) if job else None
+        json_response(handler, 200 if data else 404,
+                      data or {"ok": False, "error": "job not found"})
+    else:
+        with JOBS_LOCK:
+            jobs = [_public(j) for j in JOBS.values()]
+        jobs.sort(key=lambda j: j.get("created_at", ""), reverse=True)
+        json_response(handler, 200, {"ok": True, "jobs": jobs[:50]})
+
+
+# === Video generation job runner (Ark v3 API) ===
+
+def run_virtual_job(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        return
+    api_key = job.get("api_key")
+    asset_id = job.get("asset_id", "")
+    asset_id_2 = job.get("asset_id_2", "")
+    prompt = job.get("prompt", "")
+    model = job.get("model", "doubao-seedance-2-0-260128")
+    duration = int(job.get("duration", 12))
+    resolution = job.get("resolution", "720p")
+    ratio = job.get("ratio", "16:9")
+    repeat_count = int(job.get("total", 1))
+    extra_image_urls = job.get("extra_image_urls", [])
+
+    with JOBS_LOCK:
+        job["status"] = "running"
+        job["events"].append({"time": time.strftime("%H:%M:%S"), "message": "开始提交生成任务..."})
+
+    for idx in range(repeat_count):
+        # Build content array: text prompt + reference images
+        images = []
+        # 图1: asset_id (required)
+        images.append({"type": "image_url", "image_url": {"url": f"asset://{asset_id}"}, "role": "reference_image"})
+
+        # 图2+: asset_id_2 takes priority, then extra uploaded images
+        if asset_id_2:
+            images.append({"type": "image_url", "image_url": {"url": f"asset://{asset_id_2}"}, "role": "reference_image"})
+        elif extra_image_urls:
+            for eiu in extra_image_urls:
+                images.append({"type": "image_url", "image_url": {"url": eiu["url"]}, "role": "reference_image"})
+
+        body = {
+            "model": model,
+            "content": [{"type": "text", "text": prompt}] + images,
+            "duration": duration,
+            "resolution": resolution,
+            "ratio": ratio,
+        }
+        result = ark_v3_call("POST", "/contents/generations/tasks", body, timeout=120, api_key=api_key)
+        task_id = result.get("id") or result.get("task_id", "")
+        if "error" in result:
+            with JOBS_LOCK:
+                job["errors"].append(f"Run {idx}: {result['error']}")
+                job["done"] += 1
+                job["events"].append({"time": time.strftime("%H:%M:%S"), "message": f"Run {idx} 提交失败: {result['error']}"})
+            continue
+
+        with JOBS_LOCK:
+            job["events"].append({"time": time.strftime("%H:%M:%S"), "message": f"Run {idx} 已提交 task={task_id}"})
+
+        for _ in range(240):
+            time.sleep(5)
+            task_result = ark_v3_call("GET", f"/contents/generations/tasks/{task_id}", api_key=api_key)
+            t_status = (task_result.get("status") or "").lower()
+            if t_status in ("completed", "succeeded"):
+                video_url = extract_video_url(task_result) or ""
+                if video_url:
+                    local_path = download_video(video_url, job_id, idx)
+                    file_token = uuid.uuid4().hex
+                    if local_path:
+                        with FILES_LOCK:
+                            FILES[file_token] = local_path
+                        save_files_map()
+                    with JOBS_LOCK:
+                        job["results"].append({
+                            "index": idx,
+                            "task_id": task_id,
+                            "filename": local_path.name if local_path else f"output_{idx}.mp4",
+                            "download_url": f"/api/download/{file_token}" if local_path else video_url,
+                            "status": "succeeded",
+                        })
+                        job["done"] += 1
+                        job["events"].append({"time": time.strftime("%H:%M:%S"), "message": f"Run {idx} 完成"})
+                else:
+                    with JOBS_LOCK:
+                        job["results"].append({
+                            "index": idx,
+                            "task_id": task_id,
+                            "filename": f"output_{idx}.mp4",
+                            "download_url": extract_video_url(task_result) or "",
+                            "status": "succeeded",
+                        })
+                        job["done"] += 1
+                break
+            elif t_status in ("failed", "error"):
+                with JOBS_LOCK:
+                    job["errors"].append(f"Run {idx}: {t_status}")
+                    job["done"] += 1
+                break
+
+    with JOBS_LOCK:
+        job["status"] = "succeeded" if len(job.get("results", [])) > 0 else "failed"
+        job["events"].append({"time": time.strftime("%H:%M:%S"), "message": f"任务结束: {job['status']}"})
+
+
+# === Real Portrait Handlers (delegate to unified handlers) ===
+# Real-person assets use the same Asset API and video generation as virtual.
+# Face verification is done on the Volcengine console, not via API.
+
+def handle_real_assets_post(handler):
+    handle_virtual_assets_post(handler)
+
+
+def handle_real_assets_get(handler, asset_id=None):
+    handle_virtual_assets_get(handler, asset_id)
+
+
+def handle_real_assets_delete(handler, asset_id):
+    handle_virtual_assets_delete(handler, asset_id)
+
+
+def handle_real_jobs_post(handler):
+    handle_virtual_jobs_post(handler)
+
+
+def handle_real_jobs_get(handler, job_id=None):
+    handle_virtual_jobs_get(handler, job_id)
+
+
+def handle_real_group_get(handler, group_id):
+    handle_virtual_group_get(handler, group_id)
+
+
+def handle_real_group_update(handler, group_id):
+    handle_virtual_group_update(handler, group_id)
+
+
+def handle_real_asset_update(handler, asset_id):
+    handle_virtual_asset_update(handler, asset_id)
+
+
+def handle_real_group_delete(handler, group_id):
+    handle_virtual_group_delete(handler, group_id)
+
+
+def handle_real_groups_get(handler):
+    handle_virtual_groups_get(handler)
+
+
+# === HTTP Handler ===
+
+class Handler(SimpleHTTPRequestHandler):
+    def translate_path(self, path: str) -> str:
+        path = urllib.parse.urlparse(path).path
+        if path.startswith("/outputs/"):
+            return str((OUTPUT_DIR / path.removeprefix("/outputs/")).resolve())
+        if path.startswith("/uploads/"):
+            return str((UPLOAD_DIR / path.removeprefix("/uploads/")).resolve())
+        if path in {"/", "/index.html"}:
+            return str(STATIC_DIR / "index.html")
+        return str((STATIC_DIR / path.lstrip("/")).resolve())
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/v1/meta":
+            json_response(self, 200, {
+                "app": "volcengine-portrait",
+                "version": "1.0.0",
+                "port": PORT,
+                "capabilities": ["portrait-assets", "video-generation"],
+                "status": "ready",
+            })
+            return
+        if path == "/api/config":
+            json_response(self, 200, {
+                "ok": True,
+                "base_url": ARK_BASE_URL,
+                "has_key": bool(API_KEY),
+                "has_aksk": bool(ACCESS_KEY and SECRET_KEY),
+                "output_dir": str(OUTPUT_DIR),
+            })
+            return
+
+        # Virtual portrait
+        if path == "/api/virtual/groups":
+            handle_virtual_groups_get(self)
+            return
+        if path.startswith("/api/virtual/groups/"):
+            handle_virtual_group_get(self, path.rsplit("/", 1)[-1])
+            return
+        if path.startswith("/api/virtual/assets/"):
+            handle_virtual_assets_get(self, path.rsplit("/", 1)[-1])
+            return
+        if path == "/api/virtual/assets":
+            handle_virtual_assets_get(self)
+            return
+        if path.startswith("/api/virtual/jobs/"):
+            handle_virtual_jobs_get(self, path.rsplit("/", 1)[-1])
+            return
+        if path == "/api/virtual/jobs":
+            handle_virtual_jobs_get(self)
+            return
+
+        # Real portrait (same handlers as virtual)
+        if path.startswith("/api/real/assets/"):
+            handle_real_assets_get(self, path.rsplit("/", 1)[-1])
+            return
+        if path == "/api/real/assets":
+            handle_real_assets_get(self)
+            return
+        if path.startswith("/api/real/jobs/"):
+            handle_real_jobs_get(self, path.rsplit("/", 1)[-1])
+            return
+        if path == "/api/real/jobs":
+            handle_real_jobs_get(self)
+            return
+        if path.startswith("/api/real/groups/"):
+            handle_real_group_get(self, path.rsplit("/", 1)[-1])
+            return
+        if path == "/api/real/groups":
+            handle_real_groups_get(self)
+            return
+
+        # Generic job lookup (for Portal UsageTracker polling)
+        if path.startswith("/api/jobs/"):
+            handle_virtual_jobs_get(self, path.rsplit("/", 1)[-1])
+            return
+
+        # Download / uploads
+        if path.startswith("/api/download/"):
+            token = path.rsplit("/", 1)[-1]
+            with FILES_LOCK:
+                fpath = FILES.get(token)
+            if not fpath or not fpath.exists():
+                json_response(self, 404, {"ok": False, "error": "file not found"})
+                return
+            self._serve_file(fpath)
+            return
+        if path.startswith("/uploads/"):
+            fpath = UPLOAD_DIR / path.removeprefix("/uploads/")
+            if fpath.exists():
+                self._serve_file(fpath)
+                return
+
+        super().do_GET()
+
+    def _serve_file(self, fpath):
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(fpath.name)[0] or "application/octet-stream")
+        self.send_header("Content-Disposition", f'attachment; filename="{fpath.name}"')
+        self.send_header("Content-Length", str(fpath.stat().st_size))
+        if CORS:
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        try:
+            self.wfile.write(fpath.read_bytes())
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/config":
+            handle_config_post(self)
+            return
+        if path == "/api/choose-output-dir":
+            client_ip = self.headers.get("X-Forwarded-For") or self.client_address[0]
+            if client_ip not in ("127.0.0.1", "::1", "localhost"):
+                json_response(self, 200, {"remote": True})
+                return
+            try:
+                json_response(self, 200, {"path": choose_output_dir()})
+            except Exception as exc:
+                json_response(self, 500, {"error": str(exc)})
+            return
+        if path == "/api/virtual/groups":
+            handle_virtual_groups_post(self)
+            return
+        if path.startswith("/api/virtual/groups/"):
+            handle_virtual_group_update(self, path.rsplit("/", 1)[-1])
+            return
+        if path == "/api/virtual/assets":
+            handle_virtual_assets_post(self)
+            return
+        if path.startswith("/api/virtual/assets/"):
+            handle_virtual_asset_update(self, path.rsplit("/", 1)[-1])
+            return
+        if path == "/api/virtual/jobs":
+            handle_virtual_jobs_post(self)
+            return
+        if path == "/api/real/jobs":
+            handle_real_jobs_post(self)
+            return
+        if path.startswith("/api/real/groups/"):
+            handle_real_group_update(self, path.rsplit("/", 1)[-1])
+            return
+        if path == "/api/real/assets":
+            handle_real_assets_post(self)
+            return
+        if path.startswith("/api/real/assets/"):
+            handle_real_asset_update(self, path.rsplit("/", 1)[-1])
+            return
+        json_response(self, 404, {"ok": False, "error": "not found"})
+
+    def do_DELETE(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path.startswith("/api/virtual/assets/"):
+            handle_virtual_assets_delete(self, path.rsplit("/", 1)[-1])
+            return
+        if path.startswith("/api/virtual/groups/"):
+            handle_virtual_group_delete(self, path.rsplit("/", 1)[-1])
+            return
+        if path.startswith("/api/real/assets/"):
+            handle_real_assets_delete(self, path.rsplit("/", 1)[-1])
+            return
+        if path.startswith("/api/real/groups/"):
+            handle_real_group_delete(self, path.rsplit("/", 1)[-1])
+            return
+        json_response(self, 404, {"ok": False, "error": "not found"})
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        if CORS:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Workspace-Id, X-Api-Key, X-Access-Key, X-Secret-Key")
+            self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+
+def main():
+    load_config()
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"  Volcengine Portrait → http://{HOST}:{PORT}")
+    print(f"  Base URL: {ARK_BASE_URL}")
+    print(f"  API Key: {'configured' if API_KEY else 'NOT configured'}")
+    print(f"  AK/SK: {'configured' if ACCESS_KEY and SECRET_KEY else 'NOT configured'}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

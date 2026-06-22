@@ -19,301 +19,18 @@
     <button class="app-tab active" data-tab="seedance">Seedance</button>
     <button class="app-tab" data-tab="nb">Nano Banana</button>
     <button class="app-tab" data-tab="dreamina">Dreamina</button>
+    <button class="app-tab" data-tab="volcengine-portrait">人像生成</button>
     <button class="app-tab" data-tab="stats">统计</button>
   </div>
 
   <!-- SEEDANCE -->
-  <div class="tab-panel active" id="tab-seedance" v-scope="SeedanceApp()" @vue:mounted="init()">
-    <main class="app">
-      <aside class="sidebar">
-        <h1>Seedance <span class="app-status-dot" :class="appStatus"></span></h1>
-        <form id="sd-form" ref="form" @submit.prevent="submit()">
-          <section>
-            <h2>接口</h2>
-            <label>API Key<input name="api_key" type="password" autocomplete="off" placeholder="留空使用本地配置"></label>
-            <p class="hint">{{ keyHint }}</p>
-            <label>供应商
-              <select name="provider" v-model="provider" @change="applyProvider($event.target.value)">
-                <option v-for="(cfg, key) in providers" :value="key">{{ cfg.label || key }}</option>
-              </select>
-            </label>
-            <label>Base URL<input name="base_url" v-model="baseUrl"></label>
-            <p class="hint">{{ providerHint }}</p>
-            <label>输出目录<input name="output_dir" v-model="outputDir" placeholder="留空则保存到 outputs 文件夹"></label>
-            <div class="rowButtons outputDirBtns">
-              <button type="button" @click="chooseOutputDir()">选择目录</button>
-              <button type="button" @click="outputDir=''">程序 outputs</button>
-              <button type="button" @click="desktopOutput()">桌面 outputs</button>
-              <button type="button" @click="openOutputDir()">打开目录</button>
-              <button type="button" @click="cleanCache()">清理缓存</button>
-            </div>
-          </section>
-          <section>
-            <h2>参数</h2>
-            <label>模型
-              <select name="model">
-                <option v-for="m in models" :value="m.id">{{ m.label || m.id }}</option>
-              </select>
-            </label>
-            <div class="grid2">
-              <label>时长<input name="duration" type="number" min="4" max="15" value="12"></label>
-              <label>分辨率
-                <select name="resolution">
-                  <option>720p</option><option>480p</option><option>1080p</option>
-                  <option>native1080p</option><option>2k</option><option>4k</option>
-                </select>
-              </label>
-            </div>
-            <div class="grid2">
-              <label>比例
-                <select name="ratio">
-                  <option>16:9</option><option>9:16</option><option>1:1</option>
-                  <option>4:3</option><option>3:4</option><option>21:9</option>
-                  <option>9:21</option><option>adaptive</option>
-                </select>
-              </label>
-              <label>Seed<input name="seed" type="number" min="0" max="2147483647" placeholder="随机"></label>
-            </div>
-            <div class="toggles">
-              <label><input name="generate_audio" type="checkbox"> 生成音频</label>
-              <label><input name="watermark" type="checkbox"> 水印</label>
-              <label><input name="return_last_frame" type="checkbox"> 返回尾帧</label>
-              <label><input name="vary_seed" type="checkbox" checked> seed +1</label>
-            </div>
-            <label>输出名<input name="output_name" placeholder="留空自动命名，多并发加 -1 -2..."></label>
-          </section>
-          <section>
-            <h2>并发重复</h2>
-            <div class="grid2">
-              <label>重复次数<input name="repeat_count" type="number" min="1" max="20" value="1"></label>
-              <label>并发数<input name="concurrency" type="number" min="1" max="20" value="1"></label>
-            </div>
-          </section>
-          <button type="submit" :disabled="submitting">{{ submitting ? '生成中' : '开始生成' }}</button>
-          <section class="archiveBox">
-            <h2>存档</h2>
-            <label>存档名<input name="archive_name" placeholder="存档名称"></label>
-            <label>读取存档
-              <select v-model="selectedArchive">
-                <option v-for="a in archives" :value="a.name">{{ a.name }}</option>
-              </select>
-            </label>
-            <div class="rowButtons archiveActions">
-              <button type="button" @click="saveArchive()">保存</button>
-              <button type="button" @click="loadArchive()">读取</button>
-              <button type="button" @click="deleteArchive()">删除</button>
-            </div>
-            <p class="hint">{{ archiveHint }}</p>
-          </section>
-        </form>
-      </aside>
-      <section class="workspace">
-        <div class="panel">
-          <h2>Prompt</h2>
-          <textarea name="prompt" form="sd-form" spellcheck="false" placeholder="输入提示词，@ref_image1 引用参考图..."></textarea>
-        </div>
-        <div class="panel">
-          <h2>首尾帧</h2>
-          <div class="uploadGrid two">
-            <label class="drop">首帧<input form="sd-form" name="first_frame" type="file" accept="image/*"><span>未上传</span></label>
-            <label class="drop">尾帧<input form="sd-form" name="last_frame" type="file" accept="image/*"><span>未上传</span></label>
-          </div>
-          <h2>参考图</h2>
-          <div class="uploadGrid refs" id="sd-imageRefs"></div>
-          <h2>参考视频</h2>
-          <div class="uploadGrid three" id="sd-videoRefs"></div>
-          <h2>参考音频</h2>
-          <div class="uploadGrid three" id="sd-audioRefs"></div>
-        </div>
-        <div class="panel">
-          <div class="sub-tabs" style="margin-bottom:10px">
-            <button type="button" class="sub-tab" :class="{ isActive: wsTab === 'jobs' }" @click="wsTab='jobs'">任务</button>
-            <button type="button" class="sub-tab" :class="{ isActive: wsTab === 'activity' }" @click="wsTab='activity'; loadActivity()">活动</button>
-          </div>
-          <div v-show="wsTab==='jobs'">
-            <div class="resultHeader"><h2>结果</h2><span>{{ statusText }}</span></div>
-            <div class="results" id="sd-results"></div>
-            <pre id="sd-events">{{ eventsText }}</pre>
-          </div>
-          <div v-show="wsTab==='activity'" class="activity-panel-inner">
-            <div v-if="!activityDetail">
-              <div class="activity-counts" v-if="activityCounts">
-                <span>共 {{ activityCounts.total }} 条</span>
-                <span class="act-ok">成功 {{ activityCounts.succeeded }}</span>
-                <span class="act-fail">失败 {{ activityCounts.failed }}</span>
-              </div>
-              <div class="activity-records">
-                <div v-for="r in activityRecords" :key="r.id" class="act-item" @click="showDetail(r.id)">
-                  <span class="act-status" :class="r.status">{{ r.status }}</span>
-                  <span class="act-time">{{ (r.created_at||'').slice(5,16) }}</span>
-                  <span class="act-title">{{ r.title }}</span>
-                </div>
-                <div v-if="!activityRecords.length" style="color:#697386;font-size:12px">暂无活动记录</div>
-              </div>
-            </div>
-            <div v-else class="act-detail">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-                <button type="button" class="btn-small" @click="activityDetail=null">← 返回列表</button>
-                <button type="button" class="btn-small" style="background:#17191f;color:#fff" @click="restoreActivity()">恢复参数</button>
-              </div>
-              <div class="act-detail-meta">
-                <span :class="activityDetail.status">{{ activityDetail.status }}</span> · {{ activityDetail.created_at }}
-              </div>
-              <h3 style="margin:8px 0 4px;font-size:13px">请求参数</h3>
-              <pre style="font-size:11px;max-height:200px">{{ JSON.stringify(activityDetail.restore?.values || activityDetail.request, null, 2) }}</pre>
-              <h3 style="margin:8px 0 4px;font-size:13px" v-if="activityDetail.result">结果</h3>
-              <pre v-if="activityDetail.result" style="font-size:11px;max-height:150px">{{ JSON.stringify(activityDetail.result, null, 2) }}</pre>
-            </div>
-          </div>
-        </div>
-      </section>
-    </main>
+  <div class="tab-panel active" id="tab-seedance">
+    <iframe src="/seedance/index.html" style="width:100%;height:calc(100vh - 60px);border:none;display:block" allow="fullscreen"></iframe>
   </div>
 
   <!-- NANO BANANA -->
-  <div class="tab-panel" id="tab-nb" v-scope="NanoBananaApp()" @vue:mounted="init()">
-    <main class="app">
-      <aside class="sidebar">
-        <h1>Nano Banana <span class="app-status-dot" :class="appStatus"></span></h1>
-        <form id="nb-form" ref="form" @submit.prevent="submit()">
-          <section>
-            <h2>接口</h2>
-            <label>API Key<input name="api_key" type="password" autocomplete="off" placeholder="留空使用本地配置"></label>
-            <p class="hint">{{ keyHint }}</p>
-            <label>供应商
-              <select name="provider" v-model="provider" @change="applyProvider($event.target.value)">
-                <option v-for="(cfg, key) in providers" :value="key">{{ cfg.label || key }}</option>
-              </select>
-            </label>
-            <label>Base URL<input name="base_url" v-model="baseUrl"></label>
-            <p class="hint">{{ providerHint }}</p>
-            <label>输出目录<input name="output_dir" v-model="outputDir" placeholder="留空则保存到 outputs 文件夹"></label>
-            <div class="rowButtons outputDirBtns">
-              <button type="button" @click="chooseOutputDir()">选择目录</button>
-              <button type="button" @click="outputDir=''">程序 outputs</button>
-              <button type="button" @click="desktopOutput()">桌面 outputs</button>
-              <button type="button" @click="openOutputDir()">打开目录</button>
-              <button type="button" @click="cleanCache()">清理缓存</button>
-            </div>
-          </section>
-          <section>
-            <h2>参数</h2>
-            <label>模式
-              <select name="mode">
-                <option value="img2img">img2img</option>
-                <option value="text2img">text2img</option>
-              </select>
-            </label>
-            <label>模型
-              <select name="model">
-                <option v-for="m in models" :value="m.id">{{ m.label || m.id }}</option>
-              </select>
-            </label>
-            <div class="grid2">
-              <label>比例
-                <select name="aspect_ratio">
-                  <option value="auto">auto</option><option>1:1</option><option>16:9</option>
-                  <option>9:16</option><option>4:3</option><option>3:4</option>
-                </select>
-              </label>
-              <label>尺寸
-                <select name="image_size">
-                  <option>1K</option><option selected>2K</option><option>4K</option>
-                </select>
-              </label>
-            </div>
-            <div class="grid2">
-              <label>Seed<input name="seed" type="number" min="0" max="2147483647" placeholder="随机"></label>
-              <label>生成后 seed
-                <select name="control_after_generate">
-                  <option value="randomize">randomize</option>
-                  <option value="fixed">fixed</option>
-                </select>
-              </label>
-            </div>
-            <div class="toggles">
-              <label><input name="skip_error" type="checkbox"> 跳过错误</label>
-              <label><input name="vary_seed" type="checkbox" checked> seed +1</label>
-            </div>
-            <label>输出名<input name="output_name" placeholder="留空自动命名，多并发加 -1 -2..."></label>
-          </section>
-          <section>
-            <h2>并发重复</h2>
-            <div class="grid2">
-              <label>重复次数<input name="repeat_count" type="number" min="1" max="50" value="1"></label>
-              <label>并发数<input name="concurrency" type="number" min="1" max="20" value="1"></label>
-            </div>
-          </section>
-          <button type="submit" :disabled="submitting">{{ submitting ? '生成中' : '开始生成' }}</button>
-          <section class="archiveBox">
-            <h2>存档</h2>
-            <label>存档名<input name="archive_name" placeholder="存档名称"></label>
-            <label>读取存档
-              <select v-model="selectedArchive">
-                <option v-for="a in archives" :value="a.name">{{ a.name }}</option>
-              </select>
-            </label>
-            <div class="rowButtons archiveActions">
-              <button type="button" @click="saveArchive()">保存</button>
-              <button type="button" @click="loadArchive()">读取</button>
-              <button type="button" @click="deleteArchive()">删除</button>
-            </div>
-            <p class="hint">{{ archiveHint }}</p>
-          </section>
-        </form>
-      </aside>
-      <section class="workspace">
-        <div class="panel">
-          <h2>Prompt</h2>
-          <textarea name="prompt" form="nb-form" spellcheck="false" placeholder="输入提示词。多图参考可写：参考 Image 1 的人物..."></textarea>
-        </div>
-        <div class="panel">
-          <h2>参考图</h2>
-          <div class="uploadGrid refs" id="nb-imageRefs"></div>
-        </div>
-        <div class="panel">
-          <div class="sub-tabs" style="margin-bottom:10px">
-            <button type="button" class="sub-tab" :class="{ isActive: wsTab === 'jobs' }" @click="wsTab='jobs'">任务</button>
-            <button type="button" class="sub-tab" :class="{ isActive: wsTab === 'activity' }" @click="wsTab='activity'; loadActivity()">活动</button>
-          </div>
-          <div v-show="wsTab==='jobs'">
-            <div class="resultHeader"><h2>结果</h2><span>{{ statusText }}</span></div>
-            <div class="results" id="nb-results"></div>
-            <pre id="nb-events">{{ eventsText }}</pre>
-          </div>
-          <div v-show="wsTab==='activity'" class="activity-panel-inner">
-            <div v-if="!activityDetail">
-              <div class="activity-counts" v-if="activityCounts">
-                <span>共 {{ activityCounts.total }} 条</span>
-                <span class="act-ok">成功 {{ activityCounts.succeeded }}</span>
-                <span class="act-fail">失败 {{ activityCounts.failed }}</span>
-              </div>
-              <div class="activity-records">
-                <div v-for="r in activityRecords" :key="r.id" class="act-item" @click="showDetail(r.id)">
-                  <span class="act-status" :class="r.status">{{ r.status }}</span>
-                  <span class="act-time">{{ (r.created_at||'').slice(5,16) }}</span>
-                  <span class="act-title">{{ r.title }}</span>
-                </div>
-                <div v-if="!activityRecords.length" style="color:#697386;font-size:12px">暂无活动记录</div>
-              </div>
-            </div>
-            <div v-else class="act-detail">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-                <button type="button" class="btn-small" @click="activityDetail=null">← 返回列表</button>
-                <button type="button" class="btn-small" style="background:#17191f;color:#fff" @click="restoreActivity()">恢复参数</button>
-              </div>
-              <div class="act-detail-meta">
-                <span :class="activityDetail.status">{{ activityDetail.status }}</span> · {{ activityDetail.created_at }}
-              </div>
-              <h3 style="margin:8px 0 4px;font-size:13px">请求参数</h3>
-              <pre style="font-size:11px;max-height:200px">{{ JSON.stringify(activityDetail.restore?.values || activityDetail.request, null, 2) }}</pre>
-              <h3 style="margin:8px 0 4px;font-size:13px" v-if="activityDetail.result">结果</h3>
-              <pre v-if="activityDetail.result" style="font-size:11px;max-height:150px">{{ JSON.stringify(activityDetail.result, null, 2) }}</pre>
-            </div>
-          </div>
-        </div>
-      </section>
-    </main>
+  <div class="tab-panel" id="tab-nb">
+    <iframe src="/nano-banana/index.html" style="width:100%;height:calc(100vh - 60px);border:none;display:block" allow="fullscreen"></iframe>
   </div>
 
   <!-- DREAMINA -->
@@ -494,13 +211,14 @@
           <h2>存档</h2>
           <label>存档名<input type="text" v-model="archiveName" placeholder="存档名称..."></label>
           <div style="display:flex;gap:6px;margin-bottom:8px">
-            <select v-model="selectedArchive" style="flex:1">
+            <select v-model="selectedArchive">
               <option v-for="a in archives" :value="a.name">{{ a.name }}</option>
             </select>
             <button class="btn-small" type="button" @click="loadArchive()">读取</button>
             <button class="btn-small" type="button" @click="deleteArchive()">删除</button>
           </div>
           <button type="button" @click="saveArchive()">保存存档</button>
+          <p v-if="archiveHint" style="font-size:12px;margin-top:6px;color:#94a3b8">{{ archiveHint }}</p>
         </div>
       </aside>
       <section class="workspace">
@@ -527,6 +245,214 @@
         </div>
       </section>
     </main>
+  </div>
+
+  <!-- VOLCENGINE PORTRAIT -->
+  <div class="tab-panel" id="tab-volcengine-portrait" v-scope="VolcenginePortraitApp()" @vue:mounted="init()">
+    <div class="portrait-container">
+      <section class="card" style="margin-bottom:12px">
+        <label style="font-size:13px;color:#475569">API Key <span style="color:#94a3b8;font-size:11px">（局域网用户填写自己的 Key）</span>
+          <input type="password" v-model="apiKey" autocomplete="off" placeholder="填入火山方舟 API Key" style="margin-top:4px">
+        </label>
+        <p style="font-size:11px;color:#94a3b8;margin-top:4px">{{ apiKey ? '已设置 (masked)' : '未设置 — 将使用服务端 config.json 中的 Key' }}</p>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <label style="font-size:13px;color:#475569;flex:1">Access Key
+            <input type="password" v-model="accessKey" autocomplete="off" placeholder="AK（素材管理用）" style="margin-top:4px">
+          </label>
+          <label style="font-size:13px;color:#475569;flex:1">Secret Key
+            <input type="password" v-model="secretKey" autocomplete="off" placeholder="SK（素材管理用）" style="margin-top:4px">
+          </label>
+        </div>
+        <p style="font-size:11px;color:#94a3b8;margin-top:4px">{{ (accessKey && secretKey) ? 'AK/SK 已设置' : 'AK/SK 未设置 — 将使用服务端 config.json 中的 AK/SK' }}</p>
+      </section>
+
+      <section class="card" style="background:#eff6ff;border:1px solid #bfdbfe;margin-bottom:12px">
+        <p style="font-size:12px;color:#3b82f6;margin:0">
+          <strong>真人素材：</strong>真人认证和素材录入请在<a href="https://console.volcengine.com/ark/experience/" target="_blank" style="color:#2563eb;font-weight:600">火山方舟体验中心 → 我的 → 真人人像</a>完成。
+          录入后可直接在下方选择 Asset ID 生成视频。虚拟人像素材可直接在本页面创建组并上传。
+        </p>
+      </section>
+
+      <div class="portrait-grid">
+        <div>
+          <section class="card">
+            <h2>1. 创建人像组 <span style="font-size:11px;color:#64748b">（虚拟人像）</span></h2>
+            <div class="row">
+              <input v-model="groupName" placeholder="组名称（可选）">
+              <button @click="createGroup()" :disabled="creatingGroup">{{ creatingGroup ? '创建中...' : '创建人像组' }}</button>
+            </div>
+            <p v-if="groupId" style="color:#22c55e;font-size:12px;margin-top:6px">组 ID: {{ groupId }}</p>
+          </section>
+
+          <section class="card">
+            <h2>2. 上传素材 <span style="font-size:11px;color:#64748b">（虚拟人像）</span></h2>
+            <div class="row" style="margin-bottom:6px">
+              <input v-model="assetGroupId" placeholder="Group ID">
+              <button @click="loadGroups()" style="font-size:11px;padding:3px 8px">加载已有组</button>
+              <button @click="deleteGroup(assetGroupId)" :disabled="!assetGroupId" class="btn-sm" style="background:#dc2626;color:#fff;border-color:#dc2626;margin-left:4px">删除组</button>
+            </div>
+            <div v-if="groups.length" style="margin-bottom:6px">
+              <select v-model="assetGroupId" style="width:100%;font-size:11px">
+                <option value="">-- 选择已有组 --</option>
+                <option v-for="g in groups" :value="g.group_id">{{ g.name }} ({{ g.group_id }})</option>
+              </select>
+              <div v-if="assetGroupId" style="margin-top:4px;display:flex;gap:6px;align-items:center">
+                <span style="font-size:11px;color:#64748b">组名:</span>
+                <input v-if="renamingGroup" v-model="renameGroupName" @keyup.enter="saveGroupRename()" @keyup.escape="renamingGroup=false" style="font-size:11px;padding:4px 6px" :placeholder="groupNameFor(assetGroupId)">
+                <span v-else style="font-size:12px;color:#334155;flex:1">{{ groupNameFor(assetGroupId) }}</span>
+                <button v-if="renamingGroup" @click="saveGroupRename()" :disabled="renamingSaving" class="btn-sm" style="background:#2563eb;color:#fff;border-color:#2563eb;font-size:10px;padding:2px 8px">{{ renamingSaving ? '...' : '保存' }}</button>
+                <button v-if="renamingGroup" @click="renamingGroup=false" class="btn-sm" style="font-size:10px;padding:2px 8px">取消</button>
+                <button v-if="!renamingGroup" @click="startRenameGroup()" class="btn-sm" style="font-size:10px;padding:2px 8px">重命名</button>
+              </div>
+            </div>
+            <div class="row">
+              <input type="file" id="vp-file" accept="image/*,video/*" style="display:none" @change="onFileSelect()">
+              <button @click="document.getElementById('vp-file').click()">选择文件</button>
+              <button @click="uploadAsset()" :disabled="uploading">{{ uploading ? '上传中...' : '上传素材' }}</button>
+            </div>
+            <p v-if="selectedFile" style="font-size:12px;color:#94a3b8;margin-top:4px">已选: {{ selectedFile }}</p>
+            <p v-if="uploadMsg" :style="{fontSize:'12px',marginTop:'4px',color:uploadError?'#ef4444':'#22c55e'}">{{ uploadMsg }}</p>
+          </section>
+        </div>
+        <div>
+          <section class="card">
+            <h2>3. 我的资产 <button @click="loadAssets()" style="font-size:11px;padding:3px 10px;margin-left:8px">刷新</button></h2>
+            <p style="font-size:11px;color:#64748b;margin-top:0">包含虚拟人像和已录入的真人素材资产</p>
+            <div v-if="assets.length===0" style="color:#64748b;font-size:12px">暂无人像资产，请先上传素材或在火山方舟控制台录入真人素材</div>
+            <div v-for="a in assets" class="asset-row">
+              <img v-if="a.url" :src="a.url" class="asset-thumb" @error="$event.target.style.display='none'" alt="预览">
+              <span v-else class="asset-thumb-placeholder">{{ a.asset_type === 'Video' ? '🎬' : '🖼' }}</span>
+              <div class="asset-info">
+                <span class="asset-name">{{ a.file_name || '(未命名)' }}</span>
+                <span class="asset-id">ID: {{ a.asset_id }}</span>
+              </div>
+              <span :class="'tag tag-'+(a.status||'processing')">{{ a.status || 'processing' }}</span>
+              <span style="font-size:11px;color:#94a3b8;white-space:nowrap">{{ (a.created_at||'').slice(0,16) }}</span>
+              <button @click="deleteAsset(a.asset_id)" class="btn-sm" style="background:#dc2626;color:#fff;border-color:#dc2626">删除</button>
+            </div>
+          </section>
+
+          <section class="card">
+            <h2>4. 生成视频</h2>
+            <label>选择资产 <span style="font-size:11px;color:#94a3b8">（作为图1引用）</span>
+              <select v-model="genAssetId" style="margin-top:4px">
+                <option value="">-- 选择已有资产 --</option>
+                <option v-for="a in assets" :value="a.asset_id" :disabled="a.status !== 'active'">
+                  {{ a.file_name || a.asset_id }} [{{ a.status }}]
+                </option>
+              </select>
+            </label>
+            <p v-if="genAssetId" style="font-size:11px;color:#3b82f6;margin-top:2px">将在 Prompt 中作为「图1」引用: asset://{{ genAssetId }}</p>
+
+            <label style="margin-top:10px">选择资产2 <span style="font-size:11px;color:#94a3b8">（可选，作为图2引用）</span>
+              <select v-model="genAssetId2" style="margin-top:4px">
+                <option value="">-- 无（仅图1） --</option>
+                <option v-for="a in assets" :value="a.asset_id" :disabled="a.status !== 'active' || a.asset_id === genAssetId">
+                  {{ a.file_name || a.asset_id }} [{{ a.status }}]
+                </option>
+              </select>
+            </label>
+            <p v-if="genAssetId2" style="font-size:11px;color:#3b82f6;margin-top:2px">将作为「图2」引用: asset://{{ genAssetId2 }}</p>
+
+            <label style="margin-top:10px" v-if="!genAssetId2">上传参考图 <span style="font-size:11px;color:#94a3b8">（可选，作为图2、图3...，选资产2后此处忽略）</span>
+              <div class="row" style="margin-top:4px">
+                <input type="file" id="vp-extra-files" accept="image/*" multiple style="display:none" @change="onExtraFilesSelect()">
+                <button @click="document.getElementById('vp-extra-files').click()" style="font-size:12px">选择参考图文件</button>
+                <button v-if="extraFiles.length" @click="extraFiles=[]" class="btn-sm" style="background:#7f1d1d;color:#fff;border-color:#7f1d1d;font-size:11px">清空全部</button>
+              </div>
+            </label>
+            <div v-if="extraFiles.length && !genAssetId2" class="extra-files-preview">
+              <div v-for="(f, idx) in extraFiles" class="extra-file-item">
+                <img :src="f.preview" class="extra-file-thumb" alt="预览">
+                <span class="extra-file-name">{{ f.name }}</span>
+                <button @click="removeExtraFile(idx)" class="btn-sm" style="background:#dc2626;color:#fff;border-color:#dc2626;font-size:10px;padding:2px 6px">✕</button>
+              </div>
+            </div>
+
+            <label style="margin-top:10px">Prompt <textarea v-model="prompt" rows="3" placeholder="描述你想生成的内容..."></textarea></label>
+            <div class="row" style="flex-wrap:wrap;gap:8px;margin-top:8px">
+              <label style="flex:1;min-width:100px">时长(秒) <input type="number" v-model="duration" min="4" max="60"></label>
+              <label style="flex:1;min-width:100px">分辨率
+                <select v-model="resolution"><option>720p</option><option>1080p</option></select>
+              </label>
+              <label style="flex:1;min-width:100px">比例
+                <select v-model="ratio"><option>16:9</option><option>9:16</option><option>1:1</option></select>
+              </label>
+              <label style="flex:1;min-width:80px">次数 <input type="number" v-model="repeat" min="1" max="4"></label>
+            </div>
+            <button @click="createJob()" :disabled="submitting" class="primary" style="margin-top:8px;width:100%">
+              {{ submitting ? statusText : '开始生成' }}
+            </button>
+            <div v-if="events" style="margin-top:8px;font-size:11px;color:#334155;max-height:150px;overflow-y:auto;background:#f8fafc;padding:6px;border-radius:4px;border:1px solid #e2e8f0" v-html="events"></div>
+            <div v-for="r in results" style="margin-top:8px">
+              <video v-if="r.url" :src="r.url" controls style="max-height:200px;width:100%;border-radius:6px"></video>
+              <div v-if="r.url" class="row" style="margin-top:4px;align-items:center">
+                <span style="font-size:12px;color:#64748b;flex:1">{{ r.filename }}</span>
+                <button @click="blobDownload(r.url, r.filename)" class="btn-sm" style="background:#2563eb;color:#fff;border-color:#2563eb;font-size:12px">⬇ 下载</button>
+              </div>
+            </div>
+            <div style="margin-top:12px;padding-top:10px;border-top:1px solid #e2e8f0;font-size:12px;color:#64748b">
+              <div class="row" style="align-items:center">
+                <span>保存位置: <code style="font-size:11px;color:#334155;background:#f1f5f9;padding:2px 6px;border-radius:3px">{{ outputDir || '加载中...' }}</code></span>
+                <button @click="showOutputDirInput = !showOutputDirInput" style="font-size:11px;padding:3px 10px">{{ showOutputDirInput ? '取消' : '修改' }}</button>
+                <button @click="chooseOutputDir()" :disabled="savingOutputDir" style="font-size:11px;padding:3px 10px">选择目录</button>
+              </div>
+              <div v-if="showOutputDirInput" class="row" style="margin-top:6px">
+                <input v-model="outputDirInput" placeholder="输入新的保存路径，如 /Users/xxx/Videos" style="flex:1;font-size:12px">
+                <button @click="setOutputDir()" :disabled="savingOutputDir" style="font-size:11px;padding:3px 10px;background:#2563eb;color:#fff;border-color:#2563eb">{{ savingOutputDir ? '保存中...' : '保存' }}</button>
+              </div>
+              <p v-if="outputDirMsg" :style="{fontSize:'11px',marginTop:'4px',color:outputDirOk?'#16a34a':'#dc2626'}">{{ outputDirMsg }}</p>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <section class="card">
+        <h2>生成历史 <button @click="loadJobs()" style="font-size:11px;padding:3px 10px;margin-left:8px">刷新</button></h2>
+        <div v-if="jobs.length===0" style="color:#64748b;font-size:12px">暂无生成记录</div>
+        <div v-for="j in jobs" style="border:1px solid #e2e8f0;border-radius:8px;padding:10px;margin-bottom:10px">
+          <div class="row" style="align-items:center;margin-bottom:2px">
+            <span :class="'tag tag-'+(j.status||'queued')">{{ j.status }}</span>
+            <span style="font-size:12px;flex:1">{{ (j.prompt||'').slice(0,60) }}...</span>
+            <span style="font-size:11px;color:#64748b">{{ j.created_at }}</span>
+          </div>
+          <div v-if="j.errors && j.errors.length" style="font-size:11px;color:#dc2626;margin-top:4px">{{ j.errors.join('; ') }}</div>
+          <div v-for="r in (j.results||[])" v-if="r.download_url" class="row" style="align-items:center;margin-top:6px;padding-top:6px;border-top:1px solid #f1f5f9">
+            <video v-if="r.download_url" :src="appPath + r.download_url" controls style="width:120px;height:68px;border-radius:4px;object-fit:cover;flex-shrink:0"></video>
+            <span style="font-size:11px;color:#64748b;flex:1;margin-left:8px">{{ r.filename || 'video' }}</span>
+            <button @click="blobDownload(appPath + r.download_url, r.filename || 'video')" class="btn-sm" style="background:#2563eb;color:#fff;border-color:#2563eb;font-size:11px">⬇ 下载</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="card" style="margin-top:12px">
+        <h2>
+          <button @click="toggleDebug()" style="font-size:12px;padding:4px 10px">
+            {{ debugVisible ? '隐藏' : '显示' }}调试记录
+          </button>
+          <button @click="clearDebugLogs()" style="font-size:11px;padding:3px 8px;margin-left:6px;background:#7f1d1d;color:#fecaca;border-color:#7f1d1d">清空</button>
+          <span style="font-size:11px;color:#64748b;margin-left:8px">{{ debugLogs.length }} 条</span>
+        </h2>
+        <div v-if="debugVisible" style="max-height:300px;overflow-y:auto;font-family:monospace;font-size:11px;margin-top:8px">
+          <div v-if="debugLogs.length===0" style="color:#64748b;padding:8px">暂无调试记录</div>
+          <div v-for="(log, i) in debugLogs" style="padding:6px 0;border-bottom:1px solid #f1f5f9">
+            <div style="display:flex;gap:8px;align-items:center">
+              <span style="color:#94a3b8">{{ log.time }}</span>
+              <span style="color:#2563eb;font-weight:600">{{ log.method }}</span>
+              <span :style="{color:log.status>=200&&log.status<300?'#16a34a':log.status>0?'#dc2626':'#d97706'}">{{ log.status || 'ERR' }}</span>
+              <span style="color:#64748b;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ log.url }}</span>
+            </div>
+            <details style="margin-top:2px">
+              <summary style="color:#94a3b8;cursor:pointer;font-size:10px">Request / Response</summary>
+              <div style="margin-top:4px;white-space:pre-wrap;word-break:break-all">
+                <div v-if="log.reqBody" style="color:#7c3aed;margin-bottom:4px"><strong>Req:</strong> {{ log.reqBody }}</div>
+                <div style="color:#64748b"><strong>Res:</strong> {{ log.respBody }}</div>
+              </div>
+            </details>
+          </div>
+        </div>
+      </section>
+    </div>
   </div>
 
   <!-- STATS -->

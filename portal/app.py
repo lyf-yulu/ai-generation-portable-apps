@@ -20,23 +20,25 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent
+_DATA_BASE = Path(os.environ.get("DATA_DIR", str(ROOT)))
 STATIC_DIR = ROOT / "static"
 
 # Windows: suppress console windows for spawned subprocesses
 _POPEN_EXTRA: dict[str, Any] = {}
 if hasattr(subprocess, "CREATE_NO_WINDOW"):
     _POPEN_EXTRA["creationflags"] = subprocess.CREATE_NO_WINDOW
-STATE_DIR = ROOT / "state"
+STATE_DIR = _DATA_BASE / "state"
 USAGE_PATH = STATE_DIR / "usage.json"
 
 APPS = {
-    "seedance": {"dir": ROOT.parent / "seedance", "port": 8787},
-    "nano-banana": {"dir": ROOT.parent / "nano-banana", "port": 8797},
-    "dreamina": {"dir": ROOT.parent / "dreamina", "port": 8888},
+    "seedance": {"dir": ROOT.parent / "seedance", "port": int(os.environ.get("SEEDANCE_PORT", "8787"))},
+    "nano-banana": {"dir": ROOT.parent / "nano-banana", "port": int(os.environ.get("NANO_PORT", "8797"))},
+    "dreamina": {"dir": ROOT.parent / "dreamina", "port": int(os.environ.get("DREAMINA_PORT", "8888"))},
+    "volcengine-portrait": {"dir": ROOT.parent / "volcengine-portrait", "port": int(os.environ.get("VOLCENGINE_PORTRAIT_PORT", "8891"))},
 }
 
-PORTAL_PORT = 9090
-REDIRECT_PORT = 9089  # HTTP → HTTPS redirect port
+PORTAL_PORT = int(os.environ.get("PORTAL_PORT", "9090"))
+REDIRECT_PORT = int(os.environ.get("REDIRECT_PORT", "9089"))  # HTTP → HTTPS redirect port
 
 
 def get_lan_ip() -> str:
@@ -90,8 +92,24 @@ def _find_openssl() -> str | None:
 def ensure_certs(cert_dir: Path) -> tuple[Path, Path] | None:
     cert_file = cert_dir / "cert.pem"
     key_file = cert_dir / "key.pem"
+    ip_file = cert_dir / "lan_ip.txt"
+
+    current_ip = get_lan_ip()
+
+    # If LAN IP changed, delete old certs so they get regenerated with the new IP
     if cert_file.exists() and key_file.exists():
-        return cert_file, key_file
+        if ip_file.exists():
+            saved_ip = ip_file.read_text().strip()
+            if saved_ip != current_ip:
+                print(f"  LAN IP changed: {saved_ip} → {current_ip}, regenerating cert...")
+                cert_file.unlink(missing_ok=True)
+                key_file.unlink(missing_ok=True)
+            else:
+                return cert_file, key_file
+        else:
+            # Existing certs without IP record (from older version) — save current IP
+            ip_file.write_text(current_ip)
+            return cert_file, key_file
 
     openssl = _find_openssl()
     if not openssl:
@@ -100,15 +118,15 @@ def ensure_certs(cert_dir: Path) -> tuple[Path, Path] | None:
         return None
 
     cert_dir.mkdir(parents=True, exist_ok=True)
-    lan_ip = get_lan_ip()
     subprocess.run([
         openssl, "req", "-x509", "-newkey", "rsa:2048",
         "-keyout", str(key_file), "-out", str(cert_file),
         "-days", "365", "-nodes",
         "-subj", "/CN=AI Generation Portal",
-        "-addext", f"subjectAltName=DNS:localhost,IP:127.0.0.1,IP:{lan_ip}"
+        "-addext", f"subjectAltName=DNS:localhost,IP:127.0.0.1,IP:{current_ip}"
     ], check=True, capture_output=True)
-    print(f"  Generated self-signed certificate (LAN IP: {lan_ip})")
+    ip_file.write_text(current_ip)
+    print(f"  Generated self-signed certificate (LAN IP: {current_ip})")
     return cert_file, key_file
 
 
@@ -133,6 +151,9 @@ class AppManager:
         env["PORT"] = str(config["port"])
         env["HOST"] = "127.0.0.1"
         env["CORS"] = "1"
+        # 测试环境：每个子应用的数据重定向到各自的 test-data/ 目录
+        if "DATA_DIR" in os.environ:
+            env["DATA_DIR"] = str(app_dir / "test-data")
         old_log = self.log_handles.pop(name, None)
         if old_log:
             try:
@@ -219,6 +240,12 @@ class UsageTracker:
 
     def _save(self):
         STATE_DIR.mkdir(parents=True, exist_ok=True)
+        # Prune daily stats to last 90 days
+        cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - 90 * 86400))
+        self._data["daily"] = {k: v for k, v in self._data.get("daily", {}).items() if k >= cutoff}
+        # Prune per-IP stats to last 90 days
+        by_ip = self._data.get("by_ip", {})
+        self._data["by_ip"] = {k: v for k, v in by_ip.items() if k >= cutoff}
         USAGE_PATH.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), "utf-8")
 
     def record(self, app: str, client_ip: str, method: str, path: str):
@@ -226,8 +253,8 @@ class UsageTracker:
         entry = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "app": app, "ip": client_ip, "method": method, "path": path}
         with self._lock:
             self._data["records"].append(entry)
-            if len(self._data["records"]) > 5000:
-                self._data["records"] = self._data["records"][-3000:]
+            if len(self._data["records"]) > 2000:
+                self._data["records"] = self._data["records"][-1000:]
             day_stats = self._data["daily"].setdefault(today, {})
             app_stats = day_stats.setdefault(app, {"requests": 0, "jobs": 0})
             app_stats["requests"] += 1
@@ -287,7 +314,8 @@ class UsageTracker:
         if method != "POST":
             return False
         job_patterns = ["/api/jobs", "/api/text2image", "/api/image2image", "/api/text2video",
-                        "/api/image2video", "/api/frames2video", "/api/multimodal2video", "/api/multiframe2video"]
+                        "/api/image2video", "/api/frames2video", "/api/multimodal2video", "/api/multiframe2video",
+                        "/api/virtual/jobs", "/api/real/jobs"]
         return any(path.startswith(p) for p in job_patterns)
 
     def get_stats(self) -> dict[str, Any]:
@@ -317,6 +345,16 @@ class Handler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except ssl.SSLError as e:
+            print(f"  [SSL ERROR] {e}")
+        except OSError as e:
+            print(f"  [OS ERROR] {e}")
+
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
 
@@ -334,6 +372,11 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
         if not self._try_proxy(path, "POST"):
+            self._json(404, {"ok": False, "error": "not found"})
+
+    def do_DELETE(self):
+        path = urllib.parse.urlparse(self.path).path
+        if not self._try_proxy(path, "DELETE"):
             self._json(404, {"ok": False, "error": "not found"})
 
     def do_OPTIONS(self):
@@ -363,7 +406,7 @@ class Handler(SimpleHTTPRequestHandler):
                 resp = conn.getresponse()
                 if resp.status == 200:
                     data = json.loads(resp.read())
-                    items = data.get("items") or data.get("history") or []
+                    items = data.get("items") or data.get("history") or data.get("records") or []
                     for item in items[:20]:
                         item["_app"] = name
                         merged.append(item)
@@ -398,7 +441,7 @@ class Handler(SimpleHTTPRequestHandler):
 
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=300)
             headers = {}
-            for key in ("Content-Type", "Content-Length", "Accept", "Accept-Encoding", "X-Workspace-Id"):
+            for key in ("Content-Type", "Content-Length", "Accept", "Accept-Encoding", "X-Workspace-Id", "X-Api-Key", "X-Access-Key", "X-Secret-Key"):
                 val = self.headers.get(key)
                 if val:
                     headers[key] = val
@@ -420,20 +463,31 @@ class Handler(SimpleHTTPRequestHandler):
 
             self.send_response(resp.status)
             for key, value in resp.getheaders():
-                if key.lower() in ("transfer-encoding", "connection"):
+                if key.lower() in ("transfer-encoding", "connection", "server", "date", "content-length"):
                     continue
                 self.send_header(key, value)
+            # Prevent browser caching of static assets in iframe apps.
+            # Sub-app backends (SimpleHTTPRequestHandler) don't set Cache-Control
+            # for static files, so browsers may cache stale JS/CSS/HTML.
+            if target_path.endswith((".html", ".js", ".css", ".mjs")):
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
             self._cors_headers()
             self.send_header("Content-Length", str(len(resp_body)))
             self.end_headers()
             self.wfile.write(resp_body)
             conn.close()
+        except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
+            # Client disconnected — nothing to do
+            pass
         except Exception as exc:
             # Truncate to avoid leaking backend response bodies (may contain API keys)
             msg = str(exc)
             if len(msg) > 300:
                 msg = msg[:300] + "..."
-            self._json(502, {"ok": False, "error": f"proxy error: {msg}"})
+            try:
+                self._json(502, {"ok": False, "error": f"proxy error: {msg}"})
+            except (BrokenPipeError, ConnectionResetError, ssl.SSLError, OSError):
+                pass
 
     def _serve_portal(self, path: str):
         if path == "/" or path == "":
@@ -465,15 +519,15 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Workspace-Id, X-Api-Key, X-Access-Key, X-Secret-Key")
 
 
 def main():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
     lan_ip = get_lan_ip()
-    certs = ensure_certs(ROOT / "certs")
+    certs = ensure_certs(_DATA_BASE / "certs")
 
     server = ThreadingHTTPServer(("0.0.0.0", PORTAL_PORT), Handler)
     redirect_server = None
@@ -490,10 +544,33 @@ def main():
 
             def do_GET(self):
                 host = self.headers.get("Host", "").split(":")[0] or lan_ip
-                self.send_response(301)
-                self.send_header("Location", f"https://{host}:{PORTAL_PORT}{self.path}")
-                self.send_header("Connection", "close")
+                https_url = f"https://{host}:{PORTAL_PORT}{self.path}"
+                page = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>跳转中...</title>
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<script>
+  var host = window.location.hostname;
+  var port = {PORTAL_PORT};
+  var path = window.location.pathname + window.location.search + window.location.hash;
+  window.location.replace('https://' + host + ':' + port + path);
+</script>
+<style>body{{font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#f8fafc}}
+a{{color:#2563eb}}</style></head>
+<body><div style="text-align:center"><p>正在跳转到 HTTPS...</p>
+<p style="font-size:14px;color:#64748b">如未自动跳转，请点击：<br><a id="u" href="{https_url}">{https_url}</a></p></div>
+<script>document.getElementById('u').href='https://'+host+':'+port+path;</script>
+</body></html>"""
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(page.encode("utf-8"))))
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
                 self.end_headers()
+                self.wfile.write(page.encode("utf-8"))
 
             do_POST = do_GET
             do_OPTIONS = do_GET

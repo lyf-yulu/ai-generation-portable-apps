@@ -25,14 +25,23 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent
+_DATA_BASE = Path(os.environ.get("DATA_DIR", str(ROOT)))
 STATIC_DIR = ROOT / "static"
-OUTPUT_DIR = ROOT / "outputs"
-STATE_DIR = ROOT / "state"
+OUTPUT_DIR = _DATA_BASE / "outputs"
+STATE_DIR = _DATA_BASE / "state"
 MEDIA_DIR = STATE_DIR / "media"
 PRESET_PATH = STATE_DIR / "preset.json"
 ACTIVITY_PATH = STATE_DIR / "activity_log.json"
-ARCHIVE_DIR = ROOT / "archives"
+ARCHIVE_DIR = _DATA_BASE / "archives"
 PROVIDERS_PATH = ROOT / "providers.json"
+FILES_MAP_PATH = STATE_DIR / "download_files.json"
+SKILL_PATH = ROOT / "SKILL.md"
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+
+try:
+    SEEDANCE_SKILL = SKILL_PATH.read_text(encoding="utf-8").strip()
+except Exception:
+    SEEDANCE_SKILL = ""
 
 
 def _is_local(handler: SimpleHTTPRequestHandler) -> bool:
@@ -74,7 +83,33 @@ JOBS: dict[str, dict[str, Any]] = {}
 FILES: dict[str, Path] = {}
 JOBS_LOCK = threading.Lock()
 STATE_LOCK = threading.Lock()
-ACTIVITY_LIMIT = 300
+ACTIVITY_LIMIT = 100
+
+
+def load_files_map() -> dict[str, Path]:
+    """Load persisted download-token → file-path mapping from disk."""
+    try:
+        if FILES_MAP_PATH.exists():
+            data = json.loads(FILES_MAP_PATH.read_text(encoding="utf-8"))
+            result: dict[str, Path] = {}
+            for token, path_str in data.items():
+                p = Path(path_str)
+                if p.exists():
+                    result[token] = p
+            return result
+    except Exception:
+        pass
+    return {}
+
+
+def save_files_map() -> None:
+    """Persist the current FILES mapping to disk atomically."""
+    try:
+        with JOBS_LOCK:
+            data = {token: str(p) for token, p in FILES.items()}
+        _atomic_write(FILES_MAP_PATH, json.dumps(data, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
 
 
 def _atomic_write(path: Path, content: str):
@@ -443,7 +478,7 @@ def preset_to_client(data: dict[str, Any], ws_id: str = "localhost") -> dict[str
                 "filename": item.get("filename", path.name),
                 "mime": item.get("mime", mimetypes.guess_type(path.name)[0] or "application/octet-stream"),
                 "stored": stored,
-                "url": f"/api/media/{urllib.parse.quote(stored)}?v={int(path.stat().st_mtime)}",
+                "url": f"/api/media/{urllib.parse.quote(stored)}?ws={ws_id}&v={int(path.stat().st_mtime)}",
             }
     return {"values": data.get("values", {}), "media": media}
 
@@ -708,6 +743,38 @@ def choose_output_dir() -> str:
     if selected:
         return selected
     raise RuntimeError("未选择输出目录")
+
+
+def optimize_prompt(user_prompt: str) -> dict[str, Any]:
+    """Optimize a user prompt using DeepSeek with the Seedance 2.0 skill."""
+    if not SEEDANCE_SKILL:
+        return {"ok": False, "error": "SKILL.md 未找到或为空，无法进行优化"}
+    if not user_prompt.strip():
+        return {"ok": False, "error": "请先输入提示词"}
+
+    body = {
+        "model": "deepseek-chat",
+        "messages": [
+            {"role": "system", "content": SEEDANCE_SKILL},
+            {"role": "user", "content": user_prompt.strip()},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 4096,
+    }
+    try:
+        result = request_json(
+            "POST",
+            "https://api.deepseek.com/v1/chat/completions",
+            DEEPSEEK_API_KEY,
+            body,
+            timeout=120,
+        )
+        optimized = (result.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        if not optimized:
+            return {"ok": False, "error": "DeepSeek 返回为空，请稍后重试"}
+        return {"ok": True, "optimized": optimized.strip()}
+    except RuntimeError as exc:
+        return {"ok": False, "error": f"优化请求失败：{exc}"}
 
 
 def mask_key(key: str) -> str:
@@ -1299,6 +1366,7 @@ def run_one(job_id: str, index: int, form_values: dict[str, Any], form_files: di
         file_token = uuid.uuid4().hex
         with JOBS_LOCK:
             FILES[file_token] = out_path
+        save_files_map()
         add_event(job_id, f"Run {index}: downloaded {out_name}")
         return {
             "index": index,
@@ -1390,6 +1458,31 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path == "/api/schema":
             json_response(self, 200, api_schema())
             return
+        if self.path == "/api/jobs":
+            items = []
+            with JOBS_LOCK:
+                for jid, j in JOBS.items():
+                    results = []
+                    for r in (j.get("results") or []):
+                        results.append({
+                            "download_url": r.get("download_url", ""),
+                            "filename": r.get("filename", ""),
+                            "index": r.get("index", ""),
+                            "task_id": r.get("task_id", ""),
+                        })
+                    items.append({
+                        "job_id": jid,
+                        "status": j.get("status", "pending"),
+                        "model": j.get("model", ""),
+                        "prompt": (j.get("params", {}).get("prompt") or j.get("prompt", ""))[:200],
+                        "created_at": j.get("created_at", ""),
+                        "results": results,
+                        "errors": j.get("errors", []),
+                        "done": j.get("done", 0),
+                        "total": j.get("total", 0),
+                    })
+            json_response(self, 200, {"ok": True, "jobs": items})
+            return
         if self.path == "/api/activity":
             ws = _workspace_id(self)
             show_all = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("all") == ["1"]
@@ -1421,7 +1514,10 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(path.stat().st_size))
             self.end_headers()
-            self.wfile.write(path.read_bytes())
+            try:
+                self.wfile.write(path.read_bytes())
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
             return
         if urllib.parse.urlparse(self.path).path.startswith("/api/media/"):
             raw_name = urllib.parse.urlparse(self.path).path.rsplit("/", 1)[-1]
@@ -1436,7 +1532,10 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(path.stat().st_size))
             self.end_headers()
-            self.wfile.write(path.read_bytes())
+            try:
+                self.wfile.write(path.read_bytes())
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
             return
         if self.path.startswith("/api/jobs/"):
             job_id = self.path.rsplit("/", 1)[-1]
@@ -1453,11 +1552,14 @@ class Handler(SimpleHTTPRequestHandler):
                 json_response(self, 404, {"error": "file not found"})
                 return
             self.send_response(200)
-            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
             self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
             self.send_header("Content-Length", str(path.stat().st_size))
             self.end_headers()
-            self.wfile.write(path.read_bytes())
+            try:
+                self.wfile.write(path.read_bytes())
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
             return
         super().do_GET()
 
@@ -1510,6 +1612,16 @@ class Handler(SimpleHTTPRequestHandler):
                 json_response(self, 200, preset_to_client(collect_workspace_snapshot_from_form(form, ws), ws))
             except Exception as exc:
                 json_response(self, 500, {"error": str(exc)})
+            return
+        if self.path == "/api/optimize-prompt":
+            length = int(self.headers.get("Content-Length") or "0")
+            raw = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else "{}"
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                json_response(self, 400, {"ok": False, "error": "请求格式异常"})
+                return
+            json_response(self, 200, optimize_prompt(data.get("prompt", "")))
             return
         if self.path == "/api/preset":
             form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
@@ -1623,6 +1735,12 @@ class Handler(SimpleHTTPRequestHandler):
 
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    # Restore persisted download token → file mappings (survives server restart)
+    restored = load_files_map()
+    if restored:
+        FILES.update(restored)
+        print(f"Restored {len(restored)} download file mapping(s)")
     port = int(os.environ.get("PORT", "8787"))
     host = os.environ.get("HOST", "127.0.0.1")
     server = ThreadingHTTPServer((host, port), Handler)

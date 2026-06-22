@@ -73,7 +73,7 @@ dreamina/         → Image/video via Dreamina CLI wrapper
 - **Never overwrite git history** — always create new commits, never amend/force-push
 - **No pip dependencies** — everything uses Python stdlib only
 - **Jobs are in-memory** — restarting kills running tasks; coordinate with users before restart
-- **Frontend changes are instant** — Portal serves with `Cache-Control: no-cache`, clients get new version on refresh without restart
+- **Frontend changes are instant** — Portal serves with `Cache-Control: no-cache, no-store, must-revalidate`, clients get new version on refresh without restart
 - **Backend changes require restart** — which terminates all sub-app processes and running jobs
 - **Sub-app ports are fixed** — seedance:8787, nano-banana:8797, dreamina:8888, portal:9090
 

@@ -83,350 +83,6 @@ document.querySelectorAll('.app-tab').forEach(btn => btn.addEventListener('click
 document.getElementById('closePreviewBtn').addEventListener('click', () => document.getElementById('previewDialog').close());
 document.getElementById('previewDialog').addEventListener('click', e => { if (e.target.id === 'previewDialog') e.target.close(); });
 
-// === Shared GenApp factory (Seedance / Nano Banana) ===
-function GenApp(prefix, appPath, mediaType) {
-  return {
-    appStatus: 'unknown',
-    providers: {},
-    provider: 't8star',
-    models: [],
-    baseUrl: 'https://ai.t8star.org',
-    providerHint: '',
-    keyHint: '',
-    outputDir: '',
-    dirHandle: null,
-    autoDownload: false,
-    submitting: false,
-    statusText: '空闲',
-    eventsText: '',
-    archives: [],
-    selectedArchive: '',
-    archiveHint: '',
-    savedMedia: {},
-    wsTab: 'jobs',
-    activityRecords: [],
-    activityCounts: null,
-    activityDetail: null,
-
-    async init() {
-      // Build upload slots FIRST (synchronous DOM), then load config
-      this.buildUploadSlots();
-      this.wireDrops();
-      try { await this.loadConfig(); } catch (e) { console.warn('loadConfig failed:', e); }
-      try { this.loadArchives(); } catch (e) { console.warn('loadArchives failed:', e); }
-    },
-
-    async loadConfig() {
-      const res = await api(`${appPath}/api/config`);
-      if (!res?.providers) return;
-      this.providers = res.providers;
-      const defaultP = res.default_provider || Object.keys(res.providers)[0];
-      this.applyProvider(defaultP);
-      // PetiteVue may not sync v-model on <select> after dynamic options change — force it
-      const sel = document.querySelector(`#${prefix}-form select[name="provider"]`);
-      if (sel) {
-        if (sel.value !== defaultP) sel.value = defaultP;
-        // Also try after PetiteVue's next render cycle
-        setTimeout(() => { if (sel.value !== defaultP) sel.value = defaultP; }, 0);
-        setTimeout(() => { if (sel.value !== defaultP) sel.value = defaultP; }, 100);
-      }
-      this.keyHint = res.has_key ? `已检测到 key: ${res.masked_key}` : '未检测到本地 key';
-    },
-
-    applyProvider(provider) {
-      const cfg = this.providers[provider];
-      if (!cfg) return;
-      this.provider = provider;
-      this.baseUrl = cfg.base_url || '';
-      this.providerHint = cfg.hint || '';
-      this.models = cfg.models || [];
-      setTimeout(() => {
-        const defaults = cfg.defaults || {};
-        for (const [k, v] of Object.entries(defaults)) {
-          const el = document.querySelector(`#${prefix}-form [name="${k}"]`);
-          if (!el || el.type === 'file') continue;
-          if (el.type === 'checkbox') el.checked = !!v;
-          else if (el.tagName === 'SELECT') {
-            // Only set if the option exists (PetiteVue may not have rendered yet)
-            if ([...el.options].some(o => o.value === String(v))) el.value = v;
-          } else el.value = v;
-        }
-      });
-    },
-
-    async submit() {
-      this.submitting = true;
-      this.statusText = '提交中';
-      const resultsEl = document.getElementById(`${prefix}-results`);
-      const eventsEl = document.getElementById(`${prefix}-events`);
-      if (resultsEl) resultsEl.innerHTML = '';
-      if (eventsEl) eventsEl.textContent = '';
-      const data = new FormData(document.getElementById(`${prefix}-form`));
-      const res = await api(`${appPath}/api/jobs`, 'POST', data);
-      if (!res || res.error) {
-        this.submitting = false;
-        this.statusText = res?.error || '提交失败';
-        return;
-      }
-      await this.pollJob(res.job_id);
-      this.submitting = false;
-    },
-
-    async pollJob(jobId) {
-      const resultsEl = document.getElementById(`${prefix}-results`);
-      while (true) {
-        const job = await api(`${appPath}/api/jobs/${jobId}`);
-        if (!job) break;
-        this.statusText = `${job.status} ${job.done || 0}/${job.total || 0}`;
-        this.eventsText = (job.events || []).map(e => `[${e.time}] ${e.message}`).join('\n');
-        if (resultsEl) {
-          const eventsList = (job.events || []).slice(-8).map(e => `<div style="font-size:11px;color:#d1e0ff;padding:2px 0"><span style="color:#697386">${escHtml(e.time)}</span> ${escHtml(e.message)}</div>`).join('');
-          resultsEl.innerHTML = `<article class="result" style="border-color:#4f46e5;background:#101828;color:#e2e8f0;grid-column:1/-1">
-            <div class="meta" style="color:#818cf8;font-weight:600;margin-bottom:6px">${escHtml(job.status)} · ${job.done || 0}/${job.total || 0} ${escHtml(job.errors?.[0] || '')}</div>
-            ${eventsList || '<div style="color:#697386;font-size:11px">等待服务器响应...</div>'}
-          </article>`;
-          if (mediaType === 'video') {
-            for (const r of job.results || []) {
-              const url = `${appPath}${r.download_url}`;
-              resultsEl.innerHTML += `<article class="result"><video controls src="${url}" style="max-height:200px"></video><a href="${url}" download="${r.filename}">下载</a><div class="meta">Run ${r.index} · ${r.task_id || ''}</div></article>`;
-            }
-          } else {
-            for (const r of job.results || []) {
-              for (const img of r.images || []) {
-                const url = `${appPath}${img.download_url}`;
-                resultsEl.innerHTML += `<article class="result"><img src="${url}" style="width:100%;max-height:180px;object-fit:contain;border-radius:6px;cursor:zoom-in" onclick="openPreview('image','${url}')"><a href="${url}" download="${img.filename}">下载</a><div class="meta">Run ${r.index}</div></article>`;
-              }
-            }
-          }
-          for (const err of job.errors || []) {
-            resultsEl.innerHTML += `<article class="result" style="color:#ef4444">${escHtml(err)}</article>`;
-          }
-        }
-        if (['succeeded', 'failed'].includes(job.status)) {
-          if (job.status === 'succeeded' && this.dirHandle) {
-            await this.saveToClient(job, mediaType);
-          } else if (job.status === 'succeeded' && this.autoDownload) {
-            this.triggerDownloads(job, mediaType);
-          }
-          break;
-        }
-        await new Promise(r => setTimeout(r, 2500));
-      }
-      this.statusText = '空闲';
-    },
-
-    async saveToClient(job, type) {
-      try {
-        const files = [];
-        if (type === 'video') {
-          for (const r of job.results || []) {
-            if (r.download_url) files.push({ url: `${appPath}${r.download_url}`, filename: r.filename });
-          }
-        } else {
-          for (const r of job.results || []) {
-            for (const img of r.images || []) {
-              if (img.download_url) files.push({ url: `${appPath}${img.download_url}`, filename: img.filename });
-            }
-          }
-        }
-        for (const { url, filename } of files) {
-          const resp = await fetch(url);
-          const blob = await resp.blob();
-          const fh = await this.dirHandle.getFileHandle(filename, { create: true });
-          const w = await fh.createWritable();
-          await w.write(blob);
-          await w.close();
-        }
-        if (files.length) this.statusText = `已保存 ${files.length} 个文件到 ${this.outputDir}`;
-      } catch (e) {
-        console.warn('saveToClient failed:', e);
-      }
-    },
-
-    triggerDownloads(job, type) {
-      const urls = [];
-      if (type === 'video') {
-        for (const r of job.results || []) {
-          if (r.download_url) urls.push({ url: `${appPath}${r.download_url}`, filename: r.filename });
-        }
-      } else {
-        for (const r of job.results || []) {
-          for (const img of r.images || []) {
-            if (img.download_url) urls.push({ url: `${appPath}${img.download_url}`, filename: img.filename });
-          }
-        }
-      }
-      for (const { url, filename } of urls) {
-        const a = document.createElement('a');
-        a.href = url; a.download = filename; a.style.display = 'none';
-        document.body.appendChild(a); a.click(); document.body.removeChild(a);
-      }
-      if (urls.length) this.statusText = `已下载 ${urls.length} 个文件`;
-    },
-
-    async chooseOutputDir() {
-      // 1. 后端系统原生目录选择器 — 返回真实路径，支持"打开目录"
-      const res = await api(`${appPath}/api/choose-output-dir`, 'POST');
-      if (res?.path) { this.outputDir = res.path; this.dirHandle = null; return; }
-      // 2. 浏览器 File System Access API（需 HTTPS 安全上下文）
-      if (window.showDirectoryPicker) {
-        try {
-          this.dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
-          this.outputDir = this.dirHandle.name;
-          this.statusText = `已选择: ${this.outputDir}`;
-          return;
-        } catch (e) { /* user cancelled */ }
-      }
-      // 3. 兜底：浏览器下载
-      this.autoDownload = true;
-      this.outputDir = '浏览器下载';
-      if (res?.remote && !window.isSecureContext) {
-        this.statusText = '提示：HTTPS 访问可启用目录选择功能';
-      }
-    },
-    async desktopOutput() {
-      const res = await api(`${appPath}/api/default-output-dir`);
-      if (res?.path) this.outputDir = res.path;
-    },
-    async openOutputDir() {
-      // FSA: 无真实路径，浏览器安全模型限制无法打开系统文件管理器
-      if (this.dirHandle && !this.outputDir.includes('/')) {
-        this.statusText = `文件将保存到 "${this.outputDir}"（浏览器限制无法代为打开）`;
-        return;
-      }
-      const data = new FormData(); data.set('output_dir', this.outputDir);
-      const res = await api(`${appPath}/api/open-output-dir`, 'POST', data);
-      if (res?.remote) this.statusText = '远程客户端不支持打开服务端目录';
-    },
-    async cleanCache() {
-      const res = await api(`${appPath}/api/cleanup-cache`, 'POST');
-      if (res) alert(`清理完成：素材 ${res.media_deleted || 0} 个，日志 ${res.logs_deleted || 0} 个`);
-    },
-
-    async loadArchives() {
-      const res = await api(`${appPath}/api/archives`);
-      this.archives = res?.archives || [];
-    },
-    async saveArchive() {
-      const data = new FormData(document.getElementById(`${prefix}-form`));
-      if (this.savedMedia && Object.keys(this.savedMedia).length) {
-        data.set('saved_media', JSON.stringify(this.savedMedia));
-      }
-      const res = await api(`${appPath}/api/preset`, 'POST', data);
-      this.archiveHint = res?.archive ? `已保存: ${res.archive}` : (res?.error || '保存失败');
-      if (res?.media) this.savedMedia = res.media;
-      this.loadArchives();
-    },
-    async loadArchive() {
-      if (!this.selectedArchive) return;
-      const data = new FormData(); data.set('archive_name', this.selectedArchive);
-      const res = await api(`${appPath}/api/archive/load`, 'POST', data);
-      if (!res) return;
-      const formId = `${prefix}-form`;
-      if (res?.values) {
-        for (const [k, v] of Object.entries(res.values)) {
-          // Element may be inside the form or linked via form= attribute
-          const el = document.querySelector(`#${formId} [name="${k}"]`) || document.querySelector(`[form="${formId}"][name="${k}"]`) || document.querySelector(`[name="${k}"]`);
-          if (el && el.type !== 'file') {
-            if (el.type === 'checkbox') el.checked = ['on', 'true', '1'].includes(v);
-            else el.value = v;
-          }
-        }
-      }
-      if (res?.media) {
-        this.savedMedia = res.media;
-        for (const [name, item] of Object.entries(res.media)) {
-          const el = document.querySelector(`[form="${formId}"][name="${name}"]`) || document.querySelector(`#${formId} [name="${name}"]`) || document.querySelector(`[name="${name}"]`);
-          const drop = el?.closest('.drop');
-          if (drop && item.url) {
-            // Backend returns /api/media/xxx, prefix with appPath for proxy routing
-            const mediaUrl = item.url.startsWith('/api/') ? `${appPath}${item.url}` : item.url;
-            showPreview(drop, name, mediaUrl, item.filename);
-          }
-        }
-      } else {
-        this.savedMedia = {};
-      }
-      this.archiveHint = `已读取: ${this.selectedArchive}`;
-    },
-    async deleteArchive() {
-      if (!this.selectedArchive) return;
-      const data = new FormData(); data.set('archive_name', this.selectedArchive);
-      await api(`${appPath}/api/archive/delete`, 'POST', data);
-      this.loadArchives();
-    },
-
-    async loadActivity() {
-      const res = await api(`${appPath}/api/activity`);
-      this.activityRecords = res?.records || [];
-      this.activityCounts = res?.counts || null;
-      this.activityDetail = null;
-    },
-    async showDetail(id) {
-      const res = await api(`${appPath}/api/activity/${id}`);
-      if (res) this.activityDetail = res;
-    },
-    restoreActivity() {
-      const r = this.activityDetail?.restore;
-      if (!r) { alert('该记录无法恢复'); return; }
-      const formId = `${prefix}-form`;
-      for (const [k, v] of Object.entries(r.values || {})) {
-        if (k === 'output_dir') { this.outputDir = v; continue; }
-        const el = document.querySelector(`#${formId} [name="${k}"]`) || document.querySelector(`[form="${formId}"][name="${k}"]`) || document.querySelector(`[name="${k}"]`);
-        if (el && el.type !== 'file') {
-          if (el.type === 'checkbox') el.checked = ['on', 'true', '1'].includes(v);
-          else el.value = v;
-        }
-      }
-      if (r.values?.provider) this.applyProvider(r.values.provider);
-      if (r.values?.base_url) this.baseUrl = r.values.base_url;
-      if (r.media) {
-        this.savedMedia = r.media;
-        for (const [name, item] of Object.entries(r.media)) {
-          const el = document.querySelector(`[form="${formId}"][name="${name}"]`) || document.querySelector(`#${formId} [name="${name}"]`) || document.querySelector(`[name="${name}"]`);
-          const drop = el?.closest('.drop');
-          if (drop && item.url) {
-            const mediaUrl = item.url.startsWith('/api/') ? `${appPath}${item.url}` : item.url;
-            showPreview(drop, name, mediaUrl, item.filename);
-          }
-        }
-      }
-      this.wsTab = 'jobs';
-    },
-
-    buildUploadSlots() {},
-    wireDrops() {
-      setTimeout(() => {
-        document.querySelectorAll(`#tab-${prefix === 'sd' ? 'seedance' : 'nb'} .drop`).forEach(drop => {
-          const input = drop.querySelector('input[type="file"]');
-          if (input && !input.dataset.wired) { input.dataset.wired = '1'; wireFileDrop(drop, input, input.name); }
-        });
-      }, 0);
-    }
-  };
-}
-
-function SeedanceApp() {
-  const app = GenApp('sd', '/seedance', 'video');
-  app.buildUploadSlots = function () {
-    const ir = document.getElementById('sd-imageRefs');
-    const vr = document.getElementById('sd-videoRefs');
-    const ar = document.getElementById('sd-audioRefs');
-    if (ir) for (let i = 1; i <= 9; i++) makeDrop(ir, `ref_image_${i}`, `@ref_image${i}`, 'image/*', 'sd-form');
-    if (vr) for (let i = 1; i <= 3; i++) makeDrop(vr, `ref_video_${i}`, `参考视频${i}`, 'video/*', 'sd-form');
-    if (ar) for (let i = 1; i <= 3; i++) makeDrop(ar, `ref_audio_${i}`, `参考音频${i}`, 'audio/*', 'sd-form');
-  };
-  return app;
-}
-
-function NanoBananaApp() {
-  const app = GenApp('nb', '/nano-banana', 'image');
-  app.buildUploadSlots = function () {
-    const ir = document.getElementById('nb-imageRefs');
-    if (ir) for (let i = 1; i <= 14; i++) makeDrop(ir, `image_${i}`, `Image ${i}`, 'image/*', 'nb-form');
-  };
-  return app;
-}
 
 // === Dreamina App ===
 function DreaminaApp() {
@@ -455,6 +111,7 @@ function DreaminaApp() {
     archives: [],
     selectedArchive: '',
     archiveName: '',
+    archiveHint: '',
     accounts: [],
     activeAccount: null,
     dispatchMode: 'manual',
@@ -462,6 +119,7 @@ function DreaminaApp() {
     accountLoginUrl: null,
 
     async init() {
+      window._dmApp = this;
       window._dmRestore = (jobId) => this.restoreFromHistory(jobId);
       await this.checkEnv();
       this.buildSlots();
@@ -636,12 +294,14 @@ function DreaminaApp() {
     },
 
     async setActiveAccount(accId) {
-      await api('/dreamina/api/accounts/active', 'POST', JSON.stringify({ account_id: accId }));
+      const res = await api('/dreamina/api/accounts/active', 'POST', JSON.stringify({ account_id: accId }));
+      if (!res?.ok) { alert(res?.error || '切换账号失败'); this.loadAccounts(); return; }
       this.activeAccount = accId;
     },
 
     async setDispatchMode(mode) {
-      await api('/dreamina/api/dispatch-mode', 'POST', JSON.stringify({ mode }));
+      const res = await api('/dreamina/api/dispatch-mode', 'POST', JSON.stringify({ mode }));
+      if (!res?.ok) { alert(res?.error || '设置调度模式失败'); return; }
       this.dispatchMode = mode;
     },
 
@@ -729,11 +389,29 @@ function DreaminaApp() {
       for (const f of files) {
         const url = '/dreamina/' + f.replace(/^\//, '');
         const filename = f.split('/').pop();
-        const a = document.createElement('a');
-        a.href = url; a.download = filename; a.style.display = 'none';
-        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        this._blobDownload(url, filename);
       }
       this.statusText = `已下载 ${files.length} 个文件`;
+    },
+
+    async _blobDownload(url, filename) {
+      try {
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const blob = await resp.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl; a.download = filename; a.style.display = 'none';
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+      } catch (e) {
+        console.warn('blob download failed:', filename, e);
+        // Fallback: direct navigation
+        const a = document.createElement('a');
+        a.href = url; a.download = filename; a.target = '_blank';
+        a.style.display = 'none';
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      }
     },
 
     renderFiles(files) {
@@ -741,8 +419,9 @@ function DreaminaApp() {
       return files.map(f => {
         const url = '/dreamina/' + f.replace(/^\//, '');
         const name = f.split('/').pop();
-        if (/\.(mp4|mov|webm|avi)$/i.test(f)) return `<video controls src="${url}" style="width:100%;max-height:200px;border-radius:5px;margin-top:6px"></video><a href="${url}" download="${name}">下载</a>`;
-        return `<img src="${url}" style="width:100%;max-height:180px;object-fit:contain;border-radius:5px;margin-top:6px;cursor:zoom-in" onclick="openPreview('image','${url}')"><a href="${url}" download="${name}">下载</a>`;
+        const blobClick = `window._dmApp._blobDownload('${url}','${name}');return false`;
+        if (/\.(mp4|mov|webm|avi)$/i.test(f)) return `<video controls src="${url}" style="width:100%;max-height:200px;border-radius:5px;margin-top:6px"></video><a href="${url}" download="${name}" onclick="${blobClick}">下载</a>`;
+        return `<img src="${url}" style="width:100%;max-height:180px;object-fit:contain;border-radius:5px;margin-top:6px;cursor:zoom-in" onclick="openPreview('image','${url}')"><a href="${url}" download="${name}" onclick="${blobClick}">下载</a>`;
       }).join('');
     },
 
@@ -858,32 +537,97 @@ function DreaminaApp() {
     },
 
     async loadArchives() {
-      const res = await api('/dreamina/api/archives');
-      this.archives = res?.archives || [];
+      try {
+        const res = await api('/dreamina/api/archives');
+        this.archives = res?.archives || [];
+        if (this.selectedArchive && !this.archives.some(a => a.name === this.selectedArchive)) {
+          this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
+        }
+      } catch (e) {
+        this.archiveHint = '加载存档列表失败：' + (e.message || '网络异常');
+        console.error('[Dreamina] loadArchives error:', e);
+      }
     },
     async saveArchive() {
-      if (!this.archiveName) return;
-      const data = new FormData(document.getElementById('dm-form'));
-      data.set('archive_name', this.archiveName);
-      await api('/dreamina/api/preset', 'POST', data);
-      this.loadArchives();
+      if (!this.archiveName) { this.archiveHint = '请输入存档名称'; return; }
+      const name = this.archiveName;
+      this.archiveHint = '保存中...';
+      try {
+        const data = new FormData(document.getElementById('dm-form'));
+        data.set('archive_name', name);
+        const res = await api('/dreamina/api/preset', 'POST', data);
+        if (!res) {
+          this.archiveHint = '保存失败：网络异常，请检查服务是否运行';
+          return;
+        }
+        if (res.ok === false) {
+          this.archiveHint = '保存失败：' + (res.error || '未知错误');
+          return;
+        }
+        await this.loadArchives();
+        this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
+        this.archiveName = '';
+        this.archiveHint = '已保存：' + name;
+      } catch (e) {
+        this.archiveHint = '保存失败：' + (e.message || '未知异常');
+        console.error('[Dreamina] saveArchive error:', e);
+      }
     },
     async loadArchive() {
-      if (!this.selectedArchive) return;
-      const data = new FormData(); data.set('archive_name', this.selectedArchive);
-      const res = await api('/dreamina/api/archive/load', 'POST', data);
-      if (res?.values) {
+      if (!this.selectedArchive) { this.archiveHint = '请先选择要读取的存档'; return; }
+      const name = this.selectedArchive;
+      if (!this.archives.some(a => a.name === name)) {
+        this.archiveHint = '读取失败：存档「' + name + '」已被删除，请重新选择';
+        this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
+        return;
+      }
+      this.archiveHint = '读取中...';
+      try {
+        const data = new FormData(); data.set('archive_name', name);
+        const res = await api('/dreamina/api/archive/load', 'POST', data);
+        if (!res) {
+          this.archiveHint = '读取失败：网络异常，请检查服务是否运行';
+          return;
+        }
+        if (res.ok === false || !res.values) {
+          this.archiveHint = '读取失败：' + (res.error || '存档不存在、已损坏或无可恢复数据');
+          return;
+        }
+        let count = 0;
         for (const [k, v] of Object.entries(res.values)) {
           const el = document.querySelector(`#dm-form [name="${k}"]`);
-          if (el && el.type !== 'file') el.value = v;
+          if (el && el.type !== 'file') { el.value = v; count++; }
         }
+        this.archiveHint = '已读取：' + name + (count ? '（恢复 ' + count + ' 项参数）' : '');
+      } catch (e) {
+        this.archiveHint = '读取失败：' + (e.message || '未知异常');
+        console.error('[Dreamina] loadArchive error:', e);
       }
     },
     async deleteArchive() {
-      if (!this.selectedArchive) return;
-      const data = new FormData(); data.set('archive_name', this.selectedArchive);
-      await api('/dreamina/api/archive/delete', 'POST', data);
-      this.loadArchives();
+      if (!this.selectedArchive) { this.archiveHint = '请先选择要删除的存档'; return; }
+      const name = this.selectedArchive;
+      if (!confirm('确定删除存档「' + name + '」？此操作不可恢复。')) return;
+      this.archiveHint = '删除中...';
+      try {
+        const data = new FormData(); data.set('archive_name', name);
+        const res = await api('/dreamina/api/archive/delete', 'POST', data);
+        if (!res) {
+          this.archiveHint = '删除失败：网络异常，请检查服务是否运行';
+          return;
+        }
+        if (res.ok === false) {
+          this.archiveHint = '删除失败：' + (res.error || '存档可能已被删除或不存在');
+          return;
+        }
+        this.selectedArchive = '';
+        await this.loadArchives();
+        this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
+        this.archiveHint = '已删除：' + name;
+      } catch (e) {
+        this.archiveHint = '删除失败：' + (e.message || '未知异常');
+        console.error('[Dreamina] deleteArchive error:', e);
+      }
     },
 
     addFrame() { if (this.frameCount < 9) { this.frameCount++; this.rebuildFrames(); } },
@@ -968,11 +712,335 @@ function StatsApp() {
   };
 }
 
+// === Volcengine Portrait App ===
+function VolcenginePortraitApp() {
+  const appPath = '/volcengine-portrait';
+
+  function vpApi(url, method, body) {
+    const headers = { 'X-Workspace-Id': workspaceId() };
+    if (this.apiKey) headers['X-Api-Key'] = this.apiKey;
+    if (this.accessKey) headers['X-Access-Key'] = this.accessKey;
+    if (this.secretKey) headers['X-Secret-Key'] = this.secretKey;
+    if (typeof body === 'string') headers['Content-Type'] = 'application/json';
+    const opts = { method: method || 'GET', headers };
+    if (body) opts.body = body;
+    const m = method || 'GET';
+    const reqPreview = typeof body === 'string' ? body.slice(0, 500)
+      : (body instanceof FormData ? '[FormData]' : '');
+    return fetch(url, opts).then(r => {
+      return r.json().then(data => {
+        const respStr = JSON.stringify(data).slice(0, 500);
+        if (this.addDebugLog) {
+          this.addDebugLog(m, url, r.status, reqPreview, respStr);
+        }
+        if (!r.ok) {
+          return { ok: false, error: data.error || ('HTTP ' + r.status), detail: respStr };
+        }
+        return data;
+      });
+    }).catch(e => {
+      if (this.addDebugLog) {
+        this.addDebugLog(m, url, 0, reqPreview, e.message);
+      }
+      return { ok: false, error: 'Network error', detail: e.message };
+    });
+  }
+
+  return {
+    statusText: '空闲',
+    apiKey: '',
+    accessKey: '',
+    secretKey: '',
+
+    // Unified state (merges virtual + real)
+    groupName: '', groupId: '', creatingGroup: false,
+    groups: [],
+    assetGroupId: '', selectedFile: '', uploading: false, uploadMsg: '', uploadError: false,
+    renamingGroup: false, renameGroupName: '', renamingSaving: false,
+    assets: [],
+    genAssetId: '', genAssetId2: '', extraFiles: [],
+    prompt: '', duration: 12, resolution: '720p', ratio: '16:9', repeat: 1,
+    submitting: false, events: '', results: [], jobs: [],
+    outputDir: '', outputDirInput: '', showOutputDirInput: false,
+    savingOutputDir: false, outputDirMsg: '', outputDirOk: true,
+
+    // Debug log
+    debugLogs: [],
+    debugVisible: false,
+    addDebugLog(method, url, status, reqBody, respBody) {
+      this.debugLogs.unshift({
+        time: new Date().toLocaleTimeString(),
+        method, url, status, reqBody, respBody
+      });
+      if (this.debugLogs.length > 100) this.debugLogs.pop();
+    },
+    clearDebugLogs() { this.debugLogs = []; },
+    toggleDebug() { this.debugVisible = !this.debugVisible; },
+
+    async init() {
+      window._vpApp = this;
+      this.loadAssets();
+      this.loadJobs();
+      this.loadOutputDir();
+    },
+
+    // === Groups ===
+    async createGroup() {
+      this.creatingGroup = true;
+      if (!this.accessKey || !this.secretKey) {
+        this.uploadMsg = '请先在页面顶部设置 Access Key 和 Secret Key';
+        this.uploadError = true;
+        this.creatingGroup = false;
+        return;
+      }
+      const body = {};
+      if (this.groupName.trim()) body.name = this.groupName.trim();
+      const res = await vpApi.call(this, `${appPath}/api/virtual/groups`, 'POST', JSON.stringify(body));
+      if (res?.ok) {
+        this.groupId = res.group_id;
+        this.assetGroupId = res.group_id;
+        this.uploadMsg = '组创建成功: ' + res.group_id;
+        this.uploadError = false;
+      } else {
+        this.uploadMsg = (res?.error || '创建失败') + (res?.detail ? ' — ' + res.detail.slice(0, 120) : '');
+        this.uploadError = true;
+      }
+      this.creatingGroup = false;
+    },
+
+    async loadGroups() {
+      const res = await vpApi.call(this, `${appPath}/api/virtual/groups`);
+      if (res?.ok) this.groups = res.groups || [];
+    },
+
+    async deleteGroup(id) {
+      if (!id) return;
+      if (!confirm('确定要删除该资产组及其下所有资产吗？此操作不可撤销。')) return;
+      const res = await vpApi.call(this, `${appPath}/api/virtual/groups/${id}`, 'DELETE');
+      if (res?.ok || (res?.error && res.error !== 'Network error')) {
+        this.assetGroupId = '';
+        this.groupId = '';
+        this.loadGroups();
+        this.loadAssets();
+      }
+    },
+
+    groupNameFor(id) {
+      const g = this.groups.find(x => x.group_id === id);
+      return g ? (g.name || g.group_id) : (id || '');
+    },
+    startRenameGroup() {
+      this.renameGroupName = this.groupNameFor(this.assetGroupId);
+      this.renamingGroup = true;
+    },
+    async saveGroupRename() {
+      const name = (this.renameGroupName || '').trim();
+      if (!name || !this.assetGroupId) return;
+      this.renamingSaving = true;
+      const res = await vpApi.call(this, `${appPath}/api/virtual/groups/${this.assetGroupId}`, 'POST', JSON.stringify({ name }));
+      if (res?.ok) {
+        this.renamingGroup = false;
+        this.loadGroups();
+      } else {
+        this.uploadMsg = (res?.error || '重命名失败') + (res?.detail ? ' — ' + res.detail.slice(0, 120) : '');
+        this.uploadError = true;
+      }
+      this.renamingSaving = false;
+    },
+
+    onFileSelect() {
+      const f = document.getElementById('vp-file')?.files?.[0];
+      this.selectedFile = f ? f.name : '';
+    },
+
+    // === Assets ===
+    async uploadAsset() {
+      const el = document.getElementById('vp-file');
+      const file = el?.files?.[0];
+      if (!file) {
+        this.uploadMsg = '请先选择要上传的文件';
+        this.uploadError = true;
+        return;
+      }
+      if (!this.assetGroupId) {
+        this.uploadMsg = '请先选择或创建人像组';
+        this.uploadError = true;
+        return;
+      }
+      this.uploading = true; this.uploadMsg = '';
+      const fd = new FormData(); fd.append('group_id', this.assetGroupId); fd.append('file', file);
+      const res = await vpApi.call(this, `${appPath}/api/virtual/assets`, 'POST', fd);
+      if (res?.ok) { this.uploadMsg = '资产创建成功: ' + res.asset_id; this.uploadError = false; this.loadAssets(); }
+      else { this.uploadMsg = (res?.error || '上传失败') + (res?.detail ? ' — ' + res.detail.slice(0, 120) : ''); this.uploadError = true; }
+      this.uploading = false;
+    },
+
+    async loadAssets() {
+      let url = `${appPath}/api/virtual/assets`;
+      if (this.assetGroupId) {
+        url += '?group_ids=' + encodeURIComponent(this.assetGroupId);
+      }
+      const res = await vpApi.call(this, url);
+      if (res?.ok) this.assets = (res.assets || []).map(a => ({ ...a, asset_id: a.asset_id || a.id }));
+    },
+
+    async deleteAsset(id) {
+      const res = await vpApi.call(this, `${appPath}/api/virtual/assets/${id}`, 'DELETE');
+      if (res?.ok || (res?.error && res.error !== 'Network error')) this.loadAssets();
+    },
+
+    async loadOutputDir() {
+      const res = await vpApi.call(this, `${appPath}/api/config`);
+      if (res?.ok) {
+        this.outputDir = res.output_dir || '';
+        this.outputDirInput = this.outputDir;
+      }
+    },
+
+    async setOutputDir() {
+      const p = (this.outputDirInput || '').trim();
+      if (!p) { this.outputDirMsg = '路径不能为空'; this.outputDirOk = false; return; }
+      this.savingOutputDir = true; this.outputDirMsg = '';
+      const res = await vpApi.call(this, `${appPath}/api/config`, 'POST', JSON.stringify({ output_dir: p }));
+      if (res?.ok) {
+        this.outputDir = res.output_dir || p;
+        this.outputDirMsg = '保存位置已更新'; this.outputDirOk = true;
+        this.showOutputDirInput = false;
+      } else {
+        this.outputDirMsg = (res?.error || '保存失败') + (res?.detail ? ' — ' + res.detail.slice(0, 120) : '');
+        this.outputDirOk = false;
+      }
+      this.savingOutputDir = false;
+    },
+
+    async chooseOutputDir() {
+      // Backend native directory picker
+      const res = await vpApi.call(this, `${appPath}/api/choose-output-dir`, 'POST');
+      if (res?.path) {
+        this.outputDirInput = res.path;
+        await this.setOutputDir();
+        return;
+      }
+      // Browser File System Access API
+      if (window.showDirectoryPicker) {
+        try {
+          const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+          this.outputDirInput = handle.name;
+          this.outputDirMsg = '已选择: ' + handle.name + '（浏览器目录，非服务端路径）';
+          this.outputDirOk = true;
+          return;
+        } catch (e) { /* user cancelled */ }
+      }
+      // Fallback
+      if (res?.remote && !window.isSecureContext) {
+        this.outputDirMsg = '远程访问不支持服务端目录选择，请手动输入路径';
+        this.outputDirOk = false;
+      }
+    },
+
+    // === Extra reference image files ===
+    onExtraFilesSelect() {
+      const el = document.getElementById('vp-extra-files');
+      if (!el?.files) return;
+      const existing = new Set(this.extraFiles.map(f => f.name));
+      for (const file of el.files) {
+        if (existing.has(file.name)) continue;
+        if (!file.type.startsWith('image/')) continue;
+        this.extraFiles.push({
+          name: file.name,
+          file: file,
+          preview: URL.createObjectURL(file),
+        });
+      }
+      el.value = '';
+    },
+    removeExtraFile(idx) {
+      const removed = this.extraFiles.splice(idx, 1)[0];
+      if (removed?.preview) URL.revokeObjectURL(removed.preview);
+    },
+
+    // === Jobs ===
+    async createJob() {
+      if (!this.genAssetId) { this.statusText = '请选择资产 ID（图1）'; return; }
+      if (!this.prompt) { this.statusText = '请输入 Prompt'; return; }
+      this.submitting = true; this.statusText = '提交中...'; this.events = ''; this.results = [];
+
+      let body, res;
+      if (this.extraFiles.length && !this.genAssetId2) {
+        // Multipart mode: extra reference images + form fields
+        const fd = new FormData();
+        fd.append('asset_id', this.genAssetId);
+        fd.append('prompt', this.prompt);
+        fd.append('duration', this.duration);
+        fd.append('resolution', this.resolution);
+        fd.append('ratio', this.ratio);
+        fd.append('repeat_count', this.repeat);
+        if (this.genAssetId2) fd.append('asset_id_2', this.genAssetId2);
+        for (const f of this.extraFiles) {
+          fd.append('extra_files', f.file, f.name);
+        }
+        res = await vpApi.call(this, `${appPath}/api/virtual/jobs`, 'POST', fd);
+      } else {
+        // JSON mode (backward compatible, no files)
+        res = await vpApi.call(this, `${appPath}/api/virtual/jobs`, 'POST', JSON.stringify({
+          asset_id: this.genAssetId,
+          asset_id_2: this.genAssetId2 || undefined,
+          prompt: this.prompt,
+          duration: this.duration, resolution: this.resolution, ratio: this.ratio, repeat_count: this.repeat
+        }));
+      }
+      if (res?.ok) await this.pollJob(res.job_id);
+      else { this.submitting = false; this.statusText = '提交失败: ' + (res?.error || ''); }
+    },
+
+    async pollJob(jobId) {
+      while (true) {
+        const job = await vpApi.call(this, `${appPath}/api/virtual/jobs/${jobId}`);
+        if (!job || job.ok === false) break;
+        this.statusText = `${job.status} ${job.done || 0}/${job.total || 0}`;
+        this.events = (job.events || []).map(e => '<div>' + e.time + ' ' + e.message + '</div>').join('');
+        for (const r of job.results || []) {
+          if (r.download_url) {
+            const url = `${appPath}${r.download_url}`;
+            if (!this.results.find(x => x.url === url)) this.results.push({ url, filename: r.filename });
+          }
+        }
+        if (['succeeded', 'failed'].includes(job.status)) break;
+        await new Promise(r => setTimeout(r, 3000));
+      }
+      this.submitting = false; this.statusText = '空闲'; this.loadJobs();
+    },
+
+    async loadJobs() {
+      const res = await vpApi.call(this, `${appPath}/api/virtual/jobs`);
+      if (res?.ok) this.jobs = res.jobs || [];
+    },
+
+    async blobDownload(url, filename) {
+      try {
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const blob = await resp.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl; a.download = filename; document.body.appendChild(a);
+        a.click(); document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+      } catch (e) {
+        // Fallback: direct anchor with download attribute
+        const a = document.createElement('a');
+        a.href = url; a.download = filename; a.target = '_blank'; a.rel = 'noopener';
+        document.body.appendChild(a);
+        a.click(); document.body.removeChild(a);
+      }
+    }
+  };
+}
+
 // === Mount ===
 PetiteVue.createApp({
-  SeedanceApp,
-  NanoBananaApp,
   DreaminaApp,
+  VolcenginePortraitApp,
   StatsApp,
   openPreview
 }).mount();

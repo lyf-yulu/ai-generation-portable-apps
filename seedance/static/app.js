@@ -1,743 +1,922 @@
-const form = document.querySelector("#jobForm");
-const submitBtn = document.querySelector("#submitBtn");
-const savePresetBtn = document.querySelector("#savePresetBtn");
-const clearPresetBtn = document.querySelector("#clearPresetBtn");
-const loadArchiveBtn = document.querySelector("#loadArchiveBtn");
-const deleteArchiveBtn = document.querySelector("#deleteArchiveBtn");
-const archiveSelect = document.querySelector("#archiveSelect");
-const previewDialog = document.querySelector("#previewDialog");
-const previewDialogBody = document.querySelector("#previewDialogBody");
-const closePreviewBtn = document.querySelector("#closePreviewBtn");
-const chooseOutputBtn = document.querySelector("#chooseOutputBtn");
-const appOutputBtn = document.querySelector("#appOutputBtn");
-const desktopOutputBtn = document.querySelector("#desktopOutputBtn");
-const openOutputBtn = document.querySelector("#openOutputBtn");
-const cleanCacheBtn = document.querySelector("#cleanCacheBtn");
-const mainTabBtn = document.querySelector("#mainTabBtn");
-const activityTabBtn = document.querySelector("#activityTabBtn");
-const mainView = document.querySelector("#mainView");
-const activityView = document.querySelector("#activityView");
-const refreshActivityBtn = document.querySelector("#refreshActivityBtn");
-const activityStats = document.querySelector("#activityStats");
-const activityList = document.querySelector("#activityList");
-const activityDetail = document.querySelector("#activityDetail");
-const statusText = document.querySelector("#statusText");
-const resultsEl = document.querySelector("#results");
-const eventsEl = document.querySelector("#events");
-const keyHint = document.querySelector("#keyHint");
-const presetHint = document.querySelector("#presetHint");
-const providerHint = document.querySelector("#providerHint");
-const workspaceName = document.querySelector("#workspaceName");
-const newWorkspaceBtn = document.querySelector("#newWorkspaceBtn");
-const duplicateWorkspaceBtn = document.querySelector("#duplicateWorkspaceBtn");
-const saveWorkspaceBtn = document.querySelector("#saveWorkspaceBtn");
-const workspaceHint = document.querySelector("#workspaceHint");
-const urlParams = new URLSearchParams(window.location.search);
-let workspaceId = urlParams.get("ws");
-if (!workspaceId) {
-  workspaceId = localStorage.getItem("workspace_id");
-  if (!workspaceId) { workspaceId = crypto.randomUUID(); localStorage.setItem("workspace_id", workspaceId); }
-}
-const workspaceKey = `seedance.workspace.${workspaceId}`;
+'use strict';
 
-async function apiFetch(url, opts) {
-  opts = opts || {};
-  opts.headers = opts.headers || {};
-  opts.headers["X-Workspace-Id"] = workspaceId;
-  return fetch(url, opts);
-}
-let savedMedia = {};
-let workspaceSaveTimer = 0;
-let providerDefaults = {
-  t8star: {
-    baseUrl: "https://ai.t8star.org",
-    models: [
-      ["doubao-seedance-2-0-260128", "doubao-seedance-2-0-260128"],
-      ["doubao-seedance-2-0-fast-260128", "doubao-seedance-2-0-fast-260128"],
-    ],
-    hint: "使用原有 T8Star 兼容接口，素材会先上传到 /v1/files。",
-  },
-  volcengine: {
-    baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
-    models: [
-      ["doubao-seedance-2-0-260128", "doubao-seedance-2-0-260128"],
-      ["doubao-seedance-2-0-fast-260128", "doubao-seedance-2-0-fast-260128"],
-    ],
-    hint: "使用豆包官方火山方舟 API。首尾帧模式不能与参考素材混用；素材会先上传再引用。",
-  },
-};
+// ============================================================
+// MODE DETECTION
+// ============================================================
+// When accessed through Portal proxy: path starts with /seedance/
+// When accessed standalone: path starts with /
+const IN_PORTAL = window.location.pathname.startsWith('/seedance/');
+const APP_PATH = IN_PORTAL ? '/seedance' : '';
 
-function providersFromConfig(providers) {
-  const next = {};
-  for (const [id, provider] of Object.entries(providers || {})) {
-    next[id] = {
-      baseUrl: provider.base_url || "",
-      models: (provider.models || []).map((item) => {
-        if (typeof item === "string") return [item, item];
-        return [item.id, item.label || item.id];
-      }).filter(([value]) => value),
-      hint: provider.hint || "",
-      label: provider.label || id,
-    };
-  }
-  return Object.keys(next).length ? next : providerDefaults;
+// ============================================================
+// UTILITIES
+// ============================================================
+function workspaceId() {
+  let id = localStorage.getItem('workspace_id');
+  if (!id) { id = crypto.randomUUID(); localStorage.setItem('workspace_id', id); }
+  return id;
 }
 
-function field(name) {
-  return form.elements[name] || document.querySelector(`[name="${name}"]`);
-}
-
-function updateProviderOptions(preserveBase = true) {
-  const provider = field("provider")?.value || "t8star";
-  const config = providerDefaults[provider] || providerDefaults.t8star;
-  const baseInput = field("base_url");
-  const modelInput = field("model");
-  const currentModel = modelInput.value;
-  const knownBases = Object.values(providerDefaults).map((item) => item.baseUrl);
-  if (!preserveBase || !baseInput.value.trim() || knownBases.includes(baseInput.value.trim())) {
-    baseInput.value = config.baseUrl;
-  }
-  modelInput.innerHTML = "";
-  for (const [value, label] of config.models) {
-    const option = document.createElement("option");
-    option.value = value;
-    option.textContent = label;
-    modelInput.append(option);
-  }
-  modelInput.value = config.models.some(([value]) => value === currentModel) ? currentModel : config.models[0][0];
-  providerHint.textContent = config.hint;
-}
-
-function isWorkspaceMode() {
-  return workspaceId !== "default";
-}
-
-function workspaceLabel() {
-  return workspaceName.value.trim() || (isWorkspaceMode() ? `主题 ${workspaceId.slice(0, 6)}` : "默认主题");
-}
-
-function collectWorkspaceValues() {
-  const values = {};
-  for (const item of form.elements) {
-    if (!item.name || item.type === "file") continue;
-    values[item.name] = item.type === "checkbox" ? (item.checked ? "on" : "") : item.value;
-  }
-  return values;
-}
-
-function mediaSnapshot(media = savedMedia) {
-  return JSON.parse(JSON.stringify(media || {}));
-}
-
-function localWorkspaceSnapshot() {
-  return {
-    name: workspaceLabel(),
-    values: collectWorkspaceValues(),
-    media: mediaSnapshot(),
-    saved_at: Date.now(),
-  };
-}
-
-async function workspaceSnapshot(options = {}) {
-  if (!options.persistMedia) return localWorkspaceSnapshot();
-  const res = await apiFetch("/api/workspace/snapshot", { method: "POST", body: formDataWithSavedMedia() });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "保存主题素材失败");
-  applyPreset(data);
-  return {
-    name: workspaceLabel(),
-    values: collectWorkspaceValues(),
-    media: mediaSnapshot(data.media),
-    saved_at: Date.now(),
-  };
-}
-
-async function saveWorkspaceDraft(options = {}) {
-  const payload = await workspaceSnapshot(options);
-  localStorage.setItem(workspaceKey, JSON.stringify(payload));
-  workspaceHint.textContent = `已保存草稿：${payload.name}`;
-  return payload;
-}
-
-function scheduleWorkspaceSave() {
-  clearTimeout(workspaceSaveTimer);
-  workspaceSaveTimer = setTimeout(saveWorkspaceDraft, 500);
-}
-
-function loadWorkspaceDraft() {
-  workspaceName.value = isWorkspaceMode() ? workspaceLabel() : "默认主题";
-  workspaceHint.textContent = isWorkspaceMode() ? "当前是独立主题页，可与其它主题并发提交" : "默认主题会读取当前保存配置";
-  const raw = localStorage.getItem(workspaceKey);
-  if (!raw) return false;
+async function api(url, method, body) {
   try {
-    const draft = JSON.parse(raw);
-    workspaceName.value = draft.name || workspaceName.value;
-    applyPreset({ values: draft.values || {}, media: draft.media || {} });
-    workspaceHint.textContent = `已读取主题草稿：${workspaceName.value}`;
-    return true;
-  } catch {
-    return false;
-  }
+    const opts = { method: method || 'GET', headers: { 'X-Workspace-Id': workspaceId() } };
+    if (body) opts.body = body;
+    const res = await fetch(url, opts);
+    return await res.json();
+  } catch (e) { return null; }
 }
 
-function workspaceUrl(id) {
-  const url = new URL(window.location.href);
-  url.searchParams.set("ws", id);
-  return url.toString();
+function escHtml(s) {
+  return s ? String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') : '';
 }
 
-function newWorkspaceId() {
-  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+// ============================================================
+// FILE DROP / PREVIEW HELPERS
+// ============================================================
+function wireFileDrop(drop, input, name) {
+  if (input.dataset.wired) return;
+  input.dataset.wired = '1';
+  input.addEventListener('change', () => {
+    const f = input.files?.[0];
+    if (!f) {
+      drop.classList.remove('hasPreview');
+      drop.querySelector('.preview')?.remove();
+      drop.querySelector('span').textContent = '未上传';
+      return;
+    }
+    showPreview(drop, name, URL.createObjectURL(f), f.name);
+  });
+  drop.addEventListener('dragover', e => {
+    e.preventDefault();
+    drop.classList.add('isDragging');
+  });
+  drop.addEventListener('dragleave', () => drop.classList.remove('isDragging'));
+  drop.addEventListener('drop', e => {
+    e.preventDefault();
+    drop.classList.remove('isDragging');
+    const f = e.dataTransfer?.files?.[0];
+    if (!f) return;
+    const dt = new DataTransfer();
+    dt.items.add(f);
+    input.files = dt.files;
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  });
 }
 
-async function openWorkspace(copyCurrent) {
-  const id = newWorkspaceId();
-  if (copyCurrent) {
-    const current = await saveWorkspaceDraft({ persistMedia: true });
-    current.name = `${workspaceLabel()} 副本`;
-    localStorage.setItem(`seedance.workspace.${id}`, JSON.stringify(current));
-  }
-  window.open(workspaceUrl(id), "_blank");
-}
-
-function mediaKind(name) {
-  if (name.includes("video")) return "video";
-  if (name.includes("audio")) return "audio";
-  return "image";
-}
-
-function renderPreview(drop, kind, url, filename) {
-  drop.classList.add("hasPreview");
-  drop.querySelector(".preview")?.remove();
-  const media = document.createElement(kind === "image" ? "img" : kind);
-  media.className = "preview";
+function showPreview(drop, name, url, filename) {
+  drop.classList.add('hasPreview');
+  drop.querySelector('.preview')?.remove();
+  const kind = name.includes('video') ? 'video' : name.includes('audio') ? 'audio' : 'image';
+  const media = document.createElement(kind === 'image' ? 'img' : kind);
+  media.className = 'preview';
   media.src = url;
-  if (kind !== "image") media.controls = true;
-  if (kind !== "audio") {
-    media.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
+  if (kind !== 'image') media.controls = true;
+  if (kind !== 'audio') {
+    media.addEventListener('click', e => {
+      e.preventDefault();
+      e.stopPropagation();
       openPreview(kind, url);
     });
   }
-  drop.append(media);
-  drop.querySelector("span").textContent = filename || "已上传";
+  drop.insertBefore(media, drop.querySelector('span'));
+  drop.querySelector('span').textContent = filename || '已上传';
 }
 
 function openPreview(kind, url) {
-  previewDialogBody.innerHTML = "";
-  const media = document.createElement(kind === "image" ? "img" : "video");
-  media.src = url;
-  if (kind === "video") media.controls = true;
-  previewDialogBody.append(media);
-  previewDialog.showModal();
+  const dlg = document.getElementById('previewDialog');
+  const body = document.getElementById('previewDialogBody');
+  if (!dlg || !body) return;
+  body.innerHTML = '';
+  const m = document.createElement(kind === 'image' ? 'img' : 'video');
+  m.src = url;
+  if (kind === 'video') m.controls = true;
+  body.append(m);
+  dlg.showModal();
 }
 
-function clearPreview(drop) {
-  drop.classList.remove("hasPreview");
-  drop.querySelector(".preview")?.remove();
-  drop.querySelector("span").textContent = "未上传";
-}
-
-function clearSelectedMedia(input) {
-  input.value = "";
-  delete savedMedia[input.name];
-  clearPreview(input.closest(".drop"));
-}
-
-function clearAllMediaInputs() {
-  document.querySelectorAll('.drop input[type="file"]').forEach((input) => {
-    input.value = "";
-    const drop = input.closest(".drop");
-    if (drop) clearPreview(drop);
-  });
-}
-
-function assignFile(input, file) {
-  const transfer = new DataTransfer();
-  transfer.items.add(file);
-  input.files = transfer.files;
-  input.dispatchEvent(new Event("change", { bubbles: true }));
-}
-
-function wireFileInput(input) {
-  if (input.dataset.wired === "1") return;
-  input.dataset.wired = "1";
-  input.addEventListener("change", () => {
-    const drop = input.closest(".drop");
-    const file = input.files?.[0];
-    if (!file) {
-      clearPreview(drop);
-      return;
-    }
-    delete savedMedia[input.name];
-    renderPreview(drop, mediaKind(input.name), URL.createObjectURL(file), file.name);
-  });
-
-  const drop = input.closest(".drop");
-  drop.addEventListener("dragover", (event) => {
-    event.preventDefault();
-    drop.classList.add("isDragging");
-  });
-  drop.addEventListener("dragleave", () => {
-    drop.classList.remove("isDragging");
-  });
-  drop.addEventListener("drop", (event) => {
-    event.preventDefault();
-    drop.classList.remove("isDragging");
-    const file = event.dataTransfer?.files?.[0];
-    if (!file) return;
-    if (input.accept && !input.accept.split(",").some((accept) => {
-      const rule = accept.trim();
-      return rule.endsWith("/*") ? file.type.startsWith(rule.slice(0, -1)) : file.type === rule;
-    })) return;
-    assignFile(input, file);
-  });
-}
-
-function makeDrop(name, label, accept) {
-  const el = document.createElement("label");
-  el.className = "drop";
+function makeDrop(container, name, label, accept, formId) {
+  const el = document.createElement('label');
+  el.className = 'drop';
   el.textContent = label;
-
-  const input = document.createElement("input");
+  const input = document.createElement('input');
   input.name = name;
-  input.type = "file";
+  input.type = 'file';
   input.accept = accept;
-  input.setAttribute("form", "jobForm");
-
-  const span = document.createElement("span");
-  span.textContent = "未上传";
-
-  const removeBtn = document.createElement("button");
-  removeBtn.className = "removeMediaBtn";
-  removeBtn.type = "button";
-  removeBtn.textContent = "移除";
-  removeBtn.addEventListener("click", (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    clearSelectedMedia(input);
+  if (formId) input.setAttribute('form', formId);
+  const span = document.createElement('span');
+  span.textContent = '未上传';
+  const rmBtn = document.createElement('button');
+  rmBtn.className = 'removeMediaBtn';
+  rmBtn.type = 'button';
+  rmBtn.textContent = '移除';
+  rmBtn.addEventListener('click', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    input.value = '';
+    el.classList.remove('hasPreview');
+    el.querySelector('.preview')?.remove();
+    span.textContent = '未上传';
   });
-
-  el.append(input, span, removeBtn);
-  wireFileInput(input);
-  return el;
+  el.append(input, span, rmBtn);
+  wireFileDrop(el, input, name);
+  container.appendChild(el);
 }
 
-function ensureDropControls(input) {
-  const drop = input.closest(".drop");
-  if (!drop) return;
-  if (!drop.querySelector(".removeMediaBtn")) {
-    const removeBtn = document.createElement("button");
-    removeBtn.className = "removeMediaBtn";
-    removeBtn.type = "button";
-    removeBtn.textContent = "移除";
-    removeBtn.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      clearSelectedMedia(input);
+// ============================================================
+// PROVIDER CONFIG HELPER
+// ============================================================
+function providersFromConfig(providers) {
+  if (!providers || !Object.keys(providers).length) return null;
+  const result = {};
+  for (const [id, p] of Object.entries(providers)) {
+    result[id] = {
+      base_url: p.base_url || '',
+      models: (p.models || []).map(m => {
+        if (typeof m === 'string') return { id: m, label: m };
+        return { id: m.id || m, label: m.label || m.id || m };
+      }),
+      hint: p.hint || '',
+      label: p.label || id,
+      defaults: p.defaults || {},
+    };
+  }
+  return result;
+}
+
+// ============================================================
+// FALLBACK PROVIDERS (used if config fails to load)
+// ============================================================
+const FALLBACK_PROVIDERS = {
+  t8star: {
+    base_url: 'https://ai.t8star.org',
+    models: [
+      { id: 'doubao-seedance-2-0-260128', label: 'doubao-seedance-2-0-260128' },
+      { id: 'doubao-seedance-2-0-fast-260128', label: 'doubao-seedance-2-0-fast-260128' },
+    ],
+    hint: '使用原有 T8Star 兼容接口，素材会先上传到 /v1/files。',
+    label: 'T8Star 兼容接口',
+    defaults: {},
+  },
+  volcengine: {
+    base_url: 'https://ark.cn-beijing.volces.com/api/v3',
+    models: [
+      { id: 'doubao-seedance-2-0-260128', label: 'doubao-seedance-2-0-260128' },
+      { id: 'doubao-seedance-2-0-fast-260128', label: 'doubao-seedance-2-0-fast-260128' },
+    ],
+    hint: '使用豆包官方火山方舟 API。首尾帧模式不能与参考素材混用；素材会先上传再引用。',
+    label: '豆包官方 / 火山方舟',
+    defaults: {},
+  },
+};
+
+// ============================================================
+// SEEDANCE APP FACTORY (PetiteVue data object)
+// ============================================================
+function SeedanceApp() {
+  const wid = workspaceId();
+  const wsKey = 'seedance.workspace.' + wid;
+  const urlParams = new URLSearchParams(window.location.search);
+
+  // Resolve workspace id from URL param, falling back to localStorage
+  let effectiveWorkspaceId = urlParams.get('ws');
+  if (!effectiveWorkspaceId) {
+    effectiveWorkspaceId = wid;
+  }
+
+  // --- DOM helpers ---
+  function field(name) {
+    return document.querySelector('#sd-form [name="' + name + '"]')
+        || document.querySelector('[form="sd-form"][name="' + name + '"]')
+        || document.querySelector('[name="' + name + '"]');
+  }
+
+  function mediaKind(name) {
+    if (name.includes('video')) return 'video';
+    if (name.includes('audio')) return 'audio';
+    return 'image';
+  }
+
+  function mediaSnapshot(src) {
+    return JSON.parse(JSON.stringify(src || {}));
+  }
+
+  function clearMediaPreview(drop) {
+    if (!drop) return;
+    drop.classList.remove('hasPreview');
+    drop.querySelector('.preview')?.remove();
+    drop.querySelector('span').textContent = '未上传';
+  }
+
+  function clearAllMediaPreviews() {
+    document.querySelectorAll('.drop').forEach(clearMediaPreview);
+  }
+
+  function collectFormValues() {
+    const values = {};
+    const form = document.getElementById('sd-form');
+    if (!form) return values;
+    for (const item of form.elements) {
+      if (!item.name || item.type === 'file') continue;
+      values[item.name] = item.type === 'checkbox' ? (item.checked ? 'on' : '') : item.value;
+    }
+    return values;
+  }
+
+  return {
+    // --- Reactive State ---
+    inPortal: IN_PORTAL,
+    appPath: APP_PATH,
+    appStatus: 'unknown',
+    providers: {},
+    provider: 't8star',
+    models: [],
+    baseUrl: '',
+    providerHint: '',
+    keyHint: '',
+    outputDir: '',
+    dirHandle: null,
+    autoDownload: false,
+    submitting: false,
+    statusText: '空闲',
+    eventsText: '',
+    archives: [],
+    selectedArchive: '',
+    archiveHint: '',
+    optimizing: false,
+    optimizedPrompt: '',
+    optimizeError: '',
+    savedMedia: {},
+    wsTab: 'jobs',
+    activityRecords: [],
+    jobs: [],
+    activityCounts: null,
+    activityDetail: null,
+
+    // Standalone-specific fields
+    customModel: '',
+    webSearch: false,
+    pollInterval: 10,
+    timeout: 3600,
+    workspaceName: '默认主题',
+    workspaceHint: '',
+
+    // Internal (non-reactive but accessible)
+    _workspaceId: effectiveWorkspaceId,
+    _workspaceKey: wsKey,
+    _workspaceSaveTimer: 0,
+
+    // ============================================================
+    // INIT
+    // ============================================================
+    async init() {
+      this.buildUploadSlots();
+      this.wireDrops();
+      try { await this.loadConfig(); } catch (e) { console.warn('loadConfig failed:', e); }
+      try { await this.loadArchives(); } catch (e) { console.warn('loadArchives failed:', e); }
+      this.loadPreset();
+      try { await this.loadJobs(); } catch (e) { console.warn('loadJobs failed:', e); }
+
+      // Auto-save workspace on any form change
+      const form = document.getElementById('sd-form');
+      if (form) {
+        form.addEventListener('input', () => this.scheduleWorkspaceSave());
+        form.addEventListener('change', () => this.scheduleWorkspaceSave());
+      }
+
+      // Download links: use blob download to avoid iframe navigation timeout.
+      // Native <a download> triggers browser navigation which can time out
+      // waiting for the proxy to buffer the entire video file.
+      const dlContainer = document.getElementById('sd-results');
+      if (dlContainer) {
+        dlContainer.addEventListener('click', (e) => {
+          const btn = e.target.closest('.dl-btn');
+          if (!btn) return;
+          e.preventDefault();
+          const u = btn.dataset.url;
+          const fn = btn.dataset.filename || 'video';
+          if (u) this._blobDownload(u, fn);
+        });
+      }
+    },
+
+    // ============================================================
+    // PROVIDER SYSTEM
+    // ============================================================
+    async loadConfig() {
+      const res = await api(APP_PATH + '/api/config');
+      if (!res) {
+        // Use fallback providers
+        this.providers = FALLBACK_PROVIDERS;
+        this.keyHint = '无法连接服务器，请确认应用已启动';
+        this.applyProvider('t8star');
+        return;
+      }
+      this.keyHint = res.has_key
+        ? '已检测到本地 key：' + (res.masked_key || '')
+        : '未检测到本地 key，请手动填写';
+
+      if (res.config_error) {
+        this.keyHint += '；供应商配置读取失败：' + (res.config_error.detail || res.config_error.message || '未知错误');
+        return;
+      }
+
+      const normalized = providersFromConfig(res.providers);
+      if (normalized) {
+        this.providers = normalized;
+        const defaultP = res.default_provider || Object.keys(normalized)[0] || 't8star';
+        this.applyProvider(defaultP);
+        // Force select value after PetiteVue render
+        const sel = document.querySelector('#sd-form select[name="provider"]');
+        if (sel) {
+          setTimeout(() => {
+            if (sel.value !== defaultP) sel.value = defaultP;
+          }, 0);
+          setTimeout(() => {
+            if (sel.value !== defaultP) sel.value = defaultP;
+          }, 100);
+        }
+      } else {
+        this.providers = FALLBACK_PROVIDERS;
+        this.applyProvider('t8star');
+      }
+    },
+
+    applyProvider(providerKey) {
+      const cfg = this.providers[providerKey];
+      if (!cfg) return;
+      this.provider = providerKey;
+      this.baseUrl = cfg.base_url || '';
+      this.providerHint = cfg.hint || '';
+      this.models = cfg.models || [];
+
+      // Apply provider defaults after a tick to let DOM render
+      setTimeout(() => {
+        const defaults = cfg.defaults || {};
+        for (const [k, v] of Object.entries(defaults)) {
+          const el = field(k);
+          if (!el || el.type === 'file') continue;
+          if (el.type === 'checkbox') {
+            el.checked = !!v;
+          } else if (el.tagName === 'SELECT') {
+            if ([...el.options].some(o => o.value === String(v))) el.value = v;
+          } else {
+            el.value = v;
+          }
+        }
+      });
+    },
+
+    // ============================================================
+    // ARCHIVES
+    // ============================================================
+    async loadArchives() {
+      const res = await api(APP_PATH + '/api/archives');
+      if (res) this.archives = res.archives || [];
+      if (this.selectedArchive && !this.archives.some(a => a.name === this.selectedArchive)) {
+        this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
+      }
+    },
+
+    async saveArchive() {
+      this.archiveHint = '保存中...';
+      const data = new FormData(document.getElementById('sd-form'));
+      if (Object.keys(this.savedMedia).length) {
+        data.set('saved_media', JSON.stringify(this.savedMedia));
+      }
+      const res = await api(APP_PATH + '/api/preset', 'POST', data);
+      if (res) {
+        this.archiveHint = res.archive ? '已保存：' + res.archive : (res.error || '保存失败');
+        if (res.media) this.savedMedia = res.media;
+        await this.loadArchives();
+        this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
+      } else {
+        this.archiveHint = '保存失败';
+      }
+    },
+
+    async loadArchive() {
+      if (!this.selectedArchive) {
+        this.archiveHint = '请选择一个存档';
+        return;
+      }
+      const name = this.selectedArchive;
+      if (!this.archives.some(a => a.name === name)) {
+        this.archiveHint = '读取失败：存档「' + name + '」已被删除，请重新选择';
+        this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
+        return;
+      }
+      const data = new FormData();
+      data.set('archive_name', name);
+      const res = await api(APP_PATH + '/api/archive/load', 'POST', data);
+      if (!res) {
+        this.archiveHint = '读取失败';
+        return;
+      }
+      this.applyPreset(res);
+      const archiveInput = field('archive_name');
+      if (archiveInput) archiveInput.value = name;
+      this.archiveHint = '已读取存档：' + name;
+    },
+
+    async deleteArchive() {
+      if (!this.selectedArchive) {
+        this.archiveHint = '请选择一个存档';
+        return;
+      }
+      const name = this.selectedArchive;
+      if (!confirm('确定删除存档「' + name + '」？此操作不可恢复。')) return;
+      const data = new FormData();
+      data.set('archive_name', name);
+      const res = await api(APP_PATH + '/api/archive/delete', 'POST', data);
+      if (!res || res.ok === false) {
+        this.archiveHint = '删除失败：' + (res && res.error ? res.error : '存档可能已被删除或不存在');
+        return;
+      }
+      this.selectedArchive = '';
+      await this.loadArchives();
+      this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
+      this.archiveHint = '已删除：' + name;
+    },
+
+    // Prompt Optimizer
+    async optimizePrompt() {
+      const promptEl = document.querySelector('textarea[name="prompt"][form="sd-form"]');
+      const prompt = promptEl ? promptEl.value.trim() : '';
+      if (!prompt) {
+        this.optimizeError = '请先输入提示词';
+        return;
+      }
+      this.optimizing = true;
+      this.optimizedPrompt = '';
+      this.optimizeError = '';
+      try {
+        const res = await api(APP_PATH + '/api/optimize-prompt', 'POST', JSON.stringify({ prompt: prompt }));
+        if (!res) {
+          this.optimizeError = '优化失败：网络异常，请检查服务是否运行';
+        } else if (!res.ok) {
+          this.optimizeError = '优化失败：' + (res.error || '未知错误');
+        } else {
+          this.optimizedPrompt = res.optimized;
+        }
+      } catch (e) {
+        this.optimizeError = '优化失败：' + (e.message || '未知异常');
+      }
+      this.optimizing = false;
+    },
+    replacePrompt() {
+      const promptEl = document.querySelector('textarea[name="prompt"][form="sd-form"]');
+      if (promptEl && this.optimizedPrompt) {
+        var text = this.optimizedPrompt;
+        // Strategy 1: <PROMPT> XML tag (preferred)
+        var m = text.match(/<PROMPT>\s*([\s\S]*?)\s*<\/PROMPT>/);
+        // Strategy 2: <OPTIMIZED_PROMPT> XML tag (legacy)
+        if (!m) m = text.match(/<OPTIMIZED_PROMPT>\s*([\s\S]*?)\s*<\/OPTIMIZED_PROMPT>/);
+        // Strategy 3: Markdown ## 优化后提示词 (fallback)
+        if (!m) m = text.match(/##\s*优化后提示词[^\n]*\n+([\s\S]*?)(?=\n+##\s|\n+---\s|\n*$)/);
+        promptEl.value = (m ? m[1].trim() : text);
+      }
+      this.optimizedPrompt = '';
+      this.optimizeError = '';
+    },
+    cancelOptimize() {
+      this.optimizedPrompt = '';
+      this.optimizeError = '';
+    },
+
+    async clearPreset() {
+      const res = await api(APP_PATH + '/api/preset/clear', 'POST');
+      if (!res) return;
+      this.savedMedia = {};
+      clearAllMediaPreviews();
+      this.archiveHint = '已清空保存配置';
+    },
+
+    // ============================================================
+    // ACTIVITY
+    // ============================================================
+    async loadActivity() {
+      const res = await api(APP_PATH + '/api/activity');
+      if (res) {
+        this.activityRecords = res.records || [];
+        this.activityCounts = res.counts || null;
+      }
+      this.activityDetail = null;
+    },
+
+    async loadJobs() {
+      const res = await api(APP_PATH + '/api/jobs');
+      if (res?.jobs) {
+        this.jobs = res.jobs;
+      } else {
+        console.warn('[Seedance] loadJobs 返回异常:', res);
+      }
+    },
+
+    async showDetail(id) {
+      const res = await api(APP_PATH + '/api/activity/' + id);
+      if (res) this.activityDetail = res;
+    },
+
+    restoreActivity() {
+      const r = this.activityDetail?.restore;
+      if (!r) { alert('该记录无法恢复'); return; }
+      this.applyPreset(r);
+      if (r.warning) this.archiveHint = r.warning;
+      else this.archiveHint = '已从后台记录恢复参数和素材';
+      this.wsTab = 'jobs';
+    },
+
+    switchJobsTab() {
+      this.wsTab = 'jobs';
+      this.loadJobs();
+    },
+
+    switchActivityTab() {
+      this.wsTab = 'activity';
+      this.loadActivity();
+    },
+
+    // ============================================================
+    // OUTPUT DIRECTORY
+    // ============================================================
+    async chooseOutputDir() {
+      // Backend native directory picker
+      const res = await api(APP_PATH + '/api/choose-output-dir', 'POST');
+      if (res?.path) {
+        this.outputDir = res.path;
+        this.dirHandle = null;
+        return;
+      }
+      // Browser File System Access API
+      if (window.showDirectoryPicker) {
+        try {
+          this.dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+          this.outputDir = this.dirHandle.name;
+          this.statusText = '已选择: ' + this.outputDir;
+          return;
+        } catch (e) { /* user cancelled */ }
+      }
+      // Fallback to browser download
+      this.autoDownload = true;
+      this.outputDir = '浏览器下载';
+      if (res?.remote && !window.isSecureContext) {
+        this.statusText = '提示：HTTPS 访问可启用目录选择功能';
+      }
+    },
+
+    async desktopOutput() {
+      const res = await api(APP_PATH + '/api/default-output-dir');
+      if (res?.path) this.outputDir = res.path;
+    },
+
+    async openOutputDir() {
+      if (this.dirHandle && !this.outputDir.includes('/')) {
+        this.statusText = '文件将保存到 "' + this.outputDir + '"（浏览器限制无法代为打开）';
+        return;
+      }
+      const data = new FormData();
+      data.set('output_dir', this.outputDir);
+      const res = await api(APP_PATH + '/api/open-output-dir', 'POST', data);
+      if (res?.remote) this.statusText = '远程客户端不支持打开服务端目录';
+    },
+
+    async cleanCache() {
+      const res = await api(APP_PATH + '/api/cleanup-cache', 'POST');
+      if (res) {
+        alert('清理完成：素材 ' + (res.media_deleted || 0) + ' 个，日志 ' + (res.logs_deleted || 0) + ' 个');
+      }
+    },
+
+    // ============================================================
+    // FORM SUBMISSION
+    // ============================================================
+    async submit() {
+      this.submitting = true;
+      this.statusText = '提交中';
+      const resultsEl = document.getElementById('sd-results');
+      const eventsEl = document.getElementById('sd-events');
+      if (resultsEl) resultsEl.innerHTML = '';
+      if (eventsEl) eventsEl.textContent = '';
+      this.eventsText = '';
+
+      const data = new FormData(document.getElementById('sd-form'));
+      if (Object.keys(this.savedMedia).length) {
+        data.set('saved_media', JSON.stringify(this.savedMedia));
+      }
+
+      const res = await api(APP_PATH + '/api/jobs', 'POST', data);
+      if (!res || res.error) {
+        this.submitting = false;
+        this.statusText = res?.error || '提交失败';
+        return;
+      }
+      await this.pollJob(res.job_id);
+      this.submitting = false;
+    },
+
+    async pollJob(jobId) {
+      const resultsEl = document.getElementById('sd-results');
+      const eventsEl = document.getElementById('sd-events');
+      while (true) {
+        const job = await api(APP_PATH + '/api/jobs/' + jobId);
+        if (!job) break;
+        this.statusText = (job.status || 'unknown') + ' ' + (job.done || 0) + '/' + (job.total || 0);
+        this.eventsText = (job.events || []).map(e => '[' + (e.time || '') + '] ' + (e.message || '')).join('\n');
+        if (eventsEl) eventsEl.textContent = this.eventsText;
+
+        if (resultsEl) {
+          const recentEvents = (job.events || []).slice(-8);
+          const eventsHtml = recentEvents.length
+            ? recentEvents.map(e =>
+                '<div style="font-size:11px;color:#d1e0ff;padding:2px 0">'
+                + '<span style="color:#697386">' + escHtml(e.time) + '</span> '
+                + escHtml(e.message)
+                + '</div>'
+              ).join('')
+            : '<div style="color:#697386;font-size:11px">等待服务器响应...</div>';
+          resultsEl.innerHTML =
+            '<article class="result" style="border-color:#4f46e5;background:#101828;color:#e2e8f0;grid-column:1/-1">'
+            + '<div class="meta" style="color:#818cf8;font-weight:600;margin-bottom:6px">'
+            + escHtml(job.status) + ' · ' + (job.done || 0) + '/' + (job.total || 0)
+            + (job.errors?.[0] ? ' ' + escHtml(job.errors[0]) : '')
+            + '</div>'
+            + eventsHtml
+            + '</article>';
+
+          for (const r of job.results || []) {
+            const url = APP_PATH + (r.download_url || '');
+            resultsEl.innerHTML +=
+              '<article class="result">'
+              + '<video controls src="' + url + '" style="max-height:200px"></video>'
+              + '<a href="' + url + '" class="dl-btn" data-url="' + url + '" data-filename="' + escHtml(r.filename || 'video') + '">下载</a>'
+              + '<div class="meta">Run ' + (r.index || '') + ' · ' + (r.task_id || '') + '</div>'
+              + '</article>';
+          }
+
+          for (const err of job.errors || []) {
+            resultsEl.innerHTML += '<article class="result" style="color:#ef4444">' + escHtml(err) + '</article>';
+          }
+        }
+
+        if (['succeeded', 'failed'].includes(job.status)) {
+          if (job.status === 'succeeded' && this.dirHandle) {
+            await this.saveToClient(job);
+          } else if (job.status === 'succeeded' && this.autoDownload) {
+            this.triggerDownloads(job);
+          }
+          break;
+        }
+        await new Promise(r => setTimeout(r, 2500));
+      }
+      this.statusText = '空闲';
+      this.loadJobs();
+    },
+
+    async saveToClient(job) {
+      try {
+        const files = [];
+        for (const r of job.results || []) {
+          if (r.download_url) files.push({ url: APP_PATH + r.download_url, filename: r.filename || 'video' });
+        }
+        for (const { url, filename } of files) {
+          const resp = await fetch(url);
+          const blob = await resp.blob();
+          const fh = await this.dirHandle.getFileHandle(filename, { create: true });
+          const w = await fh.createWritable();
+          await w.write(blob);
+          await w.close();
+        }
+        if (files.length) this.statusText = '已保存 ' + files.length + ' 个文件到 ' + this.outputDir;
+      } catch (e) {
+        console.warn('saveToClient failed:', e);
+      }
+    },
+
+    triggerDownloads(job) {
+      const urls = [];
+      for (const r of job.results || []) {
+        if (r.download_url) urls.push({ url: APP_PATH + r.download_url, filename: r.filename || 'video' });
+      }
+      for (const { url, filename } of urls) {
+        this._blobDownload(url, filename);
+      }
+      if (urls.length) this.statusText = '已下载 ' + urls.length + ' 个文件';
+    },
+
+    async _blobDownload(url, filename) {
+      try {
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const blob = await resp.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = filename;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+      } catch (e) {
+        console.warn('blob download failed:', filename, e);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.target = '_blank';
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      }
+    },
+
+    // ============================================================
+    // UPLOAD SLOTS
+    // ============================================================
+    buildUploadSlots() {
+      const ir = document.getElementById('sd-imageRefs');
+      const vr = document.getElementById('sd-videoRefs');
+      const ar = document.getElementById('sd-audioRefs');
+      if (ir) {
+        for (let i = 1; i <= 9; i++) makeDrop(ir, 'ref_image_' + i, '@ref_image' + i, 'image/*', 'sd-form');
+      }
+      if (vr) {
+        for (let i = 1; i <= 3; i++) makeDrop(vr, 'ref_video_' + i, '参考视频 ' + i, 'video/*', 'sd-form');
+      }
+      if (ar) {
+        for (let i = 1; i <= 3; i++) makeDrop(ar, 'ref_audio_' + i, '参考音频 ' + i, 'audio/*', 'sd-form');
+      }
+    },
+
+    wireDrops() {
+      setTimeout(() => {
+        document.querySelectorAll('#sd-app .drop').forEach(drop => {
+          const input = drop.querySelector('input[type="file"]');
+          if (input && !input.dataset.wired) {
+            wireFileDrop(drop, input, input.name);
+          }
+        });
+      }, 0);
+    },
+
+    // ============================================================
+    // APPLY PRESET (archive load / activity restore / config load)
+    // ============================================================
+    applyPreset(preset) {
+      if (!preset) return;
+      clearAllMediaPreviews();
+      const values = preset.values || {};
+
+      for (const [name, value] of Object.entries(values)) {
+        // Handle PetiteVue-bound reactive properties explicitly
+        if (name === 'provider') {
+          if (value && this.providers[value]) {
+            this.applyProvider(value);
+          } else {
+            // Set the DOM select value directly
+            const sel = field('provider');
+            if (sel) sel.value = value;
+          }
+          continue;
+        }
+        if (name === 'base_url') { this.baseUrl = value; continue; }
+        if (name === 'output_dir') { this.outputDir = value; continue; }
+        if (name === 'custom_model') { this.customModel = value; continue; }
+        if (name === 'web_search') { this.webSearch = ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase()); continue; }
+        if (name === 'poll_interval') { this.pollInterval = Number(value) || 10; continue; }
+        if (name === 'timeout') { this.timeout = Number(value) || 3600; continue; }
+        if (name === 'workspace_name') { this.workspaceName = value || '默认主题'; continue; }
+
+        // For other fields, set DOM directly
+        const el = field(name);
+        if (!el) continue;
+        if (el.type === 'checkbox') {
+          el.checked = ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
+        } else if (el.type !== 'file') {
+          el.value = value;
+        }
+      }
+
+      // Handle saved media
+      if (preset.media) {
+        this.savedMedia = mediaSnapshot(preset.media);
+        for (const [name, item] of Object.entries(preset.media)) {
+          const el = field(name);
+          const drop = el?.closest('.drop');
+          if (drop && item.url) {
+            const mediaUrl = item.url.startsWith('/api/') ? APP_PATH + item.url : item.url;
+            showPreview(drop, name, mediaUrl, item.filename || '已上传');
+          }
+        }
+      } else {
+        this.savedMedia = {};
+      }
+
+      const mediaCount = Object.keys(this.savedMedia).length;
+      if (mediaCount) this.archiveHint = '已读取保存配置：' + mediaCount + ' 个素材';
+    },
+
+    // ============================================================
+    // WORKSPACE SYSTEM
+    // ============================================================
+    scheduleWorkspaceSave() {
+      clearTimeout(this._workspaceSaveTimer);
+      this._workspaceSaveTimer = setTimeout(() => this.saveWorkspaceDraft(), 500);
+    },
+
+    async saveWorkspaceDraft() {
+      const payload = {
+        name: this.workspaceName.trim() || '默认主题',
+        values: collectFormValues(),
+        media: mediaSnapshot(this.savedMedia),
+        saved_at: Date.now(),
+      };
+      localStorage.setItem(this._workspaceKey, JSON.stringify(payload));
+      this.workspaceHint = '已保存草稿：' + payload.name;
+      return payload;
+    },
+
+    loadWorkspaceDraft() {
+      if (this._workspaceId !== 'default' && this._workspaceId) {
+        this.workspaceName = '主题 ' + this._workspaceId.slice(0, 6);
+        this.workspaceHint = '当前是独立主题页，可与其它主题并发提交';
+      } else {
+        this.workspaceName = '默认主题';
+        this.workspaceHint = '默认主题会读取当前保存配置';
+      }
+
+      const raw = localStorage.getItem(this._workspaceKey);
+      if (!raw) return false;
+      try {
+        const draft = JSON.parse(raw);
+        if (draft.name) this.workspaceName = draft.name;
+        this.applyPreset({ values: draft.values || {}, media: draft.media || {} });
+        this.workspaceHint = '已读取主题草稿：' + this.workspaceName;
+        return true;
+      } catch (e) {
+        return false;
+      }
+    },
+
+    loadPreset() {
+      // Try workspace draft first
+      if (this.loadWorkspaceDraft()) return;
+
+      // Fall back to API preset
+      if (this._workspaceId === 'default' || !this._workspaceId) {
+        // Will load after init via the async pattern
+        this._loadApiPreset();
+      }
+    },
+
+    async _loadApiPreset() {
+      const res = await api(APP_PATH + '/api/preset');
+      if (res) {
+        this.applyPreset(res);
+      }
+    },
+
+    isWorkspaceMode() {
+      return this._workspaceId !== 'default' && !!this._workspaceId;
+    },
+
+    newWorkspace() {
+      const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      const url = new URL(window.location.href);
+      url.searchParams.set('ws', id);
+      window.open(url.toString(), '_blank');
+    },
+
+    async duplicateWorkspace() {
+      const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      const current = await this.saveWorkspaceDraft();
+      current.name = (this.workspaceName || '主题') + ' 副本';
+      localStorage.setItem('seedance.workspace.' + id, JSON.stringify(current));
+      const url = new URL(window.location.href);
+      url.searchParams.set('ws', id);
+      window.open(url.toString(), '_blank');
+    },
+  };
+}
+
+// ============================================================
+// PREVIEW DIALOG — vanilla JS (outside PetiteVue scope)
+// ============================================================
+document.addEventListener('DOMContentLoaded', function () {
+  var dlg = document.getElementById('previewDialog');
+  var closeBtn = document.getElementById('closePreviewBtn');
+  if (closeBtn) {
+    closeBtn.addEventListener('click', function () { if (dlg) dlg.close(); });
+  }
+  if (dlg) {
+    dlg.addEventListener('click', function (e) {
+      if (e.target === dlg) dlg.close();
     });
-    drop.append(removeBtn);
-  }
-  wireFileInput(input);
-}
-
-for (let i = 1; i <= 9; i += 1) {
-  document.querySelector("#imageRefs").append(makeDrop(`ref_image_${i}`, `@ref_image${i}`, "image/*"));
-}
-for (let i = 1; i <= 3; i += 1) {
-  document.querySelector("#videoRefs").append(makeDrop(`ref_video_${i}`, `参考视频 ${i}`, "video/*"));
-  document.querySelector("#audioRefs").append(makeDrop(`ref_audio_${i}`, `参考音频 ${i}`, "audio/*"));
-}
-document.querySelectorAll('.drop input[type="file"]').forEach(ensureDropControls);
-
-async function loadConfig() {
-  const res = await apiFetch("/api/config");
-  const data = await res.json();
-  keyHint.textContent = data.has_key ? `已检测到本地 key：${data.masked_key}` : "未检测到本地 key，请手动填写";
-  if (data.config_error) {
-    keyHint.textContent = `${keyHint.textContent}；供应商配置读取失败，请联系维护者：${data.config_error.detail || data.config_error.message}`;
-    submitBtn.disabled = true;
-    return;
-  }
-  providerDefaults = providersFromConfig(data.providers);
-  const providerSelect = field("provider");
-  const currentProvider = providerSelect.value;
-  providerSelect.innerHTML = "";
-  for (const [id, provider] of Object.entries(providerDefaults)) {
-    const option = document.createElement("option");
-    option.value = id;
-    option.textContent = provider.label || id;
-    providerSelect.append(option);
-  }
-  providerSelect.value = providerDefaults[currentProvider] ? currentProvider : (data.default_provider || Object.keys(providerDefaults)[0]);
-  updateProviderOptions(true);
-}
-
-function applyPreset(preset) {
-  clearAllMediaInputs();
-  const values = preset.values || {};
-  for (const [name, value] of Object.entries(values)) {
-    const input = field(name);
-    if (!input) continue;
-    if (input.type === "checkbox") {
-      input.checked = ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
-    } else if (input.type !== "file") {
-      input.value = value;
-    }
-  }
-  updateProviderOptions(true);
-
-  savedMedia = mediaSnapshot(preset.media);
-  for (const [name, item] of Object.entries(savedMedia)) {
-    const input = field(name);
-    const drop = input?.closest(".drop");
-    if (!drop) continue;
-    renderPreview(drop, mediaKind(name), item.url, item.filename);
-  }
-  const count = Object.keys(savedMedia).length;
-  presetHint.textContent = count ? `已读取保存配置：${count} 个素材` : "";
-  if (preset.archives) renderArchives(preset.archives);
-}
-
-function renderArchives(archives) {
-  archiveSelect.innerHTML = "";
-  if (!archives || archives.length === 0) {
-    const option = document.createElement("option");
-    option.value = "";
-    option.textContent = "暂无存档";
-    archiveSelect.append(option);
-    return;
-  }
-  for (const item of archives) {
-    const option = document.createElement("option");
-    option.value = item.name;
-    option.textContent = item.name;
-    archiveSelect.append(option);
-  }
-}
-
-async function loadArchives() {
-  const res = await apiFetch("/api/archives");
-  if (!res.ok) return;
-  renderArchives((await res.json()).archives);
-}
-
-async function loadPreset() {
-  if (isWorkspaceMode() && loadWorkspaceDraft()) return;
-  if (isWorkspaceMode()) {
-    loadWorkspaceDraft();
-    return;
-  }
-  workspaceName.value = "默认主题";
-  const res = await apiFetch("/api/preset");
-  if (!res.ok) return;
-  applyPreset(await res.json());
-}
-
-function formDataWithSavedMedia() {
-  const data = new FormData(form);
-  data.set("saved_media", JSON.stringify(savedMedia));
-  return data;
-}
-
-async function savePreset() {
-  presetHint.textContent = "保存中...";
-  saveWorkspaceDraft();
-  const res = await apiFetch("/api/preset", { method: "POST", body: formDataWithSavedMedia() });
-  const data = await res.json();
-  if (!res.ok) {
-    presetHint.textContent = data.error || "保存失败";
-    return;
-  }
-  applyPreset(data);
-  presetHint.textContent = data.archive ? `已保存为 ${data.archive}` : "已保存当前配置和素材";
-}
-
-async function loadArchive() {
-  const name = archiveSelect.value;
-  if (!name) {
-    presetHint.textContent = "请选择一个存档";
-    return;
-  }
-  const data = new FormData();
-  data.set("archive_name", name);
-  const res = await apiFetch("/api/archive/load", { method: "POST", body: data });
-  const payload = await res.json();
-  if (!res.ok) {
-    presetHint.textContent = payload.error || "读取失败";
-    return;
-  }
-  applyPreset(payload);
-  field("archive_name").value = name;
-  presetHint.textContent = `已读取存档：${name}`;
-}
-
-async function deleteArchive() {
-  const name = archiveSelect.value;
-  if (!name) {
-    presetHint.textContent = "请选择一个存档";
-    return;
-  }
-  const data = new FormData();
-  data.set("archive_name", name);
-  const res = await apiFetch("/api/archive/delete", { method: "POST", body: data });
-  const payload = await res.json();
-  if (res.ok) {
-    renderArchives(payload.archives);
-    presetHint.textContent = `已删除存档：${name}`;
-  }
-}
-
-async function clearPreset() {
-  const res = await apiFetch("/api/preset/clear", { method: "POST" });
-  if (!res.ok) return;
-  savedMedia = {};
-  document.querySelectorAll(".drop").forEach(clearPreview);
-  presetHint.textContent = "已清空保存配置";
-}
-
-function renderJob(job) {
-  statusText.textContent = `${job.status} ${job.done || 0}/${job.total || 0}`;
-  eventsEl.textContent = (job.events || []).map((e) => `[${e.time}] ${e.message}`).join("\n");
-
-  resultsEl.innerHTML = "";
-  for (const result of job.results || []) {
-    const card = document.createElement("article");
-    card.className = "result";
-    const video = document.createElement("video");
-    video.controls = true;
-    video.src = result.download_url;
-
-    const link = document.createElement("a");
-    link.href = result.download_url;
-    link.download = result.filename;
-    link.textContent = "下载视频";
-
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    meta.textContent = `Run ${result.index} · task ${result.task_id} · ${result.local_path}`;
-
-    card.append(video, link, meta);
-    resultsEl.append(card);
-  }
-
-  for (const error of job.errors || []) {
-    const card = document.createElement("article");
-    card.className = "result";
-    card.textContent = error;
-    resultsEl.append(card);
-  }
-}
-
-function setActiveTab(tab) {
-  const showActivity = tab === "activity";
-  mainTabBtn.classList.toggle("isActive", !showActivity);
-  activityTabBtn.classList.toggle("isActive", showActivity);
-  mainView.classList.toggle("hidden", showActivity);
-  activityView.classList.toggle("hidden", !showActivity);
-  if (showActivity) loadActivity();
-}
-
-function renderActivityStats(counts) {
-  const items = [
-    ["总记录", counts.total || 0],
-    ["页面运行", counts.page || 0],
-    ["API 调用", counts.api || 0],
-    ["成功", counts.succeeded || 0],
-    ["失败", counts.failed || 0],
-    ["运行中", counts.running || 0],
-  ];
-  activityStats.innerHTML = items.map(([label, value]) => (
-    `<div class="activityStat"><strong>${value}</strong><span>${label}</span></div>`
-  )).join("");
-}
-
-function renderActivityList(records) {
-  activityList.innerHTML = "";
-  if (!records.length) {
-    activityList.textContent = "暂无记录";
-    return;
-  }
-  for (const record of records) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "activityItem";
-    button.dataset.id = record.id;
-    button.textContent = `${record.source === "api" ? "API" : "页面"} · ${record.status || "unknown"}`;
-    const meta = document.createElement("span");
-    meta.className = "activityItemMeta";
-    meta.textContent = `${record.created_at || ""} · ${record.title || record.job_id || record.id}`;
-    button.append(meta);
-    button.addEventListener("click", () => loadActivityDetail(record.id, button));
-    activityList.append(button);
-  }
-}
-
-async function loadActivity() {
-  const res = await apiFetch("/api/activity");
-  const data = await res.json();
-  if (!res.ok) {
-    activityDetail.textContent = data.error || "读取后台记录失败";
-    return;
-  }
-  renderActivityStats(data.counts || {});
-  renderActivityList(data.records || []);
-}
-
-async function loadActivityDetail(id, activeButton) {
-  activityList.querySelectorAll(".activityItem").forEach((item) => item.classList.remove("isActive"));
-  activeButton?.classList.add("isActive");
-  const res = await apiFetch(`/api/activity/${id}`);
-  const data = await res.json();
-  activityDetail.innerHTML = "";
-  const actions = document.createElement("div");
-  actions.className = "rowButtons";
-  const restoreBtn = document.createElement("button");
-  restoreBtn.type = "button";
-  restoreBtn.textContent = "恢复到当前页";
-  restoreBtn.disabled = !data.restore;
-  restoreBtn.addEventListener("click", () => {
-    applyPreset(data.restore);
-    saveWorkspaceDraft();
-    setActiveTab("main");
-    presetHint.textContent = data.restore.warning || "已从后台记录恢复参数和素材";
-  });
-  actions.append(restoreBtn);
-  activityDetail.append(actions);
-  if (data.restore?.warning) {
-    const warning = document.createElement("p");
-    warning.className = "hint";
-    warning.textContent = data.restore.warning;
-    activityDetail.append(warning);
-  }
-  const pre = document.createElement("pre");
-  pre.textContent = JSON.stringify(data, null, 2);
-  activityDetail.append(pre);
-}
-
-async function poll(jobId) {
-  while (true) {
-    const res = await apiFetch(`/api/jobs/${jobId}`);
-    const job = await res.json();
-    renderJob(job);
-    if (["succeeded", "failed"].includes(job.status)) {
-      submitBtn.disabled = false;
-      submitBtn.textContent = "开始生成";
-      loadActivity();
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 2500));
-  }
-}
-
-form.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  saveWorkspaceDraft();
-  submitBtn.disabled = true;
-  submitBtn.textContent = "生成中";
-  statusText.textContent = "提交中";
-  resultsEl.innerHTML = "";
-  eventsEl.textContent = "";
-
-  const res = await apiFetch("/api/jobs", { method: "POST", body: formDataWithSavedMedia() });
-  const payload = await res.json();
-  if (!res.ok) {
-    submitBtn.disabled = false;
-    submitBtn.textContent = "开始生成";
-    statusText.textContent = payload.error || "提交失败";
-    return;
-  }
-  poll(payload.job_id);
-});
-
-savePresetBtn.addEventListener("click", savePreset);
-clearPresetBtn.addEventListener("click", clearPreset);
-loadArchiveBtn.addEventListener("click", loadArchive);
-deleteArchiveBtn.addEventListener("click", deleteArchive);
-newWorkspaceBtn.addEventListener("click", () => openWorkspace(false));
-mainTabBtn.addEventListener("click", () => setActiveTab("main"));
-activityTabBtn.addEventListener("click", () => setActiveTab("activity"));
-refreshActivityBtn.addEventListener("click", loadActivity);
-duplicateWorkspaceBtn.addEventListener("click", async () => {
-  duplicateWorkspaceBtn.disabled = true;
-  try {
-    await openWorkspace(true);
-  } catch (error) {
-    workspaceHint.textContent = error.message || "复制主题失败";
-  } finally {
-    duplicateWorkspaceBtn.disabled = false;
-  }
-});
-saveWorkspaceBtn.addEventListener("click", async () => {
-  saveWorkspaceBtn.disabled = true;
-  try {
-    await saveWorkspaceDraft({ persistMedia: true });
-  } catch (error) {
-    workspaceHint.textContent = error.message || "保存草稿失败";
-  } finally {
-    saveWorkspaceBtn.disabled = false;
-  }
-});
-form.addEventListener("input", scheduleWorkspaceSave);
-form.addEventListener("change", scheduleWorkspaceSave);
-field("provider").addEventListener("change", () => updateProviderOptions(false));
-closePreviewBtn.addEventListener("click", () => previewDialog.close());
-previewDialog.addEventListener("click", (event) => {
-  if (event.target === previewDialog) previewDialog.close();
-});
-
-chooseOutputBtn.addEventListener("click", async () => {
-  chooseOutputBtn.disabled = true;
-  try {
-    const res = await apiFetch("/api/choose-output-dir", { method: "POST" });
-    const data = await res.json();
-    if (res.ok && data.path) field("output_dir").value = data.path;
-    else presetHint.textContent = data.error || "未选择目录";
-  } finally {
-    chooseOutputBtn.disabled = false;
   }
 });
 
-appOutputBtn.addEventListener("click", () => {
-  field("output_dir").value = "";
-});
+// SeedanceApp must be globally accessible for PetiteVue v-scope
+window.SeedanceApp = SeedanceApp;
 
-desktopOutputBtn.addEventListener("click", async () => {
-  const res = await apiFetch("/api/default-output-dir");
-  const data = await res.json();
-  if (res.ok && data.path) field("output_dir").value = data.path;
-});
-
-openOutputBtn.addEventListener("click", async () => {
-  openOutputBtn.disabled = true;
-  try {
-    const data = new FormData();
-    data.set("output_dir", field("output_dir").value);
-    const res = await apiFetch("/api/open-output-dir", { method: "POST", body: data });
-    const payload = await res.json();
-    presetHint.textContent = res.ok ? `已打开输出目录：${payload.path}` : (payload.error || "打开输出目录失败");
-  } finally {
-    openOutputBtn.disabled = false;
-  }
-});
-
-cleanCacheBtn.addEventListener("click", async () => {
-  cleanCacheBtn.disabled = true;
-  try {
-    const res = await apiFetch("/api/cleanup-cache", { method: "POST" });
-    const data = await res.json();
-    if (res.ok) {
-      presetHint.textContent = `已清理缓存：素材 ${data.media_deleted || 0} 个，日志 ${data.logs_deleted || 0} 个`;
-    } else {
-      presetHint.textContent = data.error || "清理缓存失败";
-    }
-  } finally {
-    cleanCacheBtn.disabled = false;
-  }
-});
-
-updateProviderOptions(true);
-loadConfig();
-loadPreset();
-loadArchives();
+// Mount PetiteVue — initializes v-scope and @vue:mounted directives
+PetiteVue.createApp({ SeedanceApp }).mount();

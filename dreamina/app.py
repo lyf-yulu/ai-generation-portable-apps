@@ -8,7 +8,6 @@ import os
 import re
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -22,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent
+_DATA_BASE = Path(os.environ.get("DATA_DIR", str(ROOT)))
 STATIC_DIR = ROOT / "static"
 
 # Windows: suppress console windows for spawned subprocesses
@@ -72,12 +72,12 @@ def _ws_preset_path(ws_id: str) -> Path:
     return STATE_DIR / "workspaces" / ws_id / "preset.json"
 
 
-OUTPUT_DIR = ROOT / "outputs"
-UPLOAD_DIR = ROOT / "uploads"
-LOG_DIR = ROOT / "logs"
-STATE_DIR = ROOT / "state"
-ARCHIVE_DIR = ROOT / "archives"
-ACCOUNTS_DIR = ROOT / "accounts"
+OUTPUT_DIR = _DATA_BASE / "outputs"
+UPLOAD_DIR = _DATA_BASE / "uploads"
+LOG_DIR = _DATA_BASE / "logs"
+STATE_DIR = _DATA_BASE / "state"
+ARCHIVE_DIR = _DATA_BASE / "archives"
+ACCOUNTS_DIR = _DATA_BASE / "accounts"
 MEDIA_DIR = STATE_DIR / "media"
 PRESET_PATH = STATE_DIR / "preset.json"
 HISTORY_PATH = STATE_DIR / "history.json"
@@ -139,17 +139,6 @@ def cleanup_old_uploads():
     for f in UPLOAD_DIR.iterdir():
         if f.is_file() and (now - f.stat().st_mtime) > max_age:
             f.unlink(missing_ok=True)
-
-
-def find_available_port(start: int) -> int:
-    for port in range(start, start + 100):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind(("127.0.0.1", port))
-                return port
-            except OSError:
-                continue
-    return start + 100
 
 
 def run_cmd(args: list[str], timeout: int = 30, env_override: dict | None = None) -> dict[str, Any]:
@@ -270,9 +259,15 @@ def _rebuild_accounts_from_disk(account_ids: list[str], old_data: dict[str, Any]
     }
     # Persist the recovered data so next load is fast
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = ACCOUNTS_PATH.with_suffix(".tmp")
+    tmp = ACCOUNTS_PATH.with_suffix(f".{uuid.uuid4().hex[:8]}.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
-    tmp.replace(ACCOUNTS_PATH)
+    try:
+        tmp.replace(ACCOUNTS_PATH)
+    except FileNotFoundError:
+        # tmp file might have been cleaned up by another thread; retry with new name
+        tmp2 = ACCOUNTS_PATH.with_suffix(f".{uuid.uuid4().hex[:8]}.tmp")
+        tmp2.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+        tmp2.replace(ACCOUNTS_PATH)
     return data
 
 
@@ -289,10 +284,15 @@ def _save_accounts(data: dict[str, Any]):
                 pass
     ACCOUNTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     content = json.dumps(data, ensure_ascii=False, indent=2)
-    tmp = ACCOUNTS_PATH.with_suffix(ACCOUNTS_PATH.suffix + ".tmp")
+    tmp = ACCOUNTS_PATH.with_suffix(f".{uuid.uuid4().hex[:8]}.tmp")
     try:
         tmp.write_text(content, encoding="utf-8")
         tmp.replace(ACCOUNTS_PATH)
+    except FileNotFoundError:
+        # Unique tmp file gone (shouldn't happen, but be safe); retry with new name
+        tmp2 = ACCOUNTS_PATH.with_suffix(f".{uuid.uuid4().hex[:8]}.tmp")
+        tmp2.write_text(content, encoding="utf-8")
+        tmp2.replace(ACCOUNTS_PATH)
     except Exception as exc:
         print(f"  [ERROR] save_accounts failed: {exc}")
         try:
@@ -680,7 +680,7 @@ def sync_system_home_account(status: dict[str, Any]) -> dict[str, Any]:
         system_account.setdefault("created_at", time.strftime("%Y-%m-%dT%H:%M:%S"))
 
         active = next((a for a in data["accounts"] if a.get("id") == data.get("active_account")), None)
-        if not account_login_status_is_fresh(active):
+        if not active or not active.get("logged_in"):
             data["active_account"] = system_account["id"]
 
         _save_accounts(data)
@@ -1191,10 +1191,11 @@ def save_archive(name: str, preset: dict[str, Any], handler: SimpleHTTPRequestHa
 
 def load_archive(name: str, handler: SimpleHTTPRequestHandler | None = None) -> dict[str, Any] | None:
     dir_path = _archive_dir_for(handler) if handler else ARCHIVE_DIR
-    path = dir_path / f"{name}.dreamina"
+    safe_name = sanitize_archive_name(name)
+    path = dir_path / f"{safe_name}.dreamina"
     if not path.exists():
         # Fallback to legacy top-level location + migrate
-        legacy = ARCHIVE_DIR / f"{name}.dreamina"
+        legacy = ARCHIVE_DIR / f"{safe_name}.dreamina"
         if legacy.exists():
             path = legacy
         else:
@@ -1218,7 +1219,7 @@ def load_archive(name: str, handler: SimpleHTTPRequestHandler | None = None) -> 
 
 def delete_archive(name: str, handler: SimpleHTTPRequestHandler | None = None) -> bool:
     dir_path = _archive_dir_for(handler) if handler else ARCHIVE_DIR
-    path = dir_path / f"{name}.dreamina"
+    path = dir_path / f"{sanitize_archive_name(name)}.dreamina"
     if path.exists():
         path.unlink()
         return True
@@ -1353,14 +1354,8 @@ class Handler(SimpleHTTPRequestHandler):
             acc_id = path.split("/api/accounts/")[1].split("/")[0]
             self.handle_account_rename(acc_id)
         elif path == "/api/accounts/active":
-            if not _is_local(self):
-                json_response(self, 403, {"ok": False, "error": "admin only"})
-                return
             self.handle_set_active_account()
         elif path == "/api/dispatch-mode":
-            if not _is_local(self):
-                json_response(self, 403, {"ok": False, "error": "admin only"})
-                return
             self.handle_set_dispatch_mode()
         elif path == "/api/text2image":
             self.handle_generate("text2image")
@@ -2115,8 +2110,13 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(content)
 
     def handle_archive_load(self):
-        data = read_json_body(self)
-        name = data.get("name", "")
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart" in content_type:
+            fields, _ = parse_multipart(self)
+            name = fields.get("archive_name", "")
+        else:
+            data = read_json_body(self)
+            name = data.get("name", "")
         if not name:
             json_response(self, 400, {"ok": False, "error": "name required"})
             return
@@ -2127,8 +2127,13 @@ class Handler(SimpleHTTPRequestHandler):
         json_response(self, 200, {"ok": True, **result})
 
     def handle_archive_delete(self):
-        data = read_json_body(self)
-        name = data.get("name", "")
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart" in content_type:
+            fields, _ = parse_multipart(self)
+            name = fields.get("archive_name", "")
+        else:
+            data = read_json_body(self)
+            name = data.get("name", "")
         if not name:
             json_response(self, 400, {"ok": False, "error": "name required"})
             return
@@ -2138,9 +2143,15 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, 404, {"ok": False, "error": "archive not found"})
 
     def handle_archive_from_history(self):
-        data = read_json_body(self)
-        job_id = data.get("job_id", "")
-        archive_name = data.get("archive_name", "").strip()
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart" in content_type:
+            fields, _ = parse_multipart(self)
+            job_id = fields.get("job_id", "")
+            archive_name = fields.get("archive_name", "").strip()
+        else:
+            data = read_json_body(self)
+            job_id = data.get("job_id", "")
+            archive_name = data.get("archive_name", "").strip()
         if not job_id or not archive_name:
             json_response(self, 400, {"ok": False, "error": "job_id and archive_name required"})
             return
@@ -2192,11 +2203,16 @@ class Handler(SimpleHTTPRequestHandler):
             return
         mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
         content = file_path.read_bytes()
+        filename = file_path.name
         self.send_response(200)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(content)))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.end_headers()
-        self.wfile.write(content)
+        try:
+            self.wfile.write(content)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
     def serve_file(self, base_dir: Path, rel_path: str):
         file_path = base_dir / urllib.parse.unquote(rel_path)
@@ -2205,11 +2221,16 @@ class Handler(SimpleHTTPRequestHandler):
             return
         mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
         content = file_path.read_bytes()
+        filename = file_path.name
         self.send_response(200)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(content)))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.end_headers()
-        self.wfile.write(content)
+        try:
+            self.wfile.write(content)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
 
 def main():
@@ -2221,7 +2242,7 @@ def main():
     cfg = load_config()
     EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=cfg["max_concurrent"])
 
-    port = int(os.environ.get("PORT", 0)) or find_available_port(cfg["port"])
+    port = int(os.environ.get("PORT", str(cfg.get("port", 8888))))
     host = os.environ.get("HOST") or cfg.get("host", "127.0.0.1")
     server = ThreadingHTTPServer((host, port), Handler)
 

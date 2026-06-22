@@ -691,3 +691,54 @@ pre {
     grid-template-columns: 1fr;
   }
 }
+
+/* Prompt Optimizer */
+.optimizeBtn {
+  font-size: 13px;
+  padding: 3px 10px;
+  margin-left: 8px;
+  background: linear-gradient(135deg, #7c3aed, #6366f1);
+  color: #fff;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  font-weight: 500;
+}
+.optimizeBtn:hover:not(:disabled) {
+  background: linear-gradient(135deg, #6d28d9, #4f46e5);
+}
+.optimizeBtn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.optimizeResult {
+  margin-top: 12px;
+  border: 1px solid #6366f1;
+  border-radius: 8px;
+  background: #f5f3ff;
+  padding: 12px;
+}
+.optimizeResultHeader {
+  font-weight: 600;
+  font-size: 13px;
+  color: #4338ca;
+  margin-bottom: 8px;
+}
+.optimizeResult pre {
+  white-space: pre-wrap;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #1e293b;
+  background: #f5f3ff;
+  max-height: 360px;
+  overflow-y: auto;
+  margin-bottom: 10px;
+}
+
+/* Status tags */
+.tag { padding: 2px 8px; border-radius: 10px; font-size: 11px; background: #e2e8f0; color: #475569; white-space: nowrap; font-weight: 500; }
+.tag-active { background: #dcfce7; color: #16a34a; }
+.tag-processing { background: #fef3c7; color: #d97706; }
+.tag-error, .tag-failed { background: #fee2e2; color: #dc2626; }
+.tag-succeeded, .tag-completed { background: #dcfce7; color: #16a34a; }
+.tag-queued, .tag-running { background: #dbeafe; color: #2563eb; }

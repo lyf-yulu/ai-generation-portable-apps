@@ -26,13 +26,14 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent
+_DATA_BASE = Path(os.environ.get("DATA_DIR", str(ROOT)))
 STATIC_DIR = ROOT / "static"
-OUTPUT_DIR = ROOT / "outputs"
-STATE_DIR = ROOT / "state"
+OUTPUT_DIR = _DATA_BASE / "outputs"
+STATE_DIR = _DATA_BASE / "state"
 MEDIA_DIR = STATE_DIR / "media"
 PRESET_PATH = STATE_DIR / "preset.json"
 ACTIVITY_PATH = STATE_DIR / "activity_log.json"
-ARCHIVE_DIR = ROOT / "archives"
+ARCHIVE_DIR = _DATA_BASE / "archives"
 PROVIDERS_PATH = ROOT / "providers.json"
 
 
@@ -74,7 +75,7 @@ JOBS: dict[str, dict[str, Any]] = {}
 FILES: dict[str, Path] = {}
 LOCK = threading.Lock()
 STATE_LOCK = threading.Lock()
-ACTIVITY_LIMIT = 300
+ACTIVITY_LIMIT = 100
 
 
 def _atomic_write(path: Path, content: str):
@@ -474,7 +475,7 @@ def preset_to_client(data: dict[str, Any], ws_id: str = "localhost") -> dict[str
                 "filename": item.get("filename", path.name),
                 "mime": item.get("mime", mimetypes.guess_type(path.name)[0] or "image/png"),
                 "stored": stored,
-                "url": f"/api/media/{urllib.parse.quote(stored)}?v={int(path.stat().st_mtime)}",
+                "url": f"/api/media/{urllib.parse.quote(stored)}?ws={ws_id}&v={int(path.stat().st_mtime)}",
             }
     return {"values": data.get("values", {}), "media": media}
 
@@ -1406,7 +1407,10 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(path.stat().st_size))
             self.end_headers()
-            self.wfile.write(path.read_bytes())
+            try:
+                self.wfile.write(path.read_bytes())
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
             return
         if urllib.parse.urlparse(self.path).path.startswith("/api/media/"):
             raw_name = urllib.parse.urlparse(self.path).path.rsplit("/", 1)[-1]
@@ -1421,7 +1425,10 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(path.stat().st_size))
             self.end_headers()
-            self.wfile.write(path.read_bytes())
+            try:
+                self.wfile.write(path.read_bytes())
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
             return
         if self.path.startswith("/api/jobs/"):
             job_id = self.path.rsplit("/", 1)[-1]
@@ -1438,11 +1445,14 @@ class Handler(SimpleHTTPRequestHandler):
                 json_response(self, 404, {"error": "file not found"})
                 return
             self.send_response(200)
-            self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "image/png")
-            self.send_header("Content-Disposition", f'inline; filename="{path.name}"')
+            self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+            self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
             self.send_header("Content-Length", str(path.stat().st_size))
             self.end_headers()
-            self.wfile.write(path.read_bytes())
+            try:
+                self.wfile.write(path.read_bytes())
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
             return
         super().do_GET()
 

@@ -3,11 +3,11 @@
 # AI Generation Portal — macOS 启动器
 # 双击运行或终端执行: ./启动器.command
 # ============================================================
-set -euo pipefail
+set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PORTAL_DIR="$SCRIPT_DIR/portal"
 PID_FILE="$PORTAL_DIR/.launcher_pid.json"
-PORTS=(8787 8797 8888 9089 9090)
+PORTS=(8787 8797 8888 8891 9089 9090)
 PYTHON=""
 
 # ---- 颜色 ----
@@ -43,10 +43,11 @@ collect_child_pids() {
             cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' || true)
             if echo "$cmd" | grep -q "app.py" && echo "$cwd" | grep -q "$SCRIPT_DIR"; then
                 case "$cwd" in
-                    */portal)   name="portal(9090)" ;;
-                    */seedance) name="seedance(8787)" ;;
-                    */nano-banana) name="nano-banana(8797)" ;;
-                    */dreamina) name="dreamina(8888)" ;;
+                    */portal)             name="portal(9090)" ;;
+                    */seedance)           name="seedance(8787)" ;;
+                    */nano-banana)        name="nano-banana(8797)" ;;
+                    */dreamina)           name="dreamina(8888)" ;;
+                    */volcengine-portrait) name="volcengine-portrait(8891)" ;;
                     *) name="app($port)" ;;
                 esac
                 data=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); d['$name']=$pid; print(json.dumps(d))")
@@ -59,7 +60,7 @@ collect_child_pids() {
 status_text() {
     local pids alive=() names=()
     pids=$(load_pids)
-    for name in portal\(9090\) seedance\(8787\) nano-banana\(8797\) dreamina\(8888\); do
+    for name in portal\(9090\) seedance\(8787\) nano-banana\(8797\) dreamina\(8888\) volcengine-portrait\(8891\); do
         local pid
         pid=$(echo "$pids" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('$name',''))" 2>/dev/null || true)
         [ -n "$pid" ] && is_alive "$pid" && alive+=("$name:$pid")
@@ -79,21 +80,25 @@ do_stop() {
     local pids
     pids=$(load_pids)
     for pid in $(echo "$pids" | python3 -c "import sys,json; d=json.load(sys.stdin); [print(v) for v in d.values()]" 2>/dev/null); do
-        is_alive "$pid" && kill "$pid" 2>/dev/null && echo "  已发送终止信号 → pid $pid"
+        if is_alive "$pid"; then
+            kill "$pid" 2>/dev/null && echo "  已发送终止信号 → pid $pid" || true
+        fi
     done
     sleep 3
     for pid in $(echo "$pids" | python3 -c "import sys,json; d=json.load(sys.stdin); [print(v) for v in d.values()]" 2>/dev/null); do
-        is_alive "$pid" && kill -9 "$pid" 2>/dev/null && echo "  强制终止 → pid $pid"
+        if is_alive "$pid"; then
+            kill -9 "$pid" 2>/dev/null && echo "  强制终止 → pid $pid" || true
+        fi
     done
     for port in "${PORTS[@]}"; do
         lsof -ti ":$port" 2>/dev/null | while read -r pid; do
             local cmd
             cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
-            if echo "$cmd" | grep -q "app.py"; then
-                kill -9 "$pid" 2>/dev/null
+            if echo "$cmd" | grep -q "app.py" 2>/dev/null; then
+                kill -9 "$pid" 2>/dev/null || true
                 echo "  清理端口 $port → pid $pid"
             fi
-        done
+        done || true
     done
     rm -f "$PID_FILE"
     echo -e "${GREEN}已停止。${NC}"
