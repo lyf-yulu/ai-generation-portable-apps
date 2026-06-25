@@ -14,6 +14,12 @@ logs/
 accounts/
 certs/
 
+# Re-include portal/state/scripts/ so safe_restart.sh and friends ship with the repo
+!portal/state/
+portal/state/*
+!portal/state/scripts/
+!portal/state/scripts/**
+
 # Secrets and local configs
 *.seedance
 *.nanobanana
@@ -22,3 +28,41 @@ volcengine-portrait/config.json
 
 # Dreamina account session data (contains tokens)
 .dreamina_cli/
+
+# Local debug / signing-experiment scripts (may embed AK/SK or absolute desktop paths)
+volcengine-portrait/debug_sig.py
+volcengine-portrait/_cmp_sig.py
+debug_*.py
+_cmp_*.py
+
+# Runtime / archive folders that occasionally land at the repo root
+.coordination/
+portal/.launcher_pid.json
+docs/drafts/
+docs/superpowers/
+docs/FACT_AUDIT.md
+docs/pending-fixes.md
+
+# Per-app collateral that's stored alongside the code but isn't source
+seedance/SKILL.md
+seedance/docs/
+seedance/6018/
+seedance/6025/
+seedance/AI Tool/
+seedance/图/
+seedance/图片生成合集/
+seedance/视频生成合集/
+seedance/素材/
+seedance/浏览器下载/
+nano-banana/6023/
+nano-banana/6025/
+nano-banana/AI Tool/
+nano-banana/图/
+nano-banana/图片生成合集/
+nano-banana/视频生成合集/
+nano-banana/素材/
+nano-banana/浏览器下载/
+volcengine-portrait/6023/
+volcengine-portrait/6025/
+volcengine-portrait/AI Tool/
+volcengine-portrait/图/
