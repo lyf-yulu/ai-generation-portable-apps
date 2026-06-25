@@ -36,7 +36,21 @@ ARCHIVE_DIR = _DATA_BASE / "archives"
 PROVIDERS_PATH = ROOT / "providers.json"
 FILES_MAP_PATH = STATE_DIR / "download_files.json"
 SKILL_PATH = ROOT / "SKILL.md"
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_KEY_PATH = STATE_DIR / "deepseek.key"
+
+
+def _load_deepseek_key() -> str:
+    """Resolution order: env var → state/deepseek.key (preferred for persistent
+    config that survives restarts and isn't checked into git) → empty."""
+    env_key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+    if env_key:
+        return env_key
+    try:
+        if DEEPSEEK_KEY_PATH.exists():
+            return DEEPSEEK_KEY_PATH.read_text("utf-8").strip()
+    except Exception:
+        pass
+    return ""
 
 try:
     SEEDANCE_SKILL = SKILL_PATH.read_text(encoding="utf-8").strip()
@@ -44,9 +58,9 @@ except Exception:
     SEEDANCE_SKILL = ""
 
 
-def _is_local(handler: SimpleHTTPRequestHandler) -> bool:
-    ip = (handler.headers.get("X-Forwarded-For") or handler.client_address[0] or "").strip()
-    return ip in ("127.0.0.1", "::1", "localhost")
+def _is_admin(handler: SimpleHTTPRequestHandler) -> bool:
+    """Check if request comes from an authenticated admin (set by portal proxy)."""
+    return handler.headers.get("X-Is-Admin") == "1"
 
 
 def _workspace_id(handler) -> str:
@@ -84,6 +98,17 @@ FILES: dict[str, Path] = {}
 JOBS_LOCK = threading.Lock()
 STATE_LOCK = threading.Lock()
 ACTIVITY_LIMIT = 100
+
+# Reference media for volcengine Ark generation tasks. Ark requires video/audio
+# reference URLs to be publicly downloadable web URLs (rejects data: URLs and
+# Authenticated Ark /files paths). We stash the blob in state/refmedia/ and
+# expose it via an anonymous /api/refmedia/<token> endpoint so the public
+# entrypoint (cloudflared / HTTPS) can serve it back to Ark. Tokens are
+# unguessable hex UUIDs and self-expire after REFMEDIA_TTL seconds.
+REFMEDIA_DIR = STATE_DIR / "refmedia"
+REFMEDIA_TTL = 3600
+REFMEDIA: dict[str, dict[str, Any]] = {}
+REFMEDIA_LOCK = threading.Lock()
 
 
 def load_files_map() -> dict[str, Path]:
@@ -215,10 +240,17 @@ def json_response(handler: SimpleHTTPRequestHandler, status: int, data: dict[str
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(raw)))
+    # Surface job_id on a header so the upstream proxy can register usage stats
+    # without buffering the body (P0 fix for #15 portal-wide hang).
+    if isinstance(data, dict):
+        jid = data.get("job_id") or data.get("id")
+        if jid:
+            handler.send_header("X-Job-Id", str(jid))
     if os.environ.get("CORS") == "1":
         handler.send_header("Access-Control-Allow-Origin", "*")
         handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+        handler.send_header("Access-Control-Expose-Headers", "X-Job-Id")
     handler.end_headers()
     handler.wfile.write(raw)
 
@@ -751,6 +783,12 @@ def optimize_prompt(user_prompt: str) -> dict[str, Any]:
         return {"ok": False, "error": "SKILL.md 未找到或为空，无法进行优化"}
     if not user_prompt.strip():
         return {"ok": False, "error": "请先输入提示词"}
+    api_key = _load_deepseek_key()
+    if not api_key:
+        return {"ok": False, "error": (
+            "提示词优化未配置 DeepSeek API Key。"
+            f"请将 sk-... 写入 {DEEPSEEK_KEY_PATH}（一行,不带引号）"
+        )}
 
     body = {
         "model": "deepseek-chat",
@@ -765,7 +803,7 @@ def optimize_prompt(user_prompt: str) -> dict[str, Any]:
         result = request_json(
             "POST",
             "https://api.deepseek.com/v1/chat/completions",
-            DEEPSEEK_API_KEY,
+            api_key,
             body,
             timeout=120,
         )
@@ -774,7 +812,10 @@ def optimize_prompt(user_prompt: str) -> dict[str, Any]:
             return {"ok": False, "error": "DeepSeek 返回为空，请稍后重试"}
         return {"ok": True, "optimized": optimized.strip()}
     except RuntimeError as exc:
-        return {"ok": False, "error": f"优化请求失败：{exc}"}
+        msg = str(exc)
+        if "401" in msg:
+            msg = f"DeepSeek API Key 无效或已过期({msg[:120]})"
+        return {"ok": False, "error": f"优化请求失败：{msg}"}
 
 
 def mask_key(key: str) -> str:
@@ -810,11 +851,74 @@ def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | Non
         raise RuntimeError(f"API 请求超时或连接失败 ({exc.__class__.__name__}: {exc})") from exc
 
 
-def upload_file(upload_url: str, api_key: str, blob: bytes, filename: str, content_type: str) -> dict[str, str]:
+def _public_base_url(handler: SimpleHTTPRequestHandler) -> str | None:
+    """Build the public scheme://host prefix from forwarded headers set by the portal proxy.
+    Returns None when no X-Forwarded-Host is present (subapp accessed directly on LAN/loopback
+    where there's no public reverse-proxied URL to advertise)."""
+    host = (handler.headers.get("X-Forwarded-Host") or "").strip()
+    if not host:
+        return None
+    proto = (handler.headers.get("X-Forwarded-Proto") or "https").strip()
+    return f"{proto}://{host}"
+
+
+def register_refmedia(blob: bytes, mime: str, filename: str) -> tuple[str, str]:
+    """Stash a reference media blob under state/refmedia/ and return (token, ext).
+    The blob is exposed at GET /api/refmedia/<token><ext> for REFMEDIA_TTL seconds."""
+    token = uuid.uuid4().hex
+    ext = Path(filename).suffix or mimetypes.guess_extension(mime) or ".bin"
+    REFMEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    path = REFMEDIA_DIR / f"{token}{ext}"
+    path.write_bytes(blob)
+    with REFMEDIA_LOCK:
+        REFMEDIA[token] = {"path": path, "mime": mime, "ext": ext,
+                           "expires_at": time.time() + REFMEDIA_TTL}
+    return token, ext
+
+
+def cleanup_refmedia_loop() -> None:
+    """Background sweep — every 10 minutes, evict any refmedia entries past expires_at."""
+    while True:
+        time.sleep(600)
+        now = time.time()
+        to_remove: list[tuple[str, Path]] = []
+        with REFMEDIA_LOCK:
+            for tk, m in list(REFMEDIA.items()):
+                if m.get("expires_at", 0) < now:
+                    to_remove.append((tk, m["path"]))
+                    del REFMEDIA[tk]
+        for _tk, path in to_remove:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def reset_refmedia_dir() -> None:
+    """Clear the refmedia directory on startup. Tokens are in-memory only,
+    so any leftover files from a previous process are unreachable anyway."""
+    try:
+        if REFMEDIA_DIR.exists():
+            for child in REFMEDIA_DIR.iterdir():
+                if child.is_file():
+                    try:
+                        child.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
+def upload_file(upload_url: str, api_key: str, blob: bytes, filename: str, content_type: str, extra_fields: dict[str, str] | None = None) -> dict[str, str]:
     """Upload a file and return the reference dict for use in content items.
     Returns {"url": "..."} for t8star, {"file_id": "..."} for volcengine Ark."""
     boundary = f"----seedance{uuid.uuid4().hex}"
     body = bytearray()
+    for k, v in (extra_fields or {}).items():
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{k}"\r\n\r\n'.encode())
+        body.extend(str(v).encode())
+        body.extend(b"\r\n")
     body.extend(f"--{boundary}\r\n".encode())
     body.extend(
         (
@@ -838,7 +942,11 @@ def upload_file(upload_url: str, api_key: str, blob: bytes, filename: str, conte
         with urllib.request.urlopen(req, timeout=300) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"文件上传失败 (HTTP {exc.code})") from exc
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            detail = ""
+        raise RuntimeError(f"文件上传失败 (HTTP {exc.code}): {detail}") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise RuntimeError(f"文件上传失败 (连接错误): {exc}") from exc
     if data.get("url"):
@@ -848,11 +956,39 @@ def upload_file(upload_url: str, api_key: str, blob: bytes, filename: str, conte
     raise RuntimeError(f"Upload did not return url or id: {data}")
 
 
-def media_reference(provider: str, base_url: str, api_key: str, blob: bytes, filename: str, mime: str) -> dict[str, str]:
+def media_reference(provider: str, base_url: str, api_key: str, blob: bytes, filename: str, mime: str, request_host: str | None = None) -> dict[str, str]:
+    # Ark generation tasks (/contents/generations/tasks) handle reference media in two
+    # distinct ways depending on the slot:
+    #
+    #   image_url.url      — accepts data: URL or https://. Use base64 data URL (zero
+    #                        round-trip, no public exposure of the image).
+    #   video_url.url /
+    #   audio_url.url      — accepts ONLY https:// (rejects data: URLs with
+    #                        "must be provided as a web url"), AND Ark issues an
+    #                        unauthenticated GET to that URL — so /files/{id}/content
+    #                        (which requires Authorization) also fails with
+    #                        "resource download failed".
+    #
+    # Therefore for video/audio we stash the blob in the local refmedia/ pool and
+    # advertise it through the public scheme://host the client itself reached us on
+    # (cloudflared trycloudflare URL, named tunnel, etc). Token is unguessable hex,
+    # entries TTL after REFMEDIA_TTL seconds.
+    #
+    # Do NOT change the image branch to use /files upload — the file_id cannot be
+    # referenced from image_url.url (see seedance/docs/volcengine-media.md).
     if provider == "volcengine":
-        upload_url = f"{base_url}/files"
-    else:
-        upload_url = f"{base_url}/v1/files"
+        if mime.startswith("image/"):
+            b64 = base64.b64encode(blob).decode("ascii")
+            return {"url": f"data:{mime};base64,{b64}"}
+        # video/* or audio/* on volcengine — needs an externally reachable web URL
+        if not request_host:
+            raise RuntimeError(
+                "volcengine 视频/音频参考素材需要 portal 公网入口(cloudflared 域名);"
+                "请通过 portal 公网域名访问 seedance,或切换到 t8star provider"
+            )
+        token, ext = register_refmedia(blob, mime, filename)
+        return {"url": f"{request_host}/seedance/api/refmedia/{token}{ext}"}
+    upload_url = f"{base_url}/v1/files"
     return upload_file(upload_url, api_key, blob, filename, mime)
 
 
@@ -973,7 +1109,7 @@ def replace_refs(prompt: str) -> str:
     return re.sub(r"@ref_image(\d+)", r"Image \1", prompt)
 
 
-def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index: int, ws_id: str = "localhost") -> dict[str, Any]:
+def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index: int, ws_id: str = "localhost", request_host: str | None = None) -> dict[str, Any]:
     provider = get_field(form, "provider", "t8star")
     prompt = replace_refs(get_field(form, "prompt").strip())
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
@@ -986,7 +1122,7 @@ def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index
         has_frame_input = True
         filename, blob = first
         mime = mimetypes.guess_type(filename)[0] or "image/png"
-        ref = media_reference(provider, base_url, api_key, blob, filename, mime)
+        ref = media_reference(provider, base_url, api_key, blob, filename, mime, request_host=request_host)
         content.append({"type": "image_url", "image_url": ref, "role": "first_frame"})
 
     last = get_file_or_saved(form, "last_frame", ws_id)
@@ -994,7 +1130,7 @@ def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index
         has_frame_input = True
         filename, blob = last
         mime = mimetypes.guess_type(filename)[0] or "image/png"
-        ref = media_reference(provider, base_url, api_key, blob, filename, mime)
+        ref = media_reference(provider, base_url, api_key, blob, filename, mime, request_host=request_host)
         content.append({"type": "image_url", "image_url": ref, "role": "last_frame"})
 
     for i in range(1, 10):
@@ -1005,7 +1141,7 @@ def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index
         has_visual_reference = True
         filename, blob = file_data
         mime = mimetypes.guess_type(filename)[0] or "image/png"
-        ref = media_reference(provider, base_url, api_key, blob, filename, mime)
+        ref = media_reference(provider, base_url, api_key, blob, filename, mime, request_host=request_host)
         content.append({"type": "image_url", "image_url": ref, "role": "reference_image"})
 
     for i in range(1, 4):
@@ -1016,7 +1152,7 @@ def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index
         has_visual_reference = True
         filename, blob = file_data
         mime = mimetypes.guess_type(filename)[0] or "video/mp4"
-        ref = media_reference(provider, base_url, api_key, blob, filename, mime)
+        ref = media_reference(provider, base_url, api_key, blob, filename, mime, request_host=request_host)
         content.append({"type": "video_url", "video_url": ref, "role": "reference_video"})
 
     for i in range(1, 4):
@@ -1026,7 +1162,7 @@ def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index
         has_reference_input = True
         filename, blob = file_data
         mime = mimetypes.guess_type(filename)[0] or "audio/wav"
-        ref = media_reference(provider, base_url, api_key, blob, filename, mime)
+        ref = media_reference(provider, base_url, api_key, blob, filename, mime, request_host=request_host)
         content.append({"type": "audio_url", "audio_url": ref, "role": "reference_audio"})
 
     seed_raw = get_field(form, "seed", "").strip()
@@ -1287,8 +1423,15 @@ def values_files_from_json(payload: dict[str, Any]) -> tuple[dict[str, Any], dic
 def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], source: str, request_kind: str, request_data: dict[str, Any], ws_id: str = "localhost") -> str:
     job_id = uuid.uuid4().hex
     activity_id = uuid.uuid4().hex
+    try:
+        per_item_duration = int(values.get("duration") or 0)
+    except (TypeError, ValueError):
+        per_item_duration = 0
     with JOBS_LOCK:
-        JOBS[job_id] = {"id": job_id, "status": "queued", "events": [], "results": [], "errors": [], "done": 0, "total": 0}
+        JOBS[job_id] = {
+            "id": job_id, "status": "queued", "events": [], "results": [], "errors": [],
+            "done": 0, "total": 0, "duration": per_item_duration,
+        }
     response = job_id_response(job_id)
     record_activity({
         "id": activity_id,
@@ -1323,7 +1466,8 @@ def run_one(job_id: str, index: int, form_values: dict[str, Any], form_files: di
     base_url = str(form_values.get("base_url") or default_base).rstrip("/")
     create_url = f"{base_url}/contents/generations/tasks" if provider == "volcengine" else f"{base_url}/seedance/v3/contents/generations/tasks"
     add_event(job_id, f"Run {index}: preparing payload")
-    payload = build_payload(form, api_key, base_url, index - 1, ws_id)
+    request_host = form_values.get("_request_host") or None
+    payload = build_payload(form, api_key, base_url, index - 1, ws_id, request_host=request_host)
     add_event(job_id, f"Run {index}: creating task ({content_counts(payload)})")
     create_result = request_json("POST", create_url, api_key, payload)
     task_id = create_result.get("id") or create_result.get("task_id")
@@ -1484,15 +1628,13 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, 200, {"ok": True, "jobs": items})
             return
         if self.path == "/api/activity":
-            ws = _workspace_id(self)
-            show_all = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("all") == ["1"]
-            json_response(self, 200, activity_list(ws, show_all=show_all))
+            json_response(self, 200, activity_list(show_all=True))
             return
         if self.path.startswith("/api/activity/"):
             activity_id = self.path.rsplit("/", 1)[-1]
             ws = _workspace_id(self)
             record = next((item for item in read_activity_log() if item.get("id") == activity_id), None)
-            if record and record.get("workspace_id") != ws and not _is_local(self):
+            if record and record.get("workspace_id") != ws and not _is_admin(self):
                 record = None
             json_response(self, 200 if record else 404, activity_record_for_client(record) or {"error": "activity not found"})
             return
@@ -1543,6 +1685,32 @@ class Handler(SimpleHTTPRequestHandler):
                 job = JOBS.get(job_id)
                 data = json.loads(json.dumps(job)) if job else None
             json_response(self, 200 if data else 404, data or {"error": "job not found"})
+            return
+        if self.path.startswith("/api/refmedia/"):
+            # Anonymous endpoint for Ark to fetch reference media. Token is an
+            # unguessable hex UUID; entries expire after REFMEDIA_TTL seconds.
+            # Strip query string and extension to recover the token.
+            raw = urllib.parse.urlparse(self.path).path.rsplit("/", 1)[-1]
+            token = raw.split(".", 1)[0]
+            with REFMEDIA_LOCK:
+                meta = REFMEDIA.get(token)
+            if not meta or meta.get("expires_at", 0) < time.time() or not meta["path"].exists():
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            path = meta["path"]
+            self.send_response(200)
+            self.send_header("Content-Type", meta.get("mime") or "application/octet-stream")
+            self.send_header("Content-Length", str(path.stat().st_size))
+            self.send_header("Cache-Control", "public, max-age=3600")
+            # Public endpoint — leave CORS open so Ark's fetcher (no Origin) is fine
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            try:
+                self.wfile.write(path.read_bytes())
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
             return
         if self.path.startswith("/api/download/"):
             token = self.path.rsplit("/", 1)[-1]
@@ -1655,7 +1823,7 @@ class Handler(SimpleHTTPRequestHandler):
                 json_response(self, 400, {"error": str(exc)})
             return
         if self.path == "/api/archive/delete":
-            if not _is_local(self):
+            if not _is_admin(self):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
             form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
@@ -1665,7 +1833,7 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, 200, {"archives": list_archives(self)})
             return
         if self.path == "/api/preset/clear":
-            if not _is_local(self):
+            if not _is_admin(self):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
             ws = _workspace_id(self)
@@ -1703,6 +1871,7 @@ class Handler(SimpleHTTPRequestHandler):
                     return
                 request_data = {"raw": summarize_payload(payload), "parsed": summarize_values_files(values, files)}
                 ws = _workspace_id(self)
+                values["_request_host"] = _public_base_url(self) or ""
                 job_id = create_job(values, files, "api", "json", request_data, ws)
                 json_response(self, 200, job_id_response(job_id))
             except Exception as exc:
@@ -1712,7 +1881,7 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, 404, {"error": "not found"})
             return
         form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
-        api_key = get_field(form, "api_key") or load_default_key()
+        api_key = get_field(form, "api_key") or self.headers.get("X-Api-Key", "").strip() or load_default_key()
         if not api_key:
             json_response(self, 400, api_error("invalid_request", "API key is required"))
             return
@@ -1729,6 +1898,7 @@ class Handler(SimpleHTTPRequestHandler):
 
         request_data = summarize_values_files(form_values, form_files)
         ws = _workspace_id(self)
+        form_values["_request_host"] = _public_base_url(self) or ""
         job_id = create_job(form_values, form_files, "page", "multipart", request_data, ws)
         json_response(self, 200, job_id_response(job_id))
 
@@ -1736,6 +1906,11 @@ class Handler(SimpleHTTPRequestHandler):
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    REFMEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    # Wipe any leftover refmedia from a previous process — the token map is
+    # in-memory only, so old files are unreachable. Then start the TTL sweeper.
+    reset_refmedia_dir()
+    threading.Thread(target=cleanup_refmedia_loop, daemon=True).start()
     # Restore persisted download token → file mappings (survives server restart)
     restored = load_files_map()
     if restored:

@@ -117,10 +117,14 @@ function DreaminaApp() {
     dispatchMode: 'manual',
     accountLoginId: null,
     accountLoginUrl: null,
+    isAdmin: false,
+    historyLimit: 8,
 
     async init() {
       window._dmApp = this;
       window._dmRestore = (jobId) => this.restoreFromHistory(jobId);
+      const me = await api('/api/auth/me');
+      this.isAdmin = me?.role === 'admin';
       await this.checkEnv();
       this.buildSlots();
       if (this.loggedIn && this.accounts.length) this.refreshAllAccounts();
@@ -397,20 +401,27 @@ function DreaminaApp() {
     async _blobDownload(url, filename) {
       try {
         const resp = await fetch(url);
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
         const blob = await resp.blob();
         const blobUrl = URL.createObjectURL(blob);
         const a = document.createElement('a');
-        a.href = blobUrl; a.download = filename; a.style.display = 'none';
-        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        a.href = blobUrl;
+        a.download = filename;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
         setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
       } catch (e) {
-        console.warn('blob download failed:', filename, e);
-        // Fallback: direct navigation
         const a = document.createElement('a');
-        a.href = url; a.download = filename; a.target = '_blank';
+        a.href = url;
+        a.download = filename;
+        a.target = '_blank';
+        a.rel = 'noopener';
         a.style.display = 'none';
-        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
       }
     },
 
@@ -445,7 +456,9 @@ function DreaminaApp() {
         return this.historyFilter === 'video' ? tt.includes('video') || tt.includes('frame') : tt.includes('image');
       });
       if (!filtered.length) { list.innerHTML = '<div style="color:#697386;font-size:12px">暂无历史</div>'; return; }
-      list.innerHTML = filtered.slice(0, 30).map(item => {
+      const limit = this.historyLimit || 8;
+      const visible = filtered.slice(0, limit);
+      const cardsHtml = visible.map(item => {
         const files = item.result?.files || [];
         const thumb = files[0] ? '/dreamina/' + files[0].replace(/^\//, '') : '';
         const isVid = thumb && /\.(mp4|mov|webm)$/i.test(thumb);
@@ -454,8 +467,8 @@ function DreaminaApp() {
         const statusColor = status === 'completed' ? '#10b981' : status === 'failed' ? '#ef4444' : '#697386';
         let preview = '';
         if (thumb) {
-          if (isVid) preview = `<video src="${thumb}" style="width:100%;max-height:120px;border-radius:5px;margin-top:4px" preload="metadata"></video>`;
-          else preview = `<img src="${thumb}" style="width:100%;max-height:120px;object-fit:contain;border-radius:5px;margin-top:4px;cursor:zoom-in" onclick="event.stopPropagation();openPreview('image','${thumb}')">`;
+          if (isVid) preview = `<video src="${thumb}" style="width:100%;max-height:120px;border-radius:5px;margin-top:4px" preload="none"></video>`;
+          else preview = `<img src="${thumb}" loading="lazy" style="width:100%;max-height:120px;object-fit:contain;border-radius:5px;margin-top:4px;cursor:zoom-in" onclick="event.stopPropagation();openPreview('image','${thumb}')">`;
         }
         const logs = item.cli_logs || [];
         const logId = 'cli-log-' + item.job_id;
@@ -477,6 +490,16 @@ function DreaminaApp() {
           ${logSection}
         </div>`;
       }).join('');
+      const remaining = filtered.length - visible.length;
+      const moreBtn = remaining > 0
+        ? `<button type="button" style="width:100%;margin-top:8px;padding:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;color:#e2e8f0;cursor:pointer;font-size:12px" onclick="window._dmApp.loadMoreHistory()">加载更多 (${remaining})</button>`
+        : '';
+      list.innerHTML = cardsHtml + moreBtn;
+    },
+
+    loadMoreHistory() {
+      this.historyLimit = (this.historyLimit || 8) + 8;
+      this.loadHistory();
     },
 
     async restoreFromHistory(jobId) {
@@ -669,29 +692,125 @@ function StatsApp() {
     todayJobs: 0,
     todayRequests: 0,
     byApp: {},
-    byIp: {},
+    byUser: {},
     recentActivity: [],
+    isAdmin: false,
+    users: [],
+    newUser: { username: '', password: '', role: 'user' },
+    creating: false,
+    userHint: '',
+    userHintOk: true,
+    signupEnabled: true,
+    signupBusy: false,
+    // History / day-picker
+    selectedDate: '',          // YYYY-MM-DD; default today
+    daySnapshot: null,         // { date, total_jobs, total_requests, by_app, by_user }
+    historyDays: 7,            // 7 / 30 / 90
+    history: { dates: [], users: {} },
+    // Date-range query + CSV export
+    rangeStart: '',            // YYYY-MM-DD
+    rangeEnd: '',              // YYYY-MM-DD
+    rangeData: { dates: [], users: {} },
+    rangeLoading: false,
+    rangeError: '',
+    exporting: false,
+    // Admin-only: company-wide volcengine-portrait key (no plaintext returned)
+    portraitKey: {
+      api_key: '', access_key: '', secret_key: '',
+      has_api_key: false, has_access_key: false, has_secret_key: false,
+      saving: false, hint: '', hintOk: true,
+    },
+
+    fmtDmStat(s) {
+      if (!s) return '—';
+      const parts = [];
+      if (s.images) parts.push(s.images + '张');
+      if (s.seconds) parts.push(s.seconds + 's');
+      return parts.join(' / ') || '—';
+    },
 
     async init() {
+      const me = await api('/api/auth/me');
+      this.isAdmin = me?.role === 'admin';
+      // Default day-picker to today (local date string)
+      const today = new Date();
+      const tz = today.getTimezoneOffset() * 60000;
+      this.selectedDate = new Date(today - tz).toISOString().slice(0, 10);
+      // Default range: last 7 days ending today
+      const weekAgo = new Date(today.getTime() - 6 * 86400000);
+      this.rangeEnd = this.selectedDate;
+      this.rangeStart = new Date(weekAgo - tz).toISOString().slice(0, 10);
       this.loadStats();
       this.loadActivity();
       this.loadPlatformStatus();
+      this.loadDay();
+      this.loadHistory();
+      this.loadRange();
+      if (this.isAdmin) {
+        this.loadUsers();
+        this.loadSignupStatus();
+        this.loadPortraitKey();
+      }
       setInterval(() => this.loadPlatformStatus(), 10000);
       setInterval(() => this.loadStats(), 30000);
+    },
+
+    async loadSignupStatus() {
+      const r = await fetch('/api/auth/first-run');
+      const d = await r.json().catch(() => null);
+      if (d?.ok) this.signupEnabled = !!d.signup_enabled;
+    },
+
+    async toggleSignup() {
+      this.signupBusy = true;
+      const res = await api('/api/auth/signup-toggle', 'POST', JSON.stringify({ enabled: !this.signupEnabled }));
+      this.signupBusy = false;
+      if (res?.ok) this.signupEnabled = !!res.signup_enabled;
+      else alert(res?.error || '切换失败');
+    },
+
+    async loadPortraitKey() {
+      const res = await api('/api/platform/portrait-key');
+      if (!res?.ok) return;
+      this.portraitKey.has_api_key = !!res.has_api_key;
+      this.portraitKey.has_access_key = !!res.has_access_key;
+      this.portraitKey.has_secret_key = !!res.has_secret_key;
+    },
+
+    async savePortraitKey() {
+      const payload = {};
+      if (this.portraitKey.api_key.trim()) payload.api_key = this.portraitKey.api_key.trim();
+      if (this.portraitKey.access_key.trim()) payload.access_key = this.portraitKey.access_key.trim();
+      if (this.portraitKey.secret_key.trim()) payload.secret_key = this.portraitKey.secret_key.trim();
+      if (!Object.keys(payload).length) {
+        this.portraitKey.hint = '至少需要填写一项才能保存';
+        this.portraitKey.hintOk = false;
+        return;
+      }
+      this.portraitKey.saving = true;
+      this.portraitKey.hint = '';
+      const res = await api('/api/platform/portrait-key', 'POST', JSON.stringify(payload));
+      this.portraitKey.saving = false;
+      if (res?.ok) {
+        this.portraitKey.api_key = '';
+        this.portraitKey.access_key = '';
+        this.portraitKey.secret_key = '';
+        this.portraitKey.has_api_key = !!res.has_api_key;
+        this.portraitKey.has_access_key = !!res.has_access_key;
+        this.portraitKey.has_secret_key = !!res.has_secret_key;
+        this.portraitKey.hint = '已保存,即时生效(无需重启)';
+        this.portraitKey.hintOk = true;
+      } else {
+        this.portraitKey.hint = (res && res.error) ? '保存失败:' + res.error : '保存失败';
+        this.portraitKey.hintOk = false;
+      }
     },
 
     async loadPlatformStatus() {
       const res = await api('/api/platform/status');
       if (!res?.ok) return;
-      document.getElementById('lanInfo').textContent = `LAN: http://${res.lan_ip}:${res.portal_port}`;
+      document.getElementById('lanInfo').textContent = `LAN: ${location.protocol}//${res.lan_ip}:${res.portal_port}`;
       document.getElementById('barStats').textContent = `今日: ${this.todayJobs} jobs`;
-      for (const app of res.apps || []) {
-        const mapping = { seedance: 'sd', 'nano-banana': 'nb', dreamina: 'dm' };
-        const prefix = mapping[app.name];
-        if (prefix) {
-          const panels = document.querySelectorAll(`#tab-${app.name === 'nano-banana' ? 'nb' : app.name}`);
-        }
-      }
     },
 
     async loadStats() {
@@ -700,7 +819,7 @@ function StatsApp() {
       this.todayJobs = res.today_jobs || 0;
       this.todayRequests = res.today_requests || 0;
       this.byApp = res.by_app || {};
-      this.byIp = res.by_ip || {};
+      this.byUser = res.by_user || {};
       document.getElementById('barStats').textContent = `今日: ${this.todayJobs} jobs`;
     },
 
@@ -708,6 +827,255 @@ function StatsApp() {
       const res = await api('/api/platform/activity');
       if (!res?.ok) return;
       this.recentActivity = (res.activity || []).slice(0, 30);
+    },
+
+    async loadDay() {
+      if (!this.selectedDate) return;
+      const res = await api('/api/platform/stats/day?date=' + encodeURIComponent(this.selectedDate));
+      if (!res?.ok) { this.daySnapshot = null; return; }
+      this.daySnapshot = res;
+    },
+
+    async loadHistory() {
+      const res = await api('/api/platform/stats/history?days=' + this.historyDays);
+      if (!res?.ok) return;
+      this.history = { dates: res.dates || [], users: res.users || {} };
+    },
+
+    async loadRange() {
+      if (!this.rangeStart || !this.rangeEnd) return;
+      this.rangeError = '';
+      this.rangeLoading = true;
+      const url = '/api/platform/stats/range'
+        + '?start=' + encodeURIComponent(this.rangeStart)
+        + '&end=' + encodeURIComponent(this.rangeEnd);
+      const res = await api(url);
+      this.rangeLoading = false;
+      if (!res?.ok) {
+        this.rangeError = res?.error || '加载失败';
+        this.rangeData = { dates: [], users: {} };
+        return;
+      }
+      this.rangeData = { dates: res.dates || [], users: res.users || {} };
+    },
+
+    async exportRange() {
+      if (!this.rangeStart || !this.rangeEnd) return;
+      this.exporting = true;
+      try {
+        const url = '/api/platform/stats/export'
+          + '?start=' + encodeURIComponent(this.rangeStart)
+          + '&end=' + encodeURIComponent(this.rangeEnd);
+        // 自签 HTTPS 下走 fetch+Blob，避免下载管理器拒绝；anchor download 在生产路径有冲突。
+        const r = await fetch(url, { credentials: 'same-origin' });
+        if (!r.ok) {
+          alert('导出失败 HTTP ' + r.status);
+          return;
+        }
+        const blob = await r.blob();
+        const objUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = objUrl;
+        a.download = `usage-${this.rangeStart}-${this.rangeEnd}.csv`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(objUrl), 1000);
+      } catch (e) {
+        alert('导出失败: ' + (e?.message || e));
+      } finally {
+        this.exporting = false;
+      }
+    },
+
+    rangeUserTotals(user) {
+      // Sum images + seconds across all apps in the current rangeData.
+      const apps = this.rangeData?.users?.[user] || {};
+      let images = 0, seconds = 0;
+      for (const a in apps) {
+        const s = apps[a];
+        images += (s.images || []).reduce((x, y) => x + (y || 0), 0);
+        seconds += (s.seconds || []).reduce((x, y) => x + (y || 0), 0);
+      }
+      return { images, seconds };
+    },
+
+    setHistoryDays(n) {
+      this.historyDays = n;
+      this.loadHistory();
+    },
+
+    // Pick the metric series most relevant to each subapp.
+    // seedance / volcengine-portrait: seconds (video)
+    // nano-banana: images
+    // dreamina: images + seconds elementwise (mixed media)
+    pickAppValues(stats, app) {
+      if (!stats) return [];
+      if (app === 'nano-banana') return stats.images || [];
+      if (app === 'dreamina') {
+        const a = stats.images || [];
+        const b = stats.seconds || [];
+        const n = Math.max(a.length, b.length);
+        const out = [];
+        for (let i = 0; i < n; i++) out.push((a[i] || 0) + (b[i] || 0));
+        return out;
+      }
+      return stats.seconds || [];
+    },
+
+    appUnit(app) {
+      if (app === 'nano-banana') return '张';
+      if (app === 'dreamina') return '张+秒';
+      return '秒';
+    },
+
+    appColor(app) {
+      return {
+        'seedance': '#2563eb',
+        'nano-banana': '#10b981',
+        'dreamina': '#a855f7',
+        'volcengine-portrait': '#f59e0b',
+      }[app] || '#64748b';
+    },
+
+    appLabel(app) {
+      return {
+        'seedance': 'Seedance',
+        'nano-banana': 'Nano Banana',
+        'dreamina': 'Dreamina',
+        'volcengine-portrait': '人像生成',
+      }[app] || app;
+    },
+
+    svgSpark(values, app) {
+      const w = 160, h = 44;
+      if (!values || !values.length) return '';
+      const color = this.appColor(app);
+      const max = Math.max(1, ...values);
+      const last = values[values.length - 1];
+      const step = w / Math.max(1, values.length - 1);
+      const pts = values.map((v, i) =>
+        (i * step).toFixed(1) + ',' +
+        (h - (v / max) * (h - 8) - 4).toFixed(1)
+      ).join(' ');
+      const lastX = (w - 2).toFixed(1);
+      const lastY = (h - (last / max) * (h - 8) - 4).toFixed(1);
+      return (
+        '<svg width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' +
+          '<polyline fill="none" stroke="' + color + '" stroke-width="1.5" points="' + pts + '"/>' +
+          '<circle cx="' + lastX + '" cy="' + lastY + '" r="2" fill="' + color + '"/>' +
+        '</svg>'
+      );
+    },
+
+    sumSeries(values) {
+      if (!values || !values.length) return 0;
+      return values.reduce((a, b) => a + (b || 0), 0);
+    },
+
+    async loadUsers() {
+      const res = await api('/api/users');
+      if (res?.ok) this.users = res.users || [];
+    },
+
+    async createUser() {
+      if (!this.newUser.username || !this.newUser.password) return;
+      if (this.newUser.password.length < 6) {
+        this.userHint = '密码至少 6 位'; this.userHintOk = false; return;
+      }
+      this.creating = true; this.userHint = '';
+      const res = await api('/api/auth/create-user', 'POST', JSON.stringify(this.newUser));
+      this.creating = false;
+      if (res?.ok) {
+        this.userHint = `已创建：${this.newUser.username}`; this.userHintOk = true;
+        this.newUser = { username: '', password: '', role: 'user' };
+        await this.loadUsers();
+      } else {
+        this.userHint = res?.error || '创建失败'; this.userHintOk = false;
+      }
+    },
+
+    async setRole(u, role) {
+      if (role === u.role) return;
+      const res = await api('/api/users/' + u.id, 'POST', JSON.stringify({ role }));
+      if (res?.ok) await this.loadUsers();
+    },
+
+    async toggleEnabled(u) {
+      const res = await api('/api/users/' + u.id, 'POST', JSON.stringify({ enabled: !u.enabled }));
+      if (res?.ok) await this.loadUsers();
+    },
+
+    async resetPassword(u) {
+      const pw = prompt(`为 ${u.username} 设置新密码（≥6位）：`);
+      if (!pw) return;
+      if (pw.length < 6) { alert('密码至少 6 位'); return; }
+      const res = await api('/api/users/' + u.id, 'POST', JSON.stringify({ password: pw }));
+      if (res?.ok) alert('密码已重置');
+      else alert(res?.error || '重置失败');
+    }
+  };
+}
+
+// === Keys App ===
+function KeysApp() {
+  return {
+    keys: [],
+    form: { name: '', provider: 't8star', key: '', note: '' },
+    saving: false,
+    hint: '',
+    hintOk: true,
+
+    async init() {
+      await this.loadKeys();
+    },
+
+    async loadKeys() {
+      const res = await api('/api/keys');
+      if (res?.ok) this.keys = res.keys || [];
+    },
+
+    async addKey() {
+      if (!this.form.name || !this.form.key) return;
+      this.saving = true; this.hint = '';
+      const res = await api('/api/keys', 'POST', JSON.stringify(this.form));
+      this.saving = false;
+      if (res?.ok) {
+        this.hint = '已添加：' + this.form.name; this.hintOk = true;
+        this.form = { name: '', provider: 't8star', key: '', note: '' };
+        await this.loadKeys();
+      } else {
+        this.hint = res?.error || '添加失败'; this.hintOk = false;
+      }
+    },
+
+    async deleteKey(id) {
+      if (!confirm('确定删除该密钥？')) return;
+      const res = await api('/api/keys/' + id, 'DELETE');
+      if (res?.ok) await this.loadKeys();
+    },
+
+    async copyKey(id, name) {
+      const res = await api('/api/keys/' + id + '/reveal');
+      if (!res?.ok || !res.key) {
+        this.hint = '获取失败：' + (res?.error || '未知错误'); this.hintOk = false;
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(res.key);
+        this.hint = '已复制：' + name; this.hintOk = true;
+      } catch (e) {
+        const ta = document.createElement('textarea');
+        ta.value = res.key;
+        ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        let ok = false;
+        try { ok = document.execCommand('copy'); } catch (_) {}
+        document.body.removeChild(ta);
+        if (ok) { this.hint = '已复制：' + name; this.hintOk = true; }
+        else { this.hint = '复制失败，浏览器拒绝访问剪贴板'; this.hintOk = false; }
+      }
     }
   };
 }
@@ -717,10 +1085,9 @@ function VolcenginePortraitApp() {
   const appPath = '/volcengine-portrait';
 
   function vpApi(url, method, body) {
+    // No API key headers — volcengine-portrait uses a company-wide key configured
+    // by admin via /api/platform/portrait-key, applied server-side at fallback time.
     const headers = { 'X-Workspace-Id': workspaceId() };
-    if (this.apiKey) headers['X-Api-Key'] = this.apiKey;
-    if (this.accessKey) headers['X-Access-Key'] = this.accessKey;
-    if (this.secretKey) headers['X-Secret-Key'] = this.secretKey;
     if (typeof body === 'string') headers['Content-Type'] = 'application/json';
     const opts = { method: method || 'GET', headers };
     if (body) opts.body = body;
@@ -748,9 +1115,7 @@ function VolcenginePortraitApp() {
 
   return {
     statusText: '空闲',
-    apiKey: '',
-    accessKey: '',
-    secretKey: '',
+    appPath,  // exposed to petite-vue templates (used in index.html for download urls)
 
     // Unified state (merges virtual + real)
     groupName: '', groupId: '', creatingGroup: false,
@@ -787,12 +1152,6 @@ function VolcenginePortraitApp() {
     // === Groups ===
     async createGroup() {
       this.creatingGroup = true;
-      if (!this.accessKey || !this.secretKey) {
-        this.uploadMsg = '请先在页面顶部设置 Access Key 和 Secret Key';
-        this.uploadError = true;
-        this.creatingGroup = false;
-        return;
-      }
       const body = {};
       if (this.groupName.trim()) body.name = this.groupName.trim();
       const res = await vpApi.call(this, `${appPath}/api/virtual/groups`, 'POST', JSON.stringify(body));
@@ -1042,5 +1401,67 @@ PetiteVue.createApp({
   DreaminaApp,
   VolcenginePortraitApp,
   StatsApp,
+  KeysApp,
   openPreview
 }).mount();
+
+// === User info & session ===
+(async () => {
+  const res = await api('/api/auth/me');
+  if (!res?.ok) { location.replace('/login?next=' + encodeURIComponent(location.pathname + location.search)); return; }
+  const label = document.getElementById('userLabel');
+  const btn = document.getElementById('logoutBtn');
+  if (label) label.textContent = res.username + (res.role === 'admin' ? ' ★' : '');
+  if (btn) {
+    btn.style.display = '';
+    btn.addEventListener('click', async () => {
+      await api('/api/auth/logout', 'POST');
+      location.replace('/login');
+    });
+  }
+  // Init key-bar selectors above iframes
+  initKeyBars();
+})();
+
+// === Key-bar: dropdown above Seedance / Nano Banana iframes ===
+async function initKeyBars() {
+  for (const bar of document.querySelectorAll('.key-bar')) {
+    const app = bar.dataset.app;
+    const providers = (bar.dataset.provider || '').split(',');
+    // Build selector HTML
+    const sel = document.createElement('div');
+    sel.style.cssText = 'padding:6px 12px;background:#1e293b;border-bottom:1px solid #334155;display:flex;align-items:center;gap:10px;font-size:12px;color:#94a3b8';
+    sel.innerHTML = `<span>API Key:</span><select style="background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:3px 8px;font-size:12px"><option value="">— 使用子应用内置 Key —</option></select><span id="kbar-hint-${app}" style="color:#22c55e;font-size:11px"></span>`;
+    bar.appendChild(sel);
+    const dropdown = sel.querySelector('select');
+
+    // Load keys for all matching providers
+    for (const prov of providers) {
+      const r = await api(`/api/keys?provider=${prov.trim()}`);
+      for (const k of (r?.keys || [])) {
+        const opt = document.createElement('option');
+        opt.value = k.id;
+        opt.textContent = `[${k.provider}] ${k.name} (${k.key_hint})`;
+        dropdown.appendChild(opt);
+      }
+    }
+
+    // Restore saved selection
+    const saved = localStorage.getItem(`portal_key_id_${app}`);
+    if (saved && dropdown.querySelector(`option[value="${saved}"]`)) dropdown.value = saved;
+
+    dropdown.addEventListener('change', () => {
+      const val = dropdown.value;
+      if (val) {
+        localStorage.setItem(`portal_key_id_${app}`, val);
+        document.getElementById(`kbar-hint-${app}`).textContent = '已选择，刷新 iframe 后生效';
+        // Reload iframe to apply
+        const iframe = document.getElementById(`iframe-${app === 'nano-banana' ? 'nb' : app}`);
+        if (iframe) iframe.src = iframe.src;
+      } else {
+        localStorage.removeItem(`portal_key_id_${app}`);
+        document.getElementById(`kbar-hint-${app}`).textContent = '';
+      }
+    });
+  }
+}

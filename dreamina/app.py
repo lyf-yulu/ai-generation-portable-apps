@@ -45,10 +45,9 @@ def _archive_dir_for(handler_or_ip: Any) -> Path:
     if isinstance(handler_or_ip, str):
         return ARCHIVE_DIR / handler_or_ip
     return ARCHIVE_DIR / _client_ip(handler_or_ip)
-def _is_local(handler: SimpleHTTPRequestHandler) -> bool:
-    """Only allow access from localhost."""
-    ip = (handler.headers.get("X-Forwarded-For") or handler.client_address[0] or "").strip()
-    return ip in ("127.0.0.1", "::1", "localhost")
+def _is_admin(handler: SimpleHTTPRequestHandler) -> bool:
+    """Check if request comes from an authenticated admin (set by portal proxy)."""
+    return handler.headers.get("X-Is-Admin") == "1"
 
 
 def _workspace_id(handler) -> str:
@@ -80,7 +79,10 @@ ARCHIVE_DIR = _DATA_BASE / "archives"
 ACCOUNTS_DIR = _DATA_BASE / "accounts"
 MEDIA_DIR = STATE_DIR / "media"
 PRESET_PATH = STATE_DIR / "preset.json"
-HISTORY_PATH = STATE_DIR / "history.json"
+HISTORY_PATH = STATE_DIR / "history.json"  # legacy, read-only fallback for migration
+ACTIVITY_PATH = STATE_DIR / "activity_log.json"
+ACTIVITY_LIMIT = 500
+ACTIVITY_UPLOADS_DIR = STATE_DIR / "activity_uploads"
 ACCOUNTS_PATH = STATE_DIR / "accounts.json"
 CONFIG_PATH = ROOT / "config.json"
 
@@ -741,34 +743,181 @@ def migrate_default_account():
     sync_system_home_account(status)
 
 
-def read_history() -> list[dict[str, Any]]:
-    if not HISTORY_PATH.exists():
+def _now_text() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _legacy_history_to_activity(item: dict[str, Any]) -> dict[str, Any]:
+    """Map an old history.json entry to the new activity_log schema in-place safe form."""
+    if not isinstance(item, dict):
+        return {}
+    if "request_kind" in item and "title" in item and "id" in item:
+        return item
+    job_id = item.get("job_id") or uuid.uuid4().hex
+    params = item.get("params") or {}
+    if not isinstance(params, dict):
+        params = {}
+    prompt = str(params.get("prompt") or "").strip()
+    task_type = item.get("task_type") or ""
+    return {
+        "id": item.get("id") or uuid.uuid4().hex,
+        "job_id": job_id,
+        "source": "page",
+        "request_kind": task_type,
+        "status": item.get("status") or "running",
+        "title": prompt[:80] or (f"Dreamina {task_type}" if task_type else "Dreamina task"),
+        "client_ip": item.get("client_ip") or "",
+        "request": {
+            "task_type": task_type,
+            "params": params,
+            "uploaded_paths": item.get("uploaded_paths") or {},
+            "account_id": item.get("account_id"),
+        },
+        "response": {"job_id": job_id, "account_id": item.get("account_id")},
+        "workspace_id": "localhost",
+        "created_at": item.get("created_at") or _now_text(),
+        "updated_at": item.get("finished_at") or item.get("created_at") or _now_text(),
+        "result": item.get("result"),
+        "error": item.get("error"),
+    }
+
+
+def _migrate_history_if_needed():
+    """One-shot: if activity_log.json missing but history.json exists, convert and rename legacy."""
+    if ACTIVITY_PATH.exists() or not HISTORY_PATH.exists():
+        return
+    try:
+        raw = json.loads(HISTORY_PATH.read_text("utf-8"))
+        if not isinstance(raw, list):
+            return
+    except Exception:
+        return
+    converted = [_legacy_history_to_activity(it) for it in raw if isinstance(it, dict)]
+    converted = [c for c in converted if c]
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(ACTIVITY_PATH, json.dumps(converted[-ACTIVITY_LIMIT:], ensure_ascii=False, indent=2))
+    backup = HISTORY_PATH.with_suffix(".json.legacy.bak")
+    try:
+        HISTORY_PATH.replace(backup)
+    except Exception:
+        pass
+
+
+def read_activity_log() -> list[dict[str, Any]]:
+    _migrate_history_if_needed()
+    if not ACTIVITY_PATH.exists():
+        # Fallback: convert legacy on read without rewriting (defensive)
+        if HISTORY_PATH.exists():
+            try:
+                raw = json.loads(HISTORY_PATH.read_text("utf-8"))
+                if isinstance(raw, list):
+                    return [_legacy_history_to_activity(it) for it in raw if isinstance(it, dict)]
+            except Exception:
+                return []
         return []
     try:
-        return json.loads(HISTORY_PATH.read_text("utf-8"))
+        data = json.loads(ACTIVITY_PATH.read_text("utf-8"))
+        return data if isinstance(data, list) else []
     except Exception:
         return []
 
 
-def write_history(items: list[dict[str, Any]]):
+def write_activity_log(items: list[dict[str, Any]]):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    content = json.dumps(items[-500:], ensure_ascii=False, indent=2)
-    _atomic_write(HISTORY_PATH, content)
+    content = json.dumps(items[-ACTIVITY_LIMIT:], ensure_ascii=False, indent=2)
+    _atomic_write(ACTIVITY_PATH, content)
+
+
+def _filter_activity_by_ws(items: list[dict[str, Any]], ws_id: str) -> list[dict[str, Any]]:
+    return [item for item in items if item.get("workspace_id") == ws_id]
+
+
+def record_activity(record: dict[str, Any], ws_id: str = "localhost"):
+    items = read_activity_log()
+    record.setdefault("id", uuid.uuid4().hex)
+    record.setdefault("created_at", _now_text())
+    record.setdefault("updated_at", record["created_at"])
+    record["workspace_id"] = ws_id
+    items.append(record)
+    write_activity_log(items)
+
+
+def update_activity(activity_id: str | None, **updates: Any):
+    if not activity_id:
+        return
+    items = read_activity_log()
+    for item in items:
+        if item.get("id") == activity_id:
+            item.update(updates)
+            item["updated_at"] = _now_text()
+            write_activity_log(items)
+            return
+
+
+def activity_summary_for_client(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": item.get("id"),
+        "job_id": item.get("job_id"),
+        "source": item.get("source") or "",
+        "status": item.get("status") or "",
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+        "title": item.get("title"),
+        "request_kind": item.get("request_kind"),
+    }
+
+
+def activity_list(ws_id: str = "localhost", show_all: bool = False) -> dict[str, Any]:
+    items = read_activity_log()
+    if not show_all:
+        items = _filter_activity_by_ws(items, ws_id)
+    counts = {"total": len(items), "page": 0, "api": 0, "succeeded": 0, "completed": 0, "failed": 0, "running": 0, "pending": 0}
+    summary = []
+    for item in items:
+        source = str(item.get("source") or "")
+        status = str(item.get("status") or "")
+        if source in counts:
+            counts[source] += 1
+        if status in counts:
+            counts[status] += 1
+        summary.append(activity_summary_for_client(item))
+    summary.reverse()
+    return {"counts": counts, "records": summary}
+
+
+def activity_record_for_client(record: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not record:
+        return None
+    return json.loads(json.dumps(record))
+
+
+def read_history() -> list[dict[str, Any]]:
+    """Backwards-compatible alias used by archive_from_history; reads new activity log."""
+    return read_activity_log()
+
+
+def write_history(items: list[dict[str, Any]]):
+    """Legacy alias retained in case any caller still references it."""
+    write_activity_log(items)
 
 
 def record_job(job: dict[str, Any]):
-    items = read_history()
-    items.append(job)
-    write_history(items)
+    """Legacy compat: convert a job dict to an activity record. Prefer record_activity directly."""
+    record_activity(_legacy_history_to_activity(job), ws_id=job.get("client_ip") or "localhost")
 
 
 def update_job_in_history(job_id: str, updates: dict[str, Any]):
-    items = read_history()
+    """Legacy compat: locate by job_id and apply updates."""
+    items = read_activity_log()
+    changed = False
     for item in items:
         if item.get("job_id") == job_id:
             item.update(updates)
+            item["updated_at"] = _now_text()
+            changed = True
             break
-    write_history(items)
+    if changed:
+        write_activity_log(items)
 
 
 def parse_cli_json(stdout: str) -> dict[str, Any]:
@@ -886,7 +1035,8 @@ def execute_task(job_id: str, task_type: str, args: list[str], params: dict[str,
 
     with LOCK:
         final_job = dict(JOBS[job_id])
-    update_job_in_history(job_id, {
+    activity_id = final_job.get("activity_id")
+    update_activity(activity_id, **{
         "status": final_job["status"],
         "result": final_job.get("result"),
         "error": final_job.get("error"),
@@ -1053,10 +1203,17 @@ def json_response(handler, status: int, data: dict):
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(raw)))
+    # Surface job_id on a header so the upstream proxy can register usage stats
+    # without buffering the body (P0 fix for #15 portal-wide hang).
+    if isinstance(data, dict):
+        jid = data.get("job_id") or data.get("id")
+        if jid:
+            handler.send_header("X-Job-Id", str(jid))
     if cfg.get("cors"):
         handler.send_header("Access-Control-Allow-Origin", "*")
         handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+        handler.send_header("Access-Control-Expose-Headers", "X-Job-Id")
     handler.end_headers()
     handler.wfile.write(raw)
 
@@ -1256,6 +1413,11 @@ class Handler(SimpleHTTPRequestHandler):
             self.handle_job_status(job_id)
         elif path == "/api/history":
             self.handle_history()
+        elif path == "/api/activity":
+            self.handle_activity_list()
+        elif path.startswith("/api/activity/"):
+            activity_id = path.split("/api/activity/")[1].split("/")[0]
+            self.handle_activity_detail(activity_id)
         elif path == "/api/preset":
             json_response(self, 200, {"ok": True, **preset_for_client(self)})
         elif path == "/api/archives":
@@ -1289,66 +1451,57 @@ class Handler(SimpleHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
 
         if path == "/api/env/install-cli":
-            if not _is_local(self):
+            if not _is_admin(self):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
             self.handle_install_cli()
         elif path == "/api/env/login":
-            if not _is_local(self):
+            if not _is_admin(self):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
             self.handle_login()
         elif path == "/api/env/login-cancel":
-            if not _is_local(self):
+            if not _is_admin(self):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
             self.handle_login_cancel()
         elif path == "/api/env/switch-account":
-            if not _is_local(self):
+            if not _is_admin(self):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
             self.handle_switch_account()
         elif path == "/api/env/update-cli":
-            if not _is_local(self):
+            if not _is_admin(self):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
             self.handle_install_cli()
         elif path == "/api/accounts":
-            if not _is_local(self):
+            if not _is_admin(self):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
             self.handle_account_create()
         elif path == "/api/accounts/repair-all":
-            if not _is_local(self):
+            if not _is_admin(self):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
             self.handle_accounts_repair_all()
         elif path.startswith("/api/accounts/") and path.endswith("/login"):
-            if not _is_local(self):
-                json_response(self, 403, {"ok": False, "error": "admin only"})
-                return
             acc_id = path.split("/api/accounts/")[1].split("/")[0]
             self.handle_account_login(acc_id)
         elif path.startswith("/api/accounts/") and path.endswith("/logout"):
-            if not _is_local(self):
-                json_response(self, 403, {"ok": False, "error": "admin only"})
-                return
             acc_id = path.split("/api/accounts/")[1].split("/")[0]
             self.handle_account_logout(acc_id)
         elif path.startswith("/api/accounts/") and path.endswith("/refresh"):
-            if not _is_local(self):
-                json_response(self, 403, {"ok": False, "error": "admin only"})
-                return
             acc_id = path.split("/api/accounts/")[1].split("/")[0]
             self.handle_account_refresh(acc_id)
         elif path.startswith("/api/accounts/") and path.endswith("/delete"):
-            if not _is_local(self):
+            if not _is_admin(self):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
             acc_id = path.split("/api/accounts/")[1].split("/")[0]
             self.handle_account_delete(acc_id)
         elif path.startswith("/api/accounts/") and path.endswith("/rename"):
-            if not _is_local(self):
+            if not _is_admin(self):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
             acc_id = path.split("/api/accounts/")[1].split("/")[0]
@@ -1413,7 +1566,7 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 json_response(self, 500, {"ok": False, "error": str(exc)})
         elif path == "/api/cleanup-cache":
-            if not _is_local(self):
+            if not _is_admin(self):
                 json_response(self, 200, {"remote": True})
                 return
             try:
@@ -1423,19 +1576,19 @@ class Handler(SimpleHTTPRequestHandler):
         elif path == "/api/preset":
             self.handle_preset_save()
         elif path == "/api/preset/clear":
-            if not _is_local(self):
+            if not _is_admin(self):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
             self.handle_preset_clear()
         elif path == "/api/archive/load":
             self.handle_archive_load()
         elif path == "/api/archive/delete":
-            if not _is_local(self):
+            if not _is_admin(self):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
             self.handle_archive_delete()
         elif path == "/api/archive/from-history":
-            if not _is_local(self):
+            if not _is_admin(self):
                 json_response(self, 403, {"ok": False, "error": "admin only"})
                 return
             self.handle_archive_from_history()
@@ -1823,8 +1976,12 @@ class Handler(SimpleHTTPRequestHandler):
         env_override = selected.get("env_override")
 
         job_id = uuid.uuid4().hex
+        activity_id = uuid.uuid4().hex
+        client_ip = self._client_ip()
+        ws_id = "localhost"
         job = {
             "job_id": job_id,
+            "activity_id": activity_id,
             "task_type": task_type,
             "status": "pending",
             "total": total,
@@ -1832,7 +1989,7 @@ class Handler(SimpleHTTPRequestHandler):
             "concurrency": concurrency_val,
             "output_name": fields.get("output_name", ""),
             "output_dir": fields.get("output_dir", ""),
-            "client_ip": self._client_ip(),
+            "client_ip": client_ip,
             "events": [],
             "results": [],
             "errors": [],
@@ -1849,7 +2006,25 @@ class Handler(SimpleHTTPRequestHandler):
         with LOCK:
             JOBS[job_id] = job
 
-        record_job(job)
+        prompt_text = str(fields.get("prompt") or "").strip()
+        record_activity({
+            "id": activity_id,
+            "job_id": job_id,
+            "source": "page",
+            "request_kind": task_type,
+            "status": "running",
+            "title": prompt_text[:80] or f"Dreamina {task_type}",
+            "client_ip": client_ip,
+            "request": {
+                "task_type": task_type,
+                "params": dict(fields),
+                "uploaded_paths": uploaded_paths_rel,
+                "account_id": account["id"] if account else None,
+                "total": total,
+                "concurrency": concurrency_val,
+            },
+            "response": {"job_id": job_id, "account_id": account["id"] if account else None},
+        }, ws_id=ws_id)
 
         EXECUTOR.submit(execute_task, job_id, task_type, args, {"timeout": cli_timeout, "env_override": env_override})
 
@@ -1977,8 +2152,12 @@ class Handler(SimpleHTTPRequestHandler):
         env_override = selected.get("env_override")
 
         new_job_id = uuid.uuid4().hex
+        new_activity_id = uuid.uuid4().hex
+        client_ip = job.get("client_ip", "")
+        ws_id = "localhost"
         new_job = {
             "job_id": new_job_id,
+            "activity_id": new_activity_id,
             "task_type": task_type,
             "status": "pending",
             "total": total,
@@ -1986,7 +2165,7 @@ class Handler(SimpleHTTPRequestHandler):
             "concurrency": concurrency_val,
             "output_name": fields.get("output_name", ""),
             "output_dir": fields.get("output_dir", ""),
-            "client_ip": job.get("client_ip", ""),
+            "client_ip": client_ip,
             "events": [],
             "results": [],
             "errors": [],
@@ -2001,7 +2180,26 @@ class Handler(SimpleHTTPRequestHandler):
         }
         with LOCK:
             JOBS[new_job_id] = new_job
-        record_job(new_job)
+        prompt_text = str(fields.get("prompt") or "").strip()
+        record_activity({
+            "id": new_activity_id,
+            "job_id": new_job_id,
+            "source": "page",
+            "request_kind": task_type,
+            "status": "running",
+            "title": (prompt_text[:80] or f"Dreamina {task_type}") + " [retry]",
+            "client_ip": client_ip,
+            "request": {
+                "task_type": task_type,
+                "params": dict(fields),
+                "uploaded_paths": uploaded_paths_rel,
+                "account_id": account["id"] if account else None,
+                "total": total,
+                "concurrency": concurrency_val,
+                "retry_of": job.get("job_id"),
+            },
+            "response": {"job_id": new_job_id, "account_id": account["id"] if account else None},
+        }, ws_id=ws_id)
 
         # Notify user when referenced files are gone (text-only modes still work)
         if missing_files:
@@ -2017,9 +2215,8 @@ class Handler(SimpleHTTPRequestHandler):
                                    "missing_files": len(missing_files) if missing_files else 0})
 
     def handle_jobs_list(self):
-        ip = self._client_ip()
         with LOCK:
-            jobs = [j for j in JOBS.values() if j.get("client_ip", "") in ("", ip)]
+            jobs = list(JOBS.values())
         json_response(self, 200, {"ok": True, "jobs": jobs})
 
     def handle_job_status(self, job_id: str):
@@ -2028,13 +2225,66 @@ class Handler(SimpleHTTPRequestHandler):
         if not job:
             json_response(self, 404, {"ok": False, "error": "not found"})
             return
-        json_response(self, 200, {"ok": True, "job": job})
+        # Flatten key fields to top-level so portal's UsageTracker can read them
+        # without digging into "job". Keep the nested "job" key for the existing
+        # dreamina static UI which reads res.job.*.
+        task_type = job.get("task_type") or ""
+        is_video = any(x in task_type for x in ("video", "frame"))
+        try:
+            per_item_duration = int(job.get("params", {}).get("duration") or 0)
+        except (TypeError, ValueError):
+            per_item_duration = 0
+        json_response(self, 200, {
+            "ok": True,
+            "job": job,
+            "status": job.get("status") or "",
+            "done": job.get("done", 0),
+            "total": job.get("total", 0),
+            "task_type": task_type,
+            "duration": per_item_duration if is_video else 0,
+        })
 
     def handle_history(self):
-        ip = self._client_ip()
-        items = read_history()
-        filtered = [i for i in items if i.get("client_ip", "") in ("", ip)]
-        json_response(self, 200, {"ok": True, "history": filtered[-100:]})
+        """Return activity records re-projected to legacy `history.json` shape so the
+        existing dreamina static UI keeps rendering job cards without changes.
+        Visible to all clients (no per-IP filtering)."""
+        items = read_activity_log()
+
+        def to_legacy(rec: dict) -> dict:
+            req = rec.get("request") or {}
+            params = req.get("params") if isinstance(req, dict) else {}
+            if not isinstance(params, dict):
+                params = {}
+            return {
+                "job_id": rec.get("job_id"),
+                "task_type": req.get("task_type") or rec.get("request_kind") or "",
+                "status": rec.get("status") or "",
+                "params": params,
+                "prompt": params.get("prompt", ""),
+                "uploaded_paths": req.get("uploaded_paths") or {},
+                "account_id": req.get("account_id"),
+                "client_ip": rec.get("client_ip") or "",
+                "created_at": rec.get("created_at"),
+                "finished_at": rec.get("finished_at") or rec.get("updated_at"),
+                "result": rec.get("result"),
+                "error": rec.get("error"),
+                "total": rec.get("total"),
+                "done": rec.get("done"),
+                "retryable": rec.get("status") == "failed",
+            }
+
+        legacy_items = [to_legacy(rec) for rec in items]
+        json_response(self, 200, {"ok": True, "history": legacy_items[-100:]})
+
+    def handle_activity_list(self):
+        json_response(self, 200, activity_list(show_all=True))
+
+    def handle_activity_detail(self, activity_id: str):
+        ws = _workspace_id(self)
+        record = next((item for item in read_activity_log() if item.get("id") == activity_id), None)
+        if record and record.get("workspace_id") != ws and not _is_admin(self):
+            record = None
+        json_response(self, 200 if record else 404, activity_record_for_client(record) or {"error": "activity not found"})
 
     def handle_cache_clean(self):
         removed_uploads = 0

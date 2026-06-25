@@ -128,11 +128,99 @@ ASSETS: dict[str, dict] = {}
 JOBS: dict[str, dict] = {}
 FILES: dict[str, Path] = {}
 FILES_MAP_PATH = STATE_DIR / "download_files.json"
+ACTIVITY_PATH = STATE_DIR / "activity_log.json"
+ACTIVITY_LIMIT = 500
 
 JOBS_LOCK = threading.Lock()
 GROUP_LOCK = threading.Lock()
 ASSET_LOCK = threading.Lock()
 FILES_LOCK = threading.Lock()
+ACTIVITY_LOCK = threading.Lock()
+
+
+def _now_text() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
+
+
+def read_activity_log() -> list[dict]:
+    if not ACTIVITY_PATH.exists():
+        return []
+    try:
+        data = json.loads(ACTIVITY_PATH.read_text("utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def write_activity_log(items: list[dict]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    content = json.dumps(items[-ACTIVITY_LIMIT:], ensure_ascii=False, indent=2)
+    with ACTIVITY_LOCK:
+        _atomic_write(ACTIVITY_PATH, content)
+
+
+def record_activity(record: dict, ws_id: str = "localhost") -> None:
+    with ACTIVITY_LOCK:
+        items = read_activity_log()
+        record.setdefault("id", uuid.uuid4().hex)
+        record.setdefault("created_at", _now_text())
+        record.setdefault("updated_at", record["created_at"])
+        record["workspace_id"] = ws_id
+        items.append(record)
+        content = json.dumps(items[-ACTIVITY_LIMIT:], ensure_ascii=False, indent=2)
+        _atomic_write(ACTIVITY_PATH, content)
+
+
+def update_activity(activity_id: str | None, **updates) -> None:
+    if not activity_id:
+        return
+    with ACTIVITY_LOCK:
+        items = read_activity_log()
+        for item in items:
+            if item.get("id") == activity_id:
+                item.update(updates)
+                item["updated_at"] = _now_text()
+                content = json.dumps(items[-ACTIVITY_LIMIT:], ensure_ascii=False, indent=2)
+                _atomic_write(ACTIVITY_PATH, content)
+                return
+
+
+def activity_list() -> dict:
+    items = read_activity_log()
+    counts = {"total": len(items), "page": 0, "api": 0,
+              "succeeded": 0, "failed": 0, "running": 0, "queued": 0}
+    summary = []
+    for item in items:
+        source = str(item.get("source") or "")
+        status = str(item.get("status") or "")
+        if source in counts:
+            counts[source] += 1
+        if status in counts:
+            counts[status] += 1
+        summary.append({
+            "id": item.get("id"),
+            "job_id": item.get("job_id"),
+            "source": source,
+            "status": status,
+            "created_at": item.get("created_at"),
+            "updated_at": item.get("updated_at"),
+            "title": item.get("title"),
+            "request_kind": item.get("request_kind"),
+        })
+    summary.reverse()
+    return {"counts": counts, "records": summary}
+
+
+def activity_record_for_client(record: dict | None) -> dict | None:
+    if not record:
+        return None
+    return json.loads(json.dumps(record))
 
 
 def load_files_map() -> dict[str, Path]:
@@ -170,20 +258,43 @@ _executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT)
 
 
 def handle_config_post(handler):
-    """Update runtime config (output_dir etc.)."""
+    """Update runtime config (output_dir, and admin-only api_key/access_key/secret_key)."""
     data = read_json_body(handler)
     updates = {}
+    is_admin = handler.headers.get("X-Is-Admin") == "1"
     if "output_dir" in data:
         p = (data["output_dir"] or "").strip()
         if not p:
             json_response(handler, 400, {"ok": False, "error": "output_dir cannot be empty"})
             return
         updates["output_dir"] = p
+    # Admin-only: write the company-wide key/AK/SK.
+    # Empty strings are silently ignored (interpreted as "do not modify");
+    # to clear a key, edit config.json directly. This avoids accidental wipe.
+    key_fields_attempted = any(k in data for k in ("api_key", "access_key", "secret_key"))
+    if key_fields_attempted:
+        if not is_admin:
+            json_response(handler, 403, {"ok": False, "error": "admin only"})
+            return
+        for field in ("api_key", "access_key", "secret_key"):
+            if field in data:
+                val = (data[field] or "").strip()
+                if val:
+                    updates[field] = val
     if not updates:
         json_response(handler, 400, {"ok": False, "error": "no valid config fields"})
         return
     save_config(updates)
-    json_response(handler, 200, {"ok": True, "output_dir": str(OUTPUT_DIR)})
+    # Reload globals so fallback in ark_v3_call / openapi_call uses the new key
+    # immediately, without restarting the subapp.
+    load_config()
+    json_response(handler, 200, {
+        "ok": True,
+        "output_dir": str(OUTPUT_DIR),
+        "has_api_key": bool(API_KEY),
+        "has_access_key": bool(ACCESS_KEY),
+        "has_secret_key": bool(SECRET_KEY),
+    })
 
 
 def _public(d):
@@ -196,8 +307,15 @@ def json_response(handler, status, data):
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(raw)))
+    # Surface job_id on a header so the upstream proxy can register usage stats
+    # without buffering the body (P0 fix for #15 portal-wide hang).
+    if isinstance(data, dict):
+        jid = data.get("job_id") or data.get("id")
+        if jid:
+            handler.send_header("X-Job-Id", str(jid))
     if CORS:
         handler.send_header("Access-Control-Allow-Origin", "*")
+        handler.send_header("Access-Control-Expose-Headers", "X-Job-Id")
     handler.end_headers()
     try:
         handler.wfile.write(raw)
@@ -476,8 +594,8 @@ def handle_virtual_groups_post(handler):
     data = read_json_body(handler)
     name = (data.get("name") or "").strip() or f"group-{time.strftime('%Y%m%d-%H%M%S')}"
     description = (data.get("description") or "").strip()
-    ak = handler.headers.get("X-Access-Key", "") or None
-    sk = handler.headers.get("X-Secret-Key", "") or None
+    ak = None  # company-wide; admin-managed via /api/config (X-Is-Admin)
+    sk = None
 
     body = {"Name": name, "ProjectName": PROJECT_NAME, "GroupType": "AIGC"}
     if description:
@@ -505,8 +623,8 @@ def handle_virtual_groups_post(handler):
 
 def handle_virtual_groups_get(handler):
     """List asset groups via ListAssetGroups."""
-    ak = handler.headers.get("X-Access-Key", "") or None
-    sk = handler.headers.get("X-Secret-Key", "") or None
+    ak = None  # company-wide; admin-managed via /api/config (X-Is-Admin)
+    sk = None
 
     parsed_url = urllib.parse.urlparse(handler.path)
     query_params = urllib.parse.parse_qs(parsed_url.query)
@@ -600,9 +718,9 @@ def handle_virtual_assets_post(handler):
         json_response(handler, 400, {"ok": False, "error": "no files uploaded"})
         return
 
-    ak = handler.headers.get("X-Access-Key", "") or None
-    sk = handler.headers.get("X-Secret-Key", "") or None
-    api_key = handler.headers.get("X-Api-Key", "") or None
+    ak = None  # company-wide; admin-managed via /api/config (X-Is-Admin)
+    sk = None
+    api_key = None
 
     fname, fdata, fmime = files[0]
 
@@ -649,16 +767,14 @@ def handle_virtual_assets_post(handler):
             "file_name": fname,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "raw": result,
-            "access_key": ak,
-            "secret_key": sk,
         }
     threading.Thread(target=poll_asset_status, args=(asset_id, ak, sk), daemon=True).start()
     json_response(handler, 200, {"ok": True, "asset_id": asset_id})
 
 
 def handle_virtual_assets_get(handler, asset_id=None):
-    ak = handler.headers.get("X-Access-Key", "") or None
-    sk = handler.headers.get("X-Secret-Key", "") or None
+    ak = None  # company-wide; admin-managed via /api/config (X-Is-Admin)
+    sk = None
 
     if asset_id:
         with ASSET_LOCK:
@@ -727,16 +843,13 @@ def handle_virtual_assets_get(handler, asset_id=None):
 
 
 def handle_virtual_assets_delete(handler, asset_id):
-    ak = handler.headers.get("X-Access-Key", "") or None
-    sk = handler.headers.get("X-Secret-Key", "") or None
+    ak = None  # company-wide; admin-managed via /api/config (X-Is-Admin)
+    sk = None
 
     with ASSET_LOCK:
         asset = ASSETS.pop(asset_id, None)
-    if asset:
-        ak = ak or asset.get("access_key")
-        sk = sk or asset.get("secret_key")
-    if not ak or not sk:
-        json_response(handler, 401, {"ok": False, "error": "Missing AK/SK — 请在页面顶部设置 Access Key 和 Secret Key"})
+    if not ACCESS_KEY or not SECRET_KEY:
+        json_response(handler, 401, {"ok": False, "error": "服务端未配置 AK/SK,请联系管理员在 portal 统计页配置"})
         return
     result = openapi_call("DeleteAsset", {"Id": asset_id, "ProjectName": PROJECT_NAME}, ak=ak, sk=sk)
     if "error" in result:
@@ -748,8 +861,8 @@ def handle_virtual_assets_delete(handler, asset_id):
 
 def handle_virtual_group_get(handler, group_id):
     """Get a single asset group via GetAssetGroup."""
-    ak = handler.headers.get("X-Access-Key", "") or None
-    sk = handler.headers.get("X-Secret-Key", "") or None
+    ak = None  # company-wide; admin-managed via /api/config (X-Is-Admin)
+    sk = None
 
     result = openapi_call("GetAssetGroup", {"Id": group_id, "ProjectName": PROJECT_NAME}, ak=ak, sk=sk)
     if "error" in result:
@@ -775,8 +888,8 @@ def handle_virtual_group_update(handler, group_id):
     data = read_json_body(handler)
     name = (data.get("name") or "").strip()
     description = (data.get("description") or "").strip()
-    ak = handler.headers.get("X-Access-Key", "") or None
-    sk = handler.headers.get("X-Secret-Key", "") or None
+    ak = None  # company-wide; admin-managed via /api/config (X-Is-Admin)
+    sk = None
 
     if not name:
         json_response(handler, 400, {"ok": False, "error": "name is required"})
@@ -803,8 +916,8 @@ def handle_virtual_asset_update(handler, asset_id):
     """Update an asset name via UpdateAsset."""
     data = read_json_body(handler)
     name = (data.get("name") or "").strip()
-    ak = handler.headers.get("X-Access-Key", "") or None
-    sk = handler.headers.get("X-Secret-Key", "") or None
+    ak = None  # company-wide; admin-managed via /api/config (X-Is-Admin)
+    sk = None
 
     if not name:
         json_response(handler, 400, {"ok": False, "error": "name is required"})
@@ -824,8 +937,8 @@ def handle_virtual_asset_update(handler, asset_id):
 
 def handle_virtual_group_delete(handler, group_id):
     """Delete an asset group via DeleteAssetGroup."""
-    ak = handler.headers.get("X-Access-Key", "") or None
-    sk = handler.headers.get("X-Secret-Key", "") or None
+    ak = None  # company-wide; admin-managed via /api/config (X-Is-Admin)
+    sk = None
 
     result = openapi_call("DeleteAssetGroup", {"Id": group_id, "ProjectName": PROJECT_NAME}, ak=ak, sk=sk)
     if "error" in result:
@@ -838,7 +951,7 @@ def handle_virtual_group_delete(handler, group_id):
     json_response(handler, 200, {"ok": True})
 
 
-def handle_virtual_jobs_post(handler):
+def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
     content_type = handler.headers.get("Content-Type", "")
 
     if "multipart" in content_type:
@@ -881,7 +994,7 @@ def handle_virtual_jobs_post(handler):
         json_response(handler, 400, {"ok": False, "error": "asset_id and prompt required"})
         return
 
-    api_key = handler.headers.get("X-Api-Key", "") or None
+    api_key = None
 
     # Upload extra files to Ark Files API immediately (in handler, not background)
     extra_image_urls = []
@@ -903,9 +1016,12 @@ def handle_virtual_jobs_post(handler):
                 })
 
     job_id = uuid.uuid4().hex[:12]
+    activity_id = uuid.uuid4().hex
     with JOBS_LOCK:
         JOBS[job_id] = {
             "job_id": job_id,
+            "activity_id": activity_id,
+            "task_type": task_type,
             "asset_id": asset_id,
             "asset_id_2": asset_id_2,
             "prompt": prompt,
@@ -923,6 +1039,28 @@ def handle_virtual_jobs_post(handler):
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "api_key": api_key,
         }
+    title = (prompt or "").strip()[:80] or f"{task_type} task"
+    record_activity({
+        "id": activity_id,
+        "job_id": job_id,
+        "source": "page",
+        "request_kind": task_type,
+        "status": "running",
+        "title": title,
+        "request": {
+            "task_type": task_type,
+            "asset_id": asset_id,
+            "asset_id_2": asset_id_2,
+            "prompt": prompt,
+            "model": model,
+            "duration": duration,
+            "resolution": resolution,
+            "ratio": ratio,
+            "repeat_count": repeat_count,
+            "extra_image_count": len(extra_image_urls),
+        },
+        "response": {"job_id": job_id},
+    })
     _executor.submit(run_virtual_job, job_id)
     json_response(handler, 201, {"ok": True, "job_id": job_id})
 
@@ -947,6 +1085,26 @@ def run_virtual_job(job_id):
     job = JOBS.get(job_id)
     if not job:
         return
+    try:
+        _run_virtual_job_impl(job_id, job)
+    except Exception as exc:
+        with JOBS_LOCK:
+            job["status"] = "failed"
+            job.setdefault("errors", []).append(f"fatal: {exc}")
+            job.setdefault("events", []).append({"time": time.strftime("%H:%M:%S"), "message": f"任务异常: {exc}"})
+        try:
+            update_activity(job.get("activity_id"), status="failed", error=str(exc), result={
+                "status": "failed",
+                "done": job.get("done", 0),
+                "total": job.get("total", 0),
+                "results": list(job.get("results", [])),
+                "errors": list(job.get("errors", [])),
+            })
+        except Exception:
+            pass
+
+
+def _run_virtual_job_impl(job_id, job):
     api_key = job.get("api_key")
     asset_id = job.get("asset_id", "")
     asset_id_2 = job.get("asset_id_2", "")
@@ -1037,6 +1195,18 @@ def run_virtual_job(job_id):
     with JOBS_LOCK:
         job["status"] = "succeeded" if len(job.get("results", [])) > 0 else "failed"
         job["events"].append({"time": time.strftime("%H:%M:%S"), "message": f"任务结束: {job['status']}"})
+        final_snapshot = {
+            "status": job["status"],
+            "done": job.get("done", 0),
+            "total": job.get("total", 0),
+            "results": [{k: v for k, v in r.items()} for r in job.get("results", [])],
+            "errors": list(job.get("errors", [])),
+        }
+    try:
+        update_activity(job.get("activity_id"), status=final_snapshot["status"], result=final_snapshot,
+                        error="; ".join(final_snapshot["errors"][:3]) if final_snapshot["errors"] else None)
+    except Exception:
+        pass
 
 
 # === Real Portrait Handlers (delegate to unified handlers) ===
@@ -1056,7 +1226,7 @@ def handle_real_assets_delete(handler, asset_id):
 
 
 def handle_real_jobs_post(handler):
-    handle_virtual_jobs_post(handler)
+    handle_virtual_jobs_post(handler, task_type="real")
 
 
 def handle_real_jobs_get(handler, job_id=None):
@@ -1115,6 +1285,9 @@ class Handler(SimpleHTTPRequestHandler):
                 "base_url": ARK_BASE_URL,
                 "has_key": bool(API_KEY),
                 "has_aksk": bool(ACCESS_KEY and SECRET_KEY),
+                "has_api_key": bool(API_KEY),
+                "has_access_key": bool(ACCESS_KEY),
+                "has_secret_key": bool(SECRET_KEY),
                 "output_dir": str(OUTPUT_DIR),
             })
             return
@@ -1165,6 +1338,17 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         # Download / uploads
+        # Activity log (portal aggregates this)
+        if path == "/api/activity":
+            json_response(self, 200, activity_list())
+            return
+        if path.startswith("/api/activity/"):
+            activity_id = path.rsplit("/", 1)[-1]
+            record = next((item for item in read_activity_log() if item.get("id") == activity_id), None)
+            json_response(self, 200 if record else 404,
+                          activity_record_for_client(record) or {"ok": False, "error": "activity not found"})
+            return
+
         if path.startswith("/api/download/"):
             token = path.rsplit("/", 1)[-1]
             with FILES_LOCK:

@@ -139,10 +139,17 @@ def json_response(handler: SimpleHTTPRequestHandler, status: int, data: dict[str
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(raw)))
+    # Surface job_id on a header so the upstream proxy can register usage stats
+    # without buffering the body (P0 fix for #15 portal-wide hang).
+    if isinstance(data, dict):
+        jid = data.get("job_id") or data.get("id")
+        if jid:
+            handler.send_header("X-Job-Id", str(jid))
     if os.environ.get("CORS") == "1":
         handler.send_header("Access-Control-Allow-Origin", "*")
         handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+        handler.send_header("Access-Control-Expose-Headers", "X-Job-Id")
     handler.end_headers()
     handler.wfile.write(raw)
 
