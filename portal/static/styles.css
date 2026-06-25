@@ -124,10 +124,31 @@ pre { min-height: 80px; max-height: 200px; overflow: auto; margin: 0; padding: 1
 .app-stat-item .name { font-weight: 600; }
 .app-stat-item .count { color: #2673e8; font-weight: 700; }
 .activity-list { max-height: 300px; overflow-y: auto; }
-.activity-item { display: grid; grid-template-columns: 70px 90px 1fr; gap: 10px; padding: 6px 0; border-bottom: 1px solid #f1f3f7; font-size: 11px; align-items: center; }
+.activity-item { display: grid; grid-template-columns: 70px 90px 90px 1fr; gap: 10px; padding: 6px 0; border-bottom: 1px solid #f1f3f7; font-size: 11px; align-items: center; }
 .activity-time { color: #697386; }
 .activity-app { font-weight: 600; padding: 2px 6px; background: #f1f3f7; border-radius: 4px; text-align: center; }
+.activity-user { color: #1f2937; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .activity-detail { color: #293244; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Day picker + trend panel */
+.day-picker-row { display: flex; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+.trend-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+.trend-controls button { font-size: 12px; padding: 4px 12px; background: #f1f3f7; color: #4b5565; border: 1px solid #dde1e8; border-radius: 4px; cursor: pointer; }
+.trend-controls button.active { background: #2563eb; color: #fff; border-color: #2563eb; }
+.trend-controls button:hover:not(.active) { background: #e5e9f1; }
+.trend-range { font-size: 11px; color: #697386; margin-left: auto; }
+.trend-header,
+.trend-row { display: grid; grid-template-columns: 100px repeat(4, 1fr); gap: 14px; padding: 10px 0; border-bottom: 1px solid #f1f3f7; align-items: center; }
+.trend-header { background: #f8fafc; font-size: 11px; color: #4b5565; padding: 8px 0; border-bottom: 2px solid #dde1e8; }
+.trend-row .uname,
+.trend-header .uname { padding-left: 6px; font-weight: 700; font-size: 13px; color: #1f2937; }
+.trend-cell-h { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.trend-cell-h .label { font-weight: 700; font-size: 12px; }
+.trend-cell-h .unit { font-size: 10px; color: #94a3b8; }
+.trend-cell { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.trend-spark { line-height: 0; }
+.trend-spark svg { display: block; }
+.trend-total { font-size: 10px; color: #697386; }
 
 /* IP Stats Table */
 .ip-stats-table { width: 100%; border-collapse: collapse; font-size: 13px; }

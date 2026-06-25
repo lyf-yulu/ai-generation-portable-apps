@@ -21,7 +21,10 @@ function _workspaceId() {
 
 async function api(url, method, body) {
   try {
-    const opts = { method: method || 'GET', headers: { 'X-Workspace-Id': _workspaceId() } };
+    const headers = { 'X-Workspace-Id': _workspaceId() };
+    const keyId = localStorage.getItem('portal_key_id_nano-banana');
+    if (keyId) headers['X-Key-Id'] = keyId;
+    const opts = { method: method || 'GET', headers };
     if (body) opts.body = body;
     const res = await fetch(url, opts);
     return await res.json();
@@ -538,15 +541,23 @@ function NanoBananaApp() {
         var blob = await resp.blob();
         var blobUrl = URL.createObjectURL(blob);
         var a = document.createElement('a');
-        a.href = blobUrl; a.download = filename; a.style.display = 'none';
-        document.body.appendChild(a); a.click(); document.body.removeChild(a);
-        setTimeout(function () { URL.revokeObjectURL(blobUrl); }, 1000);
+        a.href = blobUrl;
+        a.download = filename;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function() { URL.revokeObjectURL(blobUrl); }, 1000);
       } catch (e) {
-        console.warn('blob download failed:', filename, e);
         var a2 = document.createElement('a');
-        a2.href = url; a2.download = filename; a2.target = '_blank';
+        a2.href = url;
+        a2.download = filename;
+        a2.target = '_blank';
+        a2.rel = 'noopener';
         a2.style.display = 'none';
-        document.body.appendChild(a2); a2.click(); document.body.removeChild(a2);
+        document.body.appendChild(a2);
+        a2.click();
+        document.body.removeChild(a2);
       }
     },
 

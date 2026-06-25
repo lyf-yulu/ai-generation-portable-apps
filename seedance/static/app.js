@@ -19,7 +19,10 @@ function workspaceId() {
 
 async function api(url, method, body) {
   try {
-    const opts = { method: method || 'GET', headers: { 'X-Workspace-Id': workspaceId() } };
+    const headers = { 'X-Workspace-Id': workspaceId() };
+    const keyId = localStorage.getItem('portal_key_id_seedance');
+    if (keyId) headers['X-Key-Id'] = keyId;
+    const opts = { method: method || 'GET', headers };
     if (body) opts.body = body;
     const res = await fetch(url, opts);
     return await res.json();
@@ -718,11 +721,11 @@ function SeedanceApp() {
         document.body.removeChild(a);
         setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
       } catch (e) {
-        console.warn('blob download failed:', filename, e);
         const a = document.createElement('a');
         a.href = url;
         a.download = filename;
         a.target = '_blank';
+        a.rel = 'noopener';
         a.style.display = 'none';
         document.body.appendChild(a);
         a.click();

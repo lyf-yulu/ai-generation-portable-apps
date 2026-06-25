@@ -261,7 +261,7 @@
                 <div v-if="!activityRecords.length" style="color:#697386;font-size:12px">暂无活动记录</div>
               </div>
             </div>
-            <div v-else class="act-detail">
+            <div v-else-if="activityDetail" class="act-detail">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
                 <button type="button" class="btn-small" @click="activityDetail=null">← 返回列表</button>
                 <button type="button" class="btn-small" style="background:#17191f;color:#fff" @click="restoreActivity()">恢复参数</button>

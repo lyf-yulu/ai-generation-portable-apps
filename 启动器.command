@@ -104,12 +104,25 @@ do_stop() {
     echo -e "${GREEN}已停止。${NC}"
 }
 
+# ---- 关闭残留 cloudflared tunnel（避免外网慢链路与 Portal 并存） ----
+stop_cloudflared() {
+    if pgrep -f "cloudflared tunnel" >/dev/null 2>&1; then
+        echo -e "${YELLOW}检测到 cloudflared，正在关闭以走局域网...${NC}"
+        pkill -f "cloudflared tunnel" 2>/dev/null || true
+        sleep 1
+        if pgrep -f "cloudflared tunnel" >/dev/null 2>&1; then
+            pkill -9 -f "cloudflared tunnel" 2>/dev/null || true
+        fi
+    fi
+}
+
 # ---- 启动 ----
 do_start() {
     if ! find_python; then
         osascript -e 'display dialog "未找到 Python 3.9+。请安装:" & return & "brew install python@3.12" buttons {"OK"} default button "OK" with icon stop'
         return 1
     fi
+    stop_cloudflared
     echo -e "${BLUE}Python: $PYTHON${NC}"
     echo -e "${BLUE}启动 Portal + 子应用...${NC}"
     cd "$PORTAL_DIR"

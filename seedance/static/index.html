@@ -182,7 +182,7 @@
                   <span style="font-size:11px;color:#697386;white-space:nowrap">{{ j.created_at }}</span>
                 </div>
                 <div v-if="j.errors && j.errors.length" style="font-size:11px;color:#dc2626;margin-top:4px">{{ j.errors.join('; ') }}</div>
-                <div v-for="r in (j.results||[])" v-if="r.download_url" style="display:flex;align-items:center;margin-top:6px;padding-top:6px;border-top:1px solid #f1f5f9;gap:8px">
+                <div v-for="r in (j.results||[]).filter(x => x.download_url)" style="display:flex;align-items:center;margin-top:6px;padding-top:6px;border-top:1px solid #f1f5f9;gap:8px">
                   <video :src="appPath + r.download_url" controls style="width:120px;height:68px;border-radius:4px;object-fit:cover;flex-shrink:0"></video>
                   <span style="font-size:11px;color:#697386;flex:1">{{ r.filename || 'video' }}</span>
                   <button @click="_blobDownload(appPath + r.download_url, r.filename || 'video')" style="background:#2563eb;color:#fff;border:1px solid #2563eb;font-size:11px;padding:3px 10px;border-radius:4px;cursor:pointer">下载</button>
@@ -206,7 +206,7 @@
                 <div v-if="!activityRecords.length" style="color:#697386;font-size:12px">暂无活动记录</div>
               </div>
             </div>
-            <div v-else class="act-detail">
+            <div v-else-if="activityDetail" class="act-detail">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
                 <button type="button" class="btn-small" @click="activityDetail=null">← 返回列表</button>
                 <button type="button" class="btn-small" style="background:#17191f;color:#fff" @click="restoreActivity()">恢复参数</button>
