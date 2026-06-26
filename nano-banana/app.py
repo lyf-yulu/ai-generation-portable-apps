@@ -407,7 +407,10 @@ def request_gemini_generate(url: str, api_key: str, payload: dict[str, Any], tim
     return request_json("POST", url, api_key, payload, timeout=timeout)
 
 
-def request_chat_completion(url: str, api_key: str, payload: dict[str, Any], timeout: int = 300) -> dict[str, Any]:
+def request_openai_images_sync(url: str, api_key: str, payload: dict[str, Any], timeout: int = 300) -> dict[str, Any]:
+    """Synchronous POST to /v1/images/generations (no async / no polling).
+    Used for upstreams like chiyun.work that return {"data":[{"b64_json":"..."}]}
+    in a single call. Falls back to request_json for transport so HTTPError handling stays consistent."""
     return request_json("POST", url, api_key, payload, timeout=timeout)
 
 
@@ -1046,32 +1049,10 @@ def extract_gemini_images(result: dict[str, Any]) -> list[dict[str, str]]:
     return images
 
 
-def extract_chat_completion_images(result: dict[str, Any]) -> list[dict[str, str]]:
-    images: list[dict[str, str]] = []
-    for choice in result.get("choices") or []:
-        if not isinstance(choice, dict):
-            continue
-        message = choice.get("message") or {}
-        content = message.get("content")
-        if isinstance(content, str):
-            for url in re.findall(r"https?://[^)\s]+", content):
-                images.append({"url": url})
-        elif isinstance(content, list):
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                text = part.get("text")
-                if isinstance(text, str):
-                    for url in re.findall(r"https?://[^)\s]+", text):
-                        images.append({"url": url})
-                image_url = part.get("image_url")
-                if isinstance(image_url, dict) and image_url.get("url"):
-                    images.append({"url": str(image_url["url"])})
-                if part.get("b64_json"):
-                    images.append({"b64_json": str(part["b64_json"])})
-        if message.get("b64_json"):
-            images.append({"b64_json": str(message["b64_json"])})
-    return images
+def extract_gemini_images_legacy_marker(result: dict[str, Any]) -> list[dict[str, str]]:
+    """Deprecated stub kept only so external callers that may have imported the old
+    name don't crash. The OpenAI Images route now reuses extract_items()."""
+    return []
 
 
 def file_to_data_url(filename: str, blob: bytes) -> str:
@@ -1146,25 +1127,28 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
     if provider == "gemini":
         image_count = 0
         if common["model"] == "gpt-image-2":
-            content: list[dict[str, Any]] = [{"type": "text", "text": common["prompt"]}]
+            # chiyun.work 上 gpt-image-2 走 OpenAI Images 同步协议 (data[].b64_json)。
+            # 实测不支持 ?async=true (30s 超时)，所以单写一条同步路径，不复用下方带轮询的 OpenAI Images 分支。
+            # 当前未实现 img2img：实测 chiyun.work 是否支持参考图未知，先按 text2img 处理。
             if mode != "text2img":
-                for i in range(1, 15):
-                    file_data = get_file_or_saved(form, f"image_{i}", ws_id)
-                    if not file_data:
-                        continue
-                    filename, blob = file_data
-                    content.append({"type": "image_url", "image_url": {"url": file_to_data_url(filename, blob)}})
-                    image_count += 1
-            payload = {
+                add_event(job_id, f"Run {index}: gpt-image-2 暂按 text2img 处理（img2img 未验证支持）")
+            payload: dict[str, Any] = {
                 "model": common["model"],
-                "messages": [{"role": "user", "content": content}],
-                "max_tokens": 256,
+                "prompt": common["prompt"],
+                "n": 1,
             }
-            result = request_chat_completion(f"{base_url}/v1/chat/completions", api_key, payload)
-            task_id = f"chat_{uuid.uuid4().hex[:12]}"
-            items = extract_chat_completion_images(result)
+            if common.get("aspect_ratio") and common["aspect_ratio"] != "auto":
+                payload["aspect_ratio"] = common["aspect_ratio"]
+            if image_size:
+                payload["image_size"] = image_size
+            if seed > 0:
+                payload["seed"] = seed
+            add_event(job_id, f"Run {index}: POST /v1/images/generations (sync)")
+            result = request_openai_images_sync(f"{base_url}/v1/images/generations", api_key, payload)
+            task_id = f"img_{uuid.uuid4().hex[:12]}"
+            items = extract_items(result)
             if not items:
-                raise RuntimeError(f"No image result found: {result}")
+                raise RuntimeError(f"No image result found: {str(result)[:500]}")
             out_dir = resolve_output_dir(values.get("output_dir"))
             file_token_results = []
             custom_name = values.get("output_name", "").strip()
@@ -1184,7 +1168,7 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
                     "filename": Path(local_path).name,
                     "local_path": local_path,
                 })
-            add_event(job_id, f"Run {index}: saved {len(file_token_results)} image(s), input_images:{image_count}")
+            add_event(job_id, f"Run {index}: saved {len(file_token_results)} image(s)")
             return {"index": index, "task_id": task_id, "status": "succeeded", "seed": seed or None, "images": file_token_results}
 
         parts: list[dict[str, Any]] = [{"text": common["prompt"]}]
