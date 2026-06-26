@@ -4,7 +4,7 @@
 # 用法：bash portal/state/scripts/safe_restart.sh [--force]
 # 功能：固化重启前检查 + launchctl kickstart + 重启后探活
 # ============================================================
-set -uo pipefail
+set -o pipefail
 
 FORCE=0
 if [[ "${1:-}" == "--force" ]]; then FORCE=1; fi
@@ -87,15 +87,18 @@ fi
 # ---- 4. lan_ip 与 cert 一致性 ----
 info "检查 LAN IP 与证书 SAN 一致..."
 CERT_IP_FILE=/Users/260413a/ai-generation-portable-apps/portal/certs/lan_ip.txt
+CURRENT_IP="?"
+CERT_IP="?"
+if python3 -c "import sys; sys.path.insert(0,'/Users/260413a/ai-generation-portable-apps/portal'); from app import get_lan_ip; print(get_lan_ip())" >/tmp/.safe_restart_ip.txt 2>/dev/null; then
+  CURRENT_IP=$(cat /tmp/.safe_restart_ip.txt)
+fi
+rm -f /tmp/.safe_restart_ip.txt
 if [[ -f "$CERT_IP_FILE" ]]; then
-  CURRENT_IP=$(python3 -c "
-import sys
-sys.path.insert(0, '/Users/260413a/ai-generation-portable-apps/portal')
-from app import get_lan_ip
-print(get_lan_ip())
-" 2>/dev/null || echo "?")
-  CERT_IP=$(cat "$CERT_IP_FILE" 2>/dev/null || echo "?")
-  if [[ "$CURRENT_IP" != "$CERT_IP" ]]; then
+  CERT_IP=$(cat "$CERT_IP_FILE" 2>/dev/null)
+  [[ -z "$CERT_IP" ]] && CERT_IP="?"
+  if [[ "$CURRENT_IP" == "?" ]]; then
+    warn "无法读取当前 LAN IP（python import 失败），仅显示 cert=$CERT_IP"
+  elif [[ "$CURRENT_IP" != "$CERT_IP" ]]; then
     warn "lan_ip 漂移（cert=$CERT_IP, current=$CURRENT_IP）；重启时会自动重签证书"
   else
     ok "lan_ip=$CERT_IP（与证书一致）"
