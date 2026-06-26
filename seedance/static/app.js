@@ -366,6 +366,18 @@ function SeedanceApp() {
             el.value = v;
           }
         }
+        // 火山方舟使用服务端 secrets.json 中的统一 key，前端 input 被禁用
+        const keyInput = field('api_key');
+        if (keyInput) {
+          if (providerKey === 'volcengine') {
+            keyInput.value = '';
+            keyInput.disabled = true;
+            keyInput.placeholder = '火山方舟使用公司统一 Key（服务端配置），无需填写';
+          } else {
+            keyInput.disabled = false;
+            keyInput.placeholder = '留空使用本地配置';
+          }
+        }
       });
     },
 
