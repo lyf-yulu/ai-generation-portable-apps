@@ -37,6 +37,34 @@ PROVIDERS_PATH = ROOT / "providers.json"
 FILES_MAP_PATH = STATE_DIR / "download_files.json"
 SKILL_PATH = ROOT / "SKILL.md"
 DEEPSEEK_KEY_PATH = STATE_DIR / "deepseek.key"
+SECRETS_PATH = STATE_DIR / "secrets.json"
+
+
+def load_secrets() -> dict[str, str]:
+    """Server-managed API keys (currently: volcengine).
+    Fail-fast: missing file or empty required keys raises at import time so the
+    portal watchdog surfaces the sub-app as crashed and the operator notices.
+    """
+    if not SECRETS_PATH.exists():
+        raise RuntimeError(
+            f"secrets file missing: {SECRETS_PATH}. "
+            "Copy seedance/secrets.example.json to seedance/state/secrets.json "
+            "and fill 'volcengine_api_key'."
+        )
+    try:
+        data = json.loads(SECRETS_PATH.read_text("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"secrets file {SECRETS_PATH} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"secrets file {SECRETS_PATH} must be a JSON object")
+    if not (data.get("volcengine_api_key") or "").strip():
+        raise RuntimeError(
+            f"'volcengine_api_key' missing or empty in {SECRETS_PATH}"
+        )
+    return data
+
+
+SECRETS = load_secrets()
 
 
 def _load_deepseek_key() -> str:
@@ -1847,6 +1875,9 @@ class Handler(SimpleHTTPRequestHandler):
                 payload = read_json_body(self)
                 values, files = values_files_from_json(payload)
                 api_key = str(values.get("api_key") or load_default_key()).strip()
+                # Server-managed: volcengine 用公司统一 key，忽略前端输入
+                if str(values.get("provider") or "").strip() == "volcengine":
+                    api_key = SECRETS["volcengine_api_key"]
                 if not api_key and not payload.get("dry_run"):
                     json_response(self, 400, api_error("invalid_request", "API key is required"))
                     return
@@ -1882,6 +1913,10 @@ class Handler(SimpleHTTPRequestHandler):
             return
         form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
         api_key = get_field(form, "api_key") or self.headers.get("X-Api-Key", "").strip() or load_default_key()
+        # Server-managed: volcengine 用公司统一 key，忽略前端输入
+        provider = (get_field(form, "provider") or "").strip()
+        if provider == "volcengine":
+            api_key = SECRETS["volcengine_api_key"]
         if not api_key:
             json_response(self, 400, api_error("invalid_request", "API key is required"))
             return
