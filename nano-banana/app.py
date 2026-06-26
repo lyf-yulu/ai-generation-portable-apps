@@ -1142,7 +1142,7 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
         common["seed"] = str(seed)
 
     seed_label = f", seed:{seed}" if seed > 0 else ""
-    add_event(job_id, f"Run {index}: submitting {provider}/{mode}{seed_label}")
+    add_event(job_id, f"Run {index}: submitting {provider}/{common['model']}/{mode}{seed_label}")
     if provider == "gemini":
         image_count = 0
         if common["model"] == "gpt-image-2":
