@@ -1326,7 +1326,7 @@ def run_virtual_job(job_id):
 def _run_virtual_job_impl(job_id, job):
     api_key = job.get("api_key")
     asset_id = job.get("asset_id", "")
-    asset_id_2 = job.get("asset_id_2", "")
+    extra_asset_ids = job.get("extra_asset_ids", []) or []
     prompt = job.get("prompt", "")
     model = job.get("model", "doubao-seedance-2-0-260128")
     duration = int(job.get("duration", 12))
@@ -1346,18 +1346,19 @@ def _run_virtual_job_impl(job_id, job):
         # 图1: asset_id (required)
         images.append({"type": "image_url", "image_url": {"url": f"asset://{asset_id}"}, "role": "reference_image"})
 
-        # 图2+: asset_id_2 takes priority, then extra uploaded images
-        if asset_id_2:
-            images.append({"type": "image_url", "image_url": {"url": f"asset://{asset_id_2}"}, "role": "reference_image"})
-        elif extra_image_urls:
-            for eiu in extra_image_urls:
-                mt = (eiu.get("mime_type") or "image/png").lower()
-                if mt.startswith("video/"):
-                    images.append({"type": "video_url", "video_url": {"url": eiu["url"]}, "role": "reference_video"})
-                elif mt.startswith("audio/"):
-                    images.append({"type": "audio_url", "audio_url": {"url": eiu["url"]}, "role": "reference_audio"})
-                else:
-                    images.append({"type": "image_url", "image_url": {"url": eiu["url"]}, "role": "reference_image"})
+        # 图2+：先按顺序加入所有 extra asset 资产，再加入上传的 extras。两者不再互斥。
+        for aid in extra_asset_ids:
+            if not aid or not isinstance(aid, str):
+                continue
+            images.append({"type": "image_url", "image_url": {"url": f"asset://{aid}"}, "role": "reference_image"})
+        for eiu in extra_image_urls:
+            mt = (eiu.get("mime_type") or "image/png").lower()
+            if mt.startswith("video/"):
+                images.append({"type": "video_url", "video_url": {"url": eiu["url"]}, "role": "reference_video"})
+            elif mt.startswith("audio/"):
+                images.append({"type": "audio_url", "audio_url": {"url": eiu["url"]}, "role": "reference_audio"})
+            else:
+                images.append({"type": "image_url", "image_url": {"url": eiu["url"]}, "role": "reference_image"})
 
         body = {
             "model": model,
