@@ -289,12 +289,11 @@
           <section class="card">
             <h2>2. 上传素材 <span style="font-size:11px;color:#64748b">（虚拟人像）</span></h2>
             <div class="row" style="margin-bottom:6px">
-              <input v-model="assetGroupId" placeholder="Group ID">
-              <button @click="loadGroups()" style="font-size:11px;padding:3px 8px">加载已有组</button>
-              <button @click="deleteGroup(assetGroupId)" :disabled="!assetGroupId" class="btn-sm" style="background:#dc2626;color:#fff;border-color:#dc2626;margin-left:4px">删除组</button>
+              <input v-model="assetGroupId" @change="onGroupChange()" placeholder="Group ID">
+              <button @click="deleteGroup(assetGroupId)" :disabled="!assetGroupId" class="btn-sm" style="background:#dc2626;color:#fff;border-color:#dc2626">删除组</button>
             </div>
             <div v-if="groups.length" style="margin-bottom:6px">
-              <select v-model="assetGroupId" style="width:100%;font-size:11px">
+              <select v-model="assetGroupId" @change="onGroupChange()" style="width:100%;font-size:11px">
                 <option value="">-- 选择已有组 --</option>
                 <option v-for="g in groups" :value="g.group_id">{{ g.name }} ({{ g.group_id }})</option>
               </select>
