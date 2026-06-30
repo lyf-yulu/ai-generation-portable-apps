@@ -1323,10 +1323,12 @@ function VolcenginePortraitApp() {
     },
 
     async loadAssets() {
-      let url = `${appPath}/api/virtual/assets`;
-      if (this.assetGroupId) {
-        url += '?group_ids=' + encodeURIComponent(this.assetGroupId);
+      // 未选组 → 不查不显示，避免拉到全部资产覆盖已选组的结果
+      if (!this.assetGroupId) {
+        this.assets = [];
+        return;
       }
+      const url = `${appPath}/api/virtual/assets?group_ids=${encodeURIComponent(this.assetGroupId)}`;
       const res = await vpApi.call(this, url);
       if (res?.ok) this.assets = (res.assets || []).map(a => ({ ...a, asset_id: a.asset_id || a.id }));
     },
