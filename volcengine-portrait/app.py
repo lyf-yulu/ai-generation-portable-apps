@@ -1031,7 +1031,8 @@ def handle_virtual_assets_get(handler, asset_id=None):
             if a.get("asset_id") not in api_ids:
                 merged.append(a)
         merged.sort(key=lambda a: a.get("created_at", ""), reverse=True)
-        json_response(handler, 200, {"ok": True, "assets": merged})
+        total = openapi_result(result).get("TotalCount", len(merged))
+        json_response(handler, 200, {"ok": True, "assets": merged, "total_count": total})
 
 
 def handle_virtual_assets_delete(handler, asset_id):
