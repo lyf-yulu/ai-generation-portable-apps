@@ -1251,6 +1251,10 @@ function VolcenginePortraitApp() {
     onFileSelect() {
       const f = document.getElementById('vp-file')?.files?.[0];
       this.selectedFile = f ? f.name : '';
+      // 资产名预填：若 input 为空则用文件名（去扩展名）兜底，用户可改
+      if (f && !this.assetName) {
+        this.assetName = f.name.replace(/\.[^.]+$/, '');
+      }
     },
 
     // === Assets ===
@@ -1268,9 +1272,21 @@ function VolcenginePortraitApp() {
         return;
       }
       this.uploading = true; this.uploadMsg = '';
-      const fd = new FormData(); fd.append('group_id', this.assetGroupId); fd.append('file', file);
+      const fd = new FormData();
+      fd.append('group_id', this.assetGroupId);
+      fd.append('file', file);
+      const nameForUpload = (this.assetName || '').trim() || file.name.replace(/\.[^.]+$/, '');
+      fd.append('name', nameForUpload);
       const res = await vpApi.call(this, `${appPath}/api/virtual/assets`, 'POST', fd);
-      if (res?.ok) { this.uploadMsg = '资产创建成功: ' + res.asset_id; this.uploadError = false; this.loadAssets(); }
+      if (res?.ok) {
+        this.uploadMsg = '资产创建成功: ' + res.asset_id;
+        this.uploadError = false;
+        this.assetName = '';
+        this.selectedFile = '';
+        const fileInput = document.getElementById('vp-file');
+        if (fileInput) fileInput.value = '';
+        this.loadAssets();
+      }
       else { this.uploadMsg = (res?.error || '上传失败') + (res?.detail ? ' — ' + res.detail.slice(0, 120) : ''); this.uploadError = true; }
       this.uploading = false;
     },
