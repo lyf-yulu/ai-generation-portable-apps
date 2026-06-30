@@ -1021,15 +1021,19 @@ def handle_virtual_assets_get(handler, asset_id=None):
                 with ASSET_LOCK:
                     if aid and aid not in ASSETS:
                         ASSETS[aid] = api_assets[-1]
-        # Merge with local cache
+        # Merge with local cache — 但要遵守 query 里的 group_ids 过滤，
+        # 否则切换组时本地缓存里其他组的资产会窜入结果。
+        wanted_groups = set(filter_body.get("GroupIds") or [])
         with ASSET_LOCK:
             local = [_public(a) for a in ASSETS.values()]
-        # Merge: API results first, then local items not in API results
         api_ids = {a["asset_id"] for a in api_assets}
         merged = api_assets.copy()
         for a in local:
-            if a.get("asset_id") not in api_ids:
-                merged.append(a)
+            if a.get("asset_id") in api_ids:
+                continue
+            if wanted_groups and a.get("group_id") not in wanted_groups:
+                continue
+            merged.append(a)
         merged.sort(key=lambda a: a.get("created_at", ""), reverse=True)
         total = openapi_result(result).get("TotalCount", len(merged))
         json_response(handler, 200, {"ok": True, "assets": merged, "total_count": total})
