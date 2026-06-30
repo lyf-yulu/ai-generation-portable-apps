@@ -1122,8 +1122,10 @@ function VolcenginePortraitApp() {
     groups: [],
     assetGroupId: '', selectedFile: '', uploading: false, uploadMsg: '', uploadError: false,
     renamingGroup: false, renameGroupName: '', renamingSaving: false,
+    renamingAssetId: '', renameAssetName: '',
     assets: [],
-    genAssetId: '', genAssetId2: '', extraFiles: [],
+    assetName: '',
+    genAssetId: '', extraAssetIds: [], extraFiles: [],
     prompt: '', duration: 12, resolution: '720p', ratio: '16:9', repeat: 1,
     submitting: false, events: '', results: [], jobs: [],
     runtimeTick: 0,
@@ -1145,7 +1147,7 @@ function VolcenginePortraitApp() {
 
     async init() {
       window._vpApp = this;
-      this.loadAssets();
+      this.loadGroups();
       this.loadJobs();
       this.loadOutputDir();
       setInterval(() => { this.runtimeTick = (this.runtimeTick + 1) % 1e9; }, 1000);
