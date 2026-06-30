@@ -1247,6 +1247,23 @@ function VolcenginePortraitApp() {
       }
       this.renamingSaving = false;
     },
+    startRenameAsset(a) {
+      this.renamingAssetId = a.asset_id;
+      this.renameAssetName = a.file_name || '';
+    },
+    async saveAssetRename(asset_id) {
+      const name = (this.renameAssetName || '').trim();
+      if (!name) return;
+      const res = await vpApi.call(this, `${appPath}/api/virtual/assets/${asset_id}/update`,
+                                    'POST', JSON.stringify({ name }));
+      if (res?.ok) {
+        this.renamingAssetId = '';
+        this.loadAssets();
+      } else {
+        this.uploadMsg = '重命名失败：' + (res?.error || 'unknown') + (res?.detail ? ' — ' + res.detail.slice(0, 120) : '');
+        this.uploadError = true;
+      }
+    },
 
     onFileSelect() {
       const f = document.getElementById('vp-file')?.files?.[0];
