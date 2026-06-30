@@ -1195,13 +1195,33 @@ function VolcenginePortraitApp() {
 
     async deleteGroup(id) {
       if (!id) return;
-      if (!confirm('确定要删除该资产组及其下所有资产吗？此操作不可撤销。')) return;
+      // 先确认组内资产数 — 火山方舟不允许删非空组，前端阻止误删
+      const probeUrl = `${appPath}/api/virtual/assets?group_ids=${encodeURIComponent(id)}&page_size=1`;
+      const probe = await vpApi.call(this, probeUrl);
+      if (!probe?.ok) {
+        alert('无法确认组内资产数量，请刷新重试');
+        return;
+      }
+      const total = (probe.total_count != null) ? probe.total_count : (probe.assets?.length || 0);
+      if (total > 0) {
+        alert(`该组下还有 ${total} 个资产，请先逐个删除`);
+        return;
+      }
+      if (!confirm('确认删除组？')) return;
       const res = await vpApi.call(this, `${appPath}/api/virtual/groups/${id}`, 'DELETE');
       if (res?.ok || (res?.error && res.error !== 'Network error')) {
         this.assetGroupId = '';
         this.groupId = '';
+        this.assets = [];
         this.loadGroups();
+      }
+    },
+
+    onGroupChange() {
+      if (this.assetGroupId) {
         this.loadAssets();
+      } else {
+        this.assets = [];
       }
     },
 
