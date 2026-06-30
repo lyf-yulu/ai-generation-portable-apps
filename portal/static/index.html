@@ -327,12 +327,19 @@
               <img v-if="a.url" :src="a.url" class="asset-thumb" @error="$event.target.style.display='none'" alt="预览">
               <span v-else class="asset-thumb-placeholder">{{ a.asset_type === 'Video' ? '🎬' : '🖼' }}</span>
               <div class="asset-info">
-                <span class="asset-name">{{ a.file_name || '(未命名)' }}</span>
+                <input v-if="renamingAssetId === a.asset_id" v-model="renameAssetName"
+                       @keyup.enter="saveAssetRename(a.asset_id)"
+                       @keyup.escape="renamingAssetId=''"
+                       style="font-size:12px;padding:2px 4px;width:100%">
+                <span v-else class="asset-name">{{ a.file_name || '(未命名)' }}</span>
                 <span class="asset-id">ID: {{ a.asset_id }}</span>
               </div>
               <span :class="'tag tag-'+(a.status||'processing')">{{ a.status || 'processing' }}</span>
               <span style="font-size:11px;color:#94a3b8;white-space:nowrap">{{ (a.created_at||'').slice(0,16) }}</span>
-              <button @click="deleteAsset(a.asset_id)" class="btn-sm" style="background:#dc2626;color:#fff;border-color:#dc2626">删除</button>
+              <button v-if="renamingAssetId !== a.asset_id" @click="startRenameAsset(a)" class="btn-sm" style="font-size:11px">重命名</button>
+              <button v-if="renamingAssetId === a.asset_id" @click="saveAssetRename(a.asset_id)" class="btn-sm" style="background:#2563eb;color:#fff;border-color:#2563eb;font-size:11px">保存</button>
+              <button v-if="renamingAssetId === a.asset_id" @click="renamingAssetId=''" class="btn-sm" style="font-size:11px">取消</button>
+              <button v-if="renamingAssetId !== a.asset_id" @click="deleteAsset(a.asset_id)" class="btn-sm" style="background:#dc2626;color:#fff;border-color:#dc2626">删除</button>
             </div>
           </section>
 
