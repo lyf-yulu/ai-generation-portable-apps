@@ -1456,6 +1456,12 @@ class Handler(SimpleHTTPRequestHandler):
             prefix = f"/{app_name}"
             if path == prefix or path.startswith(prefix + "/"):
                 target_path = path[len(prefix):] or "/"
+                # 透传 querystring（do_GET/do_POST/do_DELETE 提取 path 时
+                # 用 urlparse 把 query 丢了，这里补回去 — 否则子应用拿不到
+                # 像 ?group_ids=xxx 这种过滤参数）
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.query:
+                    target_path = target_path + "?" + parsed.query
                 if not auth.has_permission(user, "use_apps"):
                     self._json(403, {"ok": False, "error": "forbidden"})
                     return True
