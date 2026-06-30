@@ -355,24 +355,31 @@
             </label>
             <p v-if="genAssetId" style="font-size:11px;color:#3b82f6;margin-top:2px">将在 Prompt 中作为「图1」引用: asset://{{ genAssetId }}</p>
 
-            <label style="margin-top:10px">选择资产2 <span style="font-size:11px;color:#94a3b8">（可选，作为图2引用）</span>
-              <select v-model="genAssetId2" style="margin-top:4px">
-                <option value="">-- 无（仅图1） --</option>
-                <option v-for="a in assets" :value="a.asset_id" :disabled="a.status !== 'active' || a.asset_id === genAssetId">
+            <label style="margin-top:10px">附加资产 <span style="font-size:11px;color:#94a3b8">（可选，可多选；会按顺序作为图2、图3、...）</span>
+              <select @change="addExtraAsset($event)" style="margin-top:4px">
+                <option value="">+ 添加附加资产</option>
+                <option v-for="a in assets" :value="a.asset_id"
+                        :disabled="a.status !== 'active' || a.asset_id === genAssetId || extraAssetIds.includes(a.asset_id)">
                   {{ a.file_name || a.asset_id }} [{{ a.status }}]
                 </option>
               </select>
             </label>
-            <p v-if="genAssetId2" style="font-size:11px;color:#3b82f6;margin-top:2px">将作为「图2」引用: asset://{{ genAssetId2 }}</p>
+            <div v-if="extraAssetIds.length" style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">
+              <span v-for="aid in extraAssetIds" :key="aid"
+                    style="background:#dbeafe;border:1px solid #3b82f6;border-radius:12px;padding:2px 8px;font-size:12px;color:#1e40af;display:inline-flex;align-items:center;gap:4px">
+                {{ assetNameFor(aid) }}
+                <button @click="removeExtraAsset(aid)" style="background:none;border:none;color:#1e40af;cursor:pointer;font-weight:bold;padding:0;line-height:1">×</button>
+              </span>
+            </div>
 
-            <label style="margin-top:10px" v-if="!genAssetId2">上传参考图 <span style="font-size:11px;color:#94a3b8">（可选，作为图2、图3...，选资产2后此处忽略）</span>
+            <label style="margin-top:10px">上传参考图 <span style="font-size:11px;color:#94a3b8">（可选，会附加在所有选中资产之后）</span>
               <div class="row" style="margin-top:4px">
                 <input type="file" id="vp-extra-files" accept="image/*,video/*,audio/*" multiple style="display:none" @change="onExtraFilesSelect()">
                 <button @click="document.getElementById('vp-extra-files').click()" style="font-size:12px">选择参考图/视频/音频</button>
                 <button v-if="extraFiles.length" @click="extraFiles=[]" class="btn-sm" style="background:#7f1d1d;color:#fff;border-color:#7f1d1d;font-size:11px">清空全部</button>
               </div>
             </label>
-            <div v-if="extraFiles.length && !genAssetId2" class="extra-files-preview">
+            <div v-if="extraFiles.length" class="extra-files-preview">
               <div v-for="(f, idx) in extraFiles" class="extra-file-item">
                 <img v-if="f.preview" :src="f.preview" class="extra-file-thumb" alt="预览">
                 <span v-else class="extra-file-thumb" style="display:inline-flex;align-items:center;justify-content:center;background:#e2e8f0;color:#475569;font-size:11px">{{ (f.mime_type || '').startsWith('video/') ? '视频' : (f.mime_type || '').startsWith('audio/') ? '音频' : '文件' }}</span>
