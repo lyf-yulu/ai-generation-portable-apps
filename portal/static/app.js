@@ -1264,6 +1264,20 @@ function VolcenginePortraitApp() {
         this.uploadError = true;
       }
     },
+    addExtraAsset(ev) {
+      const aid = ev.target.value;
+      if (aid && !this.extraAssetIds.includes(aid)) {
+        this.extraAssetIds.push(aid);
+      }
+      ev.target.value = '';
+    },
+    removeExtraAsset(aid) {
+      this.extraAssetIds = this.extraAssetIds.filter(x => x !== aid);
+    },
+    assetNameFor(aid) {
+      const a = this.assets.find(x => x.asset_id === aid);
+      return a ? (a.file_name || aid) : aid;
+    },
 
     onFileSelect() {
       const f = document.getElementById('vp-file')?.files?.[0];
@@ -1405,9 +1419,10 @@ function VolcenginePortraitApp() {
       if (this.submitting) return;
       this.submitting = true; this.statusText = '提交中...'; this.events = ''; this.results = [];
 
-      let body, res;
+      let res;
       try {
-        if (this.extraFiles.length && !this.genAssetId2) {
+        if (this.extraFiles.length) {
+          // 多文件 + asset 任意组合 — 走 multipart
           const fd = new FormData();
           fd.append('asset_id', this.genAssetId);
           fd.append('prompt', this.prompt);
@@ -1415,15 +1430,16 @@ function VolcenginePortraitApp() {
           fd.append('resolution', this.resolution);
           fd.append('ratio', this.ratio);
           fd.append('repeat_count', this.repeat);
-          if (this.genAssetId2) fd.append('asset_id_2', this.genAssetId2);
+          fd.append('extra_asset_ids', JSON.stringify(this.extraAssetIds));
           for (const f of this.extraFiles) {
             fd.append('extra_files', f.file, f.name);
           }
           res = await vpApi.call(this, `${appPath}/api/virtual/jobs`, 'POST', fd);
         } else {
+          // 只有 asset 引用 — 走 JSON
           res = await vpApi.call(this, `${appPath}/api/virtual/jobs`, 'POST', JSON.stringify({
             asset_id: this.genAssetId,
-            asset_id_2: this.genAssetId2 || undefined,
+            extra_asset_ids: this.extraAssetIds,
             prompt: this.prompt,
             duration: this.duration, resolution: this.resolution, ratio: this.ratio, repeat_count: this.repeat
           }));
