@@ -1153,7 +1153,13 @@ def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
         form = cgi.FieldStorage(fp=handler.rfile, headers=handler.headers,
                                 environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type, "CONTENT_LENGTH": cl})
         asset_id = form.getfirst("asset_id", "")
-        asset_id_2 = form.getfirst("asset_id_2", "")
+        extra_asset_ids_raw = form.getfirst("extra_asset_ids", "") or "[]"
+        try:
+            extra_asset_ids = json.loads(extra_asset_ids_raw)
+            if not isinstance(extra_asset_ids, list):
+                extra_asset_ids = []
+        except (ValueError, TypeError):
+            extra_asset_ids = []
         prompt = form.getfirst("prompt", "")
         model = form.getfirst("model", "doubao-seedance-2-0-260128")
         duration = int(form.getfirst("duration", "12"))
@@ -1179,7 +1185,9 @@ def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
         # JSON mode (backward compatible)
         data = read_json_body(handler)
         asset_id = data.get("asset_id", "")
-        asset_id_2 = data.get("asset_id_2", "")
+        extra_asset_ids = data.get("extra_asset_ids", [])
+        if not isinstance(extra_asset_ids, list):
+            extra_asset_ids = []
         prompt = data.get("prompt", "")
         model = data.get("model", "doubao-seedance-2-0-260128")
         duration = int(data.get("duration", 12))
@@ -1219,7 +1227,7 @@ def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
             "activity_id": activity_id,
             "task_type": task_type,
             "asset_id": asset_id,
-            "asset_id_2": asset_id_2,
+            "extra_asset_ids": extra_asset_ids,
             "prompt": prompt,
             "model": model,
             "duration": duration,
@@ -1251,7 +1259,7 @@ def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
         "request": {
             "task_type": task_type,
             "asset_id": asset_id,
-            "asset_id_2": asset_id_2,
+            "extra_asset_ids": extra_asset_ids,
             "prompt": prompt,
             "model": model,
             "duration": duration,
