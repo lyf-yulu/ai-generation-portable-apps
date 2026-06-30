@@ -450,6 +450,30 @@ class AppManager:
         for name, config in APPS.items():
             self.start_app(name, config)
         threading.Thread(target=self._health_loop, daemon=True).start()
+        threading.Thread(target=self._log_rotation_loop, daemon=True).start()
+
+    def _log_rotation_loop(self):
+        log_dir = STATE_DIR / "logs"
+        max_age = 7 * 86400
+        while not self._stop_event.is_set():
+            try:
+                if log_dir.exists():
+                    now = time.time()
+                    for log_path in log_dir.glob("*.log"):
+                        try:
+                            if log_path.stat().st_size == 0:
+                                continue
+                            if now - log_path.stat().st_mtime < max_age:
+                                continue
+                            size_mb = log_path.stat().st_size / 1024 / 1024
+                            with log_path.open("wb"):
+                                pass
+                            print(f"  [log-rotate] truncated {log_path.name} ({size_mb:.1f} MB, >7d old)", flush=True)
+                        except OSError as exc:
+                            print(f"  [log-rotate] {log_path.name} skipped: {exc}", flush=True)
+            except Exception as exc:
+                print(f"  [log-rotate] loop error: {exc}", flush=True)
+            self._stop_event.wait(3600)
 
     def _read_portrait_keys(self) -> tuple[str, str]:
         """Read volcengine AK/SK from the portrait sub-app's config.json so
