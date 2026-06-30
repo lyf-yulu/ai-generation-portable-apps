@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 import uuid
 import webbrowser
 import zipfile
@@ -46,8 +47,56 @@ def _archive_dir_for(handler_or_ip: Any) -> Path:
         return ARCHIVE_DIR / handler_or_ip
     return ARCHIVE_DIR / _client_ip(handler_or_ip)
 def _is_admin(handler: SimpleHTTPRequestHandler) -> bool:
-    """Check if request comes from an authenticated admin (set by portal proxy)."""
-    return handler.headers.get("X-Is-Admin") == "1"
+    """Account-management gate. Dreamina account ops (login/install-cli/
+    rename/delete/etc.) are intentionally open to anyone with use_apps, so
+    portal also injects X-Dreamina-Manage for those users. Real admins keep
+    X-Is-Admin as before."""
+    return handler.headers.get("X-Is-Admin") == "1" or handler.headers.get("X-Dreamina-Manage") == "1"
+
+
+def _view_scope(handler) -> tuple[bool, str]:
+    """Per-user task visibility for /api/jobs and activity. Only true admins
+    (X-Is-Admin=1) see everything; everyone else sees only their own jobs."""
+    sees_all = handler.headers.get("X-Is-Admin", "") == "1"
+    username = _decode_username(handler)
+    return sees_all, username
+
+
+def _decode_username(handler) -> str:
+    """Portal injects X-Username via urllib.parse.quote() to survive the
+    latin-1 limit of http.client headers; decode back to unicode here."""
+    raw = (handler.headers.get("X-Username", "") or "").strip()
+    if not raw:
+        return ""
+    try:
+        return urllib.parse.unquote(raw)
+    except Exception:
+        return raw
+
+
+APP_NAME = "dreamina"
+PORTAL_INTERNAL_TOKEN = os.environ.get("PORTAL_INTERNAL_TOKEN", "")
+PORTAL_PORT_FOR_CALLBACK = int(os.environ.get("PORTAL_PORT", "9090"))
+import ssl as _ssl
+_PORTAL_SSL_CTX = _ssl.create_default_context()
+_PORTAL_SSL_CTX.check_hostname = False
+_PORTAL_SSL_CTX.verify_mode = _ssl.CERT_NONE
+
+
+def report_final_to_portal(job_id: str, status: str) -> None:
+    if not PORTAL_INTERNAL_TOKEN or not job_id:
+        return
+    try:
+        payload = json.dumps({"app": APP_NAME, "job_id": job_id, "status": status}).encode("utf-8")
+        req = urllib.request.Request(
+            f"https://127.0.0.1:{PORTAL_PORT_FOR_CALLBACK}/api/internal/jobs/finalize",
+            data=payload,
+            headers={"X-Internal-Token": PORTAL_INTERNAL_TOKEN, "Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=2, context=_PORTAL_SSL_CTX).read()
+    except Exception:
+        pass
 
 
 def _workspace_id(handler) -> str:
@@ -867,10 +916,12 @@ def activity_summary_for_client(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def activity_list(ws_id: str = "localhost", show_all: bool = False) -> dict[str, Any]:
+def activity_list(ws_id: str = "localhost", show_all: bool = False, username: str = "") -> dict[str, Any]:
     items = read_activity_log()
     if not show_all:
         items = _filter_activity_by_ws(items, ws_id)
+        if username:
+            items = [it for it in items if it.get("username", "") == username]
     counts = {"total": len(items), "page": 0, "api": 0, "succeeded": 0, "completed": 0, "failed": 0, "running": 0, "pending": 0}
     summary = []
     for item in items:
@@ -941,9 +992,33 @@ def parse_cli_json(stdout: str) -> dict[str, Any]:
 
 
 def execute_task(job_id: str, task_type: str, args: list[str], params: dict[str, Any]):
+    try:
+        _execute_task_impl(job_id, task_type, args, params)
+    except Exception as exc:
+        # Last-resort safety net: any uncaught exception inside the task pipeline
+        # must still flip the job to failed AND report to portal so usage stats
+        # roll back. Without this, an unexpected crash leaves status="running"
+        # forever and portal never decrements the +1 counter.
+        with LOCK:
+            job = JOBS.get(job_id)
+            if job:
+                job["status"] = "failed"
+                job["error"] = f"unexpected: {exc}"
+                job["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                job["finished_epoch"] = time.time()
+                job.setdefault("events", []).append({
+                    "time": time.strftime("%H:%M:%S"),
+                    "message": f"任务异常: {exc}",
+                })
+        report_final_to_portal(job_id, "failed")
+        raise
+
+
+def _execute_task_impl(job_id: str, task_type: str, args: list[str], params: dict[str, Any]):
     with LOCK:
         job = JOBS[job_id]
         job["status"] = "running"
+        job["started_epoch"] = time.time()
 
     total = job.get("total", 1)
     concurrency = job.get("concurrency", 1)
@@ -1018,6 +1093,7 @@ def execute_task(job_id: str, task_type: str, args: list[str], params: dict[str,
 
     with LOCK:
         job["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        job["finished_epoch"] = time.time()
         if job["errors"] and not job["results"]:
             job["status"] = "failed"
             job["error"] = "; ".join(job["errors"][:3])
@@ -1032,9 +1108,11 @@ def execute_task(job_id: str, task_type: str, args: list[str], params: dict[str,
                     if isinstance(r, dict):
                         all_files.extend(r.get("files", []))
                 job["result"] = {"files": all_files, "count": len(job["results"])}
+        _final_status_for_callback = job["status"]
 
     with LOCK:
         final_job = dict(JOBS[job_id])
+    report_final_to_portal(job_id, _final_status_for_callback)
     activity_id = final_job.get("activity_id")
     update_activity(activity_id, **{
         "status": final_job["status"],
@@ -1996,7 +2074,12 @@ class Handler(SimpleHTTPRequestHandler):
             "params": {k: v for k, v in fields.items()},
             "uploaded_paths": uploaded_paths_rel,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "submitted_at": time.time(),
+            "started_at": None,
             "finished_at": None,
+            "started_epoch": None,
+            "finished_epoch": None,
+            "username": _decode_username(self),
             "result": None,
             "error": None,
             "retryable": False,
@@ -2015,6 +2098,7 @@ class Handler(SimpleHTTPRequestHandler):
             "status": "running",
             "title": prompt_text[:80] or f"Dreamina {task_type}",
             "client_ip": client_ip,
+            "username": _decode_username(self),
             "request": {
                 "task_type": task_type,
                 "params": dict(fields),
@@ -2172,7 +2256,12 @@ class Handler(SimpleHTTPRequestHandler):
             "params": fields,
             "uploaded_paths": uploaded_paths_rel,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "submitted_at": time.time(),
+            "started_at": None,
             "finished_at": None,
+            "started_epoch": None,
+            "finished_epoch": None,
+            "username": _decode_username(self) or job.get("username", ""),
             "result": None,
             "error": None,
             "retryable": False,
@@ -2189,6 +2278,7 @@ class Handler(SimpleHTTPRequestHandler):
             "status": "running",
             "title": (prompt_text[:80] or f"Dreamina {task_type}") + " [retry]",
             "client_ip": client_ip,
+            "username": _decode_username(self),
             "request": {
                 "task_type": task_type,
                 "params": dict(fields),
@@ -2215,8 +2305,12 @@ class Handler(SimpleHTTPRequestHandler):
                                    "missing_files": len(missing_files) if missing_files else 0})
 
     def handle_jobs_list(self):
+        sees_all, username = _view_scope(self)
         with LOCK:
             jobs = list(JOBS.values())
+        if not sees_all:
+            jobs = [j for j in jobs if j.get("username", "") == username]
+        jobs.sort(key=lambda j: (j.get("submitted_at") or 0), reverse=True)
         json_response(self, 200, {"ok": True, "jobs": jobs})
 
     def handle_job_status(self, job_id: str):
@@ -2277,7 +2371,8 @@ class Handler(SimpleHTTPRequestHandler):
         json_response(self, 200, {"ok": True, "history": legacy_items[-100:]})
 
     def handle_activity_list(self):
-        json_response(self, 200, activity_list(show_all=True))
+        sees_all, username = _view_scope(self)
+        json_response(self, 200, activity_list(show_all=sees_all, username=username))
 
     def handle_activity_detail(self, activity_id: str):
         ws = _workspace_id(self)

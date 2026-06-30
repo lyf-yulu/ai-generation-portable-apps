@@ -7,6 +7,7 @@ import cgi
 import concurrent.futures
 import hashlib
 import hmac
+import http.client
 import json
 import mimetypes
 import os
@@ -38,15 +39,201 @@ HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8891"))
 CORS = os.environ.get("CORS") == "1"
 
+APP_NAME = "volcengine-portrait"
+PORTAL_INTERNAL_TOKEN = os.environ.get("PORTAL_INTERNAL_TOKEN", "")
+PORTAL_PORT_FOR_CALLBACK = int(os.environ.get("PORTAL_PORT", "9090"))
+import ssl as _ssl
+_PORTAL_SSL_CTX = _ssl.create_default_context()
+_PORTAL_SSL_CTX.check_hostname = False
+_PORTAL_SSL_CTX.verify_mode = _ssl.CERT_NONE
+
+
+def _view_scope(handler) -> tuple[bool, str]:
+    sees_all = handler.headers.get("X-Is-Admin", "") == "1"
+    username = _decode_username(handler)
+    return sees_all, username
+
+
+def _decode_username(handler) -> str:
+    """Portal injects X-Username via urllib.parse.quote()."""
+    raw = (handler.headers.get("X-Username", "") or "").strip()
+    if not raw:
+        return ""
+    try:
+        return urllib.parse.unquote(raw)
+    except Exception:
+        return raw
+
+
+def report_final_to_portal(job_id: str, status: str) -> None:
+    if not PORTAL_INTERNAL_TOKEN or not job_id:
+        return
+    try:
+        payload = json.dumps({"app": APP_NAME, "job_id": job_id, "status": status}).encode("utf-8")
+        req = urllib.request.Request(
+            f"https://127.0.0.1:{PORTAL_PORT_FOR_CALLBACK}/api/internal/jobs/finalize",
+            data=payload,
+            headers={"X-Internal-Token": PORTAL_INTERNAL_TOKEN, "Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=2, context=_PORTAL_SSL_CTX).read()
+    except Exception:
+        pass
+
 MAX_CONCURRENT = 2
 ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 API_KEY = ""
 ACCESS_KEY = ""
 SECRET_KEY = ""  # raw form (decoded from base64 if needed)
 
+# ── TOS upload (for image/video/audio reference media in Ark tasks) ──────────
+# Portal injects AK/SK via env from this app's config.json (same volcengine
+# credentials power both Ark API calls and TOS uploads). tos_bucket / tos_region
+# live in config.json alongside the other admin-managed fields. Both pieces
+# must be present for reference media uploads to work — tos_upload raises a
+# clear RuntimeError when anything is missing.
+TOS_ACCESS_KEY = os.environ.get("TOS_ACCESS_KEY", "").strip()
+TOS_SECRET_KEY = os.environ.get("TOS_SECRET_KEY", "").strip()
+TOS_BUCKET = ""
+TOS_REGION = ""
+TOS_DEFAULT_REGION = "cn-beijing"
+
+
+def _tos_sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _tos_hmac(key: bytes, msg: str) -> bytes:
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+
+def _tos_sign_put(bucket: str, region: str, object_key: str, mime: str, body: bytes) -> dict[str, str]:
+    """TOS PutObject SigV4-style signing. Algorithm string is `TOS4-HMAC-SHA256`
+    (NOT the AWS variant) and headers use the `x-tos-*` namespace."""
+    host = f"{bucket}.tos-{region}.volces.com"
+    amz_date = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = amz_date[:8]
+    payload_hash = _tos_sha256_hex(body)
+
+    headers = {
+        "Host": host,
+        "Content-Type": mime,
+        "x-tos-content-sha256": payload_hash,
+        "x-tos-date": amz_date,
+    }
+
+    signed = sorted(headers.keys(), key=str.lower)
+    canonical_headers = "".join(f"{k.lower()}:{headers[k].strip()}\n" for k in signed)
+    signed_headers = ";".join(k.lower() for k in signed)
+
+    canonical_uri = "/" + urllib.parse.quote(object_key, safe="/")
+    canonical_request = (
+        f"PUT\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    )
+
+    credential_scope = f"{date_stamp}/{region}/tos/request"
+    string_to_sign = (
+        f"TOS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{_tos_sha256_hex(canonical_request.encode('utf-8'))}"
+    )
+
+    k_date = _tos_hmac(TOS_SECRET_KEY.encode("utf-8"), date_stamp)
+    k_region = _tos_hmac(k_date, region)
+    k_service = _tos_hmac(k_region, "tos")
+    k_signing = _tos_hmac(k_service, "request")
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    headers["Authorization"] = (
+        f"TOS4-HMAC-SHA256 Credential={TOS_ACCESS_KEY}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    headers["Content-Length"] = str(len(body))
+    return headers
+
+
+def _tos_presigned_get_url(bucket: str, region: str, object_key: str, expires: int = 43200) -> str:
+    """Query-string-signed GET URL for a private TOS object. Default 12h TTL."""
+    host = f"{bucket}.tos-{region}.volces.com"
+    amz_date = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = amz_date[:8]
+    credential_scope = f"{date_stamp}/{region}/tos/request"
+    credential = f"{TOS_ACCESS_KEY}/{credential_scope}"
+
+    qs = {
+        "X-Tos-Algorithm": "TOS4-HMAC-SHA256",
+        "X-Tos-Credential": credential,
+        "X-Tos-Date": amz_date,
+        "X-Tos-Expires": str(expires),
+        "X-Tos-SignedHeaders": "host",
+    }
+    canonical_query = "&".join(
+        f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(qs[k], safe='')}"
+        for k in sorted(qs)
+    )
+    canonical_uri = "/" + urllib.parse.quote(object_key, safe="/")
+    canonical_headers = f"host:{host}\n"
+    canonical_request = (
+        f"GET\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\nhost\nUNSIGNED-PAYLOAD"
+    )
+    string_to_sign = (
+        f"TOS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{_tos_sha256_hex(canonical_request.encode('utf-8'))}"
+    )
+
+    k_date = _tos_hmac(TOS_SECRET_KEY.encode("utf-8"), date_stamp)
+    k_region = _tos_hmac(k_date, region)
+    k_service = _tos_hmac(k_region, "tos")
+    k_signing = _tos_hmac(k_service, "request")
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    return f"https://{host}{canonical_uri}?{canonical_query}&X-Tos-Signature={signature}"
+
+
+def _ext_from_mime(mime: str) -> str:
+    guess = mimetypes.guess_extension(mime or "")
+    return guess or ".bin"
+
+
+def tos_upload(blob: bytes, mime: str, filename: str) -> str:
+    """Upload to the configured TOS bucket, return public https URL.
+    Raises RuntimeError on any precondition or transport failure."""
+    if not (TOS_ACCESS_KEY and TOS_SECRET_KEY):
+        raise RuntimeError(
+            "TOS 凭证未配置：请在 Portal 管理员菜单 →「火山方舟人像 Key」处配置 AK/SK，"
+            "重启 Portal 后子应用会自动继承"
+        )
+    bucket = (TOS_BUCKET or "").strip()
+    if not bucket:
+        raise RuntimeError(
+            "volcengine-portrait/config.json 缺 'tos_bucket'：请在 config.json 里填入 bucket 名后重启"
+        )
+    region = (TOS_REGION or TOS_DEFAULT_REGION).strip()
+    ext = Path(filename).suffix if filename else ""
+    if not ext:
+        ext = _ext_from_mime(mime)
+    object_key = f"refmedia/{uuid.uuid4().hex}{ext}"
+    host = f"{bucket}.tos-{region}.volces.com"
+
+    headers = _tos_sign_put(bucket, region, object_key, mime, blob)
+    conn = http.client.HTTPSConnection(host, timeout=300)
+    try:
+        try:
+            conn.request("PUT", "/" + object_key, body=blob, headers=headers)
+            resp = conn.getresponse()
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"TOS 上传连接失败: {type(exc).__name__}: {exc}") from exc
+        if resp.status not in (200, 201):
+            body_err = resp.read()[:500].decode("utf-8", errors="replace")
+            raise RuntimeError(f"TOS upload HTTP {resp.status}: {body_err}")
+        resp.read()
+    finally:
+        conn.close()
+    # Bucket is private; return a 12-hour presigned GET URL so Ark can fetch it.
+    return _tos_presigned_get_url(bucket, region, object_key, expires=43200)
+
 
 def load_config():
-    global MAX_CONCURRENT, ARK_BASE_URL, API_KEY, ACCESS_KEY, SECRET_KEY, OUTPUT_DIR
+    global MAX_CONCURRENT, ARK_BASE_URL, API_KEY, ACCESS_KEY, SECRET_KEY, OUTPUT_DIR, TOS_BUCKET, TOS_REGION
     cfg_path = ROOT / "config.json"
     if cfg_path.exists():
         try:
@@ -58,6 +245,8 @@ def load_config():
             raw_sk = cfg.get("secret_key", "")
             if raw_sk:
                 SECRET_KEY = raw_sk
+            TOS_BUCKET = (cfg.get("tos_bucket") or "").strip()
+            TOS_REGION = (cfg.get("tos_region") or "").strip()
             if cfg.get("output_dir"):
                 p = Path(cfg["output_dir"])
                 p.mkdir(parents=True, exist_ok=True)
@@ -191,8 +380,10 @@ def update_activity(activity_id: str | None, **updates) -> None:
                 return
 
 
-def activity_list() -> dict:
+def activity_list(sees_all: bool = True, username: str = "") -> dict:
     items = read_activity_log()
+    if not sees_all and username:
+        items = [it for it in items if it.get("username", "") == username]
     counts = {"total": len(items), "page": 0, "api": 0,
               "succeeded": 0, "failed": 0, "running": 0, "queued": 0}
     summary = []
@@ -212,6 +403,7 @@ def activity_list() -> dict:
             "updated_at": item.get("updated_at"),
             "title": item.get("title"),
             "request_kind": item.get("request_kind"),
+            "username": item.get("username", ""),
         })
     summary.reverse()
     return {"counts": counts, "records": summary}
@@ -971,12 +1163,17 @@ def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
         extra_files = []
         for key in form.keys():
             item = form[key]
-            if item.filename:
-                extra_files.append({
-                    "filename": item.filename,
-                    "data": item.file.read(),
-                    "mime_type": item.type or "application/octet-stream",
-                })
+            # cgi.FieldStorage returns a list when the same field name has
+            # multiple values (e.g. <input multiple>). Single uploads come
+            # back as a single FieldStorage with .filename.
+            items = item if isinstance(item, list) else [item]
+            for sub in items:
+                if getattr(sub, "filename", None):
+                    extra_files.append({
+                        "filename": sub.filename,
+                        "data": sub.file.read(),
+                        "mime_type": sub.type or "application/octet-stream",
+                    })
     else:
         # JSON mode (backward compatible)
         data = read_json_body(handler)
@@ -996,24 +1193,22 @@ def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
 
     api_key = None
 
-    # Upload extra files to Ark Files API immediately (in handler, not background)
+    # Local "图2 上传本地图" extras: PUT each blob to the company TOS bucket and
+    # pass the public https URL to Ark. (Asset library uploads still go through
+    # the CreateAsset flow — they're separate routes.)
     extra_image_urls = []
     if extra_files:
         for ef in extra_files:
-            fid, fname = upload_file_to_ark(ef["data"], ef["filename"], ef["mime_type"], api_key=api_key)
-            if fid:
-                extra_image_urls.append({
-                    "url": f"https://ark.cn-beijing.volces.com/api/v3/files/{fid}/content",
-                    "filename": ef["filename"],
-                })
-            else:
-                # Fallback: save locally
-                local_fname = f"{uuid.uuid4().hex[:8]}_{ef['filename']}"
-                (UPLOAD_DIR / local_fname).write_bytes(ef["data"])
-                extra_image_urls.append({
-                    "url": f"http://{HOST}:{PORT}/uploads/{local_fname}",
-                    "filename": ef["filename"],
-                })
+            try:
+                public_url = tos_upload(ef["data"], ef["mime_type"], ef["filename"])
+            except RuntimeError as exc:
+                json_response(handler, 502, {"ok": False, "error": str(exc)})
+                return
+            extra_image_urls.append({
+                "url": public_url,
+                "filename": ef["filename"],
+                "mime_type": ef["mime_type"],
+            })
 
     job_id = uuid.uuid4().hex[:12]
     activity_id = uuid.uuid4().hex
@@ -1037,6 +1232,10 @@ def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
             "extra_image_urls": extra_image_urls,
             "events": [{"time": time.strftime("%H:%M:%S"), "message": "任务已创建"}],
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "submitted_at": time.time(),
+            "started_at": None,
+            "finished_at": None,
+            "username": _decode_username(handler),
             "api_key": api_key,
         }
     title = (prompt or "").strip()[:80] or f"{task_type} task"
@@ -1047,6 +1246,7 @@ def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
         "request_kind": task_type,
         "status": "running",
         "title": title,
+        "username": _decode_username(handler),
         "request": {
             "task_type": task_type,
             "asset_id": asset_id,
@@ -1073,9 +1273,12 @@ def handle_virtual_jobs_get(handler, job_id=None):
         json_response(handler, 200 if data else 404,
                       data or {"ok": False, "error": "job not found"})
     else:
+        sees_all, username = _view_scope(handler)
         with JOBS_LOCK:
             jobs = [_public(j) for j in JOBS.values()]
-        jobs.sort(key=lambda j: j.get("created_at", ""), reverse=True)
+        if not sees_all:
+            jobs = [j for j in jobs if j.get("username", "") == username]
+        jobs.sort(key=lambda j: (j.get("submitted_at") or 0), reverse=True)
         json_response(handler, 200, {"ok": True, "jobs": jobs[:50]})
 
 
@@ -1090,6 +1293,7 @@ def run_virtual_job(job_id):
     except Exception as exc:
         with JOBS_LOCK:
             job["status"] = "failed"
+            job["finished_at"] = time.time()
             job.setdefault("errors", []).append(f"fatal: {exc}")
             job.setdefault("events", []).append({"time": time.strftime("%H:%M:%S"), "message": f"任务异常: {exc}"})
         try:
@@ -1102,6 +1306,12 @@ def run_virtual_job(job_id):
             })
         except Exception:
             pass
+        report_final_to_portal(job_id, "failed")
+        return
+    # _run_virtual_job_impl set the final job["status"] (succeeded or failed).
+    with JOBS_LOCK:
+        final_status = job.get("status", "")
+    report_final_to_portal(job_id, final_status)
 
 
 def _run_virtual_job_impl(job_id, job):
@@ -1118,6 +1328,7 @@ def _run_virtual_job_impl(job_id, job):
 
     with JOBS_LOCK:
         job["status"] = "running"
+        job["started_at"] = time.time()
         job["events"].append({"time": time.strftime("%H:%M:%S"), "message": "开始提交生成任务..."})
 
     for idx in range(repeat_count):
@@ -1131,7 +1342,13 @@ def _run_virtual_job_impl(job_id, job):
             images.append({"type": "image_url", "image_url": {"url": f"asset://{asset_id_2}"}, "role": "reference_image"})
         elif extra_image_urls:
             for eiu in extra_image_urls:
-                images.append({"type": "image_url", "image_url": {"url": eiu["url"]}, "role": "reference_image"})
+                mt = (eiu.get("mime_type") or "image/png").lower()
+                if mt.startswith("video/"):
+                    images.append({"type": "video_url", "video_url": {"url": eiu["url"]}, "role": "reference_video"})
+                elif mt.startswith("audio/"):
+                    images.append({"type": "audio_url", "audio_url": {"url": eiu["url"]}, "role": "reference_audio"})
+                else:
+                    images.append({"type": "image_url", "image_url": {"url": eiu["url"]}, "role": "reference_image"})
 
         body = {
             "model": model,
@@ -1194,6 +1411,7 @@ def _run_virtual_job_impl(job_id, job):
 
     with JOBS_LOCK:
         job["status"] = "succeeded" if len(job.get("results", [])) > 0 else "failed"
+        job["finished_at"] = time.time()
         job["events"].append({"time": time.strftime("%H:%M:%S"), "message": f"任务结束: {job['status']}"})
         final_snapshot = {
             "status": job["status"],
@@ -1340,7 +1558,8 @@ class Handler(SimpleHTTPRequestHandler):
         # Download / uploads
         # Activity log (portal aggregates this)
         if path == "/api/activity":
-            json_response(self, 200, activity_list())
+            sees_all, username = _view_scope(self)
+            json_response(self, 200, activity_list(sees_all=sees_all, username=username))
             return
         if path.startswith("/api/activity/"):
             activity_id = path.rsplit("/", 1)[-1]

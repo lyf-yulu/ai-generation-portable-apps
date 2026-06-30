@@ -256,6 +256,8 @@
                 <div v-for="r in activityRecords" :key="r.id" class="act-item" @click="showDetail(r.id)">
                   <span class="act-status" :class="r.status">{{ r.status }}</span>
                   <span class="act-time">{{ (r.created_at||'').slice(5,16) }}</span>
+                  <span v-if="r.username" style="font-size:11px;color:#697386;margin-left:6px">@{{ r.username }}</span>
+                  <span v-if="formatRuntime(r)" style="font-size:11px;color:#475569;margin-left:6px">{{ formatRuntime(r) }}</span>
                   <span class="act-title">{{ r.title }}</span>
                 </div>
                 <div v-if="!activityRecords.length" style="color:#697386;font-size:12px">暂无活动记录</div>

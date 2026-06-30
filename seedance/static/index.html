@@ -33,13 +33,7 @@
           <!-- API -->
           <section>
             <h2>接口</h2>
-            <label>API Key<input name="api_key" type="password" autocomplete="off" placeholder="留空使用本地配置"></label>
-            <p class="hint">{{ keyHint }}</p>
-            <label>供应商
-              <select name="provider" v-model="provider" @change="applyProvider(provider)">
-                <option v-for="(cfg, key) in providers" :value="key">{{ cfg.label || key }}</option>
-              </select>
-            </label>
+            <p class="hint">供应商：豆包官方 / 火山方舟（公司统一 Key，服务端配置）</p>
             <label>Base URL<input name="base_url" v-model="baseUrl"></label>
             <p class="hint">{{ providerHint }}</p>
             <label>输出目录<input name="output_dir" v-model="outputDir" placeholder="留空则保存到 outputs 文件夹"></label>
@@ -179,6 +173,8 @@
                 <div style="display:flex;align-items:center;margin-bottom:2px;gap:8px">
                   <span :class="'tag tag-'+(j.status||'queued')">{{ j.status }}</span>
                   <span style="font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ (j.prompt||'').slice(0,60) }}</span>
+                  <span v-if="j.username" style="font-size:11px;color:#697386;white-space:nowrap">@{{ j.username }}</span>
+                  <span v-if="formatRuntime(j)" style="font-size:11px;color:#475569;white-space:nowrap">{{ formatRuntime(j) }}</span>
                   <span style="font-size:11px;color:#697386;white-space:nowrap">{{ j.created_at }}</span>
                 </div>
                 <div v-if="j.errors && j.errors.length" style="font-size:11px;color:#dc2626;margin-top:4px">{{ j.errors.join('; ') }}</div>

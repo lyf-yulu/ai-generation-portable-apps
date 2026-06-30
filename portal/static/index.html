@@ -180,7 +180,11 @@
               <label>时长
                 <select name="duration">
                   <option value="4">4s</option><option value="5" selected>5s</option>
-                  <option value="8">8s</option><option value="10">10s</option>
+                  <option value="6">6s</option><option value="7">7s</option>
+                  <option value="8">8s</option><option value="9">9s</option>
+                  <option value="10">10s</option><option value="11">11s</option>
+                  <option value="12">12s</option><option value="13">13s</option>
+                  <option value="14">14s</option><option value="15">15s</option>
                 </select>
               </label>
               <label>视频分辨率
@@ -354,14 +358,15 @@
 
             <label style="margin-top:10px" v-if="!genAssetId2">上传参考图 <span style="font-size:11px;color:#94a3b8">（可选，作为图2、图3...，选资产2后此处忽略）</span>
               <div class="row" style="margin-top:4px">
-                <input type="file" id="vp-extra-files" accept="image/*" multiple style="display:none" @change="onExtraFilesSelect()">
-                <button @click="document.getElementById('vp-extra-files').click()" style="font-size:12px">选择参考图文件</button>
+                <input type="file" id="vp-extra-files" accept="image/*,video/*,audio/*" multiple style="display:none" @change="onExtraFilesSelect()">
+                <button @click="document.getElementById('vp-extra-files').click()" style="font-size:12px">选择参考图/视频/音频</button>
                 <button v-if="extraFiles.length" @click="extraFiles=[]" class="btn-sm" style="background:#7f1d1d;color:#fff;border-color:#7f1d1d;font-size:11px">清空全部</button>
               </div>
             </label>
             <div v-if="extraFiles.length && !genAssetId2" class="extra-files-preview">
               <div v-for="(f, idx) in extraFiles" class="extra-file-item">
-                <img :src="f.preview" class="extra-file-thumb" alt="预览">
+                <img v-if="f.preview" :src="f.preview" class="extra-file-thumb" alt="预览">
+                <span v-else class="extra-file-thumb" style="display:inline-flex;align-items:center;justify-content:center;background:#e2e8f0;color:#475569;font-size:11px">{{ (f.mime_type || '').startsWith('video/') ? '视频' : (f.mime_type || '').startsWith('audio/') ? '音频' : '文件' }}</span>
                 <span class="extra-file-name">{{ f.name }}</span>
                 <button @click="removeExtraFile(idx)" class="btn-sm" style="background:#dc2626;color:#fff;border-color:#dc2626;font-size:10px;padding:2px 6px">✕</button>
               </div>
@@ -412,6 +417,8 @@
           <div class="row" style="align-items:center;margin-bottom:2px">
             <span :class="'tag tag-'+(j.status||'queued')">{{ j.status }}</span>
             <span style="font-size:12px;flex:1">{{ (j.prompt||'').slice(0,60) }}...</span>
+            <span v-if="j.username" style="font-size:11px;color:#64748b;margin-right:6px">@{{ j.username }}</span>
+            <span v-if="formatRuntime(j)" style="font-size:11px;color:#475569;margin-right:6px">{{ formatRuntime(j) }}</span>
             <span style="font-size:11px;color:#64748b">{{ j.created_at }}</span>
           </div>
           <div v-if="j.errors && j.errors.length" style="font-size:11px;color:#dc2626;margin-top:4px">{{ j.errors.join('; ') }}</div>

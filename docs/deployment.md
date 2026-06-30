@@ -203,3 +203,43 @@ launchctl kickstart -k gui/$(id -u)/com.ai-portal
 | seedance/nano-banana 任务一直 pending | `tail -f portal/state/logs/<app>.log` |
 | 子应用反复 unhealthy/restarting | 端口被孤儿占（见第 9 节）；或 sub-app 内部异常 |
 | `usage.json` 损坏 | 自动从 `.bak` 恢复，损坏文件被 quarantine 到 `usage.corrupt.<ts>.json` |
+
+## seedance + portrait「附加参考素材」走 TOS
+
+火山方舟 Ark 生成任务对参考素材（image_url / video_url / audio_url）的 URL 字段要求公网 https。两个相关子应用都通过把上传的素材 PUT 到火山对象存储 TOS（私有 bucket）拿到预签名 GET URL（默认 TTL 12 小时），再传给 Ark。bucket 不必公共读 — 预签名 URL 已经把签名带在 query 里，方舟匿名 GET 即可。
+
+**适用范围**：
+- seedance：火山方舟 provider 下所有图片/视频/音频参考素材（图片不再用 base64 data URL）
+- volcengine-portrait：用户「图2 上传本地图」（extras）—— 资产库里主动创建的 asset 不走这条，继续用 `asset://` scheme
+
+**一次性配置步骤**：
+
+1. 在火山控制台准备 TOS bucket（如果还没有）
+   - 地域：华北2(北京) — region 字符串 `cn-beijing`
+   - 权限：「私有」就行（**不需要**公共读，代码用预签名 URL）
+   - 名称：本项目用的是 `seedance-sd`
+2. 子用户 AK/SK 权限：至少包含 `tos:PutObject` 和 `tos:GetObject`（或挂 `TOSFullAccess` 策略），同一对 AK/SK 同时被人像 API 用，所以 ark 权限也得保留
+3. 在 `seedance/state/secrets.json` 配 bucket：
+   ```json
+   {
+     "volcengine_api_key": "ark-...",
+     "tos_bucket": "seedance-sd",
+     "tos_region": "cn-beijing"
+   }
+   ```
+4. 在 `volcengine-portrait/config.json` 加两个字段：
+   ```json
+   {
+     "...": "保留现有所有字段",
+     "tos_bucket": "seedance-sd",
+     "tos_region": "cn-beijing"
+   }
+   ```
+5. portal admin 通过「火山方舟人像 Key」面板已经配过 AK/SK 的话不用动；portal 启动时会读 portrait config.json 把 AK/SK 通过 env 注入给 seedance 和 portrait 两边
+6. 重启 portal（kill portal pid，launchd 自动拉起，所有子应用一并加载新 env）
+
+**验证**：
+- seedance 子应用日志：火山 provider 提交任务时应看到 `PUT https://seedance-sd.tos-cn-beijing.volces.com/refmedia/<hex>.<ext>` 后跟 200/201
+- portrait：用户在「图2」选「上传本地图」并提交时同样能在 portrait 日志里看到 PUT 行
+- 传给 Ark 的 URL 包含 `?X-Tos-Algorithm=TOS4-HMAC-SHA256&...&X-Tos-Signature=...` 这串 query
+- 配置缺失时错误消息会指明缺什么字段

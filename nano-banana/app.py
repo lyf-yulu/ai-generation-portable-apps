@@ -42,6 +42,49 @@ def _is_local(handler: SimpleHTTPRequestHandler) -> bool:
     return ip in ("127.0.0.1", "::1", "localhost")
 
 
+def _view_scope(handler) -> tuple[bool, str]:
+    """Returns (sees_all, username) for filtering jobs/activity by owner."""
+    sees_all = handler.headers.get("X-Is-Admin", "") == "1"
+    username = _decode_username(handler)
+    return sees_all, username
+
+
+def _decode_username(handler) -> str:
+    """Portal injects X-Username via urllib.parse.quote()."""
+    raw = (handler.headers.get("X-Username", "") or "").strip()
+    if not raw:
+        return ""
+    try:
+        return urllib.parse.unquote(raw)
+    except Exception:
+        return raw
+
+
+APP_NAME = "nano-banana"
+PORTAL_INTERNAL_TOKEN = os.environ.get("PORTAL_INTERNAL_TOKEN", "")
+PORTAL_PORT_FOR_CALLBACK = int(os.environ.get("PORTAL_PORT", "9090"))
+import ssl as _ssl
+_PORTAL_SSL_CTX = _ssl.create_default_context()
+_PORTAL_SSL_CTX.check_hostname = False
+_PORTAL_SSL_CTX.verify_mode = _ssl.CERT_NONE
+
+
+def report_final_to_portal(job_id: str, status: str) -> None:
+    if not PORTAL_INTERNAL_TOKEN or not job_id:
+        return
+    try:
+        payload = json.dumps({"app": APP_NAME, "job_id": job_id, "status": status}).encode("utf-8")
+        req = urllib.request.Request(
+            f"https://127.0.0.1:{PORTAL_PORT_FOR_CALLBACK}/api/internal/jobs/finalize",
+            data=payload,
+            headers={"X-Internal-Token": PORTAL_INTERNAL_TOKEN, "Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=2, context=_PORTAL_SSL_CTX).read()
+    except Exception:
+        pass
+
+
 def _workspace_id(handler) -> str:
     """Extract workspace_id: 1) X-Workspace-Id header  2) ?ws= query  3) localhost."""
     ws = (handler.headers.get("X-Workspace-Id") or "").strip()
@@ -278,8 +321,10 @@ def update_activity(activity_id: str | None, **updates: Any) -> None:
             return
 
 
-def activity_list() -> dict[str, Any]:
+def activity_list(sees_all: bool = True, username: str = "") -> dict[str, Any]:
     items = read_activity_log()
+    if not sees_all:
+        items = [it for it in items if (it.get("username", "") == username)]
     summary = []
     counts = {"total": len(items), "page": 0, "api": 0, "succeeded": 0, "failed": 0, "running": 0}
     for item in items:
@@ -298,6 +343,9 @@ def activity_list() -> dict[str, Any]:
             "updated_at": item.get("updated_at"),
             "title": item.get("title"),
             "request_kind": item.get("request_kind"),
+            "username": item.get("username", ""),
+            "started_at": item.get("started_at"),
+            "finished_at": item.get("finished_at"),
         })
     summary.reverse()
     return {"counts": counts, "records": summary}
@@ -969,11 +1017,18 @@ def values_files_from_json(payload: dict[str, Any]) -> tuple[dict[str, Any], dic
     return values, files
 
 
-def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], source: str, request_kind: str, request_data: dict[str, Any], ws_id: str = "localhost") -> str:
+def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], source: str, request_kind: str, request_data: dict[str, Any], ws_id: str = "localhost", username: str = "") -> str:
     job_id = uuid.uuid4().hex
     activity_id = uuid.uuid4().hex
     with LOCK:
-        JOBS[job_id] = {"id": job_id, "status": "queued", "events": [], "results": [], "errors": [], "done": 0, "total": 0}
+        JOBS[job_id] = {
+            "id": job_id, "status": "queued", "events": [], "results": [], "errors": [],
+            "done": 0, "total": 0,
+            "username": username,
+            "submitted_at": time.time(),
+            "started_at": None,
+            "finished_at": None,
+        }
     response = job_id_response(job_id)
     record_activity({
         "id": activity_id,
@@ -985,6 +1040,8 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
         "request": request_data,
         "response": response,
         "workspace_id": ws_id,
+        "username": username,
+        "started_at": time.time(),
         "restore": copy_files_to_restore(values, files, activity_id, ws_id),
     })
     threading.Thread(target=run_job, args=(job_id, values, files, activity_id, ws_id), daemon=True).start()
@@ -1318,7 +1375,7 @@ def run_job(job_id: str, values: dict[str, Any], files: dict[str, tuple[str, byt
         if not str(values.get("seed") or "").strip() and truthy(values.get("vary_seed")):
             values = dict(values)
             values["_auto_seed_base"] = secrets.randbelow(MAX_SEED) + 1
-        set_job(job_id, status="running", total=count, done=0, results=[], errors=[])
+        set_job(job_id, status="running", total=count, done=0, results=[], errors=[], started_at=time.time())
         add_event(job_id, f"Started {count} run(s), concurrency {concurrency}, key {mask_key(values.get('api_key', ''))}")
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = [pool.submit(run_one, job_id, i, values, files, ws_id) for i in range(1, count + 1)]
@@ -1337,16 +1394,18 @@ def run_job(job_id: str, values: dict[str, Any], files: dict[str, tuple[str, byt
             errors = JOBS[job_id]["errors"]
             final_job = json.loads(json.dumps(JOBS[job_id]))
         final_status = "failed" if errors else "succeeded"
-        set_job(job_id, status=final_status)
+        set_job(job_id, status=final_status, finished_at=time.time())
         final_job["status"] = final_status
-        update_activity(activity_id, status=final_status, result=final_job)
+        update_activity(activity_id, status=final_status, result=final_job, finished_at=time.time())
         add_event(job_id, "Finished")
+        report_final_to_portal(job_id, final_status)
     except Exception as exc:
-        set_job(job_id, status="failed", errors=[str(exc)])
+        set_job(job_id, status="failed", errors=[str(exc)], finished_at=time.time())
         with LOCK:
             final_job = json.loads(json.dumps(JOBS.get(job_id, {})))
-        update_activity(activity_id, status="failed", error=str(exc), result=final_job)
+        update_activity(activity_id, status="failed", error=str(exc), result=final_job, finished_at=time.time())
         add_event(job_id, f"Fatal: {exc}")
+        report_final_to_portal(job_id, "failed")
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -1390,7 +1449,8 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, 200, api_schema())
             return
         if self.path == "/api/activity":
-            json_response(self, 200, activity_list())
+            sees_all, username = _view_scope(self)
+            json_response(self, 200, activity_list(sees_all=sees_all, username=username))
             return
         if self.path.startswith("/api/activity/"):
             activity_id = self.path.rsplit("/", 1)[-1]
@@ -1583,7 +1643,7 @@ class Handler(SimpleHTTPRequestHandler):
                     return
                 request_data = {"raw": summarize_payload(payload), "parsed": summarize_values_files(values, files)}
                 ws = _workspace_id(self)
-                job_id = create_job(values, files, "api", "json", request_data, ws)
+                job_id = create_job(values, files, "api", "json", request_data, ws, username=_decode_username(self))
                 json_response(self, 200, job_id_response(job_id))
             except Exception as exc:
                 json_response(self, 400, api_error("invalid_request", str(exc)))
@@ -1607,7 +1667,7 @@ class Handler(SimpleHTTPRequestHandler):
                     files[key] = (Path(item.filename).name, blob)
         request_data = summarize_values_files(values, files)
         ws = _workspace_id(self)
-        job_id = create_job(values, files, "page", "multipart", request_data, ws)
+        job_id = create_job(values, files, "page", "multipart", request_data, ws, username=_decode_username(self))
         json_response(self, 200, job_id_response(job_id))
 
 

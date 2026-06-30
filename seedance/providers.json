@@ -1,34 +1,13 @@
 {
   "schema_version": 1,
   "app": "seedance",
-  "default_provider": "t8star",
+  "default_provider": "volcengine",
   "providers": {
-    "t8star": {
-      "label": "T8Star 兼容接口",
-      "base_url": "https://ai.t8star.org",
-      "api_style": "t8star_seedance",
-      "hint": "使用原有 T8Star 兼容接口，素材会先上传到 /v1/files。",
-      "defaults": {
-        "model": "doubao-seedance-2-0-260128",
-        "duration": 12,
-        "resolution": "720p",
-        "ratio": "16:9",
-        "repeat_count": 1,
-        "concurrency": 1,
-        "poll_interval": 10,
-        "timeout": 3600,
-        "vary_seed": true
-      },
-      "models": [
-        {"id": "doubao-seedance-2-0-260128", "label": "doubao-seedance-2-0-260128"},
-        {"id": "doubao-seedance-2-0-fast-260128", "label": "doubao-seedance-2-0-fast-260128"}
-      ]
-    },
     "volcengine": {
       "label": "豆包官方 / 火山方舟",
       "base_url": "https://ark.cn-beijing.volces.com/api/v3",
       "api_style": "ark_seedance",
-      "hint": "使用豆包官方火山方舟 API。首尾帧模式不能与参考素材混用；本地素材会以 data URL 发送。",
+      "hint": "豆包官方火山方舟 API。本地图/视频/音频参考素材会先上传到公司 TOS bucket，再以预签名 URL 传给方舟。",
       "defaults": {
         "model": "doubao-seedance-2-0-260128",
         "duration": 12,

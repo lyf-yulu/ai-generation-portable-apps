@@ -50,6 +50,12 @@ APPS = {
 PORTAL_PORT = int(os.environ.get("PORTAL_PORT", "9090"))
 REDIRECT_PORT = int(os.environ.get("REDIRECT_PORT", "9089"))
 
+# Shared secret between portal and sub-apps for the internal finalize callback.
+# Generated fresh per portal launch; injected into each sub-app's env so a
+# malicious local user cannot retroactively decrement stats without it.
+INTERNAL_TOKEN = os.environ.get("PORTAL_INTERNAL_TOKEN") or secrets.token_hex(32)
+os.environ["PORTAL_INTERNAL_TOKEN"] = INTERNAL_TOKEN
+
 ROLE_PERMISSIONS: dict[str, set[str]] = {
     "admin": {"use_apps", "view_stats_all", "manage_users", "manage_dreamina_accounts"},
     "user":  {"use_apps", "view_stats_own"},
@@ -445,6 +451,20 @@ class AppManager:
             self.start_app(name, config)
         threading.Thread(target=self._health_loop, daemon=True).start()
 
+    def _read_portrait_keys(self) -> tuple[str, str]:
+        """Read volcengine AK/SK from the portrait sub-app's config.json so
+        seedance can inherit the same credentials for TOS uploads. Portrait
+        stores keys at <portrait_dir>/config.json (note: not in state/, see
+        volcengine-portrait/app.py load_config). Empty on any failure."""
+        try:
+            cfg_path = APPS["volcengine-portrait"]["dir"] / "config.json"
+            if not cfg_path.exists():
+                return "", ""
+            data = json.loads(cfg_path.read_text("utf-8"))
+            return (data.get("access_key") or "").strip(), (data.get("secret_key") or "").strip()
+        except Exception:
+            return "", ""
+
     def start_app(self, name: str, config: dict):
         app_dir = config["dir"]
         if not (app_dir / "app.py").exists():
@@ -457,6 +477,11 @@ class AppManager:
         env["CORS"] = "1"
         if "DATA_DIR" in os.environ:
             env["DATA_DIR"] = str(app_dir / "test-data")
+        if name in ("seedance", "volcengine-portrait"):
+            ak, sk = self._read_portrait_keys()
+            if ak and sk:
+                env["TOS_ACCESS_KEY"] = ak
+                env["TOS_SECRET_KEY"] = sk
         old_log = self.log_handles.pop(name, None)
         if old_log:
             try: old_log.close()
@@ -726,6 +751,38 @@ class UsageTracker:
             app_stats = day_stats.setdefault(app, {"requests": 0, "jobs": 0})
             app_stats["jobs"] = int(app_stats.get("jobs", 0)) + 1
             self._save()
+
+    def finalize_job(self, app: str, job_id: str, status: str) -> bool:
+        """Idempotent: mark a job final. If status indicates failure/cancel,
+        roll back the +1 that inc_daily_jobs applied at registration time.
+        Returns True if the rollback was applied (i.e. first time we saw
+        a failure for this job), False otherwise."""
+        status = (status or "").lower()
+        is_failure = status in ("failed", "fail", "failure", "cancelled", "canceled", "error")
+        with self._lock:
+            owners = self._data.setdefault("job_owners", {})
+            key = f"{app}:{job_id}"
+            owner = owners.get(key)
+            if not isinstance(owner, dict):
+                return False
+            if owner.get("finalized"):
+                return False
+            owner["finalized"] = True
+            owner["final_status"] = status
+            rolled = False
+            if is_failure:
+                ts = owner.get("ts", time.time())
+                date = time.strftime("%Y-%m-%d", time.localtime(ts))
+                day_stats = self._data.setdefault("daily", {}).setdefault(date, {})
+                app_stats = day_stats.setdefault(app, {"requests": 0, "jobs": 0})
+                app_stats["jobs"] = max(0, int(app_stats.get("jobs", 0)) - 1)
+                rolled = True
+                # Drop from pending_jobs so the poll loop does not double-act.
+                self._pending_jobs = [
+                    j for j in self._pending_jobs if not (j["app"] == app and j["job_id"] == job_id)
+                ]
+            self._save()
+            return rolled
 
     def _is_job_request(self, method: str, path: str) -> bool:
         if method != "POST":
@@ -1031,6 +1088,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/auth/register":
             self._auth_register()
+            return
+        if path == "/api/internal/jobs/finalize":
+            self._internal_finalize_job()
             return
         user = self._require_auth(path)
         if not user:
@@ -1432,13 +1492,19 @@ class Handler(SimpleHTTPRequestHandler):
             if not fwd_proto:
                 fwd_proto = "https" if self._is_https() else "http"
             headers["X-Forwarded-Proto"] = fwd_proto
-            # Dreamina account management is intentionally open to all logged-in
-            # users (account list shared across the company). For every other sub-app
-            # only true admins get the X-Is-Admin marker.
+            # Propagate the logged-in username to every sub-app for per-user
+            # job ownership / filtering. X-Is-Admin is now strictly tied to the
+            # admin role; the dreamina-specific "everyone can manage accounts"
+            # affordance moves to X-Dreamina-Manage so task views can be
+            # per-user even when account management is open to all.
+            # http.client headers must be latin-1 safe, so URL-percent-encode
+            # the username — sub-apps urllib.parse.unquote it back. Empty/ASCII
+            # names pass through unchanged.
+            headers["X-Username"] = urllib.parse.quote(user.get("username", ""), safe="")
+            if user.get("role") == "admin" or auth.has_permission(user, "manage_dreamina_accounts"):
+                headers["X-Is-Admin"] = "1"
             if app_name == "dreamina" and auth.has_permission(user, "use_apps"):
-                headers["X-Is-Admin"] = "1"
-            elif auth.has_permission(user, "manage_dreamina_accounts"):
-                headers["X-Is-Admin"] = "1"
+                headers["X-Dreamina-Manage"] = "1"
 
             conn.request(method, target_path, body=body, headers=headers)
             resp = conn.getresponse()
@@ -1532,6 +1598,28 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Location", url)
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def _internal_finalize_job(self):
+        """Loopback-only endpoint sub-apps call to declare a job's terminal
+        status. Failures roll back the +1 inc_daily_jobs applied at register
+        time. Authenticated by a shared random token injected into the
+        sub-app's env at portal startup."""
+        token = self.headers.get("X-Internal-Token", "")
+        client_ip = self.client_address[0]
+        if token != INTERNAL_TOKEN or not client_ip.startswith("127."):
+            self._json(403, {"ok": False, "error": "forbidden"})
+            return
+        body = self._read_json()
+        if body is None:
+            return
+        app = (body.get("app") or "").strip()
+        job_id = (body.get("job_id") or "").strip()
+        status = (body.get("status") or "").strip()
+        if not app or not job_id or not status:
+            self._json(400, {"ok": False, "error": "missing fields"})
+            return
+        rolled = tracker.finalize_job(app, job_id, status)
+        self._json(200, {"ok": True, "rolled_back": rolled})
 
     def _cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin") or "*")

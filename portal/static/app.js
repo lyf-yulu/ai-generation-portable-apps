@@ -1126,6 +1126,7 @@ function VolcenginePortraitApp() {
     genAssetId: '', genAssetId2: '', extraFiles: [],
     prompt: '', duration: 12, resolution: '720p', ratio: '16:9', repeat: 1,
     submitting: false, events: '', results: [], jobs: [],
+    runtimeTick: 0,
     outputDir: '', outputDirInput: '', showOutputDirInput: false,
     savingOutputDir: false, outputDirMsg: '', outputDirOk: true,
 
@@ -1147,6 +1148,24 @@ function VolcenginePortraitApp() {
       this.loadAssets();
       this.loadJobs();
       this.loadOutputDir();
+      setInterval(() => { this.runtimeTick = (this.runtimeTick + 1) % 1e9; }, 1000);
+    },
+
+    formatRuntime(job) {
+      const _ = this.runtimeTick;
+      const start = job.started_at || job.submitted_at;
+      if (!start) return '';
+      const status = (job.status || '').toLowerCase();
+      const running = ['queued', 'pending', 'running', 'querying'].includes(status);
+      if (running) {
+        const sec = Math.max(0, Math.floor(Date.now() / 1000 - start));
+        return '已运行 ' + (sec >= 60 ? Math.floor(sec / 60) + '分' + (sec % 60) + '秒' : sec + '秒');
+      }
+      if (job.finished_at && job.started_at) {
+        const sec = Math.max(0, Math.floor(job.finished_at - job.started_at));
+        return '耗时 ' + (sec >= 60 ? Math.floor(sec / 60) + '分' + (sec % 60) + '秒' : sec + '秒');
+      }
+      return '';
     },
 
     // === Groups ===
@@ -1304,11 +1323,17 @@ function VolcenginePortraitApp() {
       const existing = new Set(this.extraFiles.map(f => f.name));
       for (const file of el.files) {
         if (existing.has(file.name)) continue;
-        if (!file.type.startsWith('image/')) continue;
+        const mime = file.type || '';
+        const isImage = mime.startsWith('image/');
+        const isVideo = mime.startsWith('video/');
+        const isAudio = mime.startsWith('audio/');
+        if (!isImage && !isVideo && !isAudio) continue;
         this.extraFiles.push({
           name: file.name,
           file: file,
-          preview: URL.createObjectURL(file),
+          mime_type: mime,
+          // Only images get a preview ObjectURL — video/audio just show a label.
+          preview: isImage ? URL.createObjectURL(file) : '',
         });
       }
       el.value = '';
@@ -1322,34 +1347,42 @@ function VolcenginePortraitApp() {
     async createJob() {
       if (!this.genAssetId) { this.statusText = '请选择资产 ID（图1）'; return; }
       if (!this.prompt) { this.statusText = '请输入 Prompt'; return; }
+      if (this.submitting) return;
       this.submitting = true; this.statusText = '提交中...'; this.events = ''; this.results = [];
 
       let body, res;
-      if (this.extraFiles.length && !this.genAssetId2) {
-        // Multipart mode: extra reference images + form fields
-        const fd = new FormData();
-        fd.append('asset_id', this.genAssetId);
-        fd.append('prompt', this.prompt);
-        fd.append('duration', this.duration);
-        fd.append('resolution', this.resolution);
-        fd.append('ratio', this.ratio);
-        fd.append('repeat_count', this.repeat);
-        if (this.genAssetId2) fd.append('asset_id_2', this.genAssetId2);
-        for (const f of this.extraFiles) {
-          fd.append('extra_files', f.file, f.name);
+      try {
+        if (this.extraFiles.length && !this.genAssetId2) {
+          const fd = new FormData();
+          fd.append('asset_id', this.genAssetId);
+          fd.append('prompt', this.prompt);
+          fd.append('duration', this.duration);
+          fd.append('resolution', this.resolution);
+          fd.append('ratio', this.ratio);
+          fd.append('repeat_count', this.repeat);
+          if (this.genAssetId2) fd.append('asset_id_2', this.genAssetId2);
+          for (const f of this.extraFiles) {
+            fd.append('extra_files', f.file, f.name);
+          }
+          res = await vpApi.call(this, `${appPath}/api/virtual/jobs`, 'POST', fd);
+        } else {
+          res = await vpApi.call(this, `${appPath}/api/virtual/jobs`, 'POST', JSON.stringify({
+            asset_id: this.genAssetId,
+            asset_id_2: this.genAssetId2 || undefined,
+            prompt: this.prompt,
+            duration: this.duration, resolution: this.resolution, ratio: this.ratio, repeat_count: this.repeat
+          }));
         }
-        res = await vpApi.call(this, `${appPath}/api/virtual/jobs`, 'POST', fd);
-      } else {
-        // JSON mode (backward compatible, no files)
-        res = await vpApi.call(this, `${appPath}/api/virtual/jobs`, 'POST', JSON.stringify({
-          asset_id: this.genAssetId,
-          asset_id_2: this.genAssetId2 || undefined,
-          prompt: this.prompt,
-          duration: this.duration, resolution: this.resolution, ratio: this.ratio, repeat_count: this.repeat
-        }));
+      } finally {
+        this.submitting = false;
       }
-      if (res?.ok) await this.pollJob(res.job_id);
-      else { this.submitting = false; this.statusText = '提交失败: ' + (res?.error || ''); }
+      if (res?.ok) {
+        this.statusText = '已提交，任务在后台运行';
+        this.loadJobs();
+        this.pollJob(res.job_id);
+      } else {
+        this.statusText = '提交失败: ' + (res?.error || '');
+      }
     },
 
     async pollJob(jobId) {
@@ -1367,7 +1400,7 @@ function VolcenginePortraitApp() {
         if (['succeeded', 'failed'].includes(job.status)) break;
         await new Promise(r => setTimeout(r, 3000));
       }
-      this.submitting = false; this.statusText = '空闲'; this.loadJobs();
+      this.statusText = '空闲'; this.loadJobs();
     },
 
     async loadJobs() {

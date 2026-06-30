@@ -132,6 +132,7 @@ function providersFromConfig(providers) {
   if (!providers || !Object.keys(providers).length) return null;
   const result = {};
   for (const [id, p] of Object.entries(providers)) {
+    if (p && p.hidden) continue;  // operator-disabled provider, skip from UI
     result[id] = {
       base_url: p.base_url || '',
       models: (p.models || []).map(m => {
@@ -143,30 +144,20 @@ function providersFromConfig(providers) {
       defaults: p.defaults || {},
     };
   }
-  return result;
+  return Object.keys(result).length ? result : null;
 }
 
 // ============================================================
 // FALLBACK PROVIDERS (used if config fails to load)
 // ============================================================
 const FALLBACK_PROVIDERS = {
-  t8star: {
-    base_url: 'https://ai.t8star.org',
-    models: [
-      { id: 'doubao-seedance-2-0-260128', label: 'doubao-seedance-2-0-260128' },
-      { id: 'doubao-seedance-2-0-fast-260128', label: 'doubao-seedance-2-0-fast-260128' },
-    ],
-    hint: '使用原有 T8Star 兼容接口，素材会先上传到 /v1/files。',
-    label: 'T8Star 兼容接口',
-    defaults: {},
-  },
   volcengine: {
     base_url: 'https://ark.cn-beijing.volces.com/api/v3',
     models: [
       { id: 'doubao-seedance-2-0-260128', label: 'doubao-seedance-2-0-260128' },
       { id: 'doubao-seedance-2-0-fast-260128', label: 'doubao-seedance-2-0-fast-260128' },
     ],
-    hint: '使用豆包官方火山方舟 API。首尾帧模式不能与参考素材混用；素材会先上传再引用。',
+    hint: '豆包官方火山方舟 API。本地图/视频/音频参考素材会先上传到公司 TOS bucket，再以预签名 URL 传给方舟。',
     label: '豆包官方 / 火山方舟',
     defaults: {},
   },
@@ -231,7 +222,7 @@ function SeedanceApp() {
     appPath: APP_PATH,
     appStatus: 'unknown',
     providers: {},
-    provider: 't8star',
+    provider: 'volcengine',
     models: [],
     baseUrl: '',
     providerHint: '',
@@ -242,6 +233,7 @@ function SeedanceApp() {
     submitting: false,
     statusText: '空闲',
     eventsText: '',
+    runtimeTick: 0,
     archives: [],
     selectedArchive: '',
     archiveHint: '',
@@ -278,6 +270,7 @@ function SeedanceApp() {
       try { await this.loadArchives(); } catch (e) { console.warn('loadArchives failed:', e); }
       this.loadPreset();
       try { await this.loadJobs(); } catch (e) { console.warn('loadJobs failed:', e); }
+      setInterval(() => { this.runtimeTick = (this.runtimeTick + 1) % 1e9; }, 1000);
 
       // Auto-save workspace on any form change
       const form = document.getElementById('sd-form');
@@ -310,37 +303,24 @@ function SeedanceApp() {
       if (!res) {
         // Use fallback providers
         this.providers = FALLBACK_PROVIDERS;
-        this.keyHint = '无法连接服务器，请确认应用已启动';
-        this.applyProvider('t8star');
+        this.applyProvider('volcengine');
         return;
       }
-      this.keyHint = res.has_key
-        ? '已检测到本地 key：' + (res.masked_key || '')
-        : '未检测到本地 key，请手动填写';
 
       if (res.config_error) {
-        this.keyHint += '；供应商配置读取失败：' + (res.config_error.detail || res.config_error.message || '未知错误');
+        this.providerHint = '供应商配置读取失败：' + (res.config_error.detail || res.config_error.message || '未知错误');
         return;
       }
 
       const normalized = providersFromConfig(res.providers);
       if (normalized) {
         this.providers = normalized;
-        const defaultP = res.default_provider || Object.keys(normalized)[0] || 't8star';
-        this.applyProvider(defaultP);
-        // Force select value after PetiteVue render
-        const sel = document.querySelector('#sd-form select[name="provider"]');
-        if (sel) {
-          setTimeout(() => {
-            if (sel.value !== defaultP) sel.value = defaultP;
-          }, 0);
-          setTimeout(() => {
-            if (sel.value !== defaultP) sel.value = defaultP;
-          }, 100);
-        }
+        // Provider locked to volcengine — ignore default_provider from config
+        // and any localStorage residue. Frontend has no provider switch anyway.
+        this.applyProvider('volcengine');
       } else {
         this.providers = FALLBACK_PROVIDERS;
-        this.applyProvider('t8star');
+        this.applyProvider('volcengine');
       }
     },
 
@@ -366,18 +346,8 @@ function SeedanceApp() {
             el.value = v;
           }
         }
-        // 火山方舟使用服务端 secrets.json 中的统一 key，前端 input 被禁用
-        const keyInput = field('api_key');
-        if (keyInput) {
-          if (providerKey === 'volcengine') {
-            keyInput.value = '';
-            keyInput.disabled = true;
-            keyInput.placeholder = '火山方舟使用公司统一 Key（服务端配置），无需填写';
-          } else {
-            keyInput.disabled = false;
-            keyInput.placeholder = '留空使用本地配置';
-          }
-        }
+        // API Key UI removed — provider is locked to volcengine and the key
+        // lives in seedance/state/secrets.json on the server.
       });
     },
 
@@ -527,6 +497,23 @@ function SeedanceApp() {
       }
     },
 
+    formatRuntime(job) {
+      const _ = this.runtimeTick;
+      const start = job.started_at || job.submitted_at;
+      if (!start) return '';
+      const status = (job.status || '').toLowerCase();
+      const running = ['queued', 'pending', 'running', 'querying'].includes(status);
+      if (running) {
+        const sec = Math.max(0, Math.floor(Date.now() / 1000 - start));
+        return '已运行 ' + (sec >= 60 ? Math.floor(sec / 60) + '分' + (sec % 60) + '秒' : sec + '秒');
+      }
+      if (job.finished_at && job.started_at) {
+        const sec = Math.max(0, Math.floor(job.finished_at - job.started_at));
+        return '耗时 ' + (sec >= 60 ? Math.floor(sec / 60) + '分' + (sec % 60) + '秒' : sec + '秒');
+      }
+      return '';
+    },
+
     async showDetail(id) {
       const res = await api(APP_PATH + '/api/activity/' + id);
       if (res) this.activityDetail = res;
@@ -606,6 +593,7 @@ function SeedanceApp() {
     // FORM SUBMISSION
     // ============================================================
     async submit() {
+      if (this.submitting) return;
       this.submitting = true;
       this.statusText = '提交中';
       const resultsEl = document.getElementById('sd-results');
@@ -619,14 +607,19 @@ function SeedanceApp() {
         data.set('saved_media', JSON.stringify(this.savedMedia));
       }
 
-      const res = await api(APP_PATH + '/api/jobs', 'POST', data);
-      if (!res || res.error) {
+      let res;
+      try {
+        res = await api(APP_PATH + '/api/jobs', 'POST', data);
+      } finally {
         this.submitting = false;
+      }
+      if (!res || res.error) {
         this.statusText = res?.error || '提交失败';
         return;
       }
-      await this.pollJob(res.job_id);
-      this.submitting = false;
+      this.statusText = '已提交，任务在后台运行';
+      this.loadJobs();
+      this.pollJob(res.job_id);
     },
 
     async pollJob(jobId) {
@@ -783,15 +776,11 @@ function SeedanceApp() {
       const values = preset.values || {};
 
       for (const [name, value] of Object.entries(values)) {
-        // Handle PetiteVue-bound reactive properties explicitly
+        // API key is server-managed; never restore from saved draft.
+        if (name === 'api_key') continue;
+        // Provider is locked to volcengine; ignore stale saved values.
         if (name === 'provider') {
-          if (value && this.providers[value]) {
-            this.applyProvider(value);
-          } else {
-            // Set the DOM select value directly
-            const sel = field('provider');
-            if (sel) sel.value = value;
-          }
+          this.applyProvider('volcengine');
           continue;
         }
         if (name === 'base_url') { this.baseUrl = value; continue; }

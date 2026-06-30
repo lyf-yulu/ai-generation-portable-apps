@@ -248,6 +248,7 @@ function NanoBananaApp() {
     submitting: false,
     statusText: '空闲',
     eventsText: '',
+    runtimeTick: 0,
 
     // Archives
     archives: [],
@@ -279,6 +280,7 @@ function NanoBananaApp() {
       var self = this;
       window._app_nb = self;
       window._currentSavedMedia = self.savedMedia;
+      setInterval(function () { self.runtimeTick = (self.runtimeTick + 1) % 1e9; }, 1000);
 
       // Workspace init
       self.workspaceId = _workspaceId();
@@ -425,6 +427,7 @@ function NanoBananaApp() {
 
     async submit() {
       var self = this;
+      if (self.submitting) return;
       self.submitting = true;
       self.statusText = '提交中';
       var resultsEl = document.getElementById('nb-results');
@@ -438,14 +441,19 @@ function NanoBananaApp() {
       }
 
       var data = await self.formDataWithSavedMedia({ resizeImages: true });
-      var res = await api(APP_PATH + '/api/jobs', 'POST', data);
-      if (!res || res.error) {
+      var res;
+      try {
+        res = await api(APP_PATH + '/api/jobs', 'POST', data);
+      } finally {
         self.submitting = false;
+      }
+      if (!res || res.error) {
         self.statusText = (res && res.error) || '提交失败';
         return;
       }
-      await self.pollJob(res.job_id);
-      self.submitting = false;
+      self.statusText = '已提交，任务在后台运行';
+      try { self.loadActivity(); } catch (e) { /* ignore */ }
+      self.pollJob(res.job_id);
     },
 
     async pollJob(jobId) {
@@ -662,6 +670,23 @@ function NanoBananaApp() {
       this.activityRecords = (res && res.records) || [];
       this.activityCounts = (res && res.counts) || null;
       this.activityDetail = null;
+    },
+
+    formatRuntime: function (job) {
+      var _ = this.runtimeTick;
+      var start = job.started_at || job.submitted_at;
+      if (!start) return '';
+      var status = String(job.status || '').toLowerCase();
+      var running = ['queued', 'pending', 'running', 'querying'].indexOf(status) >= 0;
+      if (running) {
+        var sec = Math.max(0, Math.floor(Date.now() / 1000 - start));
+        return '已运行 ' + (sec >= 60 ? Math.floor(sec / 60) + '分' + (sec % 60) + '秒' : sec + '秒');
+      }
+      if (job.finished_at && job.started_at) {
+        var sec2 = Math.max(0, Math.floor(job.finished_at - job.started_at));
+        return '耗时 ' + (sec2 >= 60 ? Math.floor(sec2 / 60) + '分' + (sec2 % 60) + '秒' : sec2 + '秒');
+      }
+      return '';
     },
 
     async showDetail(id) {

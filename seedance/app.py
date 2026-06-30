@@ -4,6 +4,9 @@ from __future__ import annotations
 import base64
 import cgi
 import concurrent.futures
+import hashlib
+import hmac
+import http.client
 import json
 import mimetypes
 import os
@@ -19,6 +22,7 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
+from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -67,6 +71,159 @@ def load_secrets() -> dict[str, str]:
 SECRETS = load_secrets()
 
 
+# ── Volcengine TOS upload (for video/audio reference media in Ark tasks) ─────
+# Portal injects AK/SK via env from volcengine-portrait/config.json so seedance
+# inherits the same company credentials. tos_bucket / tos_region live in
+# secrets.json (operator-managed). Both pieces must be present for video/audio
+# refs to work — TOS upload raises a clear RuntimeError when anything is missing.
+TOS_ACCESS_KEY = os.environ.get("TOS_ACCESS_KEY", "").strip()
+TOS_SECRET_KEY = os.environ.get("TOS_SECRET_KEY", "").strip()
+TOS_DEFAULT_REGION = "cn-beijing"
+
+
+def _tos_sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _tos_hmac(key: bytes, msg: str) -> bytes:
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+
+def _tos_sign_put(bucket: str, region: str, object_key: str, mime: str, body: bytes) -> dict[str, str]:
+    """Build SigV4-style headers for a TOS PutObject request. TOS uses the
+    `TOS4-HMAC-SHA256` algorithm and the `x-tos-*` header convention — same
+    derivation steps as AWS SigV4 but different identifiers."""
+    host = f"{bucket}.tos-{region}.volces.com"
+    amz_date = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = amz_date[:8]
+    payload_hash = _tos_sha256_hex(body)
+
+    headers = {
+        "Host": host,
+        "Content-Type": mime,
+        "x-tos-content-sha256": payload_hash,
+        "x-tos-date": amz_date,
+    }
+
+    # Canonical headers (lowercase name, sorted by name)
+    signed = sorted(headers.keys(), key=str.lower)
+    canonical_headers = "".join(f"{k.lower()}:{headers[k].strip()}\n" for k in signed)
+    signed_headers = ";".join(k.lower() for k in signed)
+
+    canonical_uri = "/" + urllib.parse.quote(object_key, safe="/")
+    canonical_request = (
+        f"PUT\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    )
+
+    credential_scope = f"{date_stamp}/{region}/tos/request"
+    string_to_sign = (
+        f"TOS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{_tos_sha256_hex(canonical_request.encode('utf-8'))}"
+    )
+
+    k_date = _tos_hmac(TOS_SECRET_KEY.encode("utf-8"), date_stamp)
+    k_region = _tos_hmac(k_date, region)
+    k_service = _tos_hmac(k_region, "tos")
+    k_signing = _tos_hmac(k_service, "request")
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    headers["Authorization"] = (
+        f"TOS4-HMAC-SHA256 Credential={TOS_ACCESS_KEY}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    headers["Content-Length"] = str(len(body))
+    return headers
+
+
+def _tos_presigned_get_url(bucket: str, region: str, object_key: str, expires: int = 43200) -> str:
+    """Generate a query-string-signed GET URL for a private TOS object.
+    Default TTL = 12 hours (covers any reasonable Ark generation cycle)."""
+    host = f"{bucket}.tos-{region}.volces.com"
+    amz_date = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = amz_date[:8]
+    credential_scope = f"{date_stamp}/{region}/tos/request"
+    credential = f"{TOS_ACCESS_KEY}/{credential_scope}"
+
+    qs = {
+        "X-Tos-Algorithm": "TOS4-HMAC-SHA256",
+        "X-Tos-Credential": credential,
+        "X-Tos-Date": amz_date,
+        "X-Tos-Expires": str(expires),
+        "X-Tos-SignedHeaders": "host",
+    }
+    canonical_query = "&".join(
+        f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(qs[k], safe='')}"
+        for k in sorted(qs)
+    )
+    canonical_uri = "/" + urllib.parse.quote(object_key, safe="/")
+    canonical_headers = f"host:{host}\n"
+    canonical_request = (
+        f"GET\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\nhost\nUNSIGNED-PAYLOAD"
+    )
+    string_to_sign = (
+        f"TOS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{_tos_sha256_hex(canonical_request.encode('utf-8'))}"
+    )
+
+    k_date = _tos_hmac(TOS_SECRET_KEY.encode("utf-8"), date_stamp)
+    k_region = _tos_hmac(k_date, region)
+    k_service = _tos_hmac(k_region, "tos")
+    k_signing = _tos_hmac(k_service, "request")
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    return f"https://{host}{canonical_uri}?{canonical_query}&X-Tos-Signature={signature}"
+
+
+def _ext_from_mime(mime: str) -> str:
+    guess = mimetypes.guess_extension(mime or "")
+    return guess or ".bin"
+
+
+def tos_upload(blob: bytes, mime: str, filename: str) -> str:
+    """Upload blob to the configured TOS bucket and return its public https URL.
+    Raises RuntimeError with a user-readable message on any precondition or
+    transport failure. The bucket must be configured as public-read so Ark can
+    GET the resulting URL without authentication."""
+    if not (TOS_ACCESS_KEY and TOS_SECRET_KEY):
+        raise RuntimeError(
+            "TOS 凭证未配置：请在 Portal 管理员菜单 →「火山方舟人像 Key」处配置 AK/SK，"
+            "重启 Portal 后 seedance 会自动继承同一对 Key"
+        )
+    bucket = (SECRETS.get("tos_bucket") or "").strip()
+    if not bucket:
+        raise RuntimeError(
+            "seedance/state/secrets.json 缺 'tos_bucket'：请在火山 TOS 控制台创建一个"
+            "公共读 bucket，把 bucket 名填进去后重启"
+        )
+    region = (SECRETS.get("tos_region") or TOS_DEFAULT_REGION).strip()
+    ext = Path(filename).suffix if filename else ""
+    if not ext:
+        ext = _ext_from_mime(mime)
+    object_key = f"refmedia/{uuid.uuid4().hex}{ext}"
+    host = f"{bucket}.tos-{region}.volces.com"
+
+    headers = _tos_sign_put(bucket, region, object_key, mime, blob)
+    conn = http.client.HTTPSConnection(host, timeout=300)
+    try:
+        try:
+            conn.request("PUT", "/" + object_key, body=blob, headers=headers)
+            resp = conn.getresponse()
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            # DNS resolution / TCP connect / TLS handshake / socket timeout —
+            # wrap so the caller gets a clear 中文 message instead of a raw
+            # network exception.
+            raise RuntimeError(f"TOS 上传连接失败: {type(exc).__name__}: {exc}") from exc
+        if resp.status not in (200, 201):
+            body_err = resp.read()[:500].decode("utf-8", errors="replace")
+            raise RuntimeError(f"TOS upload HTTP {resp.status}: {body_err}")
+        resp.read()
+    finally:
+        conn.close()
+    # Bucket is private; return a 12-hour presigned GET URL so Ark can fetch it
+    # anonymously. Plenty of margin for any reasonable generation cycle.
+    return _tos_presigned_get_url(bucket, region, object_key, expires=43200)
+
+
 def _load_deepseek_key() -> str:
     """Resolution order: env var → state/deepseek.key (preferred for persistent
     config that survives restarts and isn't checked into git) → empty."""
@@ -89,6 +246,57 @@ except Exception:
 def _is_admin(handler: SimpleHTTPRequestHandler) -> bool:
     """Check if request comes from an authenticated admin (set by portal proxy)."""
     return handler.headers.get("X-Is-Admin") == "1"
+
+
+def _view_scope(handler) -> tuple[bool, str]:
+    """Returns (sees_all, username). Used by jobs/activity endpoints to
+    enforce per-user task visibility. Admins see everything; everyone else
+    sees only jobs whose `username` matches."""
+    sees_all = handler.headers.get("X-Is-Admin", "") == "1"
+    username = _decode_username(handler)
+    return sees_all, username
+
+
+def _decode_username(handler) -> str:
+    """Portal injects X-Username via urllib.parse.quote() to survive the
+    latin-1 limit of http.client headers; decode back to unicode here."""
+    raw = (handler.headers.get("X-Username", "") or "").strip()
+    if not raw:
+        return ""
+    try:
+        return urllib.parse.unquote(raw)
+    except Exception:
+        return raw
+
+
+APP_NAME = "seedance"
+PORTAL_INTERNAL_TOKEN = os.environ.get("PORTAL_INTERNAL_TOKEN", "")
+PORTAL_PORT_FOR_CALLBACK = int(os.environ.get("PORTAL_PORT", "9090"))
+# Portal serves HTTPS-only with a self-signed cert; this loopback callback
+# must skip cert verification.
+import ssl as _ssl
+_PORTAL_SSL_CTX = _ssl.create_default_context()
+_PORTAL_SSL_CTX.check_hostname = False
+_PORTAL_SSL_CTX.verify_mode = _ssl.CERT_NONE
+
+
+def report_final_to_portal(job_id: str, status: str) -> None:
+    """Fire-and-forget callback: tell portal this job reached terminal state.
+    Portal rolls back the +1 stat counter on failure. Any error is swallowed
+    so the task's own result path is never affected."""
+    if not PORTAL_INTERNAL_TOKEN or not job_id:
+        return
+    try:
+        payload = json.dumps({"app": APP_NAME, "job_id": job_id, "status": status}).encode("utf-8")
+        req = urllib.request.Request(
+            f"https://127.0.0.1:{PORTAL_PORT_FOR_CALLBACK}/api/internal/jobs/finalize",
+            data=payload,
+            headers={"X-Internal-Token": PORTAL_INTERNAL_TOKEN, "Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=2, context=_PORTAL_SSL_CTX).read()
+    except Exception:
+        pass
 
 
 def _workspace_id(handler) -> str:
@@ -116,9 +324,7 @@ def _ws_preset_path(ws_id: str) -> Path:
     return _ws_dir(ws_id) / "preset.json"
 
 
-DEFAULT_BASE_URL = "https://ai.t8star.org"
 OFFICIAL_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-DEFAULT_CONFIG = Path.home() / "ComfyUI/custom_nodes/Comfyui-zhenzhen/Comflyapi.json"
 TERMINAL_STATUSES = {"succeeded", "success", "failed", "fail", "failure", "cancelled", "canceled"}
 
 JOBS: dict[str, dict[str, Any]] = {}
@@ -228,39 +434,18 @@ VALUE_FIELDS = {
 FALLBACK_PROVIDERS = {
     "schema_version": 1,
     "app": "seedance",
-    "default_provider": "t8star",
+    "default_provider": "volcengine",
     "providers": {
-        "t8star": {
-            "label": "T8Star 兼容接口",
-            "base_url": DEFAULT_BASE_URL,
-            "api_style": "t8star_seedance",
-            "hint": "使用原有 T8Star 兼容接口，素材会先上传到 /v1/files。",
-            "defaults": {"model": "doubao-seedance-2-0-260128", "duration": 12, "resolution": "720p", "ratio": "16:9", "repeat_count": 1, "concurrency": 1, "poll_interval": 10, "timeout": 3600, "vary_seed": True},
-            "models": [{"id": "doubao-seedance-2-0-260128", "label": "doubao-seedance-2-0-260128"}, {"id": "doubao-seedance-2-0-fast-260128", "label": "doubao-seedance-2-0-fast-260128"}],
-        },
         "volcengine": {
             "label": "豆包官方 / 火山方舟",
             "base_url": OFFICIAL_ARK_BASE_URL,
             "api_style": "ark_seedance",
-            "hint": "使用豆包官方火山方舟 API。首尾帧模式不能与参考素材混用；素材会先上传再引用。",
+            "hint": "豆包官方火山方舟 API。本地图/视频/音频参考素材会先上传到公司 TOS bucket，再以预签名 URL 传给方舟。",
             "defaults": {"model": "doubao-seedance-2-0-260128", "duration": 12, "resolution": "720p", "ratio": "16:9", "repeat_count": 1, "concurrency": 1, "poll_interval": 10, "timeout": 3600, "vary_seed": True},
             "models": [{"id": "doubao-seedance-2-0-260128", "label": "doubao-seedance-2-0-260128"}, {"id": "doubao-seedance-2-0-fast-260128", "label": "doubao-seedance-2-0-fast-260128"}],
         },
     },
 }
-
-
-def load_default_key() -> str:
-    env_key = os.environ.get("SEEDANCE_API_KEY") or os.environ.get("ZHENZHEN_API_KEY")
-    if env_key:
-        return env_key.strip()
-    if DEFAULT_CONFIG.exists():
-        try:
-            data = json.loads(DEFAULT_CONFIG.read_text(encoding="utf-8"))
-            return str(data.get("api_key") or data.get("zhenzhen", {}).get("apikey") or "").strip()
-        except Exception:
-            return ""
-    return ""
 
 
 def json_response(handler: SimpleHTTPRequestHandler, status: int, data: dict[str, Any]) -> None:
@@ -416,10 +601,12 @@ def update_activity(activity_id: str | None, **updates: Any) -> None:
             return
 
 
-def activity_list(ws_id: str = "localhost", show_all: bool = False) -> dict[str, Any]:
+def activity_list(ws_id: str = "localhost", show_all: bool = False, username: str = "") -> dict[str, Any]:
     items = read_activity_log()
     if not show_all:
         items = _filter_activity_by_ws(items, ws_id)
+        if username:
+            items = [it for it in items if it.get("username", "") == username]
     summary = []
     counts = {"total": len(items), "page": 0, "api": 0, "succeeded": 0, "failed": 0, "running": 0}
     for item in items:
@@ -438,6 +625,7 @@ def activity_list(ws_id: str = "localhost", show_all: bool = False) -> dict[str,
             "updated_at": item.get("updated_at"),
             "title": item.get("title"),
             "request_kind": item.get("request_kind"),
+            "username": item.get("username", ""),
         })
     summary.reverse()
     return {"counts": counts, "records": summary}
@@ -991,33 +1179,28 @@ def media_reference(provider: str, base_url: str, api_key: str, blob: bytes, fil
     #   image_url.url      — accepts data: URL or https://. Use base64 data URL (zero
     #                        round-trip, no public exposure of the image).
     #   video_url.url /
-    #   audio_url.url      — accepts ONLY https:// (rejects data: URLs with
-    #                        "must be provided as a web url"), AND Ark issues an
-    #                        unauthenticated GET to that URL — so /files/{id}/content
-    #                        (which requires Authorization) also fails with
-    #                        "resource download failed".
+    #   audio_url.url      — accepts ONLY https://, and Ark issues an
+    #                        unauthenticated GET to that URL. The /files/{id}/content
+    #                        endpoint needs Authorization so it doesn't work either.
     #
-    # Therefore for video/audio we stash the blob in the local refmedia/ pool and
-    # advertise it through the public scheme://host the client itself reached us on
-    # (cloudflared trycloudflare URL, named tunnel, etc). Token is unguessable hex,
-    # entries TTL after REFMEDIA_TTL seconds.
+    # Solution: PUT video/audio into a public-read TOS bucket (random hex object key)
+    # and return the bucket's https URL. The bucket must be in the same volcengine
+    # account as Ark and configured public-read; AK/SK is inherited from the portrait
+    # sub-app's config via portal-injected env (TOS_ACCESS_KEY/TOS_SECRET_KEY).
     #
     # Do NOT change the image branch to use /files upload — the file_id cannot be
     # referenced from image_url.url (see seedance/docs/volcengine-media.md).
-    if provider == "volcengine":
-        if mime.startswith("image/"):
-            b64 = base64.b64encode(blob).decode("ascii")
-            return {"url": f"data:{mime};base64,{b64}"}
-        # video/* or audio/* on volcengine — needs an externally reachable web URL
-        if not request_host:
-            raise RuntimeError(
-                "volcengine 视频/音频参考素材需要 portal 公网入口(cloudflared 域名);"
-                "请通过 portal 公网域名访问 seedance,或切换到 t8star provider"
-            )
-        token, ext = register_refmedia(blob, mime, filename)
-        return {"url": f"{request_host}/seedance/api/refmedia/{token}{ext}"}
-    upload_url = f"{base_url}/v1/files"
-    return upload_file(upload_url, api_key, blob, filename, mime)
+    # Ark generation tasks expect every reference media URL to be public https.
+    # The simplest, most uniform path is: PUT every image/video/audio blob into
+    # the company TOS bucket (public-read) and return the resulting URL. This
+    # replaces the legacy split (image as data:base64 URL, video/audio via local
+    # refmedia pool through a public-facing host).
+    # Provider is locked to volcengine; the t8star path was removed. Anything
+    # else (e.g. a stale curl call passing provider=t8star) is rejected here.
+    if provider != "volcengine":
+        raise RuntimeError(f"only volcengine provider is supported (got {provider!r})")
+    public_url = tos_upload(blob, mime, filename)
+    return {"url": public_url}
 
 
 
@@ -1138,7 +1321,7 @@ def replace_refs(prompt: str) -> str:
 
 
 def build_payload(form: cgi.FieldStorage, api_key: str, base_url: str, run_index: int, ws_id: str = "localhost", request_host: str | None = None) -> dict[str, Any]:
-    provider = get_field(form, "provider", "t8star")
+    provider = get_field(form, "provider", "volcengine")
     prompt = replace_refs(get_field(form, "prompt").strip())
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     has_frame_input = False
@@ -1362,7 +1545,7 @@ def api_schema() -> dict[str, Any]:
 
 def request_template() -> dict[str, Any]:
     config, config_error = load_provider_config()
-    provider = str(config.get("default_provider") or "t8star")
+    provider = str(config.get("default_provider") or "volcengine")
     defaults = provider_defaults(config, provider)
     minimal = {
         "api_key": "YOUR_API_KEY",
@@ -1385,7 +1568,7 @@ def request_template() -> dict[str, Any]:
     full = {
         "api_key": "YOUR_API_KEY",
         "provider": provider,
-        "base_url": defaults.get("base_url", DEFAULT_BASE_URL),
+        "base_url": defaults.get("base_url", OFFICIAL_ARK_BASE_URL),
         "model": defaults.get("model", "doubao-seedance-2-0-260128"),
         "custom_model": "",
         "prompt": "describe the video you want",
@@ -1427,7 +1610,7 @@ def values_files_from_json(payload: dict[str, Any]) -> tuple[dict[str, Any], dic
     if config_error:
         raise ValueError(f"{config_error['message']}: {config_error['detail']}")
     incoming = {key: payload[key] for key in VALUE_FIELDS if key in payload and payload[key] is not None}
-    provider = str(incoming.get("provider") or config.get("default_provider") or "t8star")
+    provider = str(incoming.get("provider") or config.get("default_provider") or "volcengine")
     values = provider_defaults(config, provider, str(incoming.get("model") or ""))
     values.update(incoming)
     values["provider"] = provider
@@ -1448,7 +1631,7 @@ def values_files_from_json(payload: dict[str, Any]) -> tuple[dict[str, Any], dic
     return values, files
 
 
-def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], source: str, request_kind: str, request_data: dict[str, Any], ws_id: str = "localhost") -> str:
+def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], source: str, request_kind: str, request_data: dict[str, Any], ws_id: str = "localhost", username: str = "") -> str:
     job_id = uuid.uuid4().hex
     activity_id = uuid.uuid4().hex
     try:
@@ -1459,6 +1642,10 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
         JOBS[job_id] = {
             "id": job_id, "status": "queued", "events": [], "results": [], "errors": [],
             "done": 0, "total": 0, "duration": per_item_duration,
+            "username": username,
+            "submitted_at": time.time(),
+            "started_at": None,
+            "finished_at": None,
         }
     response = job_id_response(job_id)
     record_activity({
@@ -1471,6 +1658,7 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
         "request": request_data,
         "response": response,
         "workspace_id": ws_id,
+        "username": username,
         "restore": copy_files_to_restore(values, files, activity_id, ws_id),
     })
     thread = threading.Thread(target=run_job, args=(job_id, values, files, activity_id, ws_id), daemon=True)
@@ -1489,10 +1677,10 @@ def run_one(job_id: str, index: int, form_values: dict[str, Any], form_files: di
         form[key] = type("Field", (), {"filename": filename, "file": type("Reader", (), {"read": lambda self, b=blob: b})()})()
 
     api_key = str(form_values["api_key"]).strip()
-    provider = str(form_values.get("provider") or "t8star")
-    default_base = OFFICIAL_ARK_BASE_URL if provider == "volcengine" else DEFAULT_BASE_URL
-    base_url = str(form_values.get("base_url") or default_base).rstrip("/")
-    create_url = f"{base_url}/contents/generations/tasks" if provider == "volcengine" else f"{base_url}/seedance/v3/contents/generations/tasks"
+    provider = str(form_values.get("provider") or "volcengine")
+    # Provider is hardcoded to volcengine — t8star path removed.
+    base_url = str(form_values.get("base_url") or OFFICIAL_ARK_BASE_URL).rstrip("/")
+    create_url = f"{base_url}/contents/generations/tasks"
     add_event(job_id, f"Run {index}: preparing payload")
     request_host = form_values.get("_request_host") or None
     payload = build_payload(form, api_key, base_url, index - 1, ws_id, request_host=request_host)
@@ -1557,7 +1745,7 @@ def run_job(job_id: str, form_values: dict[str, Any], form_files: dict[str, tupl
         requested_concurrency = max(1, min(20, int(form_values.get("concurrency") or 1)))
         count = max(requested_count, requested_concurrency)
         concurrency = min(count, requested_concurrency)
-        set_job(job_id, status="running", total=count, done=0, results=[], errors=[])
+        set_job(job_id, status="running", total=count, done=0, results=[], errors=[], started_at=time.time())
         add_event(job_id, f"Started {count} run(s), concurrency {concurrency}, key {mask_key(form_values.get('api_key', ''))}")
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = [pool.submit(run_one, job_id, i, form_values, form_files, ws_id) for i in range(1, count + 1)]
@@ -1576,16 +1764,18 @@ def run_job(job_id: str, form_values: dict[str, Any], form_files: dict[str, tupl
             errors = JOBS[job_id]["errors"]
             final_job = json.loads(json.dumps(JOBS[job_id]))
         final_status = "failed" if errors else "succeeded"
-        set_job(job_id, status=final_status)
+        set_job(job_id, status=final_status, finished_at=time.time())
         final_job["status"] = final_status
         update_activity(activity_id, status=final_status, result=final_job)
         add_event(job_id, "Finished")
+        report_final_to_portal(job_id, final_status)
     except Exception as exc:
-        set_job(job_id, status="failed", errors=[str(exc)])
+        set_job(job_id, status="failed", errors=[str(exc)], finished_at=time.time())
         with JOBS_LOCK:
             final_job = json.loads(json.dumps(JOBS.get(job_id, {})))
         update_activity(activity_id, status="failed", error=str(exc), result=final_job)
         add_event(job_id, f"Fatal: {exc}")
+        report_final_to_portal(job_id, "failed")
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -1611,8 +1801,6 @@ class Handler(SimpleHTTPRequestHandler):
             providers, config_error = load_provider_config()
             json_response(self, 200, {
                 "ok": config_error is None,
-                "has_key": bool(load_default_key()),
-                "masked_key": mask_key(load_default_key()),
                 "providers": providers.get("providers", {}),
                 "default_provider": providers.get("default_provider"),
                 "config_error": config_error,
@@ -1631,9 +1819,12 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, 200, api_schema())
             return
         if self.path == "/api/jobs":
+            sees_all, username = _view_scope(self)
             items = []
             with JOBS_LOCK:
                 for jid, j in JOBS.items():
+                    if not sees_all and j.get("username", "") != username:
+                        continue
                     results = []
                     for r in (j.get("results") or []):
                         results.append({
@@ -1648,15 +1839,21 @@ class Handler(SimpleHTTPRequestHandler):
                         "model": j.get("model", ""),
                         "prompt": (j.get("params", {}).get("prompt") or j.get("prompt", ""))[:200],
                         "created_at": j.get("created_at", ""),
+                        "submitted_at": j.get("submitted_at"),
+                        "started_at": j.get("started_at"),
+                        "finished_at": j.get("finished_at"),
+                        "username": j.get("username", ""),
                         "results": results,
                         "errors": j.get("errors", []),
                         "done": j.get("done", 0),
                         "total": j.get("total", 0),
                     })
+            items.sort(key=lambda it: (it.get("submitted_at") or 0), reverse=True)
             json_response(self, 200, {"ok": True, "jobs": items})
             return
         if self.path == "/api/activity":
-            json_response(self, 200, activity_list(show_all=True))
+            sees_all, username = _view_scope(self)
+            json_response(self, 200, activity_list(show_all=sees_all, username=username))
             return
         if self.path.startswith("/api/activity/"):
             activity_id = self.path.rsplit("/", 1)[-1]
@@ -1874,10 +2071,10 @@ class Handler(SimpleHTTPRequestHandler):
             try:
                 payload = read_json_body(self)
                 values, files = values_files_from_json(payload)
-                api_key = str(values.get("api_key") or load_default_key()).strip()
-                # Server-managed: volcengine 用公司统一 key，忽略前端输入
-                if str(values.get("provider") or "").strip() == "volcengine":
-                    api_key = SECRETS["volcengine_api_key"]
+                # Provider is locked to volcengine — ignore any provider/api_key
+                # the client passes and always use the company SECRETS key.
+                values["provider"] = "volcengine"
+                api_key = SECRETS["volcengine_api_key"]
                 if not api_key and not payload.get("dry_run"):
                     json_response(self, 400, api_error("invalid_request", "API key is required"))
                     return
@@ -1897,13 +2094,14 @@ class Handler(SimpleHTTPRequestHandler):
                         "title": str(values.get("prompt") or "")[:80] or "Seedance dry run",
                         "request": summarize_payload(payload),
                         "response": response,
+                        "username": _decode_username(self),
                     })
                     json_response(self, 200, response)
                     return
                 request_data = {"raw": summarize_payload(payload), "parsed": summarize_values_files(values, files)}
                 ws = _workspace_id(self)
                 values["_request_host"] = _public_base_url(self) or ""
-                job_id = create_job(values, files, "api", "json", request_data, ws)
+                job_id = create_job(values, files, "api", "json", request_data, ws, username=_decode_username(self))
                 json_response(self, 200, job_id_response(job_id))
             except Exception as exc:
                 json_response(self, 400, api_error("invalid_request", str(exc)))
@@ -1912,17 +2110,16 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, 404, {"error": "not found"})
             return
         form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
-        api_key = get_field(form, "api_key") or self.headers.get("X-Api-Key", "").strip() or load_default_key()
-        # Server-managed: volcengine 用公司统一 key，忽略前端输入
-        provider = (get_field(form, "provider") or "").strip()
-        if provider == "volcengine":
-            api_key = SECRETS["volcengine_api_key"]
+        # Provider is locked to volcengine — ignore any client-supplied api_key
+        # / provider and always use the company SECRETS key.
+        api_key = SECRETS["volcengine_api_key"]
         if not api_key:
             json_response(self, 400, api_error("invalid_request", "API key is required"))
             return
 
         form_values = {key: get_field(form, key) for key in form.keys() if not getattr(form[key], "filename", None)}
         form_values["api_key"] = api_key
+        form_values["provider"] = "volcengine"
         form_files: dict[str, tuple[str, bytes]] = {}
         for key in form.keys():
             item = form[key]
@@ -1934,7 +2131,7 @@ class Handler(SimpleHTTPRequestHandler):
         request_data = summarize_values_files(form_values, form_files)
         ws = _workspace_id(self)
         form_values["_request_host"] = _public_base_url(self) or ""
-        job_id = create_job(form_values, form_files, "page", "multipart", request_data, ws)
+        job_id = create_job(form_values, form_files, "page", "multipart", request_data, ws, username=_decode_username(self))
         json_response(self, 200, job_id_response(job_id))
 
 

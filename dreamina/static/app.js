@@ -403,8 +403,9 @@ async function loadJobs() {
 
 function renderJobsList(jobs) {
   const list = $('#jobsList');
+  _lastJobsForRender = jobs || [];
   const active = jobs.filter(j => j.status === 'pending' || j.status === 'running' || j.status === 'querying');
-  const recent = jobs.filter(j => j.status === 'completed' || j.status === 'failed').slice(-10).reverse();
+  const recent = jobs.filter(j => j.status === 'completed' || j.status === 'failed').slice(0, 10);
   const all = [...active, ...recent];
   $('#runningCount').textContent = active.length ? `${active.length} 进行中` : '';
   if (!all.length) { list.innerHTML = '<p style="color:#697386;font-size:13px;">暂无任务</p>'; return; }
@@ -414,6 +415,30 @@ function renderJobsList(jobs) {
 }
 
 async function renderJobs() { await loadJobs(); }
+
+function formatRuntime(job) {
+  const start = job.started_epoch || job.submitted_at;
+  if (!start) return '';
+  const status = (job.status || '').toLowerCase();
+  const running = ['queued', 'pending', 'running', 'querying'].includes(status);
+  if (running) {
+    const sec = Math.max(0, Math.floor(Date.now() / 1000 - start));
+    return sec >= 60 ? `${Math.floor(sec / 60)}分${sec % 60}秒` : `${sec}秒`;
+  }
+  if (job.finished_epoch && job.started_epoch) {
+    const sec = Math.max(0, Math.floor(job.finished_epoch - job.started_epoch));
+    return sec >= 60 ? `${Math.floor(sec / 60)}分${sec % 60}秒` : `${sec}秒`;
+  }
+  return '';
+}
+
+let _lastJobsForRender = [];
+setInterval(() => {
+  const list = document.getElementById('jobsList');
+  if (!list || !_lastJobsForRender.length) return;
+  const hasRunning = _lastJobsForRender.some(j => ['pending', 'running', 'querying'].includes((j.status || '').toLowerCase()));
+  if (hasRunning) renderJobsList(_lastJobsForRender);
+}, 1000);
 
 function renderJobCard(job) {
   let resultHtml = '';
@@ -461,10 +486,14 @@ function renderJobCard(job) {
     }).join('');
     cliLogHtml = `<div style="margin-top:6px"><span style="cursor:pointer;color:#818cf8;user-select:none;font-size:12px" onclick="var el=document.getElementById('${logId}');el.style.display=el.style.display==='none'?'block':'none'">CLI 详情 ▾</span><div id="${logId}" style="display:none;margin-top:4px;background:#1e1b2e;color:#e2e8f0;font-family:monospace;font-size:11px;padding:8px;border-radius:6px;max-height:240px;overflow:auto">${logBody}</div></div>`;
   }
+  const runtime = formatRuntime(job);
+  const userTag = job.username ? `<span class="job-user" style="font-size:11px;color:#697386;margin-left:6px">@${escHtml(job.username)}</span>` : '';
+  const runtimeTag = runtime ? `<span class="job-runtime" style="font-size:11px;color:#475569;margin-left:6px">${runtime}</span>` : '';
   return `<div class="job-card">
     <div class="job-card-header">
       <span class="job-type">${typeLabel(job.task_type)}</span>
       <span class="job-status ${job.status}">${statusLabel(job.status)}</span>
+      ${userTag}${runtimeTag}
     </div>
     <div class="job-prompt">${escHtml(job.params?.prompt || '')}</div>
     <div class="job-time">${job.created_at || ''}</div>
