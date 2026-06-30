@@ -495,11 +495,12 @@ pre,
 .portrait-sub-tab { padding: 7px 20px; border: 1px solid #cbd5e1; background: transparent; color: #64748b; cursor: pointer; border-radius: 6px; font-size: 14px; }
 .portrait-sub-tab.active { background: #2563eb; color: #fff; border-color: #2563eb; font-weight: 600; }
 .portrait-sub-tab:hover:not(.active) { background: #eff6ff; color: #1e40af; }
-.asset-row { display: flex; gap: 12px; align-items: center; padding: 10px 0; border-bottom: 1px solid #f1f5f9; font-size: 13px; }
+.asset-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 10px 0; border-bottom: 1px solid #f1f5f9; font-size: 13px; }
 .asset-row:last-child { border-bottom: none; }
+.asset-row > *:not(.asset-info) { flex-shrink: 0; }
 .asset-thumb { width: 48px; height: 48px; object-fit: cover; border-radius: 6px; border: 1px solid #e2e8f0; flex-shrink: 0; }
 .asset-thumb-placeholder { width: 48px; height: 48px; display: flex; align-items: center; justify-content: center; background: #f1f5f9; border-radius: 6px; border: 1px solid #e2e8f0; font-size: 20px; flex-shrink: 0; }
-.asset-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.asset-info { flex: 1 1 200px; min-width: 160px; display: flex; flex-direction: column; gap: 2px; }
 .asset-name { font-size: 13px; color: #1e293b; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .asset-id { font-size: 11px; color: #94a3b8; font-family: monospace; }
 .portrait-container label > input:not([type="file"]):not([type="checkbox"]):not([type="radio"]),
