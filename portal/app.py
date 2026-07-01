@@ -1540,6 +1540,18 @@ class Handler(SimpleHTTPRequestHandler):
                 if val:
                     headers[key] = val
 
+            # Resolve stored key by ID if client sent X-Key-Id
+            key_id = self.headers.get("X-Key-Id", "").strip()
+            if key_id:
+                key_val = key_manager.resolve(user["user_id"], key_id)
+                if key_val:
+                    if app_name == "volcengine-portrait" and ":::" in key_val:
+                        ak, sk = key_val.split(":::", 1)
+                        headers["X-Access-Key"] = ak
+                        headers["X-Secret-Key"] = sk
+                    else:
+                        headers["X-Api-Key"] = key_val
+
             headers["X-Forwarded-For"] = client_ip
             # Propagate public-facing host/proto so subapps can build absolute URLs
             # for callbacks. cloudflared sets these when terminating the tunnel;
@@ -1684,7 +1696,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin") or "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers",
-                         "Content-Type, X-Workspace-Id, X-Api-Key, X-Access-Key, X-Secret-Key")
+                         "Content-Type, X-Workspace-Id, X-Api-Key, X-Access-Key, X-Secret-Key, X-Key-Id")
         self.send_header("Access-Control-Allow-Credentials", "true")
 
     def _read_json(self) -> dict | None:
