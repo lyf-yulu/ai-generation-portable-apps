@@ -467,5 +467,57 @@ def main():
         print(json.dumps(result["card"], ensure_ascii=False, indent=2))
 
 
+def _marker_path(state_dir: Path, today: str) -> Path:
+    return state_dir / "reports" / f".sent-{today}"
+
+
+def _should_run_now(state_dir: Path, schedule_time: str, now_hhmm: str, today: str) -> bool:
+    if now_hhmm != schedule_time:
+        return False
+    return not _marker_path(state_dir, today).exists()
+
+
+def _mark_sent(state_dir: Path, today: str):
+    p = _marker_path(state_dir, today)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.touch()
+
+
+def scheduler_loop(state_dir: Path):
+    """Runs forever inside portal process. Every 60s, checks whether current
+    time-of-day matches configured schedule_time and today's marker is absent.
+    On failure, retries next minute; hard-caps at 3 attempts per day, then
+    stamps the marker to stop retrying and let humans investigate."""
+    fail_counts: dict[str, int] = {}
+    while True:
+        try:
+            now = datetime.now()
+            today = now.strftime("%Y-%m-%d")
+            now_hhmm = now.strftime("%H:%M")
+            cfg = load_config(state_dir)
+            if cfg.get("enabled") and _should_run_now(state_dir, cfg.get("schedule_time", "09:05"), now_hhmm, today):
+                yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+                key = _load_deepseek_key(state_dir)
+                try:
+                    result = send_daily_report(state_dir, yesterday, cfg, deepseek_key=key, dry_run=False)
+                    if result["ok"]:
+                        _mark_sent(state_dir, today)
+                        print(f"  [daily_report] sent {yesterday} report OK: {result['feishu_info']}", flush=True)
+                    else:
+                        fail_counts[today] = fail_counts.get(today, 0) + 1
+                        print(f"  [daily_report] send failed (attempt {fail_counts[today]}): {result['feishu_info']}", flush=True)
+                        if fail_counts[today] >= 3:
+                            _mark_sent(state_dir, today)
+                            print(f"  [daily_report] circuit-broken after 3 failures for {today}", flush=True)
+                except Exception as exc:
+                    fail_counts[today] = fail_counts.get(today, 0) + 1
+                    print(f"  [daily_report] exception (attempt {fail_counts[today]}): {exc}", flush=True)
+                    if fail_counts[today] >= 3:
+                        _mark_sent(state_dir, today)
+        except Exception as exc:
+            print(f"  [daily_report] scheduler tick failed: {exc}", flush=True)
+        time.sleep(60)
+
+
 if __name__ == "__main__":
     main()

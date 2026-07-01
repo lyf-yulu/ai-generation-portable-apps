@@ -1896,6 +1896,15 @@ def main():
     if redirect_server:
         threading.Thread(target=redirect_server.serve_forever, daemon=True).start()
 
+    # Feishu daily report scheduler (daemon, tolerates all errors internally)
+    threading.Thread(
+        target=_daily_report_module.scheduler_loop,
+        args=(STATE_DIR,),
+        daemon=True,
+        name="daily_report_scheduler",
+    ).start()
+    print("  [daily_report] scheduler thread started", flush=True)
+
     for name, config in APPS.items():
         print(f"    {name:20s} -> http://127.0.0.1:{config['port']}")
 

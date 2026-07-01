@@ -386,5 +386,34 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(cfg["schedule_time"], "10:00")
 
 
+class SchedulerMarkerTests(unittest.TestCase):
+    def test_should_run_true_when_time_match_and_no_marker(self):
+        mod = load_daily_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self.assertTrue(mod._should_run_now(base, "09:05", now_hhmm="09:05", today="2026-07-01"))
+
+    def test_should_run_false_when_time_mismatch(self):
+        mod = load_daily_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self.assertFalse(mod._should_run_now(base, "09:05", now_hhmm="09:06", today="2026-07-01"))
+
+    def test_should_run_false_when_marker_exists(self):
+        mod = load_daily_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "reports").mkdir()
+            (base / "reports" / ".sent-2026-07-01").write_text("", "utf-8")
+            self.assertFalse(mod._should_run_now(base, "09:05", now_hhmm="09:05", today="2026-07-01"))
+
+    def test_mark_sent_creates_marker(self):
+        mod = load_daily_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            mod._mark_sent(base, "2026-07-01")
+            self.assertTrue((base / "reports" / ".sent-2026-07-01").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
