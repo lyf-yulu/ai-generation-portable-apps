@@ -29,137 +29,100 @@ from pathlib import Path
 from typing import Any
 
 
-def _classify(method: str, path: str) -> str:
-    """Derive event_type from method+path (see spec §2)."""
-    p = path.split("?", 1)[0]
-    if method == "POST" and re.search(r"/api/(virtual/)?jobs/?$", p):
-        return "submit_job"
-    if method == "GET" and re.search(r"/api/(virtual/)?jobs/[^/]+$", p):
-        return "poll"
-    if "/api/download/" in p:
-        return "download"
-    if "/api/upload" in p:
-        return "upload"
-    if method == "POST" and "/api/login" in p:
-        return "login"
-    return "other"
-
-
-def load_events(state_dir: Path, date: str) -> tuple[list[dict], str]:
-    """Return (events, source). source is 'jsonl' if the per-day file was used,
-    or 'fallback' if we filtered usage.json.records[]. Empty list on any error."""
-    jsonl = state_dir / "logs" / f"usage-{date}.jsonl"
-    if jsonl.exists():
-        events: list[dict] = []
-        try:
-            with jsonl.open("r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        events.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-            return events, "jsonl"
-        except Exception:
-            pass
-    # Fallback: filter usage.json.records[] by date prefix
+def load_usage_data(state_dir: Path, date: str) -> tuple[dict, str]:
+    """Return (by_user, source). by_user is {username: {app: {images, seconds}}}
+    read from usage.json's `by_user[date]` structure. source is 'usage_json' when
+    the data was present, or 'missing' when the date has no entries."""
     usage_json = state_dir / "usage.json"
-    if usage_json.exists():
-        try:
-            data = json.loads(usage_json.read_text("utf-8"))
-            records = data.get("records", []) or []
-            filtered = [r for r in records if isinstance(r, dict) and str(r.get("time", "")).startswith(date)]
-            return filtered, "fallback"
-        except Exception:
-            return [], "fallback"
-    return [], "fallback"
+    if not usage_json.exists():
+        return {}, "missing"
+    try:
+        data = json.loads(usage_json.read_text("utf-8"))
+    except Exception:
+        return {}, "missing"
+    by_user_all = data.get("by_user") or {}
+    day = by_user_all.get(date) or {}
+    if not day:
+        return {}, "missing"
+    return day, "usage_json"
 
 
-def aggregate(events: list[dict], date: str) -> dict[str, Any]:
-    """Build the stats dict consumed by the card renderer + LLM prompt."""
+def aggregate(by_user_raw: dict, date: str) -> dict[str, Any]:
+    """Build the stats dict consumed by the card renderer + LLM prompt.
+    by_user_raw shape: {username: {app: {images, seconds}}}
+    Output shape includes per-app totals, per-user rows, and grand totals."""
     by_app: dict[str, dict] = {}
-    by_user_raw: dict[str, dict] = defaultdict(lambda: {"submits": 0, "downloads": 0, "apps": set()})
-    hourly = [0] * 24
-    users_seen: set[str] = set()
+    by_user_list: list[dict] = []
+    total_images = 0
+    total_seconds = 0
 
-    for ev in events:
-        app = str(ev.get("app", "unknown")) or "unknown"
-        user = str(ev.get("username", "") or "").strip()
-        etype = _classify(str(ev.get("method", "")), str(ev.get("path", "")))
-        stat = by_app.setdefault(app, {"requests": 0, "submits": 0, "downloads": 0, "users": set()})
-        stat["requests"] += 1
-        if etype == "submit_job":
-            stat["submits"] += 1
-        elif etype == "download":
-            stat["downloads"] += 1
-        if user:
-            stat["users"].add(user)
-            users_seen.add(user)
-            u = by_user_raw[user]
-            if etype == "submit_job":
-                u["submits"] += 1
-            elif etype == "download":
-                u["downloads"] += 1
-            u["apps"].add(app)
-        t = str(ev.get("time", ""))
-        if len(t) >= 13 and t[10] == " " and t[11:13].isdigit():
-            h = int(t[11:13])
-            if 0 <= h < 24:
-                hourly[h] += 1
+    for uname, apps in by_user_raw.items():
+        u_images = 0
+        u_seconds = 0
+        u_apps: list[str] = []
+        for app, stats in apps.items():
+            imgs = int(stats.get("images") or 0)
+            secs = int(stats.get("seconds") or 0)
+            if imgs == 0 and secs == 0:
+                continue
+            u_images += imgs
+            u_seconds += secs
+            u_apps.append(app)
+            ab = by_app.setdefault(app, {"images": 0, "seconds": 0, "users": set()})
+            ab["images"] += imgs
+            ab["seconds"] += secs
+            ab["users"].add(uname)
+        if u_images or u_seconds:
+            by_user_list.append({
+                "username": uname,
+                "images": u_images,
+                "seconds": u_seconds,
+                "apps": sorted(u_apps),
+            })
+            total_images += u_images
+            total_seconds += u_seconds
 
     by_app_out = {}
     for app, stat in by_app.items():
         by_app_out[app] = {
-            "requests": stat["requests"],
-            "submits": stat["submits"],
-            "downloads": stat["downloads"],
+            "images": stat["images"],
+            "seconds": stat["seconds"],
             "users": len(stat["users"]),
         }
 
-    by_user_list = []
-    for uname, u in by_user_raw.items():
-        by_user_list.append({
-            "username": uname,
-            "submits": u["submits"],
-            "downloads": u["downloads"],
-            "apps": sorted(u["apps"]),
-        })
-    by_user_list.sort(key=lambda x: (-x["submits"], -x["downloads"], x["username"]))
+    # Sort users by seconds desc (video-heavy first), then images desc, then name.
+    by_user_list.sort(key=lambda x: (-x["seconds"], -x["images"], x["username"]))
     by_user_list = by_user_list[:10]
-
-    peak_hour = max(range(24), key=lambda i: hourly[i]) if any(hourly) else 0
 
     return {
         "date": date,
-        "total_events": len(events),
-        "unique_users": len(users_seen),
+        "total_images": total_images,
+        "total_seconds": total_seconds,
+        "unique_users": len(by_user_raw),
         "by_app": by_app_out,
         "by_user": by_user_list,
-        "hourly": hourly,
-        "peak_hour": peak_hour,
     }
 
 
-def write_csv(state_dir: Path, date: str, events: list[dict]) -> Path:
-    """Write UTF-8 BOM CSV to state/reports/YYYY-MM-DD.csv and return the path."""
+def write_csv(state_dir: Path, date: str, by_user_raw: dict) -> Path:
+    """Write UTF-8 BOM CSV to state/reports/YYYY-MM-DD.csv and return the path.
+    Rows are (user × app) with images / seconds columns. Rows where both metrics
+    are zero are skipped."""
     reports_dir = state_dir / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     path = reports_dir / f"{date}.csv"
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["timestamp", "app", "username", "ip", "method", "path", "event_type"])
-    for ev in events:
-        writer.writerow([
-            ev.get("time", ""),
-            ev.get("app", ""),
-            ev.get("username", ""),
-            ev.get("ip", ""),
-            ev.get("method", ""),
-            ev.get("path", ""),
-            _classify(str(ev.get("method", "")), str(ev.get("path", ""))),
-        ])
+    writer.writerow(["date", "username", "app", "images", "seconds"])
+    for uname in sorted(by_user_raw.keys()):
+        apps = by_user_raw[uname]
+        for app in sorted(apps.keys()):
+            stats = apps[app] or {}
+            imgs = int(stats.get("images") or 0)
+            secs = int(stats.get("seconds") or 0)
+            if imgs == 0 and secs == 0:
+                continue
+            writer.writerow([date, uname, app, imgs, secs])
     with path.open("wb") as f:
         f.write(b"\xef\xbb\xbf")
         f.write(buf.getvalue().encode("utf-8"))
@@ -210,19 +173,25 @@ def _deepseek_chat(api_key: str, messages: list[dict], timeout: int = 60) -> dic
 
 
 def _summary_for_prompt(agg: dict) -> str:
-    """Compact stats text for the LLM (no IPs, no path detail)."""
+    """Compact business-metric summary for the LLM."""
     lines = [
         f"日期: {agg['date']}",
-        f"总请求数: {agg['total_events']}",
+        f"总生成图片数: {agg['total_images']} 张",
+        f"总生成视频时长: {agg['total_seconds']} 秒",
         f"活跃用户数: {agg['unique_users']}",
-        f"峰值小时: {agg['peak_hour']}:00",
-        "各应用:",
+        "各应用产出:",
     ]
-    for app, stat in sorted(agg.get("by_app", {}).items(), key=lambda kv: -kv[1]["requests"]):
-        lines.append(f"  {app}: 请求 {stat['requests']}, 提交 {stat['submits']}, 下载 {stat['downloads']}, 用户 {stat['users']}")
-    lines.append("Top 用户 (按提交):")
+    for app, stat in sorted(agg.get("by_app", {}).items(),
+                            key=lambda kv: -(kv[1]["images"] + kv[1]["seconds"])):
+        parts = []
+        if stat["images"]:
+            parts.append(f"{stat['images']} 张图片")
+        if stat["seconds"]:
+            parts.append(f"{stat['seconds']} 秒视频")
+        lines.append(f"  {app}: {', '.join(parts) or '无产出'} (用户 {stat['users']})")
+    lines.append("Top 用户 (按视频秒数):")
     for u in agg.get("by_user", [])[:5]:
-        lines.append(f"  {u['username']}: 提交 {u['submits']}, 下载 {u['downloads']}, 应用 {u['apps']}")
+        lines.append(f"  {u['username']}: {u['images']} 张图, {u['seconds']} 秒视频 ({', '.join(u['apps'])})")
     return "\n".join(lines)
 
 
@@ -259,26 +228,33 @@ def build_card(agg: dict, insight: dict, csv_url: str) -> dict:
         "title": {"tag": "plain_text", "content": f"AI 工具日报 · {agg['date']}"},
         "template": "blue",
     }
-    top_submits = sum(v["submits"] for v in agg["by_app"].values())
-    top_downloads = sum(v["downloads"] for v in agg["by_app"].values())
-
     summary_md = (
-        f"**总请求** {_fmt_int(agg['total_events'])}    "
-        f"**活跃用户** {agg['unique_users']}\n"
-        f"**提交任务** {top_submits}    **下载** {top_downloads}    "
-        f"**峰值** {agg['peak_hour']:02d}:00"
+        f"**生成图片** {_fmt_int(agg['total_images'])} 张    "
+        f"**生成视频** {_fmt_int(agg['total_seconds'])} 秒\n"
+        f"**活跃用户** {agg['unique_users']}"
     )
 
     by_app_lines = []
-    for app, stat in sorted(agg["by_app"].items(), key=lambda kv: -kv[1]["requests"]):
-        by_app_lines.append(f"- **{app}**    {_fmt_int(stat['requests'])} 请求 · {stat['users']} 用户 · {stat['submits']} 提交 · {stat['downloads']} 下载")
+    for app, stat in sorted(agg["by_app"].items(),
+                            key=lambda kv: -(kv[1]["images"] + kv[1]["seconds"])):
+        cols = []
+        if stat["images"]:
+            cols.append(f"{_fmt_int(stat['images'])} 张图片")
+        if stat["seconds"]:
+            cols.append(f"{_fmt_int(stat['seconds'])} 秒视频")
+        by_app_lines.append(f"- **{app}**    {' · '.join(cols) or '_无产出_'} · {stat['users']} 用户")
     by_app_md = "\n".join(by_app_lines) if by_app_lines else "_无数据_"
 
     by_user_lines = []
     for u in agg["by_user"][:10]:
+        cols = []
+        if u["images"]:
+            cols.append(f"{u['images']} 张图")
+        if u["seconds"]:
+            cols.append(f"{u['seconds']} 秒视频")
         apps = ", ".join(u.get("apps", []))
-        by_user_lines.append(f"- **{u['username']}**    {u['submits']} 提交 · {u['downloads']} 下载 · {apps}")
-    by_user_md = "\n".join(by_user_lines) if by_user_lines else "_无提交/下载记录_"
+        by_user_lines.append(f"- **{u['username']}**    {' · '.join(cols)} · _{apps}_")
+    by_user_md = "\n".join(by_user_lines) if by_user_lines else "_无产出记录_"
 
     fallback_flag = " _(数据洞察生成失败,使用占位文案)_" if insight.get("_fallback") else ""
     insight_md = (
@@ -292,7 +268,7 @@ def build_card(agg: dict, insight: dict, csv_url: str) -> dict:
         {"tag": "hr"},
         {"tag": "markdown", "content": "**各应用**\n" + by_app_md},
         {"tag": "hr"},
-        {"tag": "markdown", "content": "**Top 用户（按提交数）**\n" + by_user_md},
+        {"tag": "markdown", "content": "**Top 用户（按视频秒数）**\n" + by_user_md},
         {"tag": "hr"},
         {"tag": "markdown", "content": "**💡 洞察**\n" + insight_md},
         {"tag": "hr"},
@@ -419,19 +395,19 @@ def _default_portal_base_url() -> str:
 
 
 def send_daily_report(state_dir: Path, date: str, config: dict, deepseek_key: str, dry_run: bool = False) -> dict:
-    """End-to-end: load events -> aggregate -> csv -> insight -> card -> (send).
+    """End-to-end: load business metrics -> aggregate -> csv -> insight -> card -> (send).
     Returns {ok, source, csv_path, card, feishu_info}."""
-    events, source = load_events(state_dir, date)
-    csv_path = write_csv(state_dir, date, events)
-    agg = aggregate(events, date)
+    by_user_raw, source = load_usage_data(state_dir, date)
+    csv_path = write_csv(state_dir, date, by_user_raw)
+    agg = aggregate(by_user_raw, date)
     insight = generate_insight(agg, deepseek_key)
     portal_base = (config.get("portal_base_url") or "").rstrip("/") or _default_portal_base_url()
     csv_url = f"{portal_base}/api/reports/daily/{date}.csv"
     card = build_card(agg, insight, csv_url=csv_url)
-    if source == "fallback":
+    if source == "missing":
         card["card"]["body"]["elements"].insert(
             -2,
-            {"tag": "markdown", "content": "<font color='orange'>⚠️ 该日 jsonl 明细未找到,数据从 usage.json 回退读取,可能不完整</font>"},
+            {"tag": "markdown", "content": "<font color='orange'>⚠️ 该日无业务量记录 (usage.json.by_user 无此日期)</font>"},
         )
     result = {"ok": True, "source": source, "csv_path": str(csv_path), "card": card, "feishu_info": "dry_run"}
     if dry_run:

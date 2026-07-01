@@ -91,57 +91,77 @@ def load_daily_report_module():
 
 
 class AggregationTests(unittest.TestCase):
-    SAMPLE = [
-        {"time": "2026-06-30 09:00:00", "app": "seedance",    "ip": "10.0.0.1", "username": "alice", "method": "POST", "path": "/api/jobs"},
-        {"time": "2026-06-30 09:00:05", "app": "seedance",    "ip": "10.0.0.1", "username": "alice", "method": "GET",  "path": "/api/jobs/abc"},
-        {"time": "2026-06-30 14:20:00", "app": "nano-banana", "ip": "10.0.0.2", "username": "bob",   "method": "POST", "path": "/api/jobs"},
-        {"time": "2026-06-30 14:22:00", "app": "nano-banana", "ip": "10.0.0.2", "username": "bob",   "method": "GET",  "path": "/api/download/xyz"},
-    ]
+    # Business-metric shape: {username: {app: {images, seconds}}}
+    SAMPLE = {
+        "alice": {
+            "seedance": {"images": 0, "seconds": 60},
+            "nano-banana": {"images": 12, "seconds": 0},
+        },
+        "bob": {
+            "nano-banana": {"images": 5, "seconds": 0},
+            "volcengine-portrait": {"images": 0, "seconds": 30},
+        },
+    }
 
-    def _write_sample_jsonl(self, base: Path, date: str, rows: list) -> Path:
-        logs = base / "logs"
-        logs.mkdir(parents=True, exist_ok=True)
-        p = logs / f"usage-{date}.jsonl"
-        with p.open("w", encoding="utf-8") as f:
-            for row in rows:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
-        return p
+    def _write_usage_json(self, base: Path, date: str, by_user: dict):
+        (base / "usage.json").write_text(
+            json.dumps({"by_user": {date: by_user}}, ensure_ascii=False), "utf-8")
 
-    def test_load_events_from_jsonl(self):
+    def test_load_usage_data_reads_by_user_slice(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
-            self._write_sample_jsonl(base, "2026-06-30", self.SAMPLE)
+            self._write_usage_json(base, "2026-06-30", self.SAMPLE)
             mod = load_daily_report_module()
-            events, source = mod.load_events(base, "2026-06-30")
-            self.assertEqual(len(events), 4)
-            self.assertEqual(source, "jsonl")
+            by_user, source = mod.load_usage_data(base, "2026-06-30")
+            self.assertEqual(source, "usage_json")
+            self.assertEqual(set(by_user.keys()), {"alice", "bob"})
 
-    def test_load_events_fallback_to_usage_json(self):
+    def test_load_usage_data_missing_date_returns_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
-            (base / "usage.json").write_text(json.dumps({"records": self.SAMPLE}), "utf-8")
+            self._write_usage_json(base, "2026-06-29", self.SAMPLE)
             mod = load_daily_report_module()
-            events, source = mod.load_events(base, "2026-06-30")
-            self.assertEqual(len(events), 4)
-            self.assertEqual(source, "fallback")
+            by_user, source = mod.load_usage_data(base, "2026-06-30")
+            self.assertEqual(by_user, {})
+            self.assertEqual(source, "missing")
+
+    def test_load_usage_data_no_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            mod = load_daily_report_module()
+            by_user, source = mod.load_usage_data(base, "2026-06-30")
+            self.assertEqual(by_user, {})
+            self.assertEqual(source, "missing")
 
     def test_aggregate(self):
         mod = load_daily_report_module()
         agg = mod.aggregate(self.SAMPLE, "2026-06-30")
         self.assertEqual(agg["date"], "2026-06-30")
-        self.assertEqual(agg["total_events"], 4)
+        self.assertEqual(agg["total_images"], 17)     # 12 + 5
+        self.assertEqual(agg["total_seconds"], 90)    # 60 + 30
         self.assertEqual(agg["unique_users"], 2)
-        self.assertEqual(agg["by_app"]["seedance"]["requests"], 2)
-        self.assertEqual(agg["by_app"]["nano-banana"]["submits"], 1)
-        self.assertEqual(agg["by_app"]["nano-banana"]["downloads"], 1)
-        self.assertEqual(len(agg["hourly"]), 24)
-        self.assertEqual(agg["hourly"][9], 2)
-        self.assertEqual(agg["hourly"][14], 2)
-        self.assertIn(agg["peak_hour"], (9, 14))
+        self.assertEqual(agg["by_app"]["nano-banana"]["images"], 17)
+        self.assertEqual(agg["by_app"]["nano-banana"]["users"], 2)
+        self.assertEqual(agg["by_app"]["seedance"]["seconds"], 60)
+        self.assertEqual(agg["by_app"]["volcengine-portrait"]["seconds"], 30)
         top = {u["username"] for u in agg["by_user"]}
         self.assertEqual(top, {"alice", "bob"})
+        # alice has more seconds (60) than bob (30), so she ranks first.
+        self.assertEqual(agg["by_user"][0]["username"], "alice")
 
-    def test_write_csv_bom_and_derived_event_type(self):
+    def test_aggregate_skips_zero_stat_rows(self):
+        mod = load_daily_report_module()
+        sample = {
+            "carol": {
+                "seedance": {"images": 0, "seconds": 0},   # empty row, should be skipped
+                "nano-banana": {"images": 3, "seconds": 0},
+            }
+        }
+        agg = mod.aggregate(sample, "2026-06-30")
+        self.assertNotIn("seedance", agg["by_app"])
+        self.assertEqual(agg["by_user"][0]["apps"], ["nano-banana"])
+
+    def test_write_csv_bom_and_business_metrics(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             mod = load_daily_report_module()
@@ -151,21 +171,26 @@ class AggregationTests(unittest.TestCase):
             self.assertTrue(raw.startswith(b"\xef\xbb\xbf"), "csv must start with UTF-8 BOM")
             text = raw.decode("utf-8-sig")
             lines = text.strip().splitlines()
-            self.assertEqual(lines[0], "timestamp,app,username,ip,method,path,event_type")
+            self.assertEqual(lines[0], "date,username,app,images,seconds")
+            # 2 users × 2 non-zero apps each = 4 rows
             self.assertEqual(len(lines), 5)
-            self.assertIn("submit_job", lines[1])
-            self.assertIn("poll", lines[2])
-            self.assertIn("submit_job", lines[3])
-            self.assertIn("download", lines[4])
+            self.assertIn("2026-06-30,alice,nano-banana,12,0", text)
+            self.assertIn("2026-06-30,alice,seedance,0,60", text)
+            self.assertIn("2026-06-30,bob,volcengine-portrait,0,30", text)
 
 
 class InsightTests(unittest.TestCase):
+    AGG_STUB = {
+        "date": "2026-06-30", "total_images": 12, "total_seconds": 60, "unique_users": 2,
+        "by_app": {"nano-banana": {"images": 12, "seconds": 0, "users": 2}},
+        "by_user": [],
+    }
+    AGG_EMPTY = {"date": "2026-06-30", "total_images": 0, "total_seconds": 0,
+                 "unique_users": 0, "by_app": {}, "by_user": []}
+
     def test_generate_insight_returns_fallback_when_no_key(self):
         mod = load_daily_report_module()
-        agg = {"date": "2026-06-30", "total_events": 100, "unique_users": 5,
-               "by_app": {"seedance": {"requests": 100, "submits": 10, "downloads": 5, "users": 5}},
-               "by_user": [], "hourly": [0]*24, "peak_hour": 0}
-        result = mod.generate_insight(agg, deepseek_key="")
+        result = mod.generate_insight(self.AGG_STUB, deepseek_key="")
         self.assertIn("trend", result)
         self.assertIn("highlight", result)
         self.assertIn("suggestion", result)
@@ -173,8 +198,6 @@ class InsightTests(unittest.TestCase):
 
     def test_generate_insight_parses_llm_json(self):
         mod = load_daily_report_module()
-        agg = {"date": "2026-06-30", "total_events": 100, "unique_users": 5,
-               "by_app": {}, "by_user": [], "hourly": [0]*24, "peak_hour": 0}
         fake_response = {
             "choices": [{"message": {"content": json.dumps({
                 "trend": "整体平稳",
@@ -183,43 +206,39 @@ class InsightTests(unittest.TestCase):
             })}}]
         }
         with mock.patch.object(mod, "_deepseek_chat", return_value=fake_response):
-            result = mod.generate_insight(agg, deepseek_key="sk-fake")
+            result = mod.generate_insight(self.AGG_STUB, deepseek_key="sk-fake")
         self.assertEqual(result["trend"], "整体平稳")
         self.assertFalse(result.get("_fallback"))
 
     def test_generate_insight_handles_llm_failure(self):
         mod = load_daily_report_module()
-        agg = {"date": "2026-06-30", "total_events": 0, "unique_users": 0,
-               "by_app": {}, "by_user": [], "hourly": [0]*24, "peak_hour": 0}
         with mock.patch.object(mod, "_deepseek_chat", side_effect=RuntimeError("boom")):
-            result = mod.generate_insight(agg, deepseek_key="sk-fake")
+            result = mod.generate_insight(self.AGG_EMPTY, deepseek_key="sk-fake")
         self.assertTrue(result["_fallback"])
         self.assertIn("trend", result)
 
     def test_generate_insight_handles_bad_json(self):
         mod = load_daily_report_module()
-        agg = {"date": "2026-06-30", "total_events": 0, "unique_users": 0,
-               "by_app": {}, "by_user": [], "hourly": [0]*24, "peak_hour": 0}
         fake_response = {"choices": [{"message": {"content": "not json at all"}}]}
         with mock.patch.object(mod, "_deepseek_chat", return_value=fake_response):
-            result = mod.generate_insight(agg, deepseek_key="sk-fake")
+            result = mod.generate_insight(self.AGG_EMPTY, deepseek_key="sk-fake")
         self.assertTrue(result["_fallback"])
 
 
 class CardBuildTests(unittest.TestCase):
     AGG = {
         "date": "2026-06-30",
-        "total_events": 1099,
+        "total_images": 1234,
+        "total_seconds": 567,
         "unique_users": 7,
         "by_app": {
-            "nano-banana": {"requests": 552, "submits": 11, "downloads": 46, "users": 4},
-            "seedance":    {"requests": 352, "submits": 0,  "downloads": 11, "users": 3},
+            "nano-banana":         {"images": 800, "seconds": 0,   "users": 4},
+            "seedance":            {"images": 0,   "seconds": 300, "users": 3},
+            "volcengine-portrait": {"images": 434, "seconds": 267, "users": 2},
         },
         "by_user": [
-            {"username": "高大王", "submits": 8, "downloads": 13, "apps": ["nano-banana"]},
+            {"username": "高大王", "images": 500, "seconds": 120, "apps": ["nano-banana", "volcengine-portrait"]},
         ],
-        "hourly": [0]*24,
-        "peak_hour": 14,
     }
     INSIGHT = {"trend": "T", "highlight": "H", "suggestion": "S"}
 
@@ -231,8 +250,10 @@ class CardBuildTests(unittest.TestCase):
         self.assertEqual(payload["schema"], "2.0")
         blob = json.dumps(payload, ensure_ascii=False)
         self.assertIn("2026-06-30", blob)
-        self.assertIn("1,099", blob)
+        self.assertIn("1,234", blob)             # total_images formatted
+        self.assertIn("567", blob)               # total_seconds
         self.assertIn("nano-banana", blob)
+        self.assertIn("seedance", blob)
         self.assertIn("高大王", blob)
         self.assertIn("https://portal.example/api/reports/daily/2026-06-30.csv", blob)
         self.assertIn("T", blob)
@@ -295,14 +316,15 @@ class WebhookSendTests(unittest.TestCase):
 
 class SendDailyReportTests(unittest.TestCase):
     def _seed(self, base: Path):
-        (base / "logs").mkdir(parents=True, exist_ok=True)
-        events = [
-            {"time": "2026-06-30 09:00:00", "app": "seedance", "ip": "10.0.0.1", "username": "alice", "method": "POST", "path": "/api/jobs"},
-            {"time": "2026-06-30 14:20:00", "app": "nano-banana", "ip": "10.0.0.2", "username": "bob", "method": "GET", "path": "/api/download/xyz"},
-        ]
-        with (base / "logs" / "usage-2026-06-30.jsonl").open("w", encoding="utf-8") as f:
-            for e in events:
-                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        payload = {
+            "by_user": {
+                "2026-06-30": {
+                    "alice": {"seedance": {"images": 0, "seconds": 45}},
+                    "bob": {"nano-banana": {"images": 8, "seconds": 0}},
+                }
+            }
+        }
+        (base / "usage.json").write_text(json.dumps(payload, ensure_ascii=False), "utf-8")
 
     def test_send_daily_report_dry_run_writes_csv_no_webhook(self):
         with tempfile.TemporaryDirectory() as tmp:
