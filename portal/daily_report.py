@@ -297,13 +297,10 @@ def build_card(agg: dict, insight: dict, csv_url: str) -> dict:
         {"tag": "markdown", "content": "**💡 洞察**\n" + insight_md},
         {"tag": "hr"},
         {
-            "tag": "action",
-            "actions": [{
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "📥 下载 CSV 明细"},
-                "type": "primary",
-                "url": csv_url,
-            }],
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "📥 下载 CSV 明细"},
+            "type": "primary",
+            "behaviors": [{"type": "open_url", "default_url": csv_url}],
         },
         {"tag": "markdown", "content": "<font color='grey'>Portal 自动生成 · 浏览器提示自签证书时选「继续访问」</font>"},
     ]
