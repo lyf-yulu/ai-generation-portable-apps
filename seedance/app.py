@@ -257,6 +257,27 @@ def _view_scope(handler) -> tuple[bool, str]:
     return sees_all, username
 
 
+_USER_SANITIZE_RE = re.compile(r"[^\w\-一-鿿]+")
+
+
+def _sanitize_username(name: str | None) -> str:
+    """Compress a raw username into a safe directory name:
+    keep letters/digits/underscore/hyphen/CJK, replace others with `_`,
+    strip leading `.` `_`, cap at 40 chars, default to `unknown`."""
+    s = _USER_SANITIZE_RE.sub("_", (name or "").strip())
+    s = s.strip("._") or "unknown"
+    return s[:40]
+
+
+def _user_day_subdir(base: Path, username: str | None, day: str | None = None) -> Path:
+    """Return (and create) `base/<sanitized_user>/<YYYY-MM-DD>/`."""
+    user = _sanitize_username(username)
+    d = day or time.strftime("%Y-%m-%d")
+    p = base / user / d
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def _decode_username(handler) -> str:
     """Portal injects X-Username via urllib.parse.quote() to survive the
     latin-1 limit of http.client headers; decode back to unicode here."""
@@ -393,12 +414,13 @@ def _client_ip(handler: SimpleHTTPRequestHandler) -> str:
     return re.sub(r"[^0-9a-fA-F.:]+", "_", addr)
 
 def _archive_dir_for(handler_or_ip: Any) -> Path:
-    """Get the IP-scoped archive directory."""
-    if isinstance(handler_or_ip, str):
-        ip_slug = handler_or_ip
-    else:
-        ip_slug = _client_ip(handler_or_ip)
-    return ARCHIVE_DIR / ip_slug
+    """Return archive subdir. Prefers <username>/<date>/; falls back to IP for
+    string inputs (legacy call sites)."""
+    if hasattr(handler_or_ip, "headers"):
+        user = _decode_username(handler_or_ip)
+        return _user_day_subdir(ARCHIVE_DIR, user)
+    # Legacy string path: keep old behavior so read side still finds old archives
+    return ARCHIVE_DIR / _client_ip(handler_or_ip)
 
 FILE_FIELDS = {
     "first_frame",
@@ -826,7 +848,10 @@ def list_archives(handler: SimpleHTTPRequestHandler | None = None) -> list[dict[
     dir_path = _ws_dir(ws) / "archives"
     dir_path.mkdir(parents=True, exist_ok=True)
     items = []
-    for path in sorted(dir_path.glob("*.seedance"), key=lambda p: p.stat().st_mtime, reverse=True):
+    # rglob so archives saved under future <user>/<date>/ subdirs are also
+    # surfaced alongside legacy flat entries.
+    candidates = [p for p in dir_path.rglob("*.seedance") if p.is_file()]
+    for path in sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True):
         items.append(
             {
                 "name": path.stem,
@@ -1709,6 +1734,11 @@ def run_one(job_id: str, index: int, form_values: dict[str, Any], form_files: di
         video_url = extract_video_url(status_result)
         if not video_url:
             raise RuntimeError(f"Task {task_id} succeeded but no video URL was found")
+        raw_output_dir = form_values.get("output_dir")
+        if not raw_output_dir:
+            with JOBS_LOCK:
+                username = JOBS.get(job_id, {}).get("username", "")
+            form_values["output_dir"] = str(_user_day_subdir(OUTPUT_DIR, username))
         out_dir = resolve_output_dir(form_values.get("output_dir"))
         custom_name = form_values.get("output_name", "").strip()
         if custom_name:
