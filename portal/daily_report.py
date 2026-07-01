@@ -10,12 +10,14 @@ a standalone CLI (`python3 -m portal.daily_report --date YYYY-MM-DD`).
 """
 from __future__ import annotations
 
+import argparse
 import base64
 import csv
 import hashlib
 import hmac
 import io
 import json
+import os
 import re
 import time
 import urllib.request
@@ -342,3 +344,109 @@ def send_webhook(webhook_url: str, card_body: dict, sign_secret: str = "", timeo
     if code == 0:
         return True, "ok"
     return False, f"feishu code={code} msg={result.get('msg','')}"
+
+
+DEFAULT_CONFIG = {
+    "enabled": False,
+    "webhook_url": "",
+    "sign_secret": "",
+    "schedule_time": "09:05",
+    "portal_base_url": "",
+}
+
+
+def _config_path(state_dir: Path) -> Path:
+    return state_dir / "feishu.json"
+
+
+def load_config(state_dir: Path) -> dict:
+    path = _config_path(state_dir)
+    cfg = dict(DEFAULT_CONFIG)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text("utf-8"))
+            if isinstance(data, dict):
+                for k in DEFAULT_CONFIG:
+                    if k in data:
+                        cfg[k] = data[k]
+        except Exception as exc:
+            print(f"  [daily_report] config load failed: {exc}", flush=True)
+    return cfg
+
+
+def save_config(state_dir: Path, values: dict) -> dict:
+    cfg = load_config(state_dir)
+    for k in DEFAULT_CONFIG:
+        if k in values:
+            cfg[k] = values[k]
+    path = _config_path(state_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), "utf-8")
+    os.replace(tmp, path)
+    return cfg
+
+
+def _load_deepseek_key(state_dir: Path) -> str:
+    """Portal doesn't own DEEPSEEK_KEY_PATH; reuse seedance/state/deepseek.key if present.
+    Env var overrides."""
+    env = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+    if env:
+        return env
+    for candidate in (state_dir / "deepseek.key", state_dir.parent.parent / "seedance" / "state" / "deepseek.key"):
+        try:
+            if candidate.exists():
+                return candidate.read_text("utf-8").strip()
+        except Exception:
+            continue
+    return ""
+
+
+def send_daily_report(state_dir: Path, date: str, config: dict, deepseek_key: str, dry_run: bool = False) -> dict:
+    """End-to-end: load events -> aggregate -> csv -> insight -> card -> (send).
+    Returns {ok, source, csv_path, card, feishu_info}."""
+    events, source = load_events(state_dir, date)
+    csv_path = write_csv(state_dir, date, events)
+    agg = aggregate(events, date)
+    insight = generate_insight(agg, deepseek_key)
+    portal_base = (config.get("portal_base_url") or "").rstrip("/")
+    csv_url = f"{portal_base}/api/reports/daily/{date}.csv" if portal_base else f"/api/reports/daily/{date}.csv"
+    card = build_card(agg, insight, csv_url=csv_url)
+    if source == "fallback":
+        card["card"]["body"]["elements"].insert(
+            -2,
+            {"tag": "note", "elements": [{"tag": "plain_text", "content": "⚠️ 该日 jsonl 明细未找到,数据从 usage.json 回退读取,可能不完整"}]},
+        )
+    result = {"ok": True, "source": source, "csv_path": str(csv_path), "card": card, "feishu_info": "dry_run"}
+    if dry_run:
+        return result
+    ok, info = send_webhook(config.get("webhook_url", ""), card, sign_secret=config.get("sign_secret", ""))
+    result["ok"] = ok
+    result["feishu_info"] = info
+    return result
+
+
+def _default_state_dir() -> Path:
+    return Path(__file__).resolve().parent / "state"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Portal daily Feishu report")
+    parser.add_argument("--date", default=(datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d"),
+                        help="YYYY-MM-DD, default = yesterday")
+    parser.add_argument("--dry-run", action="store_true", help="build card and CSV but do not send to Feishu")
+    parser.add_argument("--state-dir", default=str(_default_state_dir()))
+    args = parser.parse_args()
+    state_dir = Path(args.state_dir)
+    cfg = load_config(state_dir)
+    key = _load_deepseek_key(state_dir)
+    result = send_daily_report(state_dir, args.date, cfg, deepseek_key=key, dry_run=args.dry_run)
+    printable = {k: v for k, v in result.items() if k != "card"}
+    print(json.dumps(printable, ensure_ascii=False, indent=2))
+    if args.dry_run:
+        print("--- card preview ---")
+        print(json.dumps(result["card"], ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

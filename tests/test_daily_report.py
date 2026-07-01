@@ -293,5 +293,71 @@ class WebhookSendTests(unittest.TestCase):
         self.assertIn("19024", info)
 
 
+class SendDailyReportTests(unittest.TestCase):
+    def _seed(self, base: Path):
+        (base / "logs").mkdir(parents=True, exist_ok=True)
+        events = [
+            {"time": "2026-06-30 09:00:00", "app": "seedance", "ip": "10.0.0.1", "username": "alice", "method": "POST", "path": "/api/jobs"},
+            {"time": "2026-06-30 14:20:00", "app": "nano-banana", "ip": "10.0.0.2", "username": "bob", "method": "GET", "path": "/api/download/xyz"},
+        ]
+        with (base / "logs" / "usage-2026-06-30.jsonl").open("w", encoding="utf-8") as f:
+            for e in events:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+    def test_send_daily_report_dry_run_writes_csv_no_webhook(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self._seed(base)
+            mod = load_daily_report_module()
+            calls = []
+            with mock.patch.object(mod, "send_webhook", side_effect=lambda *a, **kw: calls.append(a) or (True, "ok")):
+                result = mod.send_daily_report(base, "2026-06-30",
+                                               config={"webhook_url": "https://x", "portal_base_url": "https://p"},
+                                               deepseek_key="",
+                                               dry_run=True)
+            self.assertTrue(result["ok"])
+            self.assertTrue((base / "reports" / "2026-06-30.csv").exists())
+            self.assertEqual(calls, [], "dry_run must not call send_webhook")
+
+    def test_send_daily_report_real_sends_when_not_dry_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self._seed(base)
+            mod = load_daily_report_module()
+            with mock.patch.object(mod, "send_webhook", return_value=(True, "ok")) as sender:
+                result = mod.send_daily_report(base, "2026-06-30",
+                                               config={"webhook_url": "https://x", "portal_base_url": "https://p:9091"},
+                                               deepseek_key="",
+                                               dry_run=False)
+            self.assertTrue(result["ok"])
+            sender.assert_called_once()
+            args, _ = sender.call_args
+            self.assertEqual(args[0], "https://x")
+            self.assertIn("2026-06-30", json.dumps(args[1], ensure_ascii=False))
+
+
+class ConfigTests(unittest.TestCase):
+    def test_load_config_returns_defaults_when_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            mod = load_daily_report_module()
+            cfg = mod.load_config(base)
+            self.assertFalse(cfg["enabled"])
+            self.assertEqual(cfg["schedule_time"], "09:05")
+            self.assertEqual(cfg["webhook_url"], "")
+
+    def test_save_config_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            mod = load_daily_report_module()
+            mod.save_config(base, {"enabled": True, "webhook_url": "https://x",
+                                    "sign_secret": "s", "schedule_time": "10:00",
+                                    "portal_base_url": "https://p"})
+            cfg = mod.load_config(base)
+            self.assertTrue(cfg["enabled"])
+            self.assertEqual(cfg["webhook_url"], "https://x")
+            self.assertEqual(cfg["schedule_time"], "10:00")
+
+
 if __name__ == "__main__":
     unittest.main()
