@@ -11,6 +11,7 @@ import http.client
 import json
 import mimetypes
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -52,6 +53,27 @@ def _view_scope(handler) -> tuple[bool, str]:
     sees_all = handler.headers.get("X-Is-Admin", "") == "1"
     username = _decode_username(handler)
     return sees_all, username
+
+
+_USER_SANITIZE_RE = re.compile(r"[^\w\-一-鿿]+")
+
+
+def _sanitize_username(name: str | None) -> str:
+    """Compress a raw username into a safe directory name:
+    keep letters/digits/underscore/hyphen/CJK, replace others with `_`,
+    strip leading `.` `_`, cap at 40 chars, default to `unknown`."""
+    s = _USER_SANITIZE_RE.sub("_", (name or "").strip())
+    s = s.strip("._") or "unknown"
+    return s[:40]
+
+
+def _user_day_subdir(base: Path, username: str | None, day: str | None = None) -> Path:
+    """Return (and create) `base/<sanitized_user>/<YYYY-MM-DD>/`."""
+    user = _sanitize_username(username)
+    d = day or time.strftime("%Y-%m-%d")
+    p = base / user / d
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 def _decode_username(handler) -> str:
@@ -729,13 +751,13 @@ def poll_asset_status(asset_id, ak=None, sk=None):
 
 # === Download helper ===
 
-def download_video(video_url, job_id, idx):
+def download_video(video_url, job_id, idx, out_dir: Path | None = None):
     try:
         req = urllib.request.Request(video_url)
         with urllib.request.urlopen(req, timeout=300) as resp:
             ext = mimetypes.guess_extension(resp.headers.get("Content-Type", "video/mp4")) or ".mp4"
             fname = f"{job_id}_{idx}{ext}"
-            fpath = OUTPUT_DIR / fname
+            fpath = (out_dir or OUTPUT_DIR) / fname
             fpath.write_bytes(resp.read())
             return fpath
     except Exception as e:
@@ -1225,6 +1247,7 @@ def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
 
     job_id = uuid.uuid4().hex[:12]
     activity_id = uuid.uuid4().hex
+    username = _decode_username(handler)
     with JOBS_LOCK:
         JOBS[job_id] = {
             "job_id": job_id,
@@ -1248,8 +1271,9 @@ def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
             "submitted_at": time.time(),
             "started_at": None,
             "finished_at": None,
-            "username": _decode_username(handler),
+            "username": username,
             "api_key": api_key,
+            "output_dir": str(_user_day_subdir(OUTPUT_DIR, username)),
         }
     title = (prompt or "").strip()[:80] or f"{task_type} task"
     record_activity({
@@ -1259,7 +1283,7 @@ def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
         "request_kind": task_type,
         "status": "running",
         "title": title,
-        "username": _decode_username(handler),
+        "username": username,
         "request": {
             "task_type": task_type,
             "asset_id": asset_id,
@@ -1390,7 +1414,8 @@ def _run_virtual_job_impl(job_id, job):
             if t_status in ("completed", "succeeded"):
                 video_url = extract_video_url(task_result) or ""
                 if video_url:
-                    local_path = download_video(video_url, job_id, idx)
+                    out_dir = Path(job.get("output_dir")) if job.get("output_dir") else OUTPUT_DIR
+                    local_path = download_video(video_url, job_id, idx, out_dir=out_dir)
                     file_token = uuid.uuid4().hex
                     if local_path:
                         with FILES_LOCK:
