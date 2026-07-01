@@ -74,3 +74,11 @@ volcengine-portrait/60[0-9][0-9]/
 volcengine-portrait/AI Tool/
 volcengine-portrait/图/
 volcengine-portrait/视频生成合集/
+
+# ---- 输出目录统一重构（2026-07-01） ----
+# outputs/ uploads/ archives/ state/ logs/ accounts/ 已由第 9-14 行通用规则覆盖，此处不再重复列绝对路径
+
+# 用户手建目录 —— 防 `git add .` 事故
+# 只放行以 ASCII 字母、下划线、点开头的目录（守住 static/、docs/、tools/、__pycache__/ 等）
+/nano-banana/[!A-Za-z_.]*/
+/seedance/[!A-Za-z_.]*/
