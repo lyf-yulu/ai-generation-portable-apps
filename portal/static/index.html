@@ -558,6 +558,43 @@
           </div>
         </form>
       </section>
+      <section class="stats-panel" v-if="isAdmin">
+        <h2>飞书日报</h2>
+        <p style="font-size:12px;color:#94a3b8;margin:0 0 10px">每天到点自动把昨日 Portal 使用数据推送到飞书群机器人。管理员可预览/立即发送。</p>
+        <div class="stats-row" style="gap:10px;flex-wrap:wrap;align-items:flex-end">
+          <label style="flex:2 1 320px">
+            <div style="font-size:12px;color:#94a3b8">Webhook URL</div>
+            <input v-model="feishu.webhook_url" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..." style="width:100%">
+          </label>
+          <label style="flex:1 1 160px">
+            <div style="font-size:12px;color:#94a3b8">签名 secret (可选)</div>
+            <input v-model="feishu.sign_secret" :placeholder="feishu._secretPresent ? '已配置(留空不修改)' : ''" style="width:100%">
+          </label>
+          <label style="flex:0 0 120px">
+            <div style="font-size:12px;color:#94a3b8">触发时间</div>
+            <input v-model="feishu.schedule_time" placeholder="09:05" style="width:100%">
+          </label>
+          <label style="flex:1 1 220px">
+            <div style="font-size:12px;color:#94a3b8">Portal 基础 URL</div>
+            <input v-model="feishu.portal_base_url" placeholder="https://192.168.x.x:9091" style="width:100%">
+          </label>
+          <label style="flex:0 0 auto;display:flex;align-items:center;gap:6px">
+            <input type="checkbox" v-model="feishu.enabled">
+            <span>启用定时</span>
+          </label>
+        </div>
+        <div class="stats-row" style="gap:10px;margin-top:10px;align-items:center">
+          <button @click="saveFeishuConfig()">保存配置</button>
+          <label>
+            <span style="font-size:12px;color:#94a3b8">日期</span>
+            <input v-model="feishu.previewDate" type="date" style="margin-left:6px">
+          </label>
+          <button @click="previewFeishu()">预览卡片</button>
+          <button @click="sendFeishuNow()" style="background:#2563eb;color:#fff">立即发送</button>
+          <span v-if="feishu.status" style="font-size:12px;color:#cbd5e1">{{ feishu.status }}</span>
+        </div>
+        <pre v-if="feishu.previewJson" style="max-height:320px;overflow:auto;background:#0f172a;padding:10px;border-radius:6px;font-size:11px;margin-top:10px">{{ feishu.previewJson }}</pre>
+      </section>
       <section class="stats-panel">
         <h2>按用户统计</h2>
         <table class="ip-stats-table">

@@ -720,6 +720,18 @@ function StatsApp() {
       has_api_key: false, has_access_key: false, has_secret_key: false,
       saving: false, hint: '', hintOk: true,
     },
+    // Admin-only: Feishu daily report config + preview/send trigger
+    feishu: {
+      enabled: false,
+      webhook_url: '',
+      sign_secret: '',
+      schedule_time: '09:05',
+      portal_base_url: '',
+      previewDate: '',
+      previewJson: '',
+      status: '',
+      _secretPresent: false,
+    },
 
     fmtDmStat(s) {
       if (!s) return '—';
@@ -750,6 +762,10 @@ function StatsApp() {
         this.loadUsers();
         this.loadSignupStatus();
         this.loadPortraitKey();
+        this.loadFeishuConfig();
+        // default previewDate = yesterday
+        const d = new Date(); d.setDate(d.getDate() - 1);
+        this.feishu.previewDate = d.toISOString().slice(0, 10);
       }
       setInterval(() => this.loadPlatformStatus(), 10000);
       setInterval(() => this.loadStats(), 30000);
@@ -1013,6 +1029,70 @@ function StatsApp() {
       const res = await api('/api/users/' + u.id, 'POST', JSON.stringify({ password: pw }));
       if (res?.ok) alert('密码已重置');
       else alert(res?.error || '重置失败');
+    },
+
+    async loadFeishuConfig() {
+      try {
+        const r = await fetch('/api/feishu/config').then(r => r.json());
+        if (r.ok && r.config) {
+          const c = r.config;
+          this.feishu.enabled = !!c.enabled;
+          this.feishu.webhook_url = c.webhook_url || '';
+          this.feishu.schedule_time = c.schedule_time || '09:05';
+          this.feishu.portal_base_url = c.portal_base_url || '';
+          this.feishu._secretPresent = !!c.sign_secret_present;
+          // never populate sign_secret from server (masked); user re-types to change
+          this.feishu.sign_secret = '';
+        }
+      } catch (e) {
+        this.feishu.status = '读取配置失败: ' + e;
+      }
+    },
+    async saveFeishuConfig() {
+      this.feishu.status = '保存中...';
+      const body = {
+        enabled: this.feishu.enabled,
+        webhook_url: this.feishu.webhook_url,
+        schedule_time: this.feishu.schedule_time,
+        portal_base_url: this.feishu.portal_base_url,
+      };
+      // Only send sign_secret if user typed something; empty means "don't change"
+      if ((this.feishu.sign_secret || '').length > 0) body.sign_secret = this.feishu.sign_secret;
+      try {
+        const r = await fetch('/api/feishu/config', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)}).then(r => r.json());
+        this.feishu.status = r.ok ? '已保存' : ('保存失败: ' + (r.error || ''));
+        if (r.ok) await this.loadFeishuConfig();
+      } catch (e) {
+        this.feishu.status = '保存失败: ' + e;
+      }
+    },
+    async previewFeishu() {
+      const date = this.feishu.previewDate;
+      if (!date) { this.feishu.status = '请选日期'; return; }
+      this.feishu.status = '生成预览...';
+      try {
+        const r = await fetch('/api/reports/preview', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({date})}).then(r => r.json());
+        if (r.ok) {
+          this.feishu.previewJson = JSON.stringify(r.card, null, 2);
+          this.feishu.status = '预览就绪 (source=' + r.source + ')';
+        } else {
+          this.feishu.status = '预览失败: ' + (r.error || '');
+        }
+      } catch (e) {
+        this.feishu.status = '预览失败: ' + e;
+      }
+    },
+    async sendFeishuNow() {
+      const date = this.feishu.previewDate;
+      if (!date) { this.feishu.status = '请选日期'; return; }
+      if (!confirm(`确认向飞书发送 ${date} 的日报？`)) return;
+      this.feishu.status = '发送中...';
+      try {
+        const r = await fetch('/api/reports/send', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({date})}).then(r => r.json());
+        this.feishu.status = r.ok ? ('已发送: ' + (r.info || '')) : ('发送失败: ' + (r.error || r.info || ''));
+      } catch (e) {
+        this.feishu.status = '发送失败: ' + e;
+      }
     }
   };
 }
