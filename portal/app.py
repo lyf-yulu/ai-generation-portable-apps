@@ -34,6 +34,8 @@ if hasattr(subprocess, "CREATE_NO_WINDOW"):
 
 STATE_DIR = _DATA_BASE / "state"
 USAGE_PATH = STATE_DIR / "usage.json"
+LOGS_DIR = STATE_DIR / "logs"
+USAGE_JSONL_RETENTION_DAYS = 30
 USERS_PATH = STATE_DIR / "users.json"
 SESSIONS_PATH = STATE_DIR / "sessions.json"
 USER_KEYS_PATH = STATE_DIR / "user_keys.json"
@@ -593,6 +595,38 @@ class AppManager:
 
 # ─── Usage Tracker ─────────────────────────────────────────────────────────────
 
+def _append_usage_jsonl(entry: dict, today: str):
+    """Append a single usage entry to state/logs/usage-YYYY-MM-DD.jsonl.
+    Failures are logged but do NOT propagate — primary usage.json save must not be blocked."""
+    try:
+        logs_dir = STATE_DIR / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        path = logs_dir / f"usage-{today}.jsonl"
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"  [usage] jsonl append failed for {today}: {exc}", flush=True)
+
+
+def _prune_old_usage_jsonl(today: str):
+    """Delete usage-*.jsonl older than USAGE_JSONL_RETENTION_DAYS. Best-effort."""
+    try:
+        logs_dir = STATE_DIR / "logs"
+        if not logs_dir.exists():
+            return
+        from datetime import datetime, timedelta
+        cutoff = datetime.strptime(today, "%Y-%m-%d") - timedelta(days=USAGE_JSONL_RETENTION_DAYS)
+        for p in logs_dir.glob("usage-*.jsonl"):
+            try:
+                d = datetime.strptime(p.stem[len("usage-"):], "%Y-%m-%d")
+                if d < cutoff:
+                    p.unlink()
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
 class UsageTracker:
     def __init__(self):
         self._lock = threading.Lock()
@@ -686,6 +720,13 @@ class UsageTracker:
             app_stats = day_stats.setdefault(app, {"requests": 0, "jobs": 0})
             app_stats["requests"] += 1
             self._save()
+        # Below the lock: jsonl append + prune are best-effort, must not block primary save
+        try:
+            _append_usage_jsonl(entry, today)
+        except Exception:
+            pass
+        # prune once per day (cheap enough to attempt each write; glob is O(days))
+        _prune_old_usage_jsonl(today)
 
     def register_job(self, app: str, job_id: str, username: str, job_type: str = "image", duration_per_item: int = 0):
         with self._lock:
@@ -1499,18 +1540,6 @@ class Handler(SimpleHTTPRequestHandler):
                 if val:
                     headers[key] = val
 
-            # Resolve stored key by ID if client sent X-Key-Id
-            key_id = self.headers.get("X-Key-Id", "").strip()
-            if key_id:
-                key_val = key_manager.resolve(user["user_id"], key_id)
-                if key_val:
-                    if app_name == "volcengine-portrait" and ":::" in key_val:
-                        ak, sk = key_val.split(":::", 1)
-                        headers["X-Access-Key"] = ak
-                        headers["X-Secret-Key"] = sk
-                    else:
-                        headers["X-Api-Key"] = key_val
-
             headers["X-Forwarded-For"] = client_ip
             # Propagate public-facing host/proto so subapps can build absolute URLs
             # for callbacks. cloudflared sets these when terminating the tunnel;
@@ -1655,7 +1684,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin") or "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers",
-                         "Content-Type, X-Workspace-Id, X-Api-Key, X-Access-Key, X-Secret-Key, X-Key-Id")
+                         "Content-Type, X-Workspace-Id, X-Api-Key, X-Access-Key, X-Secret-Key")
         self.send_header("Access-Control-Allow-Credentials", "true")
 
     def _read_json(self) -> dict | None:
