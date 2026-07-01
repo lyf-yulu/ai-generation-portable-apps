@@ -305,7 +305,7 @@ def build_card(agg: dict, insight: dict, csv_url: str) -> dict:
                 "url": csv_url,
             }],
         },
-        {"tag": "note", "elements": [{"tag": "plain_text", "content": "Portal 自动生成 · 浏览器提示自签证书时选「继续访问」"}]},
+        {"tag": "markdown", "content": "<font color='grey'>Portal 自动生成 · 浏览器提示自签证书时选「继续访问」</font>"},
     ]
     return {
         "msg_type": "interactive",
@@ -434,7 +434,7 @@ def send_daily_report(state_dir: Path, date: str, config: dict, deepseek_key: st
     if source == "fallback":
         card["card"]["body"]["elements"].insert(
             -2,
-            {"tag": "note", "elements": [{"tag": "plain_text", "content": "⚠️ 该日 jsonl 明细未找到,数据从 usage.json 回退读取,可能不完整"}]},
+            {"tag": "markdown", "content": "<font color='orange'>⚠️ 该日 jsonl 明细未找到,数据从 usage.json 回退读取,可能不完整</font>"},
         )
     result = {"ok": True, "source": source, "csv_path": str(csv_path), "card": card, "feishu_info": "dry_run"}
     if dry_run:
