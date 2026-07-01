@@ -765,7 +765,9 @@ function StatsApp() {
         this.loadFeishuConfig();
         // default previewDate = yesterday
         const d = new Date(); d.setDate(d.getDate() - 1);
-        this.feishu.previewDate = d.toISOString().slice(0, 10);
+        // Local YYYY-MM-DD (toISOString would use UTC and drift in early-morning UTC+8)
+        const pad = n => String(n).padStart(2, '0');
+        this.feishu.previewDate = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
       }
       setInterval(() => this.loadPlatformStatus(), 10000);
       setInterval(() => this.loadStats(), 30000);
