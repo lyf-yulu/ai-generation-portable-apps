@@ -1248,6 +1248,7 @@ def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
     job_id = uuid.uuid4().hex[:12]
     activity_id = uuid.uuid4().hex
     username = _decode_username(handler)
+    output_dir_str = str(_user_day_subdir(OUTPUT_DIR, username))  # 磁盘 IO 放锁外
     with JOBS_LOCK:
         JOBS[job_id] = {
             "job_id": job_id,
@@ -1273,7 +1274,7 @@ def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
             "finished_at": None,
             "username": username,
             "api_key": api_key,
-            "output_dir": str(_user_day_subdir(OUTPUT_DIR, username)),
+            "output_dir": output_dir_str,
         }
     title = (prompt or "").strip()[:80] or f"{task_type} task"
     record_activity({
