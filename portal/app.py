@@ -1486,12 +1486,26 @@ class Handler(SimpleHTTPRequestHandler):
             "has_secret_key": bool(data.get("has_secret_key")),
         })
 
+    def _valid_report_date(self, date: str) -> bool:
+        """Accept YYYY-MM-DD strictly, reject future dates. Emits 400 on failure."""
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+            self._json(400, {"ok": False, "error": "invalid date"})
+            return False
+        try:
+            d = datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            self._json(400, {"ok": False, "error": "invalid date"})
+            return False
+        if d > datetime.now().date():
+            self._json(400, {"ok": False, "error": "date in future"})
+            return False
+        return True
+
     def _report_csv_download(self, user: dict, date: str):
         if user.get("role") != "admin":
             self._json(403, {"ok": False, "error": "admin only"})
             return
-        if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
-            self._json(400, {"ok": False, "error": "invalid date"})
+        if not self._valid_report_date(date):
             return
         state_dir = STATE_DIR
         csv_path = state_dir / "reports" / f"{date}.csv"
@@ -1513,8 +1527,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         body = self._read_json() or {}
         date = str(body.get("date") or "").strip()
-        if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
-            self._json(400, {"ok": False, "error": "invalid date"})
+        if not self._valid_report_date(date):
             return
         cfg = _daily_report_module.load_config(STATE_DIR)
         key = _daily_report_module._load_deepseek_key(STATE_DIR)
@@ -1531,8 +1544,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         body = self._read_json() or {}
         date = str(body.get("date") or "").strip()
-        if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
-            self._json(400, {"ok": False, "error": "invalid date"})
+        if not self._valid_report_date(date):
             return
         cfg = _daily_report_module.load_config(STATE_DIR)
         key = _daily_report_module._load_deepseek_key(STATE_DIR)
