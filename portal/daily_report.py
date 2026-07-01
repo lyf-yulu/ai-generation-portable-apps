@@ -10,10 +10,14 @@ a standalone CLI (`python3 -m portal.daily_report --date YYYY-MM-DD`).
 """
 from __future__ import annotations
 
+import base64
 import csv
+import hashlib
+import hmac
 import io
 import json
 import re
+import time
 import urllib.request
 import urllib.error
 from collections import Counter, defaultdict
@@ -240,3 +244,101 @@ def generate_insight(agg: dict, deepseek_key: str) -> dict:
     except Exception as exc:
         print(f"  [daily_report] insight fallback: {exc}", flush=True)
         return _fallback_insight()
+
+
+def _fmt_int(n: int) -> str:
+    return f"{n:,}"
+
+
+def build_card(agg: dict, insight: dict, csv_url: str) -> dict:
+    """Assemble Feishu interactive-card message body. Schema 2.0."""
+    header = {
+        "title": {"tag": "plain_text", "content": f"AI 工具日报 · {agg['date']}"},
+        "template": "blue",
+    }
+    top_submits = sum(v["submits"] for v in agg["by_app"].values())
+    top_downloads = sum(v["downloads"] for v in agg["by_app"].values())
+
+    summary_md = (
+        f"**总请求** {_fmt_int(agg['total_events'])}    "
+        f"**活跃用户** {agg['unique_users']}\n"
+        f"**提交任务** {top_submits}    **下载** {top_downloads}    "
+        f"**峰值** {agg['peak_hour']:02d}:00"
+    )
+
+    by_app_lines = []
+    for app, stat in sorted(agg["by_app"].items(), key=lambda kv: -kv[1]["requests"]):
+        by_app_lines.append(f"- **{app}**    {_fmt_int(stat['requests'])} 请求 · {stat['users']} 用户 · {stat['submits']} 提交 · {stat['downloads']} 下载")
+    by_app_md = "\n".join(by_app_lines) if by_app_lines else "_无数据_"
+
+    by_user_lines = []
+    for u in agg["by_user"][:10]:
+        apps = ", ".join(u.get("apps", []))
+        by_user_lines.append(f"- **{u['username']}**    {u['submits']} 提交 · {u['downloads']} 下载 · {apps}")
+    by_user_md = "\n".join(by_user_lines) if by_user_lines else "_无提交/下载记录_"
+
+    fallback_flag = " _(数据洞察生成失败,使用占位文案)_" if insight.get("_fallback") else ""
+    insight_md = (
+        f"**趋势** {insight['trend']}\n\n"
+        f"**关注** {insight['highlight']}\n\n"
+        f"**建议** {insight['suggestion']}{fallback_flag}"
+    )
+
+    elements = [
+        {"tag": "markdown", "content": summary_md},
+        {"tag": "hr"},
+        {"tag": "markdown", "content": "**各应用**\n" + by_app_md},
+        {"tag": "hr"},
+        {"tag": "markdown", "content": "**Top 用户（按提交数）**\n" + by_user_md},
+        {"tag": "hr"},
+        {"tag": "markdown", "content": "**💡 洞察**\n" + insight_md},
+        {"tag": "hr"},
+        {
+            "tag": "action",
+            "actions": [{
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "📥 下载 CSV 明细"},
+                "type": "primary",
+                "url": csv_url,
+            }],
+        },
+        {"tag": "note", "elements": [{"tag": "plain_text", "content": "Portal 自动生成 · 浏览器提示自签证书时选「继续访问」"}]},
+    ]
+    return {
+        "msg_type": "interactive",
+        "card": {"schema": "2.0", "header": header, "body": {"elements": elements}},
+    }
+
+
+def sign_webhook_body(secret: str, timestamp: int) -> str:
+    """Feishu custom-bot signature: base64(HMAC-SHA256(secret, '{ts}\\n{secret}'))."""
+    string_to_sign = f"{timestamp}\n{secret}"
+    digest = hmac.new(string_to_sign.encode("utf-8"), digestmod=hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def send_webhook(webhook_url: str, card_body: dict, sign_secret: str = "", timeout: int = 15) -> tuple[bool, str]:
+    """POST the card to the webhook. Returns (ok, info). ok=False when Feishu
+    returns non-zero code or the transport itself failed."""
+    if not webhook_url:
+        return False, "webhook_url not configured"
+    payload = dict(card_body)
+    if sign_secret:
+        ts = int(time.time())
+        payload["timestamp"] = str(ts)
+        payload["sign"] = sign_webhook_body(sign_secret, ts)
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(webhook_url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        return False, f"transport error: {exc}"
+    try:
+        result = json.loads(raw)
+    except Exception:
+        return False, f"non-json response: {raw[:200]}"
+    code = result.get("code", -1)
+    if code == 0:
+        return True, "ok"
+    return False, f"feishu code={code} msg={result.get('msg','')}"

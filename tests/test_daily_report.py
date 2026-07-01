@@ -206,5 +206,92 @@ class InsightTests(unittest.TestCase):
         self.assertTrue(result["_fallback"])
 
 
+class CardBuildTests(unittest.TestCase):
+    AGG = {
+        "date": "2026-06-30",
+        "total_events": 1099,
+        "unique_users": 7,
+        "by_app": {
+            "nano-banana": {"requests": 552, "submits": 11, "downloads": 46, "users": 4},
+            "seedance":    {"requests": 352, "submits": 0,  "downloads": 11, "users": 3},
+        },
+        "by_user": [
+            {"username": "高大王", "submits": 8, "downloads": 13, "apps": ["nano-banana"]},
+        ],
+        "hourly": [0]*24,
+        "peak_hour": 14,
+    }
+    INSIGHT = {"trend": "T", "highlight": "H", "suggestion": "S"}
+
+    def test_build_card_structure(self):
+        mod = load_daily_report_module()
+        card = mod.build_card(self.AGG, self.INSIGHT, csv_url="https://portal.example/api/reports/daily/2026-06-30.csv")
+        self.assertEqual(card["msg_type"], "interactive")
+        payload = card["card"]
+        self.assertEqual(payload["schema"], "2.0")
+        blob = json.dumps(payload, ensure_ascii=False)
+        self.assertIn("2026-06-30", blob)
+        self.assertIn("1,099", blob)
+        self.assertIn("nano-banana", blob)
+        self.assertIn("高大王", blob)
+        self.assertIn("https://portal.example/api/reports/daily/2026-06-30.csv", blob)
+        self.assertIn("T", blob)
+        self.assertIn("H", blob)
+        self.assertIn("S", blob)
+
+    def test_sign_webhook_body_matches_feishu_algo(self):
+        mod = load_daily_report_module()
+        sig = mod.sign_webhook_body("secret123", 1700000000)
+        expected_string = "1700000000\nsecret123"
+        import hmac, hashlib, base64
+        expected = base64.b64encode(hmac.new(expected_string.encode(), digestmod=hashlib.sha256).digest()).decode()
+        self.assertEqual(sig, expected)
+
+
+class WebhookSendTests(unittest.TestCase):
+    def test_send_webhook_signs_when_secret_present(self):
+        mod = load_daily_report_module()
+        captured = {}
+        class FakeResp:
+            def __enter__(self_inner): return self_inner
+            def __exit__(self_inner, *a): return False
+            def read(self_inner): return b'{"code":0,"msg":"ok"}'
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["body"] = json.loads(req.data.decode())
+            return FakeResp()
+        with mock.patch.object(mod.urllib.request, "urlopen", side_effect=fake_urlopen):
+            ok, info = mod.send_webhook("https://open.feishu.cn/x", {"msg_type": "interactive", "card": {}}, sign_secret="s")
+        self.assertTrue(ok)
+        self.assertIn("timestamp", captured["body"])
+        self.assertIn("sign", captured["body"])
+
+    def test_send_webhook_no_sign_when_secret_empty(self):
+        mod = load_daily_report_module()
+        captured = {}
+        class FakeResp:
+            def __enter__(self_inner): return self_inner
+            def __exit__(self_inner, *a): return False
+            def read(self_inner): return b'{"code":0}'
+        def fake_urlopen(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode())
+            return FakeResp()
+        with mock.patch.object(mod.urllib.request, "urlopen", side_effect=fake_urlopen):
+            ok, _ = mod.send_webhook("https://x", {"msg_type": "interactive", "card": {}}, sign_secret="")
+        self.assertTrue(ok)
+        self.assertNotIn("sign", captured["body"])
+
+    def test_send_webhook_reports_feishu_error(self):
+        mod = load_daily_report_module()
+        class FakeResp:
+            def __enter__(self_inner): return self_inner
+            def __exit__(self_inner, *a): return False
+            def read(self_inner): return b'{"code":19024,"msg":"sign error"}'
+        with mock.patch.object(mod.urllib.request, "urlopen", return_value=FakeResp()):
+            ok, info = mod.send_webhook("https://x", {"msg_type": "interactive", "card": {}}, sign_secret="")
+        self.assertFalse(ok)
+        self.assertIn("19024", info)
+
+
 if __name__ == "__main__":
     unittest.main()
