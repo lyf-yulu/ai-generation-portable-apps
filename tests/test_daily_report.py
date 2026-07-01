@@ -79,5 +79,85 @@ class UsageJsonlPruneTests(unittest.TestCase):
             self.assertTrue(bad.exists(), "malformed filename should be skipped, not deleted")
 
 
+def load_daily_report_module():
+    spec = importlib.util.spec_from_file_location(
+        "daily_report_under_test",
+        ROOT / "portal" / "daily_report.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+class AggregationTests(unittest.TestCase):
+    SAMPLE = [
+        {"time": "2026-06-30 09:00:00", "app": "seedance",    "ip": "10.0.0.1", "username": "alice", "method": "POST", "path": "/api/jobs"},
+        {"time": "2026-06-30 09:00:05", "app": "seedance",    "ip": "10.0.0.1", "username": "alice", "method": "GET",  "path": "/api/jobs/abc"},
+        {"time": "2026-06-30 14:20:00", "app": "nano-banana", "ip": "10.0.0.2", "username": "bob",   "method": "POST", "path": "/api/jobs"},
+        {"time": "2026-06-30 14:22:00", "app": "nano-banana", "ip": "10.0.0.2", "username": "bob",   "method": "GET",  "path": "/api/download/xyz"},
+    ]
+
+    def _write_sample_jsonl(self, base: Path, date: str, rows: list) -> Path:
+        logs = base / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        p = logs / f"usage-{date}.jsonl"
+        with p.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return p
+
+    def test_load_events_from_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self._write_sample_jsonl(base, "2026-06-30", self.SAMPLE)
+            mod = load_daily_report_module()
+            events, source = mod.load_events(base, "2026-06-30")
+            self.assertEqual(len(events), 4)
+            self.assertEqual(source, "jsonl")
+
+    def test_load_events_fallback_to_usage_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "usage.json").write_text(json.dumps({"records": self.SAMPLE}), "utf-8")
+            mod = load_daily_report_module()
+            events, source = mod.load_events(base, "2026-06-30")
+            self.assertEqual(len(events), 4)
+            self.assertEqual(source, "fallback")
+
+    def test_aggregate(self):
+        mod = load_daily_report_module()
+        agg = mod.aggregate(self.SAMPLE, "2026-06-30")
+        self.assertEqual(agg["date"], "2026-06-30")
+        self.assertEqual(agg["total_events"], 4)
+        self.assertEqual(agg["unique_users"], 2)
+        self.assertEqual(agg["by_app"]["seedance"]["requests"], 2)
+        self.assertEqual(agg["by_app"]["nano-banana"]["submits"], 1)
+        self.assertEqual(agg["by_app"]["nano-banana"]["downloads"], 1)
+        self.assertEqual(len(agg["hourly"]), 24)
+        self.assertEqual(agg["hourly"][9], 2)
+        self.assertEqual(agg["hourly"][14], 2)
+        self.assertIn(agg["peak_hour"], (9, 14))
+        top = {u["username"] for u in agg["by_user"]}
+        self.assertEqual(top, {"alice", "bob"})
+
+    def test_write_csv_bom_and_derived_event_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            mod = load_daily_report_module()
+            csv_path = mod.write_csv(base, "2026-06-30", self.SAMPLE)
+            self.assertTrue(csv_path.exists())
+            raw = csv_path.read_bytes()
+            self.assertTrue(raw.startswith(b"\xef\xbb\xbf"), "csv must start with UTF-8 BOM")
+            text = raw.decode("utf-8-sig")
+            lines = text.strip().splitlines()
+            self.assertEqual(lines[0], "timestamp,app,username,ip,method,path,event_type")
+            self.assertEqual(len(lines), 5)
+            self.assertIn("submit_job", lines[1])
+            self.assertIn("poll", lines[2])
+            self.assertIn("submit_job", lines[3])
+            self.assertIn("download", lines[4])
+
+
 if __name__ == "__main__":
     unittest.main()
