@@ -49,6 +49,27 @@ def _view_scope(handler) -> tuple[bool, str]:
     return sees_all, username
 
 
+_USER_SANITIZE_RE = re.compile(r"[^\w\-一-鿿]+")
+
+
+def _sanitize_username(name: str | None) -> str:
+    """Compress a raw username into a safe directory name:
+    keep letters/digits/underscore/hyphen/CJK, replace others with `_`,
+    strip leading `.` `_`, cap at 40 chars, default to `unknown`."""
+    s = _USER_SANITIZE_RE.sub("_", (name or "").strip())
+    s = s.strip("._") or "unknown"
+    return s[:40]
+
+
+def _user_day_subdir(base: Path, username: str | None, day: str | None = None) -> Path:
+    """Return (and create) `base/<sanitized_user>/<YYYY-MM-DD>/`."""
+    user = _sanitize_username(username)
+    d = day or time.strftime("%Y-%m-%d")
+    p = base / user / d
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def _decode_username(handler) -> str:
     """Portal injects X-Username via urllib.parse.quote()."""
     raw = (handler.headers.get("X-Username", "") or "").strip()
@@ -141,8 +162,12 @@ def _client_ip(handler: SimpleHTTPRequestHandler) -> str:
 
 
 def _archive_dir_for(handler_or_ip: Any) -> Path:
-    if isinstance(handler_or_ip, str):
-        return ARCHIVE_DIR / handler_or_ip
+    """Return archive subdir. Prefers <username>/<date>/; falls back to IP for
+    string inputs (legacy call sites)."""
+    if hasattr(handler_or_ip, "headers"):
+        user = _decode_username(handler_or_ip)
+        return _user_day_subdir(ARCHIVE_DIR, user)
+    # Legacy string path: keep old behavior so read side still finds old archives
     return ARCHIVE_DIR / _client_ip(handler_or_ip)
 
 FILE_FIELDS = {f"image_{i}" for i in range(1, 15)}
@@ -708,8 +733,11 @@ def list_archives(handler: SimpleHTTPRequestHandler | None = None) -> list[dict[
     ws = _workspace_id(handler) if handler else "localhost"
     dir_path = STATE_DIR / "workspaces" / ws / "archives"
     dir_path.mkdir(parents=True, exist_ok=True)
+    # rglob so archives saved under future <user>/<date>/ subdirs are also
+    # surfaced alongside legacy flat entries.
+    candidates = [p for p in dir_path.rglob("*.nanobanana") if p.is_file()]
     return [{"name": p.stem, "filename": p.name, "size": p.stat().st_size, "updated_at": int(p.stat().st_mtime)}
-            for p in sorted(dir_path.glob("*.nanobanana"), key=lambda x: x.stat().st_mtime, reverse=True)]
+            for p in sorted(candidates, key=lambda x: x.stat().st_mtime, reverse=True)]
 
 
 def save_archive_file(name: str, preset: dict[str, Any], ws_id: str = "localhost", handler: SimpleHTTPRequestHandler | None = None) -> Path:
@@ -1222,6 +1250,10 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
             items = extract_chat_completion_images(result)
             if not items:
                 raise RuntimeError(f"No image result found: {result}")
+            if not values.get("output_dir"):
+                with LOCK:
+                    username = JOBS.get(job_id, {}).get("username", "")
+                values["output_dir"] = str(_user_day_subdir(OUTPUT_DIR, username))
             out_dir = resolve_output_dir(values.get("output_dir"))
             file_token_results = []
             custom_name = values.get("output_name", "").strip()
@@ -1275,6 +1307,10 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
         items = extract_gemini_images(result)
         if not items:
             raise RuntimeError(f"No image result found: {result}")
+        if not values.get("output_dir"):
+            with LOCK:
+                username = JOBS.get(job_id, {}).get("username", "")
+            values["output_dir"] = str(_user_day_subdir(OUTPUT_DIR, username))
         out_dir = resolve_output_dir(values.get("output_dir"))
         file_token_results = []
         custom_name = values.get("output_name", "").strip()
@@ -1343,6 +1379,10 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
     items = extract_items(final)
     if not items:
         raise RuntimeError(f"No image result found: {final}")
+    if not values.get("output_dir"):
+        with LOCK:
+            username = JOBS.get(job_id, {}).get("username", "")
+        values["output_dir"] = str(_user_day_subdir(OUTPUT_DIR, username))
     out_dir = resolve_output_dir(values.get("output_dir"))
     file_token_results = []
     custom_name = values.get("output_name", "").strip()

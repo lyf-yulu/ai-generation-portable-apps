@@ -49,3 +49,19 @@ class TestSeedanceHelpers:
         out = self.mod._user_day_subdir(base, "bob")
         assert out.parent.name == "bob"
         assert re.match(r"\d{4}-\d{2}-\d{2}$", out.name)
+
+
+class TestNanoBananaHelpers:
+    def setup_method(self):
+        self.mod = _load(ROOT / "nano-banana" / "app.py", "nanobanana_app_for_layout_test")
+
+    def test_sanitize_username_matches_seedance(self):
+        seedance = _load(ROOT / "seedance" / "app.py", "seedance_app_for_layout_test_cmp")
+        cases = ["alice", "张三", "", None, "a/b", "../evil", "a" * 200]
+        for c in cases:
+            assert self.mod._sanitize_username(c) == seedance._sanitize_username(c), c
+
+    def test_user_day_subdir_creates(self, tmp_path):
+        out = self.mod._user_day_subdir(tmp_path, "alice", day="2026-07-01")
+        assert out == tmp_path / "alice" / "2026-07-01"
+        assert out.is_dir()
