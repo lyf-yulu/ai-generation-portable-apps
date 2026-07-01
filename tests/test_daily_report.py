@@ -159,5 +159,52 @@ class AggregationTests(unittest.TestCase):
             self.assertIn("download", lines[4])
 
 
+class InsightTests(unittest.TestCase):
+    def test_generate_insight_returns_fallback_when_no_key(self):
+        mod = load_daily_report_module()
+        agg = {"date": "2026-06-30", "total_events": 100, "unique_users": 5,
+               "by_app": {"seedance": {"requests": 100, "submits": 10, "downloads": 5, "users": 5}},
+               "by_user": [], "hourly": [0]*24, "peak_hour": 0}
+        result = mod.generate_insight(agg, deepseek_key="")
+        self.assertIn("trend", result)
+        self.assertIn("highlight", result)
+        self.assertIn("suggestion", result)
+        self.assertTrue(result["_fallback"])
+
+    def test_generate_insight_parses_llm_json(self):
+        mod = load_daily_report_module()
+        agg = {"date": "2026-06-30", "total_events": 100, "unique_users": 5,
+               "by_app": {}, "by_user": [], "hourly": [0]*24, "peak_hour": 0}
+        fake_response = {
+            "choices": [{"message": {"content": json.dumps({
+                "trend": "整体平稳",
+                "highlight": "seedance 使用集中",
+                "suggestion": "关注高峰时段容量",
+            })}}]
+        }
+        with mock.patch.object(mod, "_deepseek_chat", return_value=fake_response):
+            result = mod.generate_insight(agg, deepseek_key="sk-fake")
+        self.assertEqual(result["trend"], "整体平稳")
+        self.assertFalse(result.get("_fallback"))
+
+    def test_generate_insight_handles_llm_failure(self):
+        mod = load_daily_report_module()
+        agg = {"date": "2026-06-30", "total_events": 0, "unique_users": 0,
+               "by_app": {}, "by_user": [], "hourly": [0]*24, "peak_hour": 0}
+        with mock.patch.object(mod, "_deepseek_chat", side_effect=RuntimeError("boom")):
+            result = mod.generate_insight(agg, deepseek_key="sk-fake")
+        self.assertTrue(result["_fallback"])
+        self.assertIn("trend", result)
+
+    def test_generate_insight_handles_bad_json(self):
+        mod = load_daily_report_module()
+        agg = {"date": "2026-06-30", "total_events": 0, "unique_users": 0,
+               "by_app": {}, "by_user": [], "hourly": [0]*24, "peak_hour": 0}
+        fake_response = {"choices": [{"message": {"content": "not json at all"}}]}
+        with mock.patch.object(mod, "_deepseek_chat", return_value=fake_response):
+            result = mod.generate_insight(agg, deepseek_key="sk-fake")
+        self.assertTrue(result["_fallback"])
+
+
 if __name__ == "__main__":
     unittest.main()

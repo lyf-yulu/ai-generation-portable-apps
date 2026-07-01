@@ -14,6 +14,8 @@ import csv
 import io
 import json
 import re
+import urllib.request
+import urllib.error
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -155,3 +157,86 @@ def write_csv(state_dir: Path, date: str, events: list[dict]) -> Path:
         f.write(b"\xef\xbb\xbf")
         f.write(buf.getvalue().encode("utf-8"))
     return path
+
+
+INSIGHT_SYSTEM_PROMPT = """你是一个数据分析助理。给你一份 AI 生成工具的日使用统计（含各子应用请求量、用户活跃度、时段分布），请输出严格 JSON：
+{
+  "trend": "一句话，描述整体情况（20-40 字）",
+  "highlight": "一条最值得注意的现象（30-50 字，正面/负面均可）",
+  "suggestion": "一条给运营的建议（30-50 字，可执行）"
+}
+只输出 JSON，不要 markdown 代码块。所有字段必须存在。"""
+
+
+def _fallback_insight() -> dict:
+    return {
+        "trend": "数据洞察生成暂不可用，请查看 CSV 明细。",
+        "highlight": "未获取到 AI 分析结果。",
+        "suggestion": "检查 DeepSeek API Key 与网络。",
+        "_fallback": True,
+    }
+
+
+def _deepseek_chat(api_key: str, messages: list[dict], timeout: int = 60) -> dict:
+    """Call DeepSeek Chat API with JSON response_format. Returns raw response dict.
+    Raises RuntimeError on non-2xx or network errors."""
+    body = json.dumps({
+        "model": "deepseek-chat",
+        "messages": messages,
+        "temperature": 0.4,
+        "max_tokens": 500,
+        "response_format": {"type": "json_object"},
+    }, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.deepseek.com/v1/chat/completions",
+        data=body,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"deepseek http {exc.code}: {exc.reason}")
+    except Exception as exc:
+        raise RuntimeError(f"deepseek call failed: {exc}")
+
+
+def _summary_for_prompt(agg: dict) -> str:
+    """Compact stats text for the LLM (no IPs, no path detail)."""
+    lines = [
+        f"日期: {agg['date']}",
+        f"总请求数: {agg['total_events']}",
+        f"活跃用户数: {agg['unique_users']}",
+        f"峰值小时: {agg['peak_hour']}:00",
+        "各应用:",
+    ]
+    for app, stat in sorted(agg.get("by_app", {}).items(), key=lambda kv: -kv[1]["requests"]):
+        lines.append(f"  {app}: 请求 {stat['requests']}, 提交 {stat['submits']}, 下载 {stat['downloads']}, 用户 {stat['users']}")
+    lines.append("Top 用户 (按提交):")
+    for u in agg.get("by_user", [])[:5]:
+        lines.append(f"  {u['username']}: 提交 {u['submits']}, 下载 {u['downloads']}, 应用 {u['apps']}")
+    return "\n".join(lines)
+
+
+def generate_insight(agg: dict, deepseek_key: str) -> dict:
+    """Return {trend, highlight, suggestion, _fallback?}. Never raises."""
+    if not deepseek_key:
+        return _fallback_insight()
+    try:
+        resp = _deepseek_chat(deepseek_key, [
+            {"role": "system", "content": INSIGHT_SYSTEM_PROMPT},
+            {"role": "user", "content": _summary_for_prompt(agg)},
+        ])
+        content = (resp.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        parsed = json.loads(content)
+        if not all(k in parsed for k in ("trend", "highlight", "suggestion")):
+            raise ValueError("missing keys")
+        return {
+            "trend": str(parsed["trend"]).strip(),
+            "highlight": str(parsed["highlight"]).strip(),
+            "suggestion": str(parsed["suggestion"]).strip(),
+        }
+    except Exception as exc:
+        print(f"  [daily_report] insight fallback: {exc}", flush=True)
+        return _fallback_insight()
