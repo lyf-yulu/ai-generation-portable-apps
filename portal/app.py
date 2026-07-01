@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+from datetime import datetime, timedelta
 import hashlib
 import http.client
 import io
@@ -34,7 +35,6 @@ if hasattr(subprocess, "CREATE_NO_WINDOW"):
 
 STATE_DIR = _DATA_BASE / "state"
 USAGE_PATH = STATE_DIR / "usage.json"
-LOGS_DIR = STATE_DIR / "logs"
 USAGE_JSONL_RETENTION_DAYS = 30
 USERS_PATH = STATE_DIR / "users.json"
 SESSIONS_PATH = STATE_DIR / "sessions.json"
@@ -614,7 +614,6 @@ def _prune_old_usage_jsonl(today: str):
         logs_dir = STATE_DIR / "logs"
         if not logs_dir.exists():
             return
-        from datetime import datetime, timedelta
         cutoff = datetime.strptime(today, "%Y-%m-%d") - timedelta(days=USAGE_JSONL_RETENTION_DAYS)
         for p in logs_dir.glob("usage-*.jsonl"):
             try:
@@ -720,13 +719,17 @@ class UsageTracker:
             app_stats = day_stats.setdefault(app, {"requests": 0, "jobs": 0})
             app_stats["requests"] += 1
             self._save()
-        # Below the lock: jsonl append + prune are best-effort, must not block primary save
+        # Below the lock: jsonl append + prune are best-effort. Helpers already
+        # swallow errors internally; the outer try/except is a second layer so
+        # even a monkey-patched replacement (tests) cannot break usage.json save.
         try:
             _append_usage_jsonl(entry, today)
         except Exception:
             pass
-        # prune once per day (cheap enough to attempt each write; glob is O(days))
-        _prune_old_usage_jsonl(today)
+        try:
+            _prune_old_usage_jsonl(today)
+        except Exception:
+            pass
 
     def register_job(self, app: str, job_id: str, username: str, job_type: str = "image", duration_per_item: int = 0):
         with self._lock:

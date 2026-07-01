@@ -51,5 +51,33 @@ class UsageJsonlTests(unittest.TestCase):
             self.assertEqual(len(data["records"]), 1)
 
 
+class UsageJsonlPruneTests(unittest.TestCase):
+    def test_prune_deletes_files_older_than_retention(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            module = load_portal_module(base)
+            logs = base / "logs"
+            logs.mkdir()
+            old = logs / "usage-2026-05-01.jsonl"
+            recent = logs / "usage-2026-06-29.jsonl"
+            old.write_text("{}\n", "utf-8")
+            recent.write_text("{}\n", "utf-8")
+            module._prune_old_usage_jsonl("2026-06-30")
+            self.assertFalse(old.exists(), "file older than 30 days should be pruned")
+            self.assertTrue(recent.exists(), "file within retention should stay")
+
+    def test_prune_ignores_files_with_bad_date_stem(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            module = load_portal_module(base)
+            logs = base / "logs"
+            logs.mkdir()
+            bad = logs / "usage-notadate.jsonl"
+            bad.write_text("{}\n", "utf-8")
+            # Must not raise
+            module._prune_old_usage_jsonl("2026-06-30")
+            self.assertTrue(bad.exists(), "malformed filename should be skipped, not deleted")
+
+
 if __name__ == "__main__":
     unittest.main()
