@@ -9,6 +9,7 @@ import io
 import json
 import mimetypes
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -28,6 +29,12 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 _DATA_BASE = Path(os.environ.get("DATA_DIR", str(ROOT)))
 STATIC_DIR = ROOT / "static"
+
+# Ensure `portal/` dir is on sys.path so `import daily_report` works whether
+# the process was launched from repo root or from portal/.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import daily_report as _daily_report_module
 
 _POPEN_EXTRA: dict[str, Any] = {}
 if hasattr(subprocess, "CREATE_NO_WINDOW"):
@@ -1126,6 +1133,11 @@ class Handler(SimpleHTTPRequestHandler):
             self._platform_activity(user)
         elif path == "/api/platform/portrait-key":
             self._platform_portrait_key_get(user)
+        elif path == "/api/feishu/config":
+            self._feishu_config_get(user)
+        elif path.startswith("/api/reports/daily/") and path.endswith(".csv"):
+            date = path[len("/api/reports/daily/"):-len(".csv")]
+            self._report_csv_download(user, date)
         elif path == "/api/auth/me":
             self._json(200, {"ok": True, "username": user["username"], "role": user["role"]})
         elif path == "/api/users":
@@ -1219,6 +1231,15 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/platform/portrait-key":
             self._platform_portrait_key_set(user)
+            return
+        if path == "/api/reports/send":
+            self._report_send(user)
+            return
+        if path == "/api/reports/preview":
+            self._report_preview(user)
+            return
+        if path == "/api/feishu/config":
+            self._feishu_config_put(user)
             return
         if not self._try_proxy(path, "POST", user):
             self._json(404, {"ok": False, "error": "not found"})
@@ -1464,6 +1485,98 @@ class Handler(SimpleHTTPRequestHandler):
             "has_access_key": bool(data.get("has_access_key")),
             "has_secret_key": bool(data.get("has_secret_key")),
         })
+
+    def _report_csv_download(self, user: dict, date: str):
+        if user.get("role") != "admin":
+            self._json(403, {"ok": False, "error": "admin only"})
+            return
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+            self._json(400, {"ok": False, "error": "invalid date"})
+            return
+        state_dir = STATE_DIR
+        csv_path = state_dir / "reports" / f"{date}.csv"
+        if not csv_path.exists():
+            # generate on demand
+            events, _ = _daily_report_module.load_events(state_dir, date)
+            csv_path = _daily_report_module.write_csv(state_dir, date, events)
+        data = csv_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="usage-{date}.csv"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _report_send(self, user: dict):
+        if user.get("role") != "admin":
+            self._json(403, {"ok": False, "error": "admin only"})
+            return
+        body = self._read_json() or {}
+        date = str(body.get("date") or "").strip()
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+            self._json(400, {"ok": False, "error": "invalid date"})
+            return
+        cfg = _daily_report_module.load_config(STATE_DIR)
+        key = _daily_report_module._load_deepseek_key(STATE_DIR)
+        try:
+            result = _daily_report_module.send_daily_report(STATE_DIR, date, cfg, deepseek_key=key, dry_run=False)
+        except Exception as exc:
+            self._json(500, {"ok": False, "error": f"send failed: {exc}"})
+            return
+        self._json(200, {"ok": result["ok"], "info": result["feishu_info"], "source": result["source"]})
+
+    def _report_preview(self, user: dict):
+        if user.get("role") != "admin":
+            self._json(403, {"ok": False, "error": "admin only"})
+            return
+        body = self._read_json() or {}
+        date = str(body.get("date") or "").strip()
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+            self._json(400, {"ok": False, "error": "invalid date"})
+            return
+        cfg = _daily_report_module.load_config(STATE_DIR)
+        key = _daily_report_module._load_deepseek_key(STATE_DIR)
+        try:
+            result = _daily_report_module.send_daily_report(STATE_DIR, date, cfg, deepseek_key=key, dry_run=True)
+        except Exception as exc:
+            self._json(500, {"ok": False, "error": f"preview failed: {exc}"})
+            return
+        self._json(200, {
+            "ok": True,
+            "source": result["source"],
+            "card": result["card"],
+        })
+
+    def _feishu_config_get(self, user: dict):
+        if user.get("role") != "admin":
+            self._json(403, {"ok": False, "error": "admin only"})
+            return
+        cfg = _daily_report_module.load_config(STATE_DIR)
+        masked = dict(cfg)
+        w = masked.get("webhook_url", "")
+        if w:
+            masked["webhook_url"] = w[:32] + "..." if len(w) > 35 else w
+        s = masked.get("sign_secret", "")
+        if s:
+            masked["sign_secret_present"] = True
+            masked["sign_secret"] = ""
+        else:
+            masked["sign_secret_present"] = False
+        self._json(200, {"ok": True, "config": masked})
+
+    def _feishu_config_put(self, user: dict):
+        if user.get("role") != "admin":
+            self._json(403, {"ok": False, "error": "admin only"})
+            return
+        body = self._read_json()
+        if body is None:
+            return
+        updates: dict = {}
+        for k in ("enabled", "webhook_url", "sign_secret", "schedule_time", "portal_base_url"):
+            if k in body:
+                updates[k] = body[k]
+        cfg = _daily_report_module.save_config(STATE_DIR, updates)
+        self._json(200, {"ok": True, "config": {k: cfg[k] for k in ("enabled", "schedule_time", "portal_base_url")}})
 
     def _platform_activity(self, user: dict):
         if not auth.has_permission(user, "view_stats_all"):
