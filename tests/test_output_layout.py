@@ -65,3 +65,18 @@ class TestNanoBananaHelpers:
         out = self.mod._user_day_subdir(tmp_path, "alice", day="2026-07-01")
         assert out == tmp_path / "alice" / "2026-07-01"
         assert out.is_dir()
+
+
+class TestDreaminaHelpers:
+    def setup_method(self):
+        self.mod = _load(ROOT / "dreamina" / "app.py", "dreamina_app_for_layout_test")
+
+    def test_sanitize_matches_others(self):
+        seedance = _load(ROOT / "seedance" / "app.py", "seedance_app_for_layout_test_cmp2")
+        for c in ["alice", "张三", "", None, "a/b", "../evil"]:
+            assert self.mod._sanitize_username(c) == seedance._sanitize_username(c)
+
+    def test_user_day_subdir_creates(self, tmp_path):
+        out = self.mod._user_day_subdir(tmp_path, "alice", day="2026-07-01")
+        assert out == tmp_path / "alice" / "2026-07-01"
+        assert out.is_dir()

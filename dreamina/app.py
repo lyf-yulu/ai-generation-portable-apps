@@ -43,8 +43,11 @@ def _client_ip(handler: SimpleHTTPRequestHandler) -> str:
 
 
 def _archive_dir_for(handler_or_ip: Any) -> Path:
-    if isinstance(handler_or_ip, str):
-        return ARCHIVE_DIR / handler_or_ip
+    """Return archive subdir. Prefers <username>/<date>/; falls back to IP for
+    string inputs (legacy call sites) and old data."""
+    if hasattr(handler_or_ip, "headers"):
+        user = _decode_username(handler_or_ip)
+        return _user_day_subdir(ARCHIVE_DIR, user)
     return ARCHIVE_DIR / _client_ip(handler_or_ip)
 def _is_admin(handler: SimpleHTTPRequestHandler) -> bool:
     """Account-management gate. Dreamina account ops (login/install-cli/
@@ -60,6 +63,27 @@ def _view_scope(handler) -> tuple[bool, str]:
     sees_all = handler.headers.get("X-Is-Admin", "") == "1"
     username = _decode_username(handler)
     return sees_all, username
+
+
+_USER_SANITIZE_RE = re.compile(r"[^\w\-一-鿿]+")
+
+
+def _sanitize_username(name: str | None) -> str:
+    """Compress a raw username into a safe directory name:
+    keep letters/digits/underscore/hyphen/CJK, replace others with `_`,
+    strip leading `.` `_`, cap at 40 chars, default to `unknown`."""
+    s = _USER_SANITIZE_RE.sub("_", (name or "").strip())
+    s = s.strip("._") or "unknown"
+    return s[:40]
+
+
+def _user_day_subdir(base: Path, username: str | None, day: str | None = None) -> Path:
+    """Return (and create) `base/<sanitized_user>/<YYYY-MM-DD>/`."""
+    user = _sanitize_username(username)
+    d = day or time.strftime("%Y-%m-%d")
+    p = base / user / d
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 def _decode_username(handler) -> str:
@@ -1217,7 +1241,12 @@ def cleanup_cache(media_days: int = 30, log_days: int = 14) -> dict[str, Any]:
 def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str, output_name: str = "", output_dir: str = "", sub_index: int = 1, total: int = 1, env_override: dict | None = None) -> dict | None:
     if not submit_id:
         return None
-    base_dir = resolve_output_dir(output_dir) if output_dir else OUTPUT_DIR
+    if output_dir:
+        base_dir = resolve_output_dir(output_dir)
+    else:
+        with LOCK:
+            username = JOBS.get(job_id, {}).get("username", "")
+        base_dir = _user_day_subdir(OUTPUT_DIR, username)
     ts = time.strftime("%Y%m%d_%H%M%S")
     short_id = job_id[:8]
     custom_name = (output_name or "").strip()
@@ -1396,13 +1425,30 @@ def preset_for_client(handler: SimpleHTTPRequestHandler | None = None) -> dict[s
 
 def list_archives(handler: SimpleHTTPRequestHandler | None = None) -> list[dict[str, Any]]:
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    dir_path = _archive_dir_for(handler) if handler else ARCHIVE_DIR
-    dir_path.mkdir(parents=True, exist_ok=True)
-    archives = []
-    for f in sorted(dir_path.iterdir()):
-        if f.suffix == ".dreamina" and f.is_file():
-            archives.append({"name": f.stem, "size": f.stat().st_size, "mtime": f.stat().st_mtime})
-    return archives
+    seen: dict[str, dict[str, Any]] = {}
+    candidates: list[Path] = []
+    if handler is not None:
+        # New layout: ARCHIVE_DIR/<username>/<date>/*.dreamina (all dates)
+        user = _sanitize_username(_decode_username(handler))
+        user_root = ARCHIVE_DIR / user
+        if user_root.is_dir():
+            candidates.extend(p for p in user_root.rglob("*.dreamina") if p.is_file())
+        # Legacy IP-scoped layout: ARCHIVE_DIR/<ip>/*.dreamina
+        legacy_ip_dir = ARCHIVE_DIR / _client_ip(handler)
+        if legacy_ip_dir.is_dir():
+            candidates.extend(p for p in legacy_ip_dir.iterdir()
+                              if p.is_file() and p.suffix == ".dreamina")
+    else:
+        if ARCHIVE_DIR.is_dir():
+            candidates.extend(p for p in ARCHIVE_DIR.iterdir()
+                              if p.is_file() and p.suffix == ".dreamina")
+    for f in candidates:
+        # Dedupe by stem; keep newest mtime if the same name lives in both places.
+        prev = seen.get(f.stem)
+        if prev is None or f.stat().st_mtime > prev["mtime"]:
+            seen[f.stem] = {"name": f.stem, "size": f.stat().st_size,
+                            "mtime": f.stat().st_mtime}
+    return sorted(seen.values(), key=lambda x: x["mtime"], reverse=True)
 
 
 def save_archive(name: str, preset: dict[str, Any], handler: SimpleHTTPRequestHandler | None = None):
@@ -1429,11 +1475,27 @@ def load_archive(name: str, handler: SimpleHTTPRequestHandler | None = None) -> 
     safe_name = sanitize_archive_name(name)
     path = dir_path / f"{safe_name}.dreamina"
     if not path.exists():
-        # Fallback to legacy top-level location + migrate
-        legacy = ARCHIVE_DIR / f"{safe_name}.dreamina"
-        if legacy.exists():
-            path = legacy
-        else:
+        # Search wider: today's <user>/<date>/ may not have it, but an older
+        # date under the same user, the legacy IP dir, or the flat top-level
+        # location might.
+        path = None  # type: ignore[assignment]
+        if handler is not None:
+            user = _sanitize_username(_decode_username(handler))
+            user_root = ARCHIVE_DIR / user
+            if user_root.is_dir():
+                match = next((p for p in user_root.rglob(f"{safe_name}.dreamina")
+                              if p.is_file()), None)
+                if match:
+                    path = match
+            if path is None:
+                legacy_ip = ARCHIVE_DIR / _client_ip(handler) / f"{safe_name}.dreamina"
+                if legacy_ip.is_file():
+                    path = legacy_ip
+        if path is None:
+            legacy = ARCHIVE_DIR / f"{safe_name}.dreamina"
+            if legacy.is_file():
+                path = legacy
+        if path is None:
             return None
     ws = _workspace_id(handler) if handler else "localhost"
     ws_media = _ws_media_dir(ws)
