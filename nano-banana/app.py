@@ -70,6 +70,16 @@ def _user_day_subdir(base: Path, username: str | None, day: str | None = None) -
     return p
 
 
+def _ensure_output_dir(values: dict, job_id: str) -> None:
+    """Fill values['output_dir'] with a <user>/<date>/ subdir when the caller
+    left it empty. Reads username from the JOBS registry under the module lock."""
+    if values.get("output_dir"):
+        return
+    with LOCK:
+        username = JOBS.get(job_id, {}).get("username", "")
+    values["output_dir"] = str(_user_day_subdir(OUTPUT_DIR, username))
+
+
 def _decode_username(handler) -> str:
     """Portal injects X-Username via urllib.parse.quote()."""
     raw = (handler.headers.get("X-Username", "") or "").strip()
@@ -1250,10 +1260,7 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
             items = extract_chat_completion_images(result)
             if not items:
                 raise RuntimeError(f"No image result found: {result}")
-            if not values.get("output_dir"):
-                with LOCK:
-                    username = JOBS.get(job_id, {}).get("username", "")
-                values["output_dir"] = str(_user_day_subdir(OUTPUT_DIR, username))
+            _ensure_output_dir(values, job_id)
             out_dir = resolve_output_dir(values.get("output_dir"))
             file_token_results = []
             custom_name = values.get("output_name", "").strip()
@@ -1307,10 +1314,7 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
         items = extract_gemini_images(result)
         if not items:
             raise RuntimeError(f"No image result found: {result}")
-        if not values.get("output_dir"):
-            with LOCK:
-                username = JOBS.get(job_id, {}).get("username", "")
-            values["output_dir"] = str(_user_day_subdir(OUTPUT_DIR, username))
+        _ensure_output_dir(values, job_id)
         out_dir = resolve_output_dir(values.get("output_dir"))
         file_token_results = []
         custom_name = values.get("output_name", "").strip()
@@ -1379,10 +1383,7 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
     items = extract_items(final)
     if not items:
         raise RuntimeError(f"No image result found: {final}")
-    if not values.get("output_dir"):
-        with LOCK:
-            username = JOBS.get(job_id, {}).get("username", "")
-        values["output_dir"] = str(_user_day_subdir(OUTPUT_DIR, username))
+    _ensure_output_dir(values, job_id)
     out_dir = resolve_output_dir(values.get("output_dir"))
     file_token_results = []
     custom_name = values.get("output_name", "").strip()
