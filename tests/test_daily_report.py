@@ -335,6 +335,33 @@ class SendDailyReportTests(unittest.TestCase):
             self.assertEqual(args[0], "https://x")
             self.assertIn("2026-06-30", json.dumps(args[1], ensure_ascii=False))
 
+    def test_csv_url_uses_portal_base_when_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self._seed(base)
+            mod = load_daily_report_module()
+            result = mod.send_daily_report(base, "2026-06-30",
+                                           config={"webhook_url": "", "portal_base_url": "https://portal.internal:9090/"},
+                                           deepseek_key="",
+                                           dry_run=True)
+            blob = json.dumps(result["card"], ensure_ascii=False)
+            self.assertIn("https://portal.internal:9090/api/reports/daily/2026-06-30.csv", blob)
+
+    def test_csv_url_falls_back_to_lan_url_when_config_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self._seed(base)
+            mod = load_daily_report_module()
+            with mock.patch.object(mod, "_default_portal_base_url", return_value="https://192.168.1.2:9090"):
+                result = mod.send_daily_report(base, "2026-06-30",
+                                               config={"webhook_url": "", "portal_base_url": ""},
+                                               deepseek_key="",
+                                               dry_run=True)
+            blob = json.dumps(result["card"], ensure_ascii=False)
+            self.assertIn("https://192.168.1.2:9090/api/reports/daily/2026-06-30.csv", blob)
+            # Guard against regressions where the button URL becomes a bare path
+            self.assertNotIn('"url": "/api/reports', blob)
+
 
 class ConfigTests(unittest.TestCase):
     def test_load_config_returns_defaults_when_missing(self):

@@ -19,6 +19,7 @@ import io
 import json
 import os
 import re
+import socket
 import time
 import urllib.request
 import urllib.error
@@ -402,6 +403,24 @@ def _load_deepseek_key(state_dir: Path) -> str:
     return ""
 
 
+def _default_portal_base_url() -> str:
+    """Best-effort LAN base URL when config.portal_base_url is empty.
+    Uses the UDP-connect trick to grab the outbound interface IP; falls back
+    to 127.0.0.1 which is only useful for local self-testing but at least
+    yields a valid absolute URL so the Feishu button doesn't 404."""
+    ip = "127.0.0.1"
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(2.0)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        pass
+    port = os.environ.get("PORTAL_PORT", "9090")
+    return f"https://{ip}:{port}"
+
+
 def send_daily_report(state_dir: Path, date: str, config: dict, deepseek_key: str, dry_run: bool = False) -> dict:
     """End-to-end: load events -> aggregate -> csv -> insight -> card -> (send).
     Returns {ok, source, csv_path, card, feishu_info}."""
@@ -409,8 +428,8 @@ def send_daily_report(state_dir: Path, date: str, config: dict, deepseek_key: st
     csv_path = write_csv(state_dir, date, events)
     agg = aggregate(events, date)
     insight = generate_insight(agg, deepseek_key)
-    portal_base = (config.get("portal_base_url") or "").rstrip("/")
-    csv_url = f"{portal_base}/api/reports/daily/{date}.csv" if portal_base else f"/api/reports/daily/{date}.csv"
+    portal_base = (config.get("portal_base_url") or "").rstrip("/") or _default_portal_base_url()
+    csv_url = f"{portal_base}/api/reports/daily/{date}.csv"
     card = build_card(agg, insight, csv_url=csv_url)
     if source == "fallback":
         card["card"]["body"]["elements"].insert(
