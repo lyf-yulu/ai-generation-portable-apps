@@ -48,6 +48,8 @@ def _archive_dir_for(handler_or_ip: Any) -> Path:
     if hasattr(handler_or_ip, "headers"):
         user = _decode_username(handler_or_ip)
         return _user_day_subdir(ARCHIVE_DIR, user)
+    if isinstance(handler_or_ip, str):
+        return ARCHIVE_DIR / handler_or_ip
     return ARCHIVE_DIR / _client_ip(handler_or_ip)
 def _is_admin(handler: SimpleHTTPRequestHandler) -> bool:
     """Account-management gate. Dreamina account ops (login/install-cli/
