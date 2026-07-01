@@ -731,6 +731,8 @@ function StatsApp() {
       previewJson: '',
       status: '',
       _secretPresent: false,
+      _webhookPresent: false,
+      _webhookHint: '',
     },
 
     fmtDmStat(s) {
@@ -1039,11 +1041,13 @@ function StatsApp() {
         if (r.ok && r.config) {
           const c = r.config;
           this.feishu.enabled = !!c.enabled;
-          this.feishu.webhook_url = c.webhook_url || '';
+          // Server never sends plaintext webhook_url back; show a hint instead
+          this.feishu.webhook_url = '';
+          this.feishu._webhookPresent = !!c.webhook_url_present;
+          this.feishu._webhookHint = c.webhook_url_hint || '';
           this.feishu.schedule_time = c.schedule_time || '09:05';
           this.feishu.portal_base_url = c.portal_base_url || '';
           this.feishu._secretPresent = !!c.sign_secret_present;
-          // never populate sign_secret from server (masked); user re-types to change
           this.feishu.sign_secret = '';
         }
       } catch (e) {
@@ -1054,11 +1058,11 @@ function StatsApp() {
       this.feishu.status = '保存中...';
       const body = {
         enabled: this.feishu.enabled,
-        webhook_url: this.feishu.webhook_url,
         schedule_time: this.feishu.schedule_time,
         portal_base_url: this.feishu.portal_base_url,
       };
-      // Only send sign_secret if user typed something; empty means "don't change"
+      // Only send webhook_url / sign_secret if user typed something; empty means "don't change"
+      if ((this.feishu.webhook_url || '').length > 0) body.webhook_url = this.feishu.webhook_url;
       if ((this.feishu.sign_secret || '').length > 0) body.sign_secret = this.feishu.sign_secret;
       try {
         const r = await fetch('/api/feishu/config', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)}).then(r => r.json());

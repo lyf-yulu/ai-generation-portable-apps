@@ -1564,16 +1564,20 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(403, {"ok": False, "error": "admin only"})
             return
         cfg = _daily_report_module.load_config(STATE_DIR)
+        # Secrets (webhook URL + sign secret) are never sent back to the browser
+        # in plaintext to avoid accidental round-trip corruption if the admin
+        # saves without retyping. Frontend shows a *_present flag instead.
         masked = dict(cfg)
         w = masked.get("webhook_url", "")
+        masked["webhook_url_present"] = bool(w)
         if w:
-            masked["webhook_url"] = w[:32] + "..." if len(w) > 35 else w
-        s = masked.get("sign_secret", "")
-        if s:
-            masked["sign_secret_present"] = True
-            masked["sign_secret"] = ""
+            masked["webhook_url_hint"] = w[:35] + "..." if len(w) > 38 else w
         else:
-            masked["sign_secret_present"] = False
+            masked["webhook_url_hint"] = ""
+        masked["webhook_url"] = ""
+        s = masked.get("sign_secret", "")
+        masked["sign_secret_present"] = bool(s)
+        masked["sign_secret"] = ""
         self._json(200, {"ok": True, "config": masked})
 
     def _feishu_config_put(self, user: dict):
