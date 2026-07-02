@@ -677,8 +677,10 @@ def ark_v3_call(method, path, body=None, timeout=120, api_key=None):
             err_body = e.read().decode(errors="replace")[:500]
         except Exception:
             pass
+        print(f"  [ark_v3_call] FAIL {method} {path} HTTP={e.code}: {err_body}", flush=True)
         return {"error": f"HTTP {e.code}", "detail": err_body}
     except Exception as e:
+        print(f"  [ark_v3_call] EXC {method} {path}: {e}", flush=True)
         return {"error": str(e)}
 
 
@@ -1399,10 +1401,12 @@ def _run_virtual_job_impl(job_id, job):
         result = ark_v3_call("POST", "/contents/generations/tasks", body, timeout=120, api_key=api_key)
         task_id = result.get("id") or result.get("task_id", "")
         if "error" in result:
+            detail = result.get("detail", "")
+            err_msg = f"{result['error']}: {detail}" if detail else result["error"]
             with JOBS_LOCK:
-                job["errors"].append(f"Run {idx}: {result['error']}")
+                job["errors"].append(f"Run {idx}: {err_msg}")
                 job["done"] += 1
-                job["events"].append({"time": time.strftime("%H:%M:%S"), "message": f"Run {idx} 提交失败: {result['error']}"})
+                job["events"].append({"time": time.strftime("%H:%M:%S"), "message": f"Run {idx} 提交失败: {err_msg}"})
             continue
 
         with JOBS_LOCK:

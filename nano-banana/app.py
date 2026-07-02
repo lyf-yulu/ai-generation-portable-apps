@@ -438,7 +438,11 @@ def media_item_to_file(field: str, item: Any) -> tuple[str, bytes] | None:
                 blob = resp.read()
                 mime = resp.headers.get_content_type() or mimetypes.guess_type(url)[0] or "image/png"
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"参考素材下载失败 (HTTP {exc.code}): {url}") from exc
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                detail = ""
+            raise RuntimeError(f"参考素材下载失败 (HTTP {exc.code}): {url} — {detail}") from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise RuntimeError(f"参考素材下载失败 (连接错误): {url} — {exc}") from exc
         if not blob:
@@ -1105,7 +1109,11 @@ def download_url(url: str, out_path: Path) -> None:
         with urllib.request.urlopen(req, timeout=300) as resp:
             out_path.write_bytes(resp.read())
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"生成结果下载失败 (HTTP {exc.code}): {url[:120]}") from exc
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            detail = ""
+        raise RuntimeError(f"生成结果下载失败 (HTTP {exc.code}): {url[:120]} — {detail}") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise RuntimeError(f"生成结果下载失败 (连接错误): {url[:120]} — {exc}") from exc
 
