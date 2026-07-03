@@ -118,9 +118,9 @@ class TestPurgeHandler:
 
         def fake_openapi(action, body, ak=None, sk=None):
             if action == "ListAssetGroups":
-                return {"result": {"Items": page_items, "TotalCount": 4}}
+                return {"Result": {"Items": page_items, "TotalCount": 4}}
             if action == "ListAssets":
-                return {"result": {"Items": [], "TotalCount": 0}}
+                return {"Result": {"Items": [], "TotalCount": 0}}
             return {"error": "unexpected"}
 
         monkeypatch.setattr(self.mod, "openapi_call", fake_openapi)
@@ -142,7 +142,7 @@ class TestPurgeHandler:
 
         def fake_openapi(action, body, ak=None, sk=None):
             if action == "ListAssetGroups":
-                return {"result": {"Items": many, "TotalCount": 210}}
+                return {"Result": {"Items": many, "TotalCount": 210}}
             return {"error": "unexpected"}
 
         monkeypatch.setattr(self.mod, "openapi_call", fake_openapi)

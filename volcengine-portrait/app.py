@@ -1192,20 +1192,6 @@ def handle_virtual_group_delete(handler, group_id):
 _PURGE_MAX_GROUPS = 200
 
 
-def _purge_extract_items(response):
-    """Extract Items list from an OpenAPI response, tolerating Result/result casing."""
-    if not isinstance(response, dict):
-        return []
-    for key in ("Result", "result"):
-        inner = response.get(key)
-        if isinstance(inner, dict):
-            items = inner.get("Items")
-            if items is not None:
-                return items or []
-    items = response.get("Items")
-    return items or []
-
-
 def handle_virtual_groups_purge(handler):
     """Bulk-delete AIGC groups whose ID date is strictly before `before_date`.
     Admin only. See docs/superpowers/specs/2026-07-02-portrait-purge-old-groups-design.md."""
@@ -1248,7 +1234,7 @@ def handle_virtual_groups_purge(handler):
             json_response(handler, 502, {"ok": False, "error": list_result["error"],
                                          "detail": list_result.get("detail")})
             return
-        items = _purge_extract_items(list_result)
+        items = openapi_result(list_result).get("Items") or []
         if not items:
             break
         all_groups.extend(items)
@@ -1294,7 +1280,7 @@ def handle_virtual_groups_purge(handler):
             if "error" in r:
                 list_err = r
                 break
-            items = _purge_extract_items(r)
+            items = openapi_result(r).get("Items") or []
             for it in items:
                 aid = it.get("Id") or it.get("AssetId", "")
                 if aid:
@@ -1304,7 +1290,6 @@ def handle_virtual_groups_purge(handler):
             asset_page += 1
             if asset_page > 100:  # 10000-asset safety cap per group
                 break
-            time.sleep(0.1)
         candidates.append({**m, "asset_count": len(asset_ids), "_asset_ids": asset_ids,
                            "_list_error": list_err})
 
@@ -1343,7 +1328,6 @@ def handle_virtual_groups_purge(handler):
                 asset_fail = True
                 break
             assets_deleted += 1
-            time.sleep(0.1)
         if asset_fail:
             result_rows.append({**{k: v for k, v in c.items() if not k.startswith("_")},
                                 "deleted": False, "error": "asset deletion failed"})
