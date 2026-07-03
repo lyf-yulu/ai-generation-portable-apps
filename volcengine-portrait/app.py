@@ -1156,6 +1156,23 @@ def handle_virtual_asset_update(handler, asset_id):
     json_response(handler, 200, {"ok": True, "asset_id": asset_id})
 
 
+_GROUP_ID_DATE_RE = re.compile(r"^group-(\d{8})\d{6}-[a-zA-Z0-9]+$")
+
+
+def _parse_group_id_date(group_id: str | None) -> str | None:
+    """Extract YYYY-MM-DD from a Volcengine group ID.
+    Group IDs are server-generated as `group-YYYYMMDDHHMMSS-<random>`.
+    Returns None if the id doesn't match this strict shape (e.g. renamed
+    or manually-created groups we should skip)."""
+    if not group_id:
+        return None
+    m = _GROUP_ID_DATE_RE.match(group_id)
+    if not m:
+        return None
+    ymd = m.group(1)
+    return f"{ymd[0:4]}-{ymd[4:6]}-{ymd[6:8]}"
+
+
 def handle_virtual_group_delete(handler, group_id):
     """Delete an asset group via DeleteAssetGroup."""
     ak = None  # company-wide; admin-managed via /api/config (X-Is-Admin)
