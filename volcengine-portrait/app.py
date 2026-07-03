@@ -1189,6 +1189,193 @@ def handle_virtual_group_delete(handler, group_id):
     json_response(handler, 200, {"ok": True})
 
 
+_PURGE_MAX_GROUPS = 200
+
+
+def _purge_extract_items(response):
+    """Extract Items list from an OpenAPI response, tolerating Result/result casing."""
+    if not isinstance(response, dict):
+        return []
+    for key in ("Result", "result"):
+        inner = response.get(key)
+        if isinstance(inner, dict):
+            items = inner.get("Items")
+            if items is not None:
+                return items or []
+    items = response.get("Items")
+    return items or []
+
+
+def handle_virtual_groups_purge(handler):
+    """Bulk-delete AIGC groups whose ID date is strictly before `before_date`.
+    Admin only. See docs/superpowers/specs/2026-07-02-portrait-purge-old-groups-design.md."""
+    if handler.headers.get("X-Is-Admin", "") != "1":
+        json_response(handler, 403, {"ok": False, "error": "admin only"})
+        return
+
+    data = read_json_body(handler)
+    before_date = (data.get("before_date") or "").strip()
+    dry_run = bool(data.get("dry_run", True))
+
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", before_date):
+        json_response(handler, 400, {"ok": False, "error": "before_date must be YYYY-MM-DD"})
+        return
+    from datetime import date as _date, timedelta as _td
+    try:
+        target = _date.fromisoformat(before_date)
+    except ValueError:
+        json_response(handler, 400, {"ok": False, "error": "invalid before_date"})
+        return
+    if target < _date(2020, 1, 1) or target > _date.today() + _td(days=1):
+        json_response(handler, 400, {"ok": False, "error": "before_date out of allowed range"})
+        return
+    before_yyyymmdd = before_date.replace("-", "")
+
+    ak = None
+    sk = None
+
+    all_groups = []
+    page_num = 1
+    _max_pages = 50  # safety cap: 50 * 100 = 5000 groups max scanned
+    while page_num <= _max_pages:
+        list_result = openapi_call("ListAssetGroups", {
+            "Filter": {"GroupType": "AIGC"},
+            "PageNumber": page_num,
+            "PageSize": 100,
+            "ProjectName": PROJECT_NAME,
+        }, ak=ak, sk=sk)
+        if "error" in list_result:
+            json_response(handler, 502, {"ok": False, "error": list_result["error"],
+                                         "detail": list_result.get("detail")})
+            return
+        items = _purge_extract_items(list_result)
+        if not items:
+            break
+        all_groups.extend(items)
+        if len(items) < 100:
+            break
+        # Early exit: already past cap, no need to keep paging.
+        if len(all_groups) > _PURGE_MAX_GROUPS:
+            break
+        page_num += 1
+
+    total_scanned = len(all_groups)
+
+    matched = []
+    skipped_non_matching = 0
+    for g in all_groups:
+        gid = g.get("Id", "")
+        gdate = _parse_group_id_date(gid)
+        if gdate is None:
+            skipped_non_matching += 1
+            continue
+        if gdate.replace("-", "") < before_yyyymmdd:
+            matched.append({"group_id": gid, "name": g.get("Name", ""), "date": gdate})
+
+    if len(matched) > _PURGE_MAX_GROUPS:
+        json_response(handler, 400, {"ok": False,
+            "error": f"too many groups matched ({len(matched)}); max {_PURGE_MAX_GROUPS} per batch. Please pick a more recent date."})
+        return
+
+    candidates = []
+    for m in matched:
+        gid = m["group_id"]
+        asset_ids = []
+        asset_page = 1
+        list_err = None
+        while True:
+            r = openapi_call("ListAssets", {
+                "Filter": {"GroupType": "AIGC", "GroupIds": [gid],
+                           "Statuses": ["Active", "Processing", "Failed"]},
+                "PageNumber": asset_page,
+                "PageSize": 100,
+                "ProjectName": PROJECT_NAME,
+            }, ak=ak, sk=sk)
+            if "error" in r:
+                list_err = r
+                break
+            items = _purge_extract_items(r)
+            for it in items:
+                aid = it.get("Id") or it.get("AssetId", "")
+                if aid:
+                    asset_ids.append(aid)
+            if len(items) < 100:
+                break
+            asset_page += 1
+            if asset_page > 100:  # 10000-asset safety cap per group
+                break
+            time.sleep(0.1)
+        candidates.append({**m, "asset_count": len(asset_ids), "_asset_ids": asset_ids,
+                           "_list_error": list_err})
+
+    if dry_run:
+        json_response(handler, 200, {
+            "ok": True, "dry_run": True, "before_date": before_date,
+            "total_scanned": total_scanned, "matched": len(matched),
+            "skipped_non_matching_id": skipped_non_matching,
+            "candidates": [{k: v for k, v in c.items() if not k.startswith("_")}
+                           for c in candidates],
+        })
+        return
+
+    print(f"  [purge] before_date={before_date} scanned={total_scanned} matched={len(matched)}", flush=True)
+    groups_deleted = 0
+    assets_deleted = 0
+    errors = []
+    result_rows = []
+
+    for c in candidates:
+        gid = c["group_id"]
+        if c.get("_list_error"):
+            errors.append({"group_id": gid, "stage": "list_assets",
+                           "detail": c["_list_error"].get("error", "unknown")})
+            result_rows.append({**{k: v for k, v in c.items() if not k.startswith("_")},
+                                "deleted": False, "error": "list_assets failed"})
+            print(f"  [purge] group={gid} FAIL stage=list_assets", flush=True)
+            continue
+        asset_fail = False
+        for aid in c["_asset_ids"]:
+            r = openapi_call("DeleteAsset", {"Id": aid, "ProjectName": PROJECT_NAME},
+                             ak=ak, sk=sk)
+            if "error" in r:
+                errors.append({"group_id": gid, "stage": "delete_asset",
+                               "asset_id": aid, "detail": r.get("error", "")})
+                asset_fail = True
+                break
+            assets_deleted += 1
+            time.sleep(0.1)
+        if asset_fail:
+            result_rows.append({**{k: v for k, v in c.items() if not k.startswith("_")},
+                                "deleted": False, "error": "asset deletion failed"})
+            print(f"  [purge] group={gid} FAIL stage=delete_asset", flush=True)
+            continue
+        r = openapi_call("DeleteAssetGroup", {"Id": gid, "ProjectName": PROJECT_NAME},
+                         ak=ak, sk=sk)
+        if "error" in r:
+            errors.append({"group_id": gid, "stage": "delete_group",
+                           "detail": r.get("error", "")})
+            result_rows.append({**{k: v for k, v in c.items() if not k.startswith("_")},
+                                "deleted": False, "error": "delete_group failed"})
+            print(f"  [purge] group={gid} FAIL stage=delete_group", flush=True)
+            continue
+        groups_deleted += 1
+        with GROUP_LOCK:
+            GROUPS.pop(gid, None)
+        result_rows.append({**{k: v for k, v in c.items() if not k.startswith("_")},
+                            "deleted": True})
+        print(f"  [purge] group={gid} assets={len(c['_asset_ids'])} ok", flush=True)
+        time.sleep(0.1)
+
+    print(f"  [purge] done groups={groups_deleted} assets={assets_deleted} errors={len(errors)}", flush=True)
+    json_response(handler, 200, {
+        "ok": True, "dry_run": False, "before_date": before_date,
+        "total_scanned": total_scanned, "matched": len(matched),
+        "skipped_non_matching_id": skipped_non_matching,
+        "groups_deleted": groups_deleted, "assets_deleted": assets_deleted,
+        "errors": errors, "candidates": result_rows,
+    })
+
+
 def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
     content_type = handler.headers.get("Content-Type", "")
 
@@ -1675,6 +1862,9 @@ class Handler(SimpleHTTPRequestHandler):
                 json_response(self, 200, {"path": choose_output_dir()})
             except Exception as exc:
                 json_response(self, 500, {"error": str(exc)})
+            return
+        if path == "/api/virtual/groups/purge":
+            handle_virtual_groups_purge(self)
             return
         if path == "/api/virtual/groups":
             handle_virtual_groups_post(self)
