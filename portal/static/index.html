@@ -286,6 +286,44 @@
             <p v-if="groupId" style="color:#22c55e;font-size:12px;margin-top:6px">组 ID: {{ groupId }}</p>
           </section>
 
+          <section class="card" v-if="isAdmin" style="background:#fef3c7;border:1px solid #f59e0b">
+            <h2>🧹 批量清理旧素材组 <span style="font-size:11px;color:#92400e">（管理员）</span></h2>
+            <p style="font-size:12px;color:#78350f;margin-bottom:8px">
+              删除 group ID 日期在此之前的所有 AIGC 组（含内部资产）。仅按 ID 规则识别（重命名不影响；不符合 ID 规则的手动组会被跳过）。
+            </p>
+            <div class="row" style="margin-bottom:6px;align-items:center">
+              <label style="font-size:12px;color:#78350f">保留日期
+                <input type="date" v-model="purge.beforeDate" style="margin-left:6px;font-size:12px">
+              </label>
+              <button @click="previewPurge()" :disabled="purge.running || !purge.beforeDate" class="btn-sm">
+                {{ purge.running && !purge.dryRun && !purge.lastResult ? '扫描中...' : '预览待删' }}
+              </button>
+            </div>
+            <div v-if="purge.errorMsg" style="color:#dc2626;font-size:12px;margin-top:6px">{{ purge.errorMsg }}</div>
+            <div v-if="purge.dryRun" style="margin-top:8px;padding:8px;background:#fff;border:1px solid #fbbf24;border-radius:4px">
+              <div style="font-size:12px;color:#78350f;margin-bottom:6px">
+                扫描到 {{ purge.dryRun.total_scanned }} 个组，将删除
+                <strong>{{ purge.dryRun.matched }}</strong> 个组
+                （跳过 {{ purge.dryRun.skipped_non_matching_id }} 个不符合命名规则的组）：
+              </div>
+              <ul style="max-height:180px;overflow:auto;font-size:11px;color:#334155;margin:0;padding-left:16px">
+                <li v-for="c in purge.dryRun.candidates">
+                  {{ c.date }} · {{ c.name || '(无名)' }} · {{ c.group_id }} · <em>{{ c.asset_count }} 资产</em>
+                </li>
+              </ul>
+              <button @click="executePurge()" :disabled="purge.running" class="btn-sm"
+                      style="margin-top:8px;background:#dc2626;color:#fff;border-color:#dc2626">
+                {{ purge.running ? '执行中...' : '确认执行' }}
+              </button>
+            </div>
+            <div v-if="purge.lastResult" style="margin-top:8px;padding:8px;background:#dcfce7;border:1px solid #22c55e;border-radius:4px;font-size:12px;color:#166534">
+              ✓ 清理完成：删除了 {{ purge.lastResult.groups_deleted }} 个组，{{ purge.lastResult.assets_deleted }} 个资产。
+              <span v-if="purge.lastResult.errors && purge.lastResult.errors.length" style="color:#dc2626">
+                有 {{ purge.lastResult.errors.length }} 个错误（查看日志）
+              </span>
+            </div>
+          </section>
+
           <section class="card">
             <h2>2. 上传素材 <span style="font-size:11px;color:#64748b">（虚拟人像）</span></h2>
             <div class="row" style="margin-bottom:6px">

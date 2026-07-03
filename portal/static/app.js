@@ -1218,6 +1218,15 @@ function VolcenginePortraitApp() {
     outputDir: '', outputDirInput: '', showOutputDirInput: false,
     savingOutputDir: false, outputDirMsg: '', outputDirOk: true,
 
+    isAdmin: false,
+    purge: {
+      beforeDate: '',
+      dryRun: null,
+      running: false,
+      lastResult: null,
+      errorMsg: '',
+    },
+
     // Debug log
     debugLogs: [],
     debugVisible: false,
@@ -1233,6 +1242,15 @@ function VolcenginePortraitApp() {
 
     async init() {
       window._vpApp = this;
+      // Local today for default purge cutoff (YYYY-MM-DD, local timezone)
+      const now = new Date();
+      const pad = n => String(n).padStart(2, '0');
+      this.purge.beforeDate = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}`;
+      // Pull my role once
+      try {
+        const me = await (await fetch('/api/auth/me')).json();
+        this.isAdmin = me?.role === 'admin';
+      } catch (e) { this.isAdmin = false; }
       this.loadGroups();
       this.loadJobs();
       this.loadOutputDir();
@@ -1300,6 +1318,41 @@ function VolcenginePortraitApp() {
         this.groupId = '';
         this.assets = [];
         this.loadGroups();
+      }
+    },
+
+    async previewPurge() {
+      this.purge.errorMsg = '';
+      this.purge.dryRun = null;
+      this.purge.lastResult = null;
+      this.purge.running = true;
+      const res = await vpApi.call(this, `${appPath}/api/virtual/groups/purge`, 'POST',
+        JSON.stringify({ before_date: this.purge.beforeDate, dry_run: true }));
+      this.purge.running = false;
+      if (res?.ok) {
+        this.purge.dryRun = res;
+      } else {
+        this.purge.errorMsg = (res?.error || '预览失败') + (res?.detail ? ` — ${String(res.detail).slice(0, 200)}` : '');
+      }
+    },
+
+    async executePurge() {
+      if (!this.purge.dryRun) return;
+      const n = this.purge.dryRun.matched;
+      const a = (this.purge.dryRun.candidates || []).reduce((s, c) => s + (c.asset_count || 0), 0);
+      if (!confirm(`将删除 ${n} 个组，含约 ${a} 个资产。此操作不可撤销，确认执行？`)) return;
+      this.purge.errorMsg = '';
+      this.purge.lastResult = null;
+      this.purge.running = true;
+      const res = await vpApi.call(this, `${appPath}/api/virtual/groups/purge`, 'POST',
+        JSON.stringify({ before_date: this.purge.beforeDate, dry_run: false }));
+      this.purge.running = false;
+      if (res?.ok) {
+        this.purge.lastResult = res;
+        this.purge.dryRun = null;
+        this.loadGroups();
+      } else {
+        this.purge.errorMsg = (res?.error || '清理失败') + (res?.detail ? ` — ${String(res.detail).slice(0, 200)}` : '');
       }
     },
 
