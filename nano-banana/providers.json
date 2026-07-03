@@ -29,7 +29,9 @@
       },
       "models": [
         {"id": "nano-banana-2", "label": "nano-banana-2"},
-        {"id": "gemini-3.1-flash-image-preview", "label": "gemini-3.1-flash-image-preview"}
+        {"id": "gemini-3.1-flash-image-preview", "label": "gemini-3.1-flash-image-preview"},
+        {"id": "gemini-3-pro-image-2k", "label": "gemini-3-pro-image-2k"},
+        {"id": "gemini-3-pro-image-4k", "label": "gemini-3-pro-image-4k"}
       ]
     },
     "gemini": {

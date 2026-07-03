@@ -22,8 +22,6 @@ function _workspaceId() {
 async function api(url, method, body) {
   try {
     const headers = { 'X-Workspace-Id': _workspaceId() };
-    const keyId = localStorage.getItem('portal_key_id_nano-banana');
-    if (keyId) headers['X-Key-Id'] = keyId;
     const opts = { method: method || 'GET', headers };
     if (body) opts.body = body;
     const res = await fetch(url, opts);
@@ -219,7 +217,7 @@ function resolveMediaUrl(url) {
 // Module 7: Provider Models (fallback)
 // ============================================================
 var FALLBACK_PROVIDERS = {
-  t8star: { label: 'T8Star Images API', base_url: 'https://ai.t8star.org', models: [{ id: 'nano-banana-2', label: 'nano-banana-2' }, { id: 'gemini-3.1-flash-image-preview', label: 'gemini-3.1-flash-image-preview' }] },
+  t8star: { label: 'T8Star Images API', base_url: 'https://ai.t8star.org', models: [{ id: 'nano-banana-2', label: 'nano-banana-2' }, { id: 'gemini-3.1-flash-image-preview', label: 'gemini-3.1-flash-image-preview' }, { id: 'gemini-3-pro-image-2k', label: 'gemini-3-pro-image-2k' }, { id: 'gemini-3-pro-image-4k', label: 'gemini-3-pro-image-4k' }] },
   gemini: { label: 'Chiyun', base_url: 'https://chiyun.work', models: [{ id: 'banana2-ssvip', label: 'banana2-ssvip' }, { id: 'nano-banana2[2K]-base', label: 'nano-banana2[2K]-base' }, { id: 'gpt-image-2', label: 'gpt-image-2' }] },
 };
 
