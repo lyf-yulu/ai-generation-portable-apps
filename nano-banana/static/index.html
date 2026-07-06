@@ -14,24 +14,24 @@
       <h1>Nano Banana <span class="app-status-dot" :class="appStatus"></span></h1>
     </template>
 
-    <main class="app">
-      <div class="app-tabs" v-if="tabs.length">
-        <div v-for="t in tabs" :key="t.id"
-             class="app-tab" :class="{ active: t.id === activeTabId, editing: t.id === editingTabId }"
-             @click="switchTab(t.id)"
-             @dblclick="startEditTab(t.id)">
-          <span class="dot" :class="{ running: t.running }"></span>
-          <span v-if="editingTabId !== t.id" class="name">{{ t.name || '未命名' }}</span>
-          <input v-else type="text" :value="t.name"
-                 @keydown.enter="finishEditTab(t.id, $event.target.value)"
-                 @keydown.esc="editingTabId = null"
-                 @blur="finishEditTab(t.id, $event.target.value)"
-                 v-effect="editingTabId === t.id && $el.focus()">
-          <span v-if="tabs.length > 1 && editingTabId !== t.id"
-                class="close" @click.stop="closeTab(t.id)">×</span>
-        </div>
-        <div class="app-tab plus" @click="newTab()">+ 新主题</div>
+    <div class="app-tabs" v-if="tabs.length">
+      <div v-for="t in tabs" :key="t.id"
+           class="app-tab" :class="{ active: t.id === activeTabId, editing: t.id === editingTabId }"
+           @click="switchTab(t.id)"
+           @dblclick="startEditTab(t.id)">
+        <span class="dot" :class="{ running: t.running }"></span>
+        <span v-if="editingTabId !== t.id" class="name">{{ t.name || '未命名' }}</span>
+        <input v-else type="text" :value="t.name"
+               @keydown.enter="finishEditTab(t.id, $event.target.value)"
+               @keydown.esc="editingTabId = null"
+               @blur="finishEditTab(t.id, $event.target.value)"
+               v-effect="editingTabId === t.id && $el.focus()">
+        <span v-if="tabs.length > 1 && editingTabId !== t.id"
+              class="close" @click.stop="closeTab(t.id)">×</span>
       </div>
+      <div class="app-tab plus" @click="newTab()">+ 新主题</div>
+    </div>
+    <main class="app">
       <!-- ====== SIDEBAR ====== -->
       <aside class="sidebar">
 
