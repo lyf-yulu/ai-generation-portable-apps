@@ -8,6 +8,9 @@
 const IN_PORTAL = window.location.pathname.startsWith('/seedance/');
 const APP_PATH = IN_PORTAL ? '/seedance' : '';
 
+// Lowercased job.status values considered terminal (used to gate poll loops and running-indicator recomputation).
+const TERMINAL_STATUSES = new Set(['succeeded', 'success', 'failed', 'fail', 'failure', 'cancelled', 'canceled']);
+
 // ============================================================
 // UTILITIES
 // ============================================================
@@ -326,6 +329,13 @@ function SeedanceApp() {
           if (u) this._blobDownload(u, fn);
         });
       }
+
+      // Global 5s tick: refresh jobs list so every tab's green-dot indicator
+      // stays fresh, not just the tab that submitted. Skip while the page is
+      // hidden to avoid burning cycles when the tab is in the background.
+      this._loadJobsTimer = setInterval(() => {
+        if (document.visibilityState !== 'hidden') this.loadJobs();
+      }, 5000);
     },
 
     // ============================================================
@@ -528,6 +538,15 @@ function SeedanceApp() {
       } else {
         console.warn('[Seedance] loadJobs 返回异常:', res);
       }
+      // Recompute per-tab running flag off the freshly loaded jobs. Drives the
+      // green-dot indicator on every tab, not just the one that submitted.
+      if (this.tabs && this.tabs.length) {
+        this.tabs.forEach(t => {
+          t.running = (this.jobs || []).some(j =>
+            !TERMINAL_STATUSES.has((j.status || '').toLowerCase()) && j.workspace_id === t.id
+          );
+        });
+      }
     },
 
     formatRuntime(job) {
@@ -656,61 +675,102 @@ function SeedanceApp() {
     },
 
     async pollJob(jobId) {
-      const resultsEl = document.getElementById('sd-results');
-      const eventsEl = document.getElementById('sd-events');
+      // Record which tab initiated this poll. If the user switches tabs while the
+      // job is still running, subsequent state writes must NOT contaminate the
+      // now-active tab — they route into _tabStateCache[startWsId] instead.
+      const startWsId = this.activeTabId;
+      const isActive = () => this.activeTabId === startWsId;
+      const cache = () => (this._tabStateCache[startWsId] = this._tabStateCache[startWsId] || {});
+
+      const setStatus = (t) => { if (isActive()) this.statusText = t; else cache().statusText = t; };
+      const setEvents = (t) => { if (isActive()) this.eventsText = t; else cache().eventsText = t; };
+      const setSubmitting = (v) => { if (isActive()) this.submitting = v; else cache().submitting = v; };
+      const setLatestJob = (job) => { cache()._latestJob = job; };
+
       while (true) {
         const job = await api(APP_PATH + '/api/jobs/' + jobId);
         if (!job) break;
-        this.statusText = (job.status || 'unknown') + ' ' + (job.done || 0) + '/' + (job.total || 0);
-        this.eventsText = (job.events || []).map(e => '[' + (e.time || '') + '] ' + (e.message || '')).join('\n');
-        if (eventsEl) eventsEl.textContent = this.eventsText;
+        setStatus((job.status || 'unknown') + ' ' + (job.done || 0) + '/' + (job.total || 0));
+        setEvents((job.events || []).map(e => '[' + (e.time || '') + '] ' + (e.message || '')).join('\n'));
+        setLatestJob(job);
 
-        if (resultsEl) {
-          const recentEvents = (job.events || []).slice(-8);
-          const eventsHtml = recentEvents.length
-            ? recentEvents.map(e =>
-                '<div style="font-size:11px;color:#d1e0ff;padding:2px 0">'
-                + '<span style="color:#697386">' + escHtml(e.time) + '</span> '
-                + escHtml(e.message)
-                + '</div>'
-              ).join('')
-            : '<div style="color:#697386;font-size:11px">等待服务器响应...</div>';
-          resultsEl.innerHTML =
-            '<article class="result" style="border-color:#4f46e5;background:#101828;color:#e2e8f0;grid-column:1/-1">'
-            + '<div class="meta" style="color:#818cf8;font-weight:600;margin-bottom:6px">'
-            + escHtml(job.status) + ' · ' + (job.done || 0) + '/' + (job.total || 0)
-            + (job.errors?.[0] ? ' ' + escHtml(job.errors[0]) : '')
-            + '</div>'
-            + eventsHtml
-            + '</article>';
-
-          for (const r of job.results || []) {
-            const url = APP_PATH + (r.download_url || '');
-            resultsEl.innerHTML +=
-              '<article class="result">'
-              + '<video controls src="' + url + '" style="max-height:200px"></video>'
-              + '<a href="' + url + '" class="dl-btn" data-url="' + url + '" data-filename="' + escHtml(r.filename || 'video') + '">下载</a>'
-              + '<div class="meta">Run ' + (r.index || '') + ' · ' + (r.task_id || '') + '</div>'
-              + '</article>';
-          }
-
-          for (const err of job.errors || []) {
-            resultsEl.innerHTML += '<article class="result" style="color:#ef4444">' + escHtml(err) + '</article>';
-          }
+        if (isActive()) {
+          this._renderJobToDom(job);
         }
 
-        if (['succeeded', 'failed'].includes(job.status)) {
+        if (TERMINAL_STATUSES.has((job.status || '').toLowerCase())) {
+          // Preserved terminal-status behavior from original pollJob:
+          //   - job.status === 'succeeded' + dirHandle → saveToClient
+          //   - job.status === 'succeeded' + autoDownload → triggerDownloads
+          // Note: saveToClient/triggerDownloads still key on the literal 'succeeded'
+          // (not the whole TERMINAL_STATUSES set) so failed/cancelled jobs never
+          // trigger downloads. dirHandle/autoDownload are tab-scoped via
+          // saveCurrentTabState/loadTargetTabState, but here we intentionally read
+          // this.dirHandle/this.autoDownload at terminal time — matching the
+          // original behavior of using whatever is live now (side-effects still
+          // fire even if the user has since switched tabs).
           if (job.status === 'succeeded' && this.dirHandle) {
             await this.saveToClient(job);
           } else if (job.status === 'succeeded' && this.autoDownload) {
             this.triggerDownloads(job);
           }
+          setSubmitting(false);
+          setStatus('空闲');
           break;
         }
         await new Promise(r => setTimeout(r, 2500));
       }
-      this.statusText = '空闲';
+      // Original pollJob always refreshed the jobs list on exit — keep that.
       this.loadJobs();
+    },
+
+    // Extracted from pollJob so that both live polling (from pollJob) and
+    // tab-switch rehydration (from loadTargetTabState) can rebuild the DOM
+    // from a job snapshot. Structure must match the original pollJob output
+    // verbatim so downstream click handlers (._blobDownload via .dl-btn) still
+    // work.
+    _renderJobToDom(job) {
+      const resultsEl = document.getElementById('sd-results');
+      const eventsEl = document.getElementById('sd-events');
+      if (!resultsEl && !eventsEl) return;
+
+      if (eventsEl) {
+        eventsEl.textContent = (job.events || []).map(e => '[' + (e.time || '') + '] ' + (e.message || '')).join('\n');
+      }
+
+      if (resultsEl) {
+        const recentEvents = (job.events || []).slice(-8);
+        const eventsHtml = recentEvents.length
+          ? recentEvents.map(e =>
+              '<div style="font-size:11px;color:#d1e0ff;padding:2px 0">'
+              + '<span style="color:#697386">' + escHtml(e.time) + '</span> '
+              + escHtml(e.message)
+              + '</div>'
+            ).join('')
+          : '<div style="color:#697386;font-size:11px">等待服务器响应...</div>';
+        resultsEl.innerHTML =
+          '<article class="result" style="border-color:#4f46e5;background:#101828;color:#e2e8f0;grid-column:1/-1">'
+          + '<div class="meta" style="color:#818cf8;font-weight:600;margin-bottom:6px">'
+          + escHtml(job.status) + ' · ' + (job.done || 0) + '/' + (job.total || 0)
+          + (job.errors?.[0] ? ' ' + escHtml(job.errors[0]) : '')
+          + '</div>'
+          + eventsHtml
+          + '</article>';
+
+        for (const r of job.results || []) {
+          const url = APP_PATH + (r.download_url || '');
+          resultsEl.innerHTML +=
+            '<article class="result">'
+            + '<video controls src="' + url + '" style="max-height:200px"></video>'
+            + '<a href="' + url + '" class="dl-btn" data-url="' + url + '" data-filename="' + escHtml(r.filename || 'video') + '">下载</a>'
+            + '<div class="meta">Run ' + (r.index || '') + ' · ' + (r.task_id || '') + '</div>'
+            + '</article>';
+        }
+
+        for (const err of job.errors || []) {
+          resultsEl.innerHTML += '<article class="result" style="color:#ef4444">' + escHtml(err) + '</article>';
+        }
+      }
     },
 
     async saveToClient(job) {
@@ -992,7 +1052,10 @@ function SeedanceApp() {
     saveCurrentTabState() {
       const wsId = this.activeTabId;
       if (typeof this.saveWorkspaceDraft === 'function') this.saveWorkspaceDraft();
+      // Preserve any fields already set by pollJob (notably _latestJob) so tab
+      // switch → return still has a snapshot to re-render.
       this._tabStateCache[wsId] = {
+        ...(this._tabStateCache[wsId] || {}),
         statusText: this.statusText,
         eventsText: this.eventsText,
         submitting: this.submitting,
@@ -1017,6 +1080,17 @@ function SeedanceApp() {
       if (form) form.reset();
       this.savedMedia = {};
       if (typeof this.loadPreset === 'function') this.loadPreset();
+
+      // If a background pollJob stashed a job snapshot for this tab, replay it
+      // into the DOM. Otherwise clear any stale DOM left by the previous tab.
+      if (cache._latestJob) {
+        this._renderJobToDom(cache._latestJob);
+      } else {
+        const resultsEl = document.getElementById('sd-results');
+        const eventsEl = document.getElementById('sd-events');
+        if (resultsEl) resultsEl.innerHTML = '';
+        if (eventsEl) eventsEl.textContent = '';
+      }
     },
 
     _scrollActiveTabIntoView() {
