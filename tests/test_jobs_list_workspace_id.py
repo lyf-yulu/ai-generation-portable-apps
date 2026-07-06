@@ -103,6 +103,12 @@ class JobsListWorkspaceIdTests(unittest.TestCase):
         module = load_module("nano_jobs_under_test", ROOT / "nano-banana" / "app.py")
         items = self._run(module, "LOCK")
         self._assert_workspace_ids(items)
+        # nano-banana per-result shape nests download_url/filename inside
+        # images[]; the list endpoint intentionally omits results — full
+        # detail is served by /api/jobs/{id}. Guard against re-adding a
+        # broken top-level projection.
+        for item in items:
+            self.assertNotIn("results", item)
 
 
 if __name__ == "__main__":

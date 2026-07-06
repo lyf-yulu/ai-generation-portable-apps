@@ -1564,7 +1564,6 @@ class Handler(SimpleHTTPRequestHandler):
                         "finished_at": j.get("finished_at"),
                         "username": j.get("username", ""),
                         "workspace_id": j.get("workspace_id", ""),
-                        "results": [{"download_url": r.get("download_url", ""), "filename": r.get("filename", "")} for r in (j.get("results") or [])],
                         "errors": j.get("errors", []),
                         "done": j.get("done", 0),
                         "total": j.get("total", 0),
