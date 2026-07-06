@@ -19,12 +19,21 @@ function _workspaceId() {
   return id;
 }
 
+function getActiveWorkspaceId() {
+  return window._activeWorkspaceId || _workspaceId();
+}
+
 async function api(url, method, body) {
   try {
-    const headers = { 'X-Workspace-Id': _workspaceId() };
+    const wsId = getActiveWorkspaceId();
+    const sep = url.includes('?') ? '&' : '?';
+    const urlWithWs = url + sep + 'ws=' + encodeURIComponent(wsId);
+    const headers = { 'X-Workspace-Id': wsId };
+    const keyId = localStorage.getItem('portal_key_id_nano_banana');
+    if (keyId) headers['X-Key-Id'] = keyId;
     const opts = { method: method || 'GET', headers };
     if (body) opts.body = body;
-    const res = await fetch(url, opts);
+    const res = await fetch(urlWithWs, opts);
     return await res.json();
   } catch (e) { return null; }
 }
@@ -295,7 +304,8 @@ function NanoBananaApp() {
       // Legacy: also try raw /api/config (standalone path)
       if (!Object.keys(self.providers).length) {
         try {
-          var fallbackRes = await fetch(APP_PATH + '/api/config');
+          var wsId = getActiveWorkspaceId();
+          var fallbackRes = await fetch(APP_PATH + '/api/config?ws=' + encodeURIComponent(wsId));
           if (fallbackRes.ok) await self.loadConfigFromResponse(fallbackRes);
         } catch (e) { /* ignore */ }
       }
@@ -763,7 +773,8 @@ function NanoBananaApp() {
       if (this.isStandalone && this.loadWorkspaceDraft()) return;
 
       // Otherwise load server preset
-      var res = await fetch(APP_PATH + '/api/preset', { headers: { 'X-Workspace-Id': _workspaceId() } });
+      var wsId = getActiveWorkspaceId();
+      var res = await fetch(APP_PATH + '/api/preset?ws=' + encodeURIComponent(wsId), { headers: { 'X-Workspace-Id': wsId } });
       if (res.ok) {
         var data = await res.json();
         this.applyPreset(data);

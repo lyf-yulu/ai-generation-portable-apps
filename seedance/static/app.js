@@ -17,14 +17,21 @@ function workspaceId() {
   return id;
 }
 
+function getActiveWorkspaceId() {
+  return window._activeWorkspaceId || workspaceId();
+}
+
 async function api(url, method, body) {
   try {
-    const headers = { 'X-Workspace-Id': workspaceId() };
+    const wsId = getActiveWorkspaceId();
+    const sep = url.includes('?') ? '&' : '?';
+    const urlWithWs = url + sep + 'ws=' + encodeURIComponent(wsId);
+    const headers = { 'X-Workspace-Id': wsId };
     const keyId = localStorage.getItem('portal_key_id_seedance');
     if (keyId) headers['X-Key-Id'] = keyId;
     const opts = { method: method || 'GET', headers };
     if (body) opts.body = body;
-    const res = await fetch(url, opts);
+    const res = await fetch(urlWithWs, opts);
     return await res.json();
   } catch (e) { return null; }
 }
