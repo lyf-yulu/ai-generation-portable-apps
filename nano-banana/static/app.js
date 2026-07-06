@@ -281,6 +281,13 @@ function NanoBananaApp() {
     // Resize toggle
     resizeEnabled: false,
 
+    // --- Tab bar state (Task 4) ---
+    tabs: [],                   // [{id, name, running}]
+    activeTabId: 'default',
+    editingTabId: null,         // tab id being renamed inline, or null
+    _closeConfirmTabId: null,   // tab id that opened the close-confirm modal
+    _tabStateCache: {},         // { wsId: {statusText, eventsText, submitting, baseUrl, provider, models, workspaceName} }
+
     // ---- 8b. init() ----
 
     async init() {
@@ -318,6 +325,24 @@ function NanoBananaApp() {
 
       // Load archives
       try { self.loadArchives(); } catch (e) { console.warn('loadArchives failed:', e); }
+
+      // --- Tab bar restoration (Task 4) ---
+      var raw = localStorage.getItem('nano-banana.tabs');
+      if (raw) {
+        try {
+          var data = JSON.parse(raw);
+          if (data.tabs && data.tabs.length) {
+            self.tabs = data.tabs.map(function (t) { return { id: t.id, name: t.name || '未命名主题', running: false }; });
+            self.activeTabId = data.activeTabId || data.tabs[0].id;
+          }
+        } catch (e) {}
+      }
+      if (!self.tabs.length) {
+        var oldWsId = localStorage.getItem('workspace_id') || 'default';
+        self.tabs = [{ id: oldWsId, name: self.workspaceName || '未命名主题', running: false }];
+        self.activeTabId = oldWsId;
+      }
+      window._activeWorkspaceId = self.activeTabId;
 
       // Load workspace or server preset
       try { self.loadInitialPreset(); } catch (e) { console.warn('loadPreset failed:', e); }
@@ -836,22 +861,114 @@ function NanoBananaApp() {
       }
     },
 
-    newWorkspace() {
-      var id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-      var url = new URL(window.location.href);
-      url.searchParams.set('ws', id);
-      window.open(url.toString(), '_blank');
+    // ============================================================
+    // TAB BAR METHODS (Task 4)
+    // ============================================================
+    saveTabsToLocalStorage() {
+      localStorage.setItem('nano-banana.tabs', JSON.stringify({
+        tabs: this.tabs.map(function (t) { return { id: t.id, name: t.name }; }),
+        activeTabId: this.activeTabId,
+      }));
     },
 
-    async duplicateWorkspace() {
-      var id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-      var current = this.localWorkspaceSnapshot();
-      current.name = (this.workspaceName || '主题') + ' 副本';
-      var key = 'nano-banana.workspace.' + id;
-      localStorage.setItem(key, JSON.stringify(current));
-      var url = new URL(window.location.href);
-      url.searchParams.set('ws', id);
-      window.open(url.toString(), '_blank');
+    newTab() {
+      this.saveCurrentTabState();
+      var id = 'ws-' + Date.now() + '-' + Math.random().toString(16).slice(2, 7);
+      this.tabs.push({ id: id, name: '未命名主题', running: false });
+      this.activeTabId = id;
+      window._activeWorkspaceId = id;
+      this.workspaceName = '';
+      this.savedMedia = {};
+      var form = document.querySelector('#nb-form');
+      if (form) form.reset();
+      this.statusText = '空闲';
+      this.eventsText = '';
+      this.submitting = false;
+      this.saveTabsToLocalStorage();
+      var self = this;
+      setTimeout(function () { self._scrollActiveTabIntoView(); }, 0);
+    },
+
+    switchTab(id) {
+      if (id === this.activeTabId || this.editingTabId) return;
+      this.saveCurrentTabState();
+      this.activeTabId = id;
+      window._activeWorkspaceId = id;
+      this.loadTargetTabState();
+      this.saveTabsToLocalStorage();
+      var self = this;
+      setTimeout(function () { self._scrollActiveTabIntoView(); }, 0);
+    },
+
+    startEditTab(id) { this.editingTabId = id; },
+
+    finishEditTab(id, name) {
+      var trimmed = (name || '').trim() || '未命名主题';
+      var tab = this.tabs.find(function (t) { return t.id === id; });
+      if (tab) {
+        tab.name = trimmed;
+        if (id === this.activeTabId) this.workspaceName = trimmed;
+        if (typeof this.saveWorkspaceDraft === 'function') this.saveWorkspaceDraft();
+        this.saveTabsToLocalStorage();
+      }
+      this.editingTabId = null;
+    },
+
+    closeTab(id) {
+      var tab = this.tabs.find(function (t) { return t.id === id; });
+      if (!tab || this.tabs.length <= 1) return;
+      if (tab.running) { this._closeConfirmTabId = id; return; }
+      this._forceCloseTab(id);
+    },
+
+    _forceCloseTab(id) {
+      var idx = this.tabs.findIndex(function (t) { return t.id === id; });
+      if (idx < 0 || this.tabs.length <= 1) return;
+      this.tabs.splice(idx, 1);
+      localStorage.removeItem('nano-banana.workspace.' + id);
+      delete this._tabStateCache[id];
+      if (this.activeTabId === id) {
+        this.activeTabId = this.tabs[Math.max(0, idx - 1)].id;
+        window._activeWorkspaceId = this.activeTabId;
+        this.loadTargetTabState();
+      }
+      this.saveTabsToLocalStorage();
+    },
+
+    saveCurrentTabState() {
+      var wsId = this.activeTabId;
+      if (typeof this.saveWorkspaceDraft === 'function') this.saveWorkspaceDraft();
+      // Preserve any fields already set on the cache (Task 5 will add job snapshots).
+      this._tabStateCache[wsId] = Object.assign({}, this._tabStateCache[wsId] || {}, {
+        statusText: this.statusText,
+        eventsText: this.eventsText,
+        submitting: this.submitting,
+        baseUrl: this.baseUrl,
+        provider: this.provider,
+        models: this.models ? JSON.parse(JSON.stringify(this.models)) : [],
+        workspaceName: this.workspaceName,
+      });
+    },
+
+    loadTargetTabState() {
+      var wsId = this.activeTabId;
+      var cache = this._tabStateCache[wsId] || {};
+      this.statusText = cache.statusText || '空闲';
+      this.eventsText = cache.eventsText || '';
+      this.submitting = cache.submitting || false;
+      if (cache.baseUrl !== undefined) this.baseUrl = cache.baseUrl;
+      if (cache.provider !== undefined) this.provider = cache.provider;
+      if (cache.models !== undefined) this.models = cache.models;
+      if (cache.workspaceName !== undefined) this.workspaceName = cache.workspaceName;
+      var form = document.querySelector('#nb-form');
+      if (form) form.reset();
+      this.savedMedia = {};
+      if (typeof this.loadInitialPreset === 'function') this.loadInitialPreset();
+    },
+
+    _scrollActiveTabIntoView() {
+      var el = document.querySelector('.app-tab.active');
+      if (el && el.scrollIntoView) el.scrollIntoView({ inline: 'nearest', block: 'nearest' });
     },
 
     // ---- 8k. Resize state / form data helpers ----

@@ -486,3 +486,116 @@ pre {
     grid-template-columns: 1fr;
   }
 }
+.tag-error, .tag-failed { background: #fee2e2; color: #dc2626; }
+.tag-succeeded, .tag-completed { background: #dcfce7; color: #16a34a; }
+.tag-queued, .tag-running { background: #dbeafe; color: #2563eb; }
+
+/* ============================================================
+   TAB BAR (Task 4 — mirror of seedance Task 2)
+   ============================================================ */
+.app-tabs {
+  display: flex;
+  background: #111827;
+  padding: 6px 8px 0 8px;
+  gap: 2px;
+  overflow-x: auto;
+  align-items: flex-end;
+  border-bottom: 1px solid #334155;
+}
+.app-tabs::-webkit-scrollbar { height: 6px; }
+.app-tabs::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+.app-tab {
+  background: #1f2937;
+  color: #94a3b8;
+  padding: 8px 12px;
+  border-radius: 6px 6px 0 0;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 220px;
+  flex-shrink: 0;
+  user-select: none;
+}
+.app-tab.active {
+  background: #334155;
+  color: #f1f5f9;
+  box-shadow: inset 0 2px 0 #38bdf8;
+}
+.app-tab .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #475569;
+  flex-shrink: 0;
+}
+.app-tab .dot.running {
+  background: #22c55e;
+  box-shadow: 0 0 6px #22c55e;
+}
+.app-tab .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 160px;
+}
+.app-tab input {
+  background: #0f172a;
+  color: #f1f5f9;
+  border: 1px solid #38bdf8;
+  border-radius: 3px;
+  padding: 2px 6px;
+  font-size: 13px;
+  width: 130px;
+  outline: none;
+}
+.app-tab .close {
+  color: #64748b;
+  font-size: 14px;
+  padding: 0 2px;
+}
+.app-tab .close:hover { color: #f1f5f9; }
+.app-tab.plus {
+  background: transparent;
+  color: #94a3b8;
+  border: 1px dashed #475569;
+}
+.app-tab.plus:hover { background: #1e293b; }
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.modal {
+  background: #1e293b;
+  border: 1px solid #475569;
+  border-radius: 6px;
+  padding: 18px;
+  color: #f1f5f9;
+  width: 340px;
+  font-size: 13px;
+}
+.modal-title { font-weight: 600; margin-bottom: 8px; }
+.modal-body { color: #94a3b8; line-height: 1.5; }
+.modal-btns {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 14px;
+}
+.modal-btns button {
+  background: #334155;
+  color: #f1f5f9;
+  border: none;
+  padding: 6px 14px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.modal-btns button.danger { background: #7f1d1d; }
