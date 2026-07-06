@@ -1546,6 +1546,32 @@ class Handler(SimpleHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
             return
+        if self.path == "/api/jobs":
+            sees_all, username = _view_scope(self)
+            items = []
+            with LOCK:
+                for jid, j in JOBS.items():
+                    if not sees_all and j.get("username", "") != username:
+                        continue
+                    items.append({
+                        "job_id": jid,
+                        "status": j.get("status", "pending"),
+                        "model": j.get("model", ""),
+                        "prompt": (j.get("params", {}).get("prompt") or j.get("prompt", ""))[:200],
+                        "created_at": j.get("created_at", ""),
+                        "submitted_at": j.get("submitted_at"),
+                        "started_at": j.get("started_at"),
+                        "finished_at": j.get("finished_at"),
+                        "username": j.get("username", ""),
+                        "workspace_id": j.get("workspace_id", ""),
+                        "results": [{"download_url": r.get("download_url", ""), "filename": r.get("filename", "")} for r in (j.get("results") or [])],
+                        "errors": j.get("errors", []),
+                        "done": j.get("done", 0),
+                        "total": j.get("total", 0),
+                    })
+            items.sort(key=lambda it: (it.get("submitted_at") or 0), reverse=True)
+            json_response(self, 200, {"ok": True, "jobs": items})
+            return
         if self.path.startswith("/api/jobs/"):
             job_id = self.path.rsplit("/", 1)[-1]
             with LOCK:

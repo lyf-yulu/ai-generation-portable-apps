@@ -1884,6 +1884,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "results": results,
                         "errors": j.get("errors", []),
                         "done": j.get("done", 0),
+                        "workspace_id": j.get("workspace_id", ""),
                         "total": j.get("total", 0),
                     })
             items.sort(key=lambda it: (it.get("submitted_at") or 0), reverse=True)
