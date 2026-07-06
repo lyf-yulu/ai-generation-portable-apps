@@ -10,26 +10,29 @@
 <body>
   <div id="sd-app" v-scope="SeedanceApp()" @vue:mounted="init()">
     <main class="app">
+      <div class="app-tabs" v-if="tabs.length">
+        <div v-for="t in tabs" :key="t.id"
+             class="app-tab" :class="{ active: t.id === activeTabId, editing: t.id === editingTabId }"
+             @click="switchTab(t.id)"
+             @dblclick="startEditTab(t.id)">
+          <span class="dot" :class="{ running: t.running }"></span>
+          <span v-if="editingTabId !== t.id" class="name">{{ t.name || '未命名' }}</span>
+          <input v-else type="text" :value="t.name"
+                 @keydown.enter="finishEditTab(t.id, $event.target.value)"
+                 @keydown.esc="editingTabId = null"
+                 @blur="finishEditTab(t.id, $event.target.value)"
+                 v-effect="editingTabId === t.id && $el.focus()">
+          <span v-if="tabs.length > 1 && editingTabId !== t.id"
+                class="close" @click.stop="closeTab(t.id)">×</span>
+        </div>
+        <div class="app-tab plus" @click="newTab()">+ 新主题</div>
+      </div>
       <aside class="sidebar">
         <h1 v-if="!inPortal" style="font-size:24px;margin-bottom:16px">
           Seedance
           <span class="app-status-dot" :class="appStatus"></span>
         </h1>
         <form id="sd-form" @submit.prevent="submit()">
-          <!-- Workspace -->
-          <section class="workspaceBox">
-            <h2>主题工作区</h2>
-            <label>当前主题
-              <input name="workspace_name" v-model="workspaceName" placeholder="例如 门口冲突 / 产品A / 场景2" @input="scheduleWorkspaceSave" @change="scheduleWorkspaceSave">
-            </label>
-            <div class="rowButtons">
-              <button type="button" @click="newWorkspace()">新主题页</button>
-              <button type="button" @click="duplicateWorkspace()">复制当前</button>
-              <button type="button" @click="saveWorkspaceDraft()">保存草稿</button>
-            </div>
-            <p class="hint">{{ workspaceHint }}</p>
-          </section>
-
           <!-- API -->
           <section>
             <h2>接口</h2>
@@ -219,6 +222,17 @@
         </div>
       </section>
     </main>
+
+    <div v-if="_closeConfirmTabId" class="modal-overlay" @click.self="_closeConfirmTabId = null">
+      <div class="modal">
+        <div class="modal-title">关闭「{{ (tabs.find(t => t.id === _closeConfirmTabId) || {}).name }}」？</div>
+        <div class="modal-body">该主题有任务正在跑。关闭后任务会在后台继续，可从运行历史面板查看结果。</div>
+        <div class="modal-btns">
+          <button type="button" @click="_closeConfirmTabId = null">取消</button>
+          <button type="button" class="danger" @click="_forceCloseTab(_closeConfirmTabId); _closeConfirmTabId = null">仍然关闭</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <dialog id="previewDialog" class="previewDialog">

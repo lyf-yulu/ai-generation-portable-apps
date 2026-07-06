@@ -262,6 +262,13 @@ function SeedanceApp() {
     workspaceName: '默认主题',
     workspaceHint: '',
 
+    // --- Tab bar state (Task 2) ---
+    tabs: [],                   // [{id, name, running}]
+    activeTabId: 'default',
+    editingTabId: null,         // tab id being renamed inline, or null
+    _closeConfirmTabId: null,   // tab id that opened the close-confirm modal
+    _tabStateCache: {},         // { wsId: {statusText, eventsText, submitting, baseUrl, provider, models, workspaceName} }
+
     // Internal (non-reactive but accessible)
     _workspaceId: effectiveWorkspaceId,
     _workspaceKey: wsKey,
@@ -275,6 +282,25 @@ function SeedanceApp() {
       this.wireDrops();
       try { await this.loadConfig(); } catch (e) { console.warn('loadConfig failed:', e); }
       try { await this.loadArchives(); } catch (e) { console.warn('loadArchives failed:', e); }
+
+      // --- Tab bar restoration (Task 2) ---
+      const raw = localStorage.getItem('seedance.tabs');
+      if (raw) {
+        try {
+          const data = JSON.parse(raw);
+          if (data.tabs && data.tabs.length) {
+            this.tabs = data.tabs.map(t => ({ id: t.id, name: t.name || '未命名主题', running: false }));
+            this.activeTabId = data.activeTabId || data.tabs[0].id;
+          }
+        } catch (e) {}
+      }
+      if (!this.tabs.length) {
+        const oldWsId = localStorage.getItem('workspace_id') || 'default';
+        this.tabs = [{ id: oldWsId, name: this.workspaceName || '未命名主题', running: false }];
+        this.activeTabId = oldWsId;
+      }
+      window._activeWorkspaceId = this.activeTabId;
+
       this.loadPreset();
       try { await this.loadJobs(); } catch (e) { console.warn('loadJobs failed:', e); }
       setInterval(() => { this.runtimeTick = (this.runtimeTick + 1) % 1e9; }, 1000);
@@ -891,21 +917,111 @@ function SeedanceApp() {
       return this._workspaceId !== 'default' && !!this._workspaceId;
     },
 
-    newWorkspace() {
-      const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-      const url = new URL(window.location.href);
-      url.searchParams.set('ws', id);
-      window.open(url.toString(), '_blank');
+    // ============================================================
+    // TAB BAR METHODS (Task 2)
+    // ============================================================
+    saveTabsToLocalStorage() {
+      localStorage.setItem('seedance.tabs', JSON.stringify({
+        tabs: this.tabs.map(t => ({ id: t.id, name: t.name })),
+        activeTabId: this.activeTabId,
+      }));
     },
 
-    async duplicateWorkspace() {
-      const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-      const current = await this.saveWorkspaceDraft();
-      current.name = (this.workspaceName || '主题') + ' 副本';
-      localStorage.setItem('seedance.workspace.' + id, JSON.stringify(current));
-      const url = new URL(window.location.href);
-      url.searchParams.set('ws', id);
-      window.open(url.toString(), '_blank');
+    newTab() {
+      this.saveCurrentTabState();
+      const id = 'ws-' + Date.now() + '-' + Math.random().toString(16).slice(2, 7);
+      this.tabs.push({ id, name: '未命名主题', running: false });
+      this.activeTabId = id;
+      window._activeWorkspaceId = id;
+      this.workspaceName = '';
+      this.savedMedia = {};
+      const form = document.querySelector('#sd-form');
+      if (form) form.reset();
+      this.statusText = '空闲';
+      this.eventsText = '';
+      this.submitting = false;
+      this.saveTabsToLocalStorage();
+      setTimeout(() => this._scrollActiveTabIntoView(), 0);
+    },
+
+    switchTab(id) {
+      if (id === this.activeTabId || this.editingTabId) return;
+      this.saveCurrentTabState();
+      this.activeTabId = id;
+      window._activeWorkspaceId = id;
+      this.loadTargetTabState();
+      this.saveTabsToLocalStorage();
+      setTimeout(() => this._scrollActiveTabIntoView(), 0);
+    },
+
+    startEditTab(id) { this.editingTabId = id; },
+
+    finishEditTab(id, name) {
+      const trimmed = (name || '').trim() || '未命名主题';
+      const tab = this.tabs.find(t => t.id === id);
+      if (tab) {
+        tab.name = trimmed;
+        if (id === this.activeTabId) this.workspaceName = trimmed;
+        if (typeof this.saveWorkspaceDraft === 'function') this.saveWorkspaceDraft();
+        this.saveTabsToLocalStorage();
+      }
+      this.editingTabId = null;
+    },
+
+    closeTab(id) {
+      const tab = this.tabs.find(t => t.id === id);
+      if (!tab || this.tabs.length <= 1) return;
+      if (tab.running) { this._closeConfirmTabId = id; return; }
+      this._forceCloseTab(id);
+    },
+
+    _forceCloseTab(id) {
+      const idx = this.tabs.findIndex(t => t.id === id);
+      if (idx < 0 || this.tabs.length <= 1) return;
+      this.tabs.splice(idx, 1);
+      localStorage.removeItem('seedance.workspace.' + id);
+      delete this._tabStateCache[id];
+      if (this.activeTabId === id) {
+        this.activeTabId = this.tabs[Math.max(0, idx - 1)].id;
+        window._activeWorkspaceId = this.activeTabId;
+        this.loadTargetTabState();
+      }
+      this.saveTabsToLocalStorage();
+    },
+
+    saveCurrentTabState() {
+      const wsId = this.activeTabId;
+      if (typeof this.saveWorkspaceDraft === 'function') this.saveWorkspaceDraft();
+      this._tabStateCache[wsId] = {
+        statusText: this.statusText,
+        eventsText: this.eventsText,
+        submitting: this.submitting,
+        baseUrl: this.baseUrl,
+        provider: this.provider,
+        models: this.models ? JSON.parse(JSON.stringify(this.models)) : [],
+        workspaceName: this.workspaceName,
+      };
+    },
+
+    loadTargetTabState() {
+      const wsId = this.activeTabId;
+      const cache = this._tabStateCache[wsId] || {};
+      this.statusText = cache.statusText || '空闲';
+      this.eventsText = cache.eventsText || '';
+      this.submitting = cache.submitting || false;
+      if (cache.baseUrl !== undefined) this.baseUrl = cache.baseUrl;
+      if (cache.provider !== undefined) this.provider = cache.provider;
+      if (cache.models !== undefined) this.models = cache.models;
+      if (cache.workspaceName !== undefined) this.workspaceName = cache.workspaceName;
+      const form = document.querySelector('#sd-form');
+      if (form) form.reset();
+      this.savedMedia = {};
+      if (typeof this.loadPreset === 'function') this.loadPreset();
+    },
+
+    _scrollActiveTabIntoView() {
+      const el = document.querySelector('.app-tab.active');
+      if (el && el.scrollIntoView) el.scrollIntoView({ inline: 'nearest', block: 'nearest' });
     },
   };
 }
