@@ -6,6 +6,9 @@
 const IN_PORTAL = window.location.pathname.startsWith('/nano-banana/');
 const APP_PATH  = IN_PORTAL ? '/nano-banana' : '';
 
+// Lowercased job.status values considered terminal (used to gate poll loops and running-indicator recomputation).
+var TERMINAL_STATUSES = new Set(['succeeded', 'success', 'failed', 'fail', 'failure', 'cancelled', 'canceled']);
+
 // ============================================================
 // Module 2: Utilities
 // ============================================================
@@ -268,6 +271,9 @@ function NanoBananaApp() {
     // Workspace tabs
     wsTab: 'jobs',
 
+    // Jobs list (drives green-dot indicator on non-active tabs)
+    jobs: [],
+
     // Activity
     activityRecords: [],
     activityCounts: null,
@@ -362,6 +368,15 @@ function NanoBananaApp() {
           if (u) self._blobDownload(u, fn);
         });
       }
+
+      // Global 5s tick: refresh jobs list so every tab's green-dot indicator
+      // stays fresh, not just the tab that submitted. Skip while the page is
+      // hidden to avoid burning cycles when the tab is in the background.
+      self._loadJobsTimer = setInterval(function () {
+        if (document.visibilityState !== 'hidden') self.loadJobs();
+      }, 5000);
+      // Also fire once at init to populate tab.running on first load.
+      try { self.loadJobs(); } catch (e) { /* silent */ }
     },
 
     // ---- 8c. loadConfig / applyProvider ----
@@ -491,46 +506,106 @@ function NanoBananaApp() {
 
     async pollJob(jobId) {
       var self = this;
-      var resultsEl = document.getElementById('nb-results');
+      // Record which tab initiated this poll. If the user switches tabs while
+      // the job is still running, subsequent state writes must NOT contaminate
+      // the now-active tab — they route into _tabStateCache[startWsId] instead.
+      var startWsId = self.activeTabId;
+      var isActive = function () { return self.activeTabId === startWsId; };
+      var cache = function () { return (self._tabStateCache[startWsId] = self._tabStateCache[startWsId] || {}); };
+
+      var setStatus = function (t) { if (isActive()) self.statusText = t; else cache().statusText = t; };
+      var setEvents = function (t) { if (isActive()) self.eventsText = t; else cache().eventsText = t; };
+      var setSubmitting = function (v) { if (isActive()) self.submitting = v; else cache().submitting = v; };
+      var setLatestJob = function (job) { cache()._latestJob = job; };
+
       while (true) {
         var job = await api(APP_PATH + '/api/jobs/' + jobId);
         if (!job) break;
-        self.statusText = (job.status || '') + ' ' + (job.done || 0) + '/' + (job.total || 0);
-        self.eventsText = (job.events || []).map(function (e) { return '[' + (e.time || '') + '] ' + (e.message || ''); }).join('\n');
-        if (resultsEl) {
-          var eventsList = (job.events || []).slice(-8).map(function (e) {
-            return '<div style="font-size:11px;color:#d1e0ff;padding:2px 0"><span style="color:#697386">' + escHtml(e.time) + '</span> ' + escHtml(e.message) + '</div>';
-          }).join('');
-          resultsEl.innerHTML = '<article class="result" style="border-color:#4f46e5;background:#101828;color:#e2e8f0;grid-column:1/-1">' +
-            '<div class="meta" style="color:#818cf8;font-weight:600;margin-bottom:6px">' + escHtml(job.status) + ' · ' + (job.done || 0) + '/' + (job.total || 0) + ' ' + escHtml((job.errors && job.errors[0]) || '') + '</div>' +
-            (eventsList || '<div style="color:#697386;font-size:11px">等待服务器响应...</div>') +
-            '</article>';
-          for (var ri = 0; ri < (job.results || []).length; ri++) {
-            var r = job.results[ri];
-            for (var ii = 0; ii < (r.images || []).length; ii++) {
-              var img = r.images[ii];
-              var url = APP_PATH + img.download_url;
-              var safeFn = escHtml(img.filename);
-              resultsEl.innerHTML += '<article class="result"><img src="' + url + '" style="width:100%;max-height:180px;object-fit:contain;border-radius:6px;cursor:zoom-in" onclick="openPreview(\'image\',\'' + url + '\')"><a href="' + url + '" class="dl-btn" data-url="' + url + '" data-filename="' + safeFn + '">下载</a><div class="meta">Run ' + r.index + '</div></article>';
-            }
-          }
-          for (var ei = 0; ei < (job.errors || []).length; ei++) {
-            resultsEl.innerHTML += '<article class="result" style="color:#ef4444">' + escHtml(job.errors[ei]) + '</article>';
-          }
+        setStatus((job.status || '') + ' ' + (job.done || 0) + '/' + (job.total || 0));
+        setEvents((job.events || []).map(function (e) { return '[' + (e.time || '') + '] ' + (e.message || ''); }).join('\n'));
+        setLatestJob(job);
+
+        if (isActive()) {
+          self._renderJobToDom(job);
         }
-        if (job.status === 'succeeded' || job.status === 'failed') {
+
+        if (TERMINAL_STATUSES.has((job.status || '').toLowerCase())) {
+          // Preserved terminal-status behavior from original pollJob:
+          //   - job.status === 'succeeded' + dirHandle → saveToClient
+          //   - job.status === 'succeeded' + autoDownload → triggerDownloads
+          // dirHandle/autoDownload are read live (this.*) — side effects still
+          // fire even if the user has since switched tabs, matching original.
           if (job.status === 'succeeded' && self.dirHandle) {
             await self.saveToClient(job);
           } else if (job.status === 'succeeded' && self.autoDownload) {
             self.triggerDownloads(job);
           }
+          setSubmitting(false);
+          setStatus('空闲');
           break;
         }
         await new Promise(function (r) { setTimeout(r, 2500); });
       }
-      self.statusText = '空闲';
-      // Refresh activity list
+      // Refresh activity list + jobs list on exit (original always ran activity).
       try { self.loadActivity(); } catch (e) { /* ignore */ }
+      if (isActive()) self.loadJobs(); else { try { self.loadJobs(); } catch (e) { /* ignore */ } }
+    },
+
+    // Extracted from pollJob so that both live polling (from pollJob) and
+    // tab-switch rehydration (from loadTargetTabState) can rebuild the DOM
+    // from a job snapshot. Structure must match the original pollJob output
+    // verbatim so downstream click handlers (._blobDownload via .dl-btn) still
+    // work.
+    _renderJobToDom(job) {
+      var resultsEl = document.getElementById('nb-results');
+      var eventsEl = document.getElementById('nb-events');
+      if (!resultsEl && !eventsEl) return;
+
+      if (eventsEl) {
+        eventsEl.textContent = (job.events || []).map(function (e) { return '[' + (e.time || '') + '] ' + (e.message || ''); }).join('\n');
+      }
+
+      if (resultsEl) {
+        var eventsList = (job.events || []).slice(-8).map(function (e) {
+          return '<div style="font-size:11px;color:#d1e0ff;padding:2px 0"><span style="color:#697386">' + escHtml(e.time) + '</span> ' + escHtml(e.message) + '</div>';
+        }).join('');
+        resultsEl.innerHTML = '<article class="result" style="border-color:#4f46e5;background:#101828;color:#e2e8f0;grid-column:1/-1">' +
+          '<div class="meta" style="color:#818cf8;font-weight:600;margin-bottom:6px">' + escHtml(job.status) + ' · ' + (job.done || 0) + '/' + (job.total || 0) + ' ' + escHtml((job.errors && job.errors[0]) || '') + '</div>' +
+          (eventsList || '<div style="color:#697386;font-size:11px">等待服务器响应...</div>') +
+          '</article>';
+        for (var ri = 0; ri < (job.results || []).length; ri++) {
+          var r = job.results[ri];
+          for (var ii = 0; ii < (r.images || []).length; ii++) {
+            var img = r.images[ii];
+            var url = APP_PATH + img.download_url;
+            var safeFn = escHtml(img.filename);
+            resultsEl.innerHTML += '<article class="result"><img src="' + url + '" style="width:100%;max-height:180px;object-fit:contain;border-radius:6px;cursor:zoom-in" onclick="openPreview(\'image\',\'' + url + '\')"><a href="' + url + '" class="dl-btn" data-url="' + url + '" data-filename="' + safeFn + '">下载</a><div class="meta">Run ' + r.index + '</div></article>';
+          }
+        }
+        for (var ei = 0; ei < (job.errors || []).length; ei++) {
+          resultsEl.innerHTML += '<article class="result" style="color:#ef4444">' + escHtml(job.errors[ei]) + '</article>';
+        }
+      }
+    },
+
+    async loadJobs() {
+      var self = this;
+      try {
+        var res = await api(APP_PATH + '/api/jobs');
+        if (res && Array.isArray(res.jobs)) {
+          self.jobs = res.jobs;
+        } else if (res && res.error) {
+          // Silent on error to avoid spamming the 5s loop
+          return;
+        }
+        if (self.tabs && self.tabs.length) {
+          self.tabs.forEach(function (t) {
+            t.running = (self.jobs || []).some(function (j) {
+              return !TERMINAL_STATUSES.has((j.status || '').toLowerCase()) && j.workspace_id === t.id;
+            });
+          });
+        }
+      } catch (e) { /* silent */ }
     },
 
     // ---- 8f. saveToClient / triggerDownloads / _blobDownload ----
@@ -951,6 +1026,7 @@ function NanoBananaApp() {
     },
 
     loadTargetTabState() {
+      var self = this;
       var wsId = this.activeTabId;
       var cache = this._tabStateCache[wsId] || {};
       this.statusText = cache.statusText || '空闲';
@@ -964,6 +1040,17 @@ function NanoBananaApp() {
       if (form) form.reset();
       this.savedMedia = {};
       if (typeof this.loadInitialPreset === 'function') this.loadInitialPreset();
+
+      // If a background pollJob stashed a job snapshot for this tab, replay it
+      // into the DOM. Otherwise clear any stale DOM left by the previous tab.
+      if (cache._latestJob) {
+        self._renderJobToDom(cache._latestJob);
+      } else {
+        var resultsEl = document.getElementById('nb-results');
+        var eventsEl = document.getElementById('nb-events');
+        if (resultsEl) resultsEl.innerHTML = '';
+        if (eventsEl) eventsEl.textContent = '';
+      }
     },
 
     _scrollActiveTabIntoView() {
