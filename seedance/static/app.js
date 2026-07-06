@@ -720,6 +720,12 @@ function SeedanceApp() {
         }
         await new Promise(r => setTimeout(r, 2500));
       }
+      // Clear status + submitting on ALL exit paths (terminal AND null-break).
+      // The terminal branch above already sets these for clarity, but this
+      // catches the `if (!job) break;` early exit that otherwise leaves stale
+      // progress text and a locked submit button.
+      setStatus('空闲');
+      setSubmitting(false);
       // Original pollJob always refreshed the jobs list on exit — keep that.
       this.loadJobs();
     },

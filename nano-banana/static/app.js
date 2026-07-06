@@ -546,6 +546,12 @@ function NanoBananaApp() {
         }
         await new Promise(function (r) { setTimeout(r, 2500); });
       }
+      // Clear status + submitting on ALL exit paths (terminal AND null-break).
+      // The terminal branch above already sets these for clarity, but this
+      // catches the `if (!job) break;` early exit that otherwise leaves stale
+      // progress text and a locked submit button.
+      setStatus('空闲');
+      setSubmitting(false);
       // Refresh activity list + jobs list on exit (original always ran activity).
       try { self.loadActivity(); } catch (e) { /* ignore */ }
       if (isActive()) self.loadJobs(); else { try { self.loadJobs(); } catch (e) { /* ignore */ } }
@@ -558,33 +564,31 @@ function NanoBananaApp() {
     // work.
     _renderJobToDom(job) {
       var resultsEl = document.getElementById('nb-results');
-      var eventsEl = document.getElementById('nb-events');
-      if (!resultsEl && !eventsEl) return;
+      if (!resultsEl) return;
 
-      if (eventsEl) {
-        eventsEl.textContent = (job.events || []).map(function (e) { return '[' + (e.time || '') + '] ' + (e.message || ''); }).join('\n');
+      // Note: no eventsEl DOM write here. The original nano-banana pollJob
+      // only updated the reactive `self.eventsText` (bound to {{ eventsText }}
+      // in the template); setEvents() routes that value correctly whether the
+      // owning tab is active or cached. Writing #nb-events directly was scope
+      // creep in the Task 5 extraction.
+      var eventsList = (job.events || []).slice(-8).map(function (e) {
+        return '<div style="font-size:11px;color:#d1e0ff;padding:2px 0"><span style="color:#697386">' + escHtml(e.time) + '</span> ' + escHtml(e.message) + '</div>';
+      }).join('');
+      resultsEl.innerHTML = '<article class="result" style="border-color:#4f46e5;background:#101828;color:#e2e8f0;grid-column:1/-1">' +
+        '<div class="meta" style="color:#818cf8;font-weight:600;margin-bottom:6px">' + escHtml(job.status) + ' · ' + (job.done || 0) + '/' + (job.total || 0) + ' ' + escHtml((job.errors && job.errors[0]) || '') + '</div>' +
+        (eventsList || '<div style="color:#697386;font-size:11px">等待服务器响应...</div>') +
+        '</article>';
+      for (var ri = 0; ri < (job.results || []).length; ri++) {
+        var r = job.results[ri];
+        for (var ii = 0; ii < (r.images || []).length; ii++) {
+          var img = r.images[ii];
+          var url = APP_PATH + img.download_url;
+          var safeFn = escHtml(img.filename);
+          resultsEl.innerHTML += '<article class="result"><img src="' + url + '" style="width:100%;max-height:180px;object-fit:contain;border-radius:6px;cursor:zoom-in" onclick="openPreview(\'image\',\'' + url + '\')"><a href="' + url + '" class="dl-btn" data-url="' + url + '" data-filename="' + safeFn + '">下载</a><div class="meta">Run ' + r.index + '</div></article>';
+        }
       }
-
-      if (resultsEl) {
-        var eventsList = (job.events || []).slice(-8).map(function (e) {
-          return '<div style="font-size:11px;color:#d1e0ff;padding:2px 0"><span style="color:#697386">' + escHtml(e.time) + '</span> ' + escHtml(e.message) + '</div>';
-        }).join('');
-        resultsEl.innerHTML = '<article class="result" style="border-color:#4f46e5;background:#101828;color:#e2e8f0;grid-column:1/-1">' +
-          '<div class="meta" style="color:#818cf8;font-weight:600;margin-bottom:6px">' + escHtml(job.status) + ' · ' + (job.done || 0) + '/' + (job.total || 0) + ' ' + escHtml((job.errors && job.errors[0]) || '') + '</div>' +
-          (eventsList || '<div style="color:#697386;font-size:11px">等待服务器响应...</div>') +
-          '</article>';
-        for (var ri = 0; ri < (job.results || []).length; ri++) {
-          var r = job.results[ri];
-          for (var ii = 0; ii < (r.images || []).length; ii++) {
-            var img = r.images[ii];
-            var url = APP_PATH + img.download_url;
-            var safeFn = escHtml(img.filename);
-            resultsEl.innerHTML += '<article class="result"><img src="' + url + '" style="width:100%;max-height:180px;object-fit:contain;border-radius:6px;cursor:zoom-in" onclick="openPreview(\'image\',\'' + url + '\')"><a href="' + url + '" class="dl-btn" data-url="' + url + '" data-filename="' + safeFn + '">下载</a><div class="meta">Run ' + r.index + '</div></article>';
-          }
-        }
-        for (var ei = 0; ei < (job.errors || []).length; ei++) {
-          resultsEl.innerHTML += '<article class="result" style="color:#ef4444">' + escHtml(job.errors[ei]) + '</article>';
-        }
+      for (var ei = 0; ei < (job.errors || []).length; ei++) {
+        resultsEl.innerHTML += '<article class="result" style="color:#ef4444">' + escHtml(job.errors[ei]) + '</article>';
       }
     },
 
