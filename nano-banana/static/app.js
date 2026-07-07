@@ -916,7 +916,9 @@ function NanoBananaApp() {
     async saveWorkspaceDraft() {
       try {
         var payload = this.localWorkspaceSnapshot();
-        var key = 'nano-banana.workspace.' + this.workspaceId;
+        // Key must track activeTabId so each tab's draft stays isolated.
+        // Using this.workspaceId (fixed at init) caused all tabs to overwrite one another.
+        var key = 'nano-banana.workspace.' + this.activeTabId;
         localStorage.setItem(key, JSON.stringify(payload));
         this.workspaceHint = '已保存草稿：' + (payload.name || '');
       } catch (e) {
@@ -925,7 +927,8 @@ function NanoBananaApp() {
     },
 
     loadWorkspaceDraft() {
-      var key = 'nano-banana.workspace.' + this.workspaceId;
+      // Key must track activeTabId — see saveWorkspaceDraft.
+      var key = 'nano-banana.workspace.' + this.activeTabId;
       this.workspaceHint = '当前是独立主题页，可与其它主题并发提交';
       var raw = localStorage.getItem(key);
       if (!raw) return false;

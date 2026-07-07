@@ -934,7 +934,10 @@ function SeedanceApp() {
         media: mediaSnapshot(this.savedMedia),
         saved_at: Date.now(),
       };
-      localStorage.setItem(this._workspaceKey, JSON.stringify(payload));
+      // Key must track activeTabId so each tab's draft stays isolated.
+      // Using a fixed key computed at init caused all tabs to overwrite one another.
+      const key = 'seedance.workspace.' + this.activeTabId;
+      localStorage.setItem(key, JSON.stringify(payload));
       this.workspaceHint = '已保存草稿：' + payload.name;
       return payload;
     },
@@ -948,7 +951,9 @@ function SeedanceApp() {
         this.workspaceHint = '默认主题会读取当前保存配置';
       }
 
-      const raw = localStorage.getItem(this._workspaceKey);
+      // Key must track activeTabId — see saveWorkspaceDraft.
+      const key = 'seedance.workspace.' + this.activeTabId;
+      const raw = localStorage.getItem(key);
       if (!raw) return false;
       try {
         const draft = JSON.parse(raw);
