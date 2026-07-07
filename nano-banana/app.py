@@ -1556,6 +1556,21 @@ class Handler(SimpleHTTPRequestHandler):
                 for jid, j in JOBS.items():
                     if not sees_all and j.get("username", "") != username:
                         continue
+                    results = []
+                    for r in (j.get("results") or []):
+                        images = []
+                        for img in (r.get("images") or []):
+                            if img.get("download_url"):
+                                images.append({
+                                    "download_url": img.get("download_url", ""),
+                                    "filename": img.get("filename", ""),
+                                })
+                        results.append({
+                            "index": r.get("index", ""),
+                            "task_id": r.get("task_id", ""),
+                            "status": r.get("status", ""),
+                            "images": images,
+                        })
                     items.append({
                         "job_id": jid,
                         "status": j.get("status", "pending"),
@@ -1567,6 +1582,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "finished_at": j.get("finished_at"),
                         "username": j.get("username", ""),
                         "workspace_id": j.get("workspace_id", ""),
+                        "results": results,
                         "errors": j.get("errors", []),
                         "done": j.get("done", 0),
                         "total": j.get("total", 0),
