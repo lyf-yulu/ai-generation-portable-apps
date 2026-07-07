@@ -325,8 +325,9 @@ def _workspace_id(handler) -> str:
     ws = (handler.headers.get("X-Workspace-Id") or "").strip()
     if ws:
         return re.sub(r"[^a-zA-Z0-9_\-]", "_", ws)[:64]
-    # Fallback to query parameter
-    qs = urllib.parse.urlparse(handler.path).query
+    # Fallback to query parameter (read from raw path since self.path is stripped of query in do_GET/do_POST)
+    raw = getattr(handler, "_raw_path", None) or handler.path
+    qs = urllib.parse.urlparse(raw).query
     params = urllib.parse.parse_qs(qs)
     if "ws" in params:
         return re.sub(r"[^a-zA-Z0-9_\-]", "_", str(params["ws"][0]))[:64]
@@ -1826,6 +1827,7 @@ class Handler(SimpleHTTPRequestHandler):
         return str((STATIC_DIR / path.lstrip("/")).resolve())
 
     def do_GET(self) -> None:
+        self._raw_path = self.path
         self.path = urllib.parse.urlparse(self.path).path
         if self.path == "/api/v1/meta":
             json_response(self, 200, {
@@ -2007,6 +2009,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:
+        self._raw_path = self.path
         self.path = urllib.parse.urlparse(self.path).path
         if self.path == "/api/choose-output-dir":
             client_ip = self.headers.get("X-Forwarded-For") or self.client_address[0]
