@@ -49,7 +49,7 @@ function escHtml(s) {
 function wireFileDrop(drop, input, name) {
   if (input.dataset.wired) return;
   input.dataset.wired = '1';
-  input.addEventListener('change', () => {
+  input.addEventListener('change', async () => {
     const f = input.files?.[0];
     if (!f) {
       drop.classList.remove('hasPreview');
@@ -57,7 +57,31 @@ function wireFileDrop(drop, input, name) {
       drop.querySelector('span').textContent = '未上传';
       return;
     }
-    showPreview(drop, name, URL.createObjectURL(f), f.name);
+    // Immediate local preview
+    const localUrl = URL.createObjectURL(f);
+    showPreview(drop, name, localUrl, f.name);
+    // Upload to server so the file survives tab switch / refresh / archive save.
+    try {
+      const fd = new FormData();
+      fd.set(input.name, f);
+      const res = await api(APP_PATH + '/api/media/upload', 'POST', fd);
+      if (res && res.stored) {
+        const app = window._app_sd;
+        const media = (app && app.savedMedia) || window._currentSavedMedia || {};
+        media[input.name] = {
+          filename: res.filename,
+          mime: res.mime,
+          stored: res.stored,
+          url: res.url,
+        };
+        if (app) app.savedMedia = media;
+        window._currentSavedMedia = media;
+        const serverUrl = res.url.startsWith('/api/') ? APP_PATH + res.url : res.url;
+        showPreview(drop, name, serverUrl, res.filename);
+        try { URL.revokeObjectURL(localUrl); } catch (e) {}
+        if (app && typeof app.saveWorkspaceDraft === 'function') app.saveWorkspaceDraft();
+      }
+    } catch (e) { /* silent fallback: local blob preview stays */ }
   });
   drop.addEventListener('dragover', e => {
     e.preventDefault();
@@ -129,6 +153,9 @@ function makeDrop(container, name, label, accept, formId) {
     el.classList.remove('hasPreview');
     el.querySelector('.preview')?.remove();
     span.textContent = '未上传';
+    const app = window._app_sd;
+    if (app && app.savedMedia) delete app.savedMedia[name];
+    if (window._currentSavedMedia) delete window._currentSavedMedia[name];
   });
   el.append(input, span, rmBtn);
   wireFileDrop(el, input, name);
@@ -281,6 +308,8 @@ function SeedanceApp() {
     // INIT
     // ============================================================
     async init() {
+      window._app_sd = this;
+      window._currentSavedMedia = this.savedMedia;
       this.buildUploadSlots();
       this.wireDrops();
       try { await this.loadConfig(); } catch (e) { console.warn('loadConfig failed:', e); }

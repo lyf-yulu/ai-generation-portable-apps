@@ -70,10 +70,33 @@ function clearAllMediaInputs() {
 // Module 4: File Drop Helpers
 // ============================================================
 function wireFileDrop(drop, input) {
-  input.addEventListener('change', function () {
+  input.addEventListener('change', async function () {
     const f = input.files?.[0];
     if (!f) { clearPreview(drop); return; }
-    showPreview(drop, input.name, URL.createObjectURL(f), f.name);
+    // Immediate local preview
+    const localUrl = URL.createObjectURL(f);
+    showPreview(drop, input.name, localUrl, f.name);
+    // Upload to server so the file survives tab switch / refresh / archive save.
+    try {
+      const fd = new FormData();
+      fd.set(input.name, f);
+      const res = await api(APP_PATH + '/api/media/upload', 'POST', fd);
+      if (res && res.stored) {
+        const app = window._app_nb;
+        const media = (app && app.savedMedia) || window._currentSavedMedia || {};
+        media[input.name] = {
+          filename: res.filename,
+          mime: res.mime,
+          stored: res.stored,
+          url: res.url,
+        };
+        if (app) app.savedMedia = media;
+        window._currentSavedMedia = media;
+        showPreview(drop, input.name, resolveMediaUrl(res.url), res.filename);
+        try { URL.revokeObjectURL(localUrl); } catch (e) {}
+        if (app && typeof app.saveWorkspaceDraft === 'function') app.saveWorkspaceDraft();
+      }
+    } catch (e) { /* silent fallback: local blob preview stays */ }
   });
   drop.addEventListener('dragover', function (e) { e.preventDefault(); drop.classList.add('isDragging'); });
   drop.addEventListener('dragleave', function () { drop.classList.remove('isDragging'); });

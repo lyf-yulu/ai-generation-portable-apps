@@ -2071,6 +2071,73 @@ class Handler(SimpleHTTPRequestHandler):
             response["archives"] = list_archives(self)
             json_response(self, 200, response)
             return
+        if self.path == "/api/media/upload":
+            ws = _workspace_id(self)
+            ctype = self.headers.get("Content-Type", "")
+            if not ctype.startswith("multipart/form-data"):
+                json_response(self, 400, {"error": "expected multipart/form-data"})
+                return
+            form = cgi.FieldStorage(
+                fp=self.rfile,
+                headers=self.headers,
+                environ={
+                    "REQUEST_METHOD": "POST",
+                    "CONTENT_TYPE": ctype,
+                    "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
+                },
+                keep_blank_values=True,
+            )
+            field_name = None
+            file_item = None
+            for key in form.keys():
+                item = form[key]
+                if isinstance(item, list):
+                    item = item[0] if item else None
+                if item is None:
+                    continue
+                fname = getattr(item, "filename", None)
+                fobj = getattr(item, "file", None)
+                if fname and fobj is not None:
+                    field_name = key
+                    file_item = item
+                    break
+            if not field_name or file_item is None:
+                json_response(self, 400, {"error": "no file provided"})
+                return
+            filename = Path(file_item.filename).name
+            data = file_item.file.read()
+            if not data:
+                json_response(self, 400, {"error": "empty file"})
+                return
+            suffix = Path(filename).suffix.lower()
+            stored = f"{uuid.uuid4().hex}_{field_name}{suffix}"
+            media_dir = _ws_media_dir(ws)
+            media_dir.mkdir(parents=True, exist_ok=True)
+            (media_dir / stored).write_bytes(data)
+            mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            preset = read_preset(ws)
+            media = preset.get("media") or {}
+            old = media.get(field_name)
+            if old and old.get("stored"):
+                old_path = media_dir / old["stored"]
+                try:
+                    if old_path.exists() and old_path.name != stored:
+                        old_path.unlink()
+                except Exception:
+                    pass
+            media[field_name] = {"filename": filename, "mime": mime, "stored": stored}
+            preset["media"] = media
+            write_active_preset(preset, ws)
+            url = f"/api/media/{urllib.parse.quote(stored)}?ws={urllib.parse.quote(ws)}&v={int(time.time())}"
+            json_response(self, 200, {
+                "ok": True,
+                "field": field_name,
+                "filename": filename,
+                "mime": mime,
+                "stored": stored,
+                "url": url,
+            })
+            return
         if self.path == "/api/archive/load":
             form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
             try:
