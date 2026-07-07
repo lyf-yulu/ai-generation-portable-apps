@@ -1664,49 +1664,4 @@ PetiteVue.createApp({
       location.replace('/login');
     });
   }
-  // Init key-bar selectors above iframes
-  initKeyBars();
 })();
-
-// === Key-bar: dropdown above Seedance / Nano Banana iframes ===
-async function initKeyBars() {
-  for (const bar of document.querySelectorAll('.key-bar')) {
-    const app = bar.dataset.app;
-    const providers = (bar.dataset.provider || '').split(',');
-    // Build selector HTML
-    const sel = document.createElement('div');
-    sel.style.cssText = 'padding:6px 12px;background:#1e293b;border-bottom:1px solid #334155;display:flex;align-items:center;gap:10px;font-size:12px;color:#94a3b8';
-    sel.innerHTML = `<span>API Key:</span><select style="background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:3px 8px;font-size:12px"><option value="">— 使用子应用内置 Key —</option></select><span id="kbar-hint-${app}" style="color:#22c55e;font-size:11px"></span>`;
-    bar.appendChild(sel);
-    const dropdown = sel.querySelector('select');
-
-    // Load keys for all matching providers
-    for (const prov of providers) {
-      const r = await api(`/api/keys?provider=${prov.trim()}`);
-      for (const k of (r?.keys || [])) {
-        const opt = document.createElement('option');
-        opt.value = k.id;
-        opt.textContent = `[${k.provider}] ${k.name} (${k.key_hint})`;
-        dropdown.appendChild(opt);
-      }
-    }
-
-    // Restore saved selection
-    const saved = localStorage.getItem(`portal_key_id_${app}`);
-    if (saved && dropdown.querySelector(`option[value="${saved}"]`)) dropdown.value = saved;
-
-    dropdown.addEventListener('change', () => {
-      const val = dropdown.value;
-      if (val) {
-        localStorage.setItem(`portal_key_id_${app}`, val);
-        document.getElementById(`kbar-hint-${app}`).textContent = '已选择，刷新 iframe 后生效';
-        // Reload iframe to apply
-        const iframe = document.getElementById(`iframe-${app === 'nano-banana' ? 'nb' : app}`);
-        if (iframe) iframe.src = iframe.src;
-      } else {
-        localStorage.removeItem(`portal_key_id_${app}`);
-        document.getElementById(`kbar-hint-${app}`).textContent = '';
-      }
-    });
-  }
-}
