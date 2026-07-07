@@ -1037,6 +1037,10 @@ function SeedanceApp() {
       this.savedMedia = {};
       const form = document.querySelector('#sd-form');
       if (form) form.reset();
+      // form.reset() clears file inputs' .files but not the preview <img>/<video>
+      // that showPreview() manually injected into each .drop — mirror the cleanup
+      // applyPreset() already does so the new tab starts truly blank.
+      clearAllMediaPreviews();
       this.statusText = '空闲';
       this.eventsText = '';
       this.submitting = false;

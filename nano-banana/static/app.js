@@ -986,6 +986,10 @@ function NanoBananaApp() {
       this.savedMedia = {};
       var form = document.querySelector('#nb-form');
       if (form) form.reset();
+      // form.reset() clears file inputs' .files but not the preview <img>
+      // that showPreview() manually injected into each .drop — mirror the cleanup
+      // applyPreset() already does so the new tab starts truly blank.
+      clearAllMediaInputs();
       this.statusText = '空闲';
       this.eventsText = '';
       this.submitting = false;
