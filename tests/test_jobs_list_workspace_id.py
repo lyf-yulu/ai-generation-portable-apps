@@ -1,9 +1,15 @@
-"""Verify /api/jobs list responses expose workspace_id for both sub-apps.
+"""Verify /api/jobs list responses expose the fields the frontend needs.
 
-The frontend in-app tab bar aggregates the running-indicator dot per tab by
-filtering /api/jobs results on workspace_id. If the field is missing from the
-list response, the dot logic silently degrades to "no jobs" — this test
-prevents that regression.
+Two contracts guarded here:
+
+1. workspace_id — the in-app tab bar filters running-indicator dots per tab
+   on this field. Missing → dots silently degrade to "no jobs".
+
+2. results[] with download URLs — loadJobs() rebuilds image/video cards from
+   the list rows (5s refresh + tab-switch restore). Seedance uses a flat
+   results[].download_url shape; nano-banana nests inside results[].images[].
+   Either dropping the field would silently render "succeeded" jobs with no
+   media.
 """
 import importlib.util
 import json
@@ -59,7 +65,18 @@ class JobsListWorkspaceIdTests(unittest.TestCase):
                 "finished_at": 2100,
                 "username": "alice",
                 "workspace_id": "client-b",
-                "results": [],
+                "results": [
+                    {
+                        "index": 0,
+                        "task_id": "t1",
+                        "status": "succeeded",
+                        "download_url": "/api/download/aaa",  # seedance flat shape
+                        "filename": "out.mp4",
+                        "images": [  # nano-banana nested shape
+                            {"download_url": "/api/download/bbb", "filename": "out.png"},
+                        ],
+                    },
+                ],
                 "errors": [],
                 "done": 1,
                 "total": 1,
@@ -103,12 +120,27 @@ class JobsListWorkspaceIdTests(unittest.TestCase):
         module = load_module("nano_jobs_under_test", ROOT / "nano-banana" / "app.py")
         items = self._run(module, "LOCK")
         self._assert_workspace_ids(items)
-        # nano-banana per-result shape nests download_url/filename inside
-        # images[]; the list endpoint intentionally omits results — full
-        # detail is served by /api/jobs/{id}. Guard against re-adding a
-        # broken top-level projection.
-        for item in items:
-            self.assertNotIn("results", item)
+        # The list endpoint MUST include results[].images[].download_url so
+        # that loadJobs() (5s refresh + tab-switch restore) can rebuild the
+        # image cards. Dropping it would silently show "succeeded" jobs with
+        # no images after any refresh.
+        job_b = next(it for it in items if it["job_id"] == "job-b")
+        self.assertEqual(len(job_b["results"]), 1)
+        images = job_b["results"][0]["images"]
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0]["download_url"], "/api/download/bbb")
+        self.assertEqual(images[0]["filename"], "out.png")
+
+    def test_seedance_jobs_list_includes_download_url(self):
+        module = load_module("seedance_jobs_dl_url", ROOT / "seedance" / "app.py")
+        items = self._run(module, "JOBS_LOCK")
+        # seedance uses a flat results[] shape with download_url on the row.
+        # loadJobs() reads r.download_url directly, so the list endpoint
+        # must expose it.
+        job_b = next(it for it in items if it["job_id"] == "job-b")
+        self.assertEqual(len(job_b["results"]), 1)
+        self.assertEqual(job_b["results"][0]["download_url"], "/api/download/aaa")
+        self.assertEqual(job_b["results"][0]["filename"], "out.mp4")
 
 
 if __name__ == "__main__":
