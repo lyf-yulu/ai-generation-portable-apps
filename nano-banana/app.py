@@ -1465,6 +1465,7 @@ class Handler(SimpleHTTPRequestHandler):
         return str((STATIC_DIR / path.lstrip("/")).resolve())
 
     def do_GET(self) -> None:
+        self.path = urllib.parse.urlparse(self.path).path
         if self.path == "/api/v1/meta":
             json_response(self, 200, {
                 "app": "nano-banana",
@@ -1608,6 +1609,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:
+        self.path = urllib.parse.urlparse(self.path).path
         if self.path == "/api/choose-output-dir":
             client_ip = self.headers.get("X-Forwarded-For") or self.client_address[0]
             if client_ip not in ("127.0.0.1", "::1", "localhost"):
