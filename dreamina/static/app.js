@@ -447,7 +447,7 @@ function renderJobCard(job) {
     resultHtml = '<div class="job-result">' + files.map(f => {
       const ext = f.split('.').pop().toLowerCase();
       if (['mp4','webm','mov'].includes(ext)) {
-        return `<video class="result-thumb" src="/${f}" data-src="/${f}" muted></video>`;
+        return `<video class="result-thumb" src="/${f}" data-src="/${f}" muted playsinline preload="metadata"></video>`;
       }
       return `<img class="result-thumb" src="/${f}" data-src="/${f}" alt="result">`;
     }).join('') + '</div>';

@@ -796,7 +796,7 @@ function SeedanceApp() {
           const url = APP_PATH + (r.download_url || '');
           resultsEl.innerHTML +=
             '<article class="result">'
-            + '<video controls src="' + url + '" style="max-height:200px"></video>'
+            + '<video controls preload="metadata" muted playsinline src="' + url + '" style="max-height:200px"></video>'
             + '<a href="' + url + '" class="dl-btn" data-url="' + url + '" data-filename="' + escHtml(r.filename || 'video') + '">下载</a>'
             + '<div class="meta">Run ' + (r.index || '') + ' · ' + (r.task_id || '') + '</div>'
             + '</article>';
