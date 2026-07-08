@@ -763,36 +763,69 @@
 
   <!-- KEYS -->
   <div class="tab-panel" id="tab-keys" v-scope="KeysApp()" @vue:mounted="init()">
-    <div class="portal-content" style="max-width:640px">
-      <section class="stats-panel">
-        <h2>我的 API 密钥</h2>
-        <p style="font-size:12px;color:#94a3b8;margin-bottom:16px">密钥库仅本人可见。点「复制」获取明文，粘贴到子应用的 API Key 输入框。</p>
-        <form @submit.prevent="addKey()" style="display:grid;gap:8px;margin-bottom:20px">
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
-            <label style="font-size:12px;color:#94a3b8">Key 名称<input v-model="form.name" required placeholder="如「T8Star主力」" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:#1e293b;border:1px solid #334155;border-radius:5px;color:#e2e8f0;font-size:13px"></label>
-            <label style="font-size:12px;color:#94a3b8">供应商<select v-model="form.provider" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:#1e293b;border:1px solid #334155;border-radius:5px;color:#e2e8f0;font-size:13px">
-              <option value="t8star">T8Star (Claude/OpenAI)</option>
-              <option value="chiyun">Chiyun（赤云）</option>
-              <option value="volcengine">火山方舟 API Key</option>
-              <option value="volcengine_ak">火山方舟 AK/SK（格式: AK:::SK）</option>
-              <option value="gemini">Google Gemini</option>
-              <option value="openai">OpenAI</option>
-              <option value="other">其他</option>
-            </select></label>
+    <div class="portal-content keys-content">
+      <section class="stats-panel keys-panel">
+        <header class="keys-header">
+          <h2>我的 API 密钥</h2>
+          <p class="keys-desc">密钥库仅本人可见。点「复制」获取明文，粘贴到子应用的 API Key 输入框。</p>
+        </header>
+        <div class="keys-layout">
+          <form class="keys-form" @submit.prevent="addKey()">
+            <h3 class="keys-form-title">添加新密钥</h3>
+            <div class="keys-form-grid">
+              <label class="keys-field">
+                <span class="keys-field-label">Key 名称</span>
+                <input v-model="form.name" required placeholder="如「T8Star主力」">
+              </label>
+              <label class="keys-field">
+                <span class="keys-field-label">供应商</span>
+                <select v-model="form.provider">
+                  <option value="t8star">T8Star (Claude/OpenAI)</option>
+                  <option value="chiyun">Chiyun（赤云）</option>
+                  <option value="volcengine">火山方舟 API Key</option>
+                  <option value="volcengine_ak">火山方舟 AK/SK（格式: AK:::SK）</option>
+                  <option value="gemini">Google Gemini</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="other">其他</option>
+                </select>
+              </label>
+              <label class="keys-field keys-field-full">
+                <span class="keys-field-label">Key 值</span>
+                <input v-model="form.key" required type="password" placeholder="粘贴 API Key">
+              </label>
+              <label class="keys-field keys-field-full">
+                <span class="keys-field-label">备注（可选）</span>
+                <input v-model="form.note" placeholder="如「个人额度，5月到期」">
+              </label>
+            </div>
+            <div class="keys-form-actions">
+              <button type="submit" class="keys-submit" :disabled="saving">{{ saving ? '保存中…' : '添加密钥' }}</button>
+              <p v-if="hint" class="keys-hint" :class="{ok: hintOk, err: !hintOk}">{{ hint }}</p>
+            </div>
+          </form>
+          <div class="keys-list-wrap">
+            <h3 class="keys-list-title">已保存 <span class="keys-count">{{ keys.length }}</span></h3>
+            <div v-if="!keys.length" class="keys-empty">
+              <div class="keys-empty-icon">🔑</div>
+              <div class="keys-empty-text">还没有密钥，先在左侧添加一个。</div>
+            </div>
+            <div v-for="k in keys" class="key-item" :key="k.id">
+              <div class="key-item-main">
+                <div class="key-item-title">
+                  <span class="key-name">{{ k.name }}</span>
+                  <span class="key-provider">{{ k.provider }}</span>
+                </div>
+                <div class="key-item-meta">
+                  <code class="key-hint">{{ k.key_hint }}</code>
+                  <span v-if="k.note" class="key-note">{{ k.note }}</span>
+                </div>
+              </div>
+              <div class="key-item-actions">
+                <button type="button" class="btn-key btn-copy" @click="copyKey(k.id, k.name)">复制</button>
+                <button type="button" class="btn-key btn-delete" @click="deleteKey(k.id)">删除</button>
+              </div>
+            </div>
           </div>
-          <label style="font-size:12px;color:#94a3b8">Key 值<input v-model="form.key" required type="password" placeholder="粘贴 API Key" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:#1e293b;border:1px solid #334155;border-radius:5px;color:#e2e8f0;font-size:13px"></label>
-          <label style="font-size:12px;color:#94a3b8">备注（可选）<input v-model="form.note" placeholder="如「个人额度，5月到期」" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:#1e293b;border:1px solid #334155;border-radius:5px;color:#e2e8f0;font-size:13px"></label>
-          <button type="submit" :disabled="saving" style="padding:8px;background:#4f46e5;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:13px">{{ saving ? '保存中...' : '添加密钥' }}</button>
-          <p v-if="hint" style="font-size:12px;margin:0" :style="{color:hintOk?'#22c55e':'#f87171'}">{{ hint }}</p>
-        </form>
-        <div v-if="!keys.length" style="color:#697386;font-size:13px;text-align:center;padding:20px">暂无密钥</div>
-        <div v-for="k in keys" style="display:flex;align-items:center;gap:10px;padding:10px;border:1px solid #334155;border-radius:6px;margin-bottom:8px">
-          <div style="flex:1;min-width:0">
-            <div style="font-size:13px;font-weight:600;color:#e2e8f0">{{ k.name }}</div>
-            <div style="font-size:11px;color:#94a3b8;margin-top:2px">{{ k.provider }} · <code style="font-family:monospace">{{ k.key_hint }}</code><span v-if="k.note"> · {{ k.note }}</span></div>
-          </div>
-          <button @click="copyKey(k.id, k.name)" style="padding:4px 10px;background:#1e3a8a;color:#bfdbfe;border:1px solid #1e40af;border-radius:4px;font-size:11px;cursor:pointer">复制</button>
-          <button @click="deleteKey(k.id)" style="padding:4px 10px;background:#7f1d1d;color:#fca5a5;border:1px solid #991b1b;border-radius:4px;font-size:11px;cursor:pointer">删除</button>
         </div>
       </section>
     </div>

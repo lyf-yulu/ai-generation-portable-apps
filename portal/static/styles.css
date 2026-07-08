@@ -620,3 +620,65 @@ button:disabled,
 .extra-file-thumb { width: 100%; height: 100%; object-fit: cover; }
 .extra-file-name { position: absolute; bottom: 0; left: 0; right: 0; background: rgba(0,0,0,0.6); color: var(--surface); font-size: 9px; padding: 1px 4px; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .extra-file-item .btn-sm { position: absolute; top: 1px; right: 1px; }
+
+/* === Keystore (tab-keys) === */
+.keys-content { max-width: 1120px; }
+.keys-panel { padding: 24px 28px 28px; }
+.keys-header { margin-bottom: 20px; }
+.keys-header h2 { margin: 0 0 6px; font-size: 18px; }
+.keys-desc { margin: 0; font-size: 13px; color: var(--text-secondary); line-height: 1.55; }
+.keys-layout { display: grid; grid-template-columns: minmax(320px, 420px) 1fr; gap: 24px; align-items: start; }
+@media (max-width: 860px) { .keys-layout { grid-template-columns: 1fr; } }
+
+.keys-form { background: var(--surface-soft); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 18px 18px 16px; }
+.keys-form-title,
+.keys-list-title { margin: 0 0 14px; font-size: 13px; font-weight: 700; color: var(--text-secondary); letter-spacing: 0.04em; text-transform: uppercase; }
+.keys-count { display: inline-block; margin-left: 6px; padding: 1px 8px; background: var(--accent-soft); color: var(--accent); border-radius: var(--radius-pill); font-size: 11px; font-weight: 700; letter-spacing: 0; text-transform: none; }
+.keys-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.keys-field { display: grid; gap: 6px; margin: 0; font-size: var(--font-size-sm); font-weight: 650; color: var(--text-secondary); }
+.keys-field-full { grid-column: 1 / -1; }
+.keys-field-label { font-size: 11px; }
+.keys-field input,
+.keys-field select {
+  width: 100%; padding: 8px 10px; height: 36px;
+  background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-md);
+  color: var(--text); font-size: 13px; font-family: inherit; outline: none;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+.keys-field input:focus,
+.keys-field select:focus { border-color: var(--accent); box-shadow: var(--shadow-focus); }
+.keys-field input::placeholder { color: #9aa3b2; }
+
+.keys-form-actions { margin-top: 14px; display: grid; gap: 8px; }
+.keys-submit { width: 100%; height: 40px; background: var(--accent); color: var(--surface); border-radius: var(--radius-md); font-weight: 700; font-size: 13px; transition: background var(--transition-fast); }
+.keys-submit:hover:not(:disabled) { background: var(--accent-hover); }
+.keys-hint { margin: 0; font-size: var(--font-size-sm); }
+.keys-hint.ok { color: var(--success-text); }
+.keys-hint.err { color: var(--danger-text); }
+
+.keys-list-wrap { min-width: 0; }
+.keys-empty { padding: 40px 20px; background: var(--surface-soft); border: 1px dashed var(--border-strong); border-radius: var(--radius-lg); text-align: center; }
+.keys-empty-icon { font-size: 28px; margin-bottom: 8px; opacity: 0.55; }
+.keys-empty-text { font-size: 13px; color: var(--muted); }
+
+.key-item {
+  display: flex; align-items: center; gap: 14px;
+  padding: 12px 14px; margin-bottom: 10px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+.key-item:hover { border-color: var(--border-strong); box-shadow: var(--shadow-sm); }
+.key-item-main { flex: 1; min-width: 0; }
+.key-item-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.key-name { font-size: 14px; font-weight: 700; color: var(--text); }
+.key-provider { font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; padding: 2px 8px; background: var(--accent-soft); color: var(--accent); border-radius: var(--radius-pill); }
+.key-item-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 4px; font-size: 11px; color: var(--muted); }
+.key-hint { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; padding: 1px 6px; background: var(--surface-sunken); border-radius: var(--radius-sm); color: var(--text-secondary); }
+.key-note { color: var(--text-secondary); }
+
+.key-item-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.btn-key { width: auto; height: 30px; padding: 0 14px; border-radius: var(--radius-md); font-size: 12px; font-weight: 650; border: 1px solid transparent; transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast); }
+.btn-copy { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-soft); }
+.btn-copy:hover { background: var(--accent); color: var(--surface); border-color: var(--accent); }
+.btn-delete { background: var(--surface); color: var(--danger-text); border-color: var(--border-strong); }
+.btn-delete:hover { background: var(--danger-soft); border-color: var(--danger); color: var(--danger-text); }
