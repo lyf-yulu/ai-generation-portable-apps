@@ -649,6 +649,8 @@ def activity_list(ws_id: str = "localhost", show_all: bool = False, username: st
             "title": item.get("title"),
             "request_kind": item.get("request_kind"),
             "username": item.get("username", ""),
+            "started_at": item.get("started_at"),
+            "finished_at": item.get("finished_at"),
         })
     summary.reverse()
     return {"counts": counts, "records": summary}
@@ -1693,6 +1695,7 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
         "response": response,
         "workspace_id": ws_id,
         "username": username,
+        "started_at": time.time(),
         "restore": copy_files_to_restore(values, files, activity_id, ws_id),
     })
     thread = threading.Thread(target=run_job, args=(job_id, values, files, activity_id, ws_id), daemon=True)
@@ -1805,14 +1808,14 @@ def run_job(job_id: str, form_values: dict[str, Any], form_files: dict[str, tupl
         final_status = "failed" if errors else "succeeded"
         set_job(job_id, status=final_status, finished_at=time.time())
         final_job["status"] = final_status
-        update_activity(activity_id, status=final_status, result=final_job)
+        update_activity(activity_id, status=final_status, result=final_job, finished_at=time.time())
         add_event(job_id, "Finished")
         report_final_to_portal(job_id, final_status)
     except Exception as exc:
         set_job(job_id, status="failed", errors=[str(exc)], finished_at=time.time())
         with JOBS_LOCK:
             final_job = json.loads(json.dumps(JOBS.get(job_id, {})))
-        update_activity(activity_id, status="failed", error=str(exc), result=final_job)
+        update_activity(activity_id, status="failed", error=str(exc), result=final_job, finished_at=time.time())
         add_event(job_id, f"Fatal: {exc}")
         report_final_to_portal(job_id, "failed")
 
