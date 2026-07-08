@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nano Banana 多图生成器</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="nb-app" v-scope="NanoBananaApp()" @vue:mounted="init()">
+
+    <!-- Standalone page chrome (hidden in Portal proxy) -->
+    <template v-if="isStandalone">
+      <h1>Nano Banana <span class="app-status-dot" :class="appStatus"></span></h1>
+    </template>
+
+    <div class="app-tabs" v-if="tabs.length">
+      <div v-for="t in tabs" :key="t.id"
+           class="app-tab" :class="{ active: t.id === activeTabId, editing: t.id === editingTabId }"
+           @click="switchTab(t.id)"
+           @dblclick="startEditTab(t.id)">
+        <span class="dot" :class="{ running: t.running }"></span>
+        <span v-if="editingTabId !== t.id" class="name">{{ t.name || '未命名' }}</span>
+        <input v-else type="text" :value="t.name"
+               @keydown.enter="finishEditTab(t.id, $event.target.value)"
+               @keydown.esc="editingTabId = null"
+               @blur="finishEditTab(t.id, $event.target.value)"
+               v-effect="editingTabId === t.id && $el.focus()">
+        <span v-if="tabs.length > 1 && editingTabId !== t.id"
+              class="close" @click.stop="closeTab(t.id)">×</span>
+      </div>
+      <div class="app-tab plus" @click="newTab()">+ 新主题</div>
+    </div>
+    <main class="app">
+      <!-- ====== SIDEBAR ====== -->
+      <aside class="sidebar">
+
+        <form id="nb-form" @submit.prevent="submit">
+
+          <!-- 接口 -->
+          <section>
+            <h2>接口</h2>
+            <label>API Key
+              <input name="api_key" type="password" autocomplete="off" placeholder="留空使用本地配置">
+            </label>
+            <p class="hint">{{ keyHint }}</p>
+            <label>供应商
+              <select name="provider" v-model="provider" @change="applyProvider($event.target.value)">
+                <option v-for="(cfg, key) in providers" :value="key">{{ cfg.label || key }}</option>
+              </select>
+            </label>
+            <label>Base URL
+              <input name="base_url" v-model="baseUrl">
+            </label>
+            <p class="hint">{{ providerHint }}</p>
+            <label>输出目录
+              <input name="output_dir" v-model="outputDir" placeholder="留空则保存到 outputs 文件夹">
+            </label>
+            <div class="rowButtons outputDirBtns">
+              <button type="button" @click="chooseOutputDir">选择目录</button>
+              <button type="button" @click="outputDir=''">程序 outputs</button>
+              <button type="button" @click="desktopOutput">桌面 outputs</button>
+              <button type="button" @click="openOutputDir">打开目录</button>
+              <button type="button" @click="cleanCache">清理缓存</button>
+            </div>
+          </section>
+
+          <!-- 参数 -->
+          <section>
+            <h2>参数</h2>
+            <label>模式
+              <select name="mode">
+                <option value="img2img">img2img</option>
+                <option value="text2img">text2img</option>
+              </select>
+            </label>
+            <label>模型
+              <select name="model">
+                <option v-for="m in models" :value="m.id">{{ m.label || m.id }}</option>
+              </select>
+            </label>
+            <label>自定义模型名（高级）
+              <input name="custom_model" placeholder="留空使用上方模型">
+            </label>
+            <div class="grid2">
+              <label>比例
+                <select name="aspect_ratio">
+                  <option value="auto">auto</option><option>1:1</option><option>16:9</option>
+                  <option>9:16</option><option>4:3</option><option>3:4</option>
+                  <option>2:3</option><option>3:2</option><option>21:9</option><option>9:21</option>
+                </select>
+              </label>
+              <label>尺寸
+                <select name="image_size">
+                  <option>1K</option><option selected>2K</option><option>4K</option>
+                </select>
+              </label>
+            </div>
+            <div class="grid2">
+              <label>返回格式
+                <select name="response_format">
+                  <option value="url">url</option>
+                  <option value="b64_json">b64_json</option>
+                </select>
+              </label>
+              <label>Seed
+                <input name="seed" type="number" min="0" max="2147483647" placeholder="随机">
+              </label>
+            </div>
+            <label>生成后 seed
+              <select name="control_after_generate">
+                <option value="randomize">randomize</option>
+                <option value="fixed">fixed</option>
+              </select>
+            </label>
+
+            <!-- Image Resize Section (from standalone) -->
+            <section class="resizeBox">
+              <label class="inlineToggle">
+                <input name="resize_enabled" type="checkbox" @change="updateResizeState"> 启用 Image Resize
+              </label>
+              <div class="resizeControls" :class="{ isDisabled: !resizeEnabled }">
+                <div class="grid2">
+                  <label>宽度
+                    <input name="resize_width" type="number" min="1" max="8192" value="1700" :disabled="!resizeEnabled">
+                  </label>
+                  <label>高度
+                    <input name="resize_height" type="number" min="1" max="8192" value="2500" :disabled="!resizeEnabled">
+                  </label>
+                </div>
+                <div class="grid2">
+                  <label>插值
+                    <select name="resize_interpolation" :disabled="!resizeEnabled">
+                      <option value="high">bicubic</option>
+                      <option value="medium">bilinear</option>
+                      <option value="low">nearest</option>
+                    </select>
+                  </label>
+                  <label>方法
+                    <select name="resize_method" :disabled="!resizeEnabled">
+                      <option value="stretch">stretch</option>
+                      <option value="contain">contain</option>
+                      <option value="cover">cover</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="grid2">
+                  <label>条件
+                    <select name="resize_condition" :disabled="!resizeEnabled">
+                      <option value="always">always</option>
+                      <option value="only_downscale">only downscale</option>
+                      <option value="only_upscale">only upscale</option>
+                    </select>
+                  </label>
+                  <label>multiple_of
+                    <input name="resize_multiple_of" type="number" min="0" max="512" value="0" :disabled="!resizeEnabled">
+                  </label>
+                </div>
+                <p class="hint">勾选后才会在提交生成时处理参考图；不勾选则发送原图。</p>
+              </div>
+            </section>
+
+            <div class="toggles">
+              <label><input name="skip_error" type="checkbox"> 跳过错误</label>
+              <label><input name="vary_seed" type="checkbox" checked> seed +1</label>
+            </div>
+            <label>输出名
+              <input name="output_name" placeholder="留空自动命名，多并发加 -1 -2...">
+            </label>
+          </section>
+
+          <!-- 并发重复 -->
+          <section>
+            <h2>并发重复</h2>
+            <p class="hint">实际生成次数取「重复次数」和「并发数」中较大的值。</p>
+            <div class="grid2">
+              <label>重复次数
+                <input name="repeat_count" type="number" min="1" max="50" value="1">
+              </label>
+              <label>并发数
+                <input name="concurrency" type="number" min="1" max="20" value="1">
+              </label>
+            </div>
+            <div class="grid2">
+              <label>轮询秒
+                <input name="poll_interval" type="number" min="3" max="120" value="10">
+              </label>
+              <label>超时秒
+                <input name="timeout" type="number" min="60" value="900">
+              </label>
+            </div>
+          </section>
+
+          <button type="submit" :disabled="submitting">{{ submitting ? '生成中' : '开始生成' }}</button>
+
+          <!-- 存档 -->
+          <section class="archiveBox">
+            <h2>存档</h2>
+            <label>存档名
+              <input name="archive_name" placeholder="存档名称">
+            </label>
+            <label>读取存档
+              <select v-model="selectedArchive">
+                <option v-for="a in archives" :value="a.name">{{ a.name }}</option>
+              </select>
+            </label>
+            <div class="rowButtons archiveActions">
+              <button type="button" @click="saveArchive">保存</button>
+              <button type="button" @click="loadArchive">读取</button>
+              <button type="button" @click="deleteArchive">删除</button>
+            </div>
+            <p class="hint">{{ archiveHint }}</p>
+          </section>
+
+          <!-- Clear preset (from standalone) -->
+          <button type="button" class="secondaryWide" @click="clearPreset">清空当前读取配置</button>
+
+        </form>
+      </aside>
+
+      <!-- ====== WORKSPACE ====== -->
+      <section class="workspace">
+
+        <!-- Prompt -->
+        <div class="panel">
+          <h2>Prompt</h2>
+          <textarea name="prompt" form="nb-form" spellcheck="false" placeholder="输入提示词。多图参考可写：参考 Image 1 的人物..."></textarea>
+        </div>
+
+        <!-- Reference Images -->
+        <div class="panel">
+          <h2>参考图</h2>
+          <div class="uploadGrid refs" id="nb-imageRefs"></div>
+        </div>
+
+        <!-- Jobs / Activity -->
+        <div class="panel">
+          <div class="sub-tabs" style="margin-bottom:10px">
+            <button type="button" class="sub-tab" :class="{ isActive: wsTab === 'jobs' }" @click="wsTab='jobs'">任务</button>
+            <button type="button" class="sub-tab" :class="{ isActive: wsTab === 'activity' }" @click="wsTab='activity'; loadActivity()">活动</button>
+          </div>
+
+          <!-- Jobs Tab -->
+          <div v-show="wsTab==='jobs'">
+            <div class="resultHeader"><h2>结果</h2><span>{{ statusText }}</span></div>
+            <div class="results" id="nb-results"></div>
+            <pre id="nb-events">{{ eventsText }}</pre>
+          </div>
+
+          <!-- Activity Tab -->
+          <div v-show="wsTab==='activity'" class="activity-panel-inner">
+            <div v-if="!activityDetail">
+              <div class="activity-counts" v-if="activityCounts">
+                <span>共 {{ activityCounts.total }} 条</span>
+                <span class="act-ok">成功 {{ activityCounts.succeeded }}</span>
+                <span class="act-fail">失败 {{ activityCounts.failed }}</span>
+              </div>
+              <div class="activity-records">
+                <div v-for="r in activityRecords" :key="r.id" class="act-item" @click="showDetail(r.id)">
+                  <span class="act-status" :class="r.status">{{ r.status }}</span>
+                  <span class="act-time">{{ (r.created_at||'').slice(5,16) }}</span>
+                  <span v-if="r.username" style="font-size:11px;color:#697386;margin-left:6px">@{{ r.username }}</span>
+                  <span v-if="formatRuntime(r)" style="font-size:11px;color:#475569;margin-left:6px">{{ formatRuntime(r) }}</span>
+                  <span class="act-title">{{ r.title }}</span>
+                </div>
+                <div v-if="!activityRecords.length" style="color:#697386;font-size:12px">暂无活动记录</div>
+              </div>
+            </div>
+            <div v-else-if="activityDetail" class="act-detail">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+                <button type="button" class="btn-small" @click="activityDetail=null">← 返回列表</button>
+                <button type="button" class="btn-small" style="background:#17191f;color:#fff" @click="restoreActivity()">恢复参数</button>
+              </div>
+              <div class="act-detail-meta">
+                <span :class="activityDetail.status">{{ activityDetail.status }}</span> · {{ activityDetail.created_at }}
+              </div>
+              <h3 style="margin:8px 0 4px;font-size:13px">请求参数</h3>
+              <pre style="font-size:11px;max-height:200px">{{ JSON.stringify(activityDetail.restore?.values || activityDetail.request, null, 2) }}</pre>
+              <h3 style="margin:8px 0 4px;font-size:13px" v-if="activityDetail.result">结果</h3>
+              <pre v-if="activityDetail.result" style="font-size:11px;max-height:150px">{{ JSON.stringify(activityDetail.result, null, 2) }}</pre>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <div v-if="_closeConfirmTabId" class="modal-overlay" @click.self="_closeConfirmTabId = null">
+      <div class="modal">
+        <div class="modal-title">关闭「{{ (tabs.find(function(t){ return t.id === _closeConfirmTabId; }) || {}).name }}」？</div>
+        <div class="modal-body">该主题有任务正在跑。关闭后任务会在后台继续，可从运行历史面板查看结果。</div>
+        <div class="modal-btns">
+          <button type="button" @click="_closeConfirmTabId = null">取消</button>
+          <button type="button" class="danger" @click="_forceCloseTab(_closeConfirmTabId); _closeConfirmTabId = null">仍然关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Preview Dialog (standalone only; Portal has its own) -->
+    <dialog id="previewDialog" class="previewDialog" v-if="isStandalone" @click="onPreviewDialogClick">
+      <button id="closePreviewBtn" type="button" aria-label="关闭" @click="closePreview">×</button>
+      <div id="previewDialogBody"></div>
+    </dialog>
+
+  </div>
+
+  <script src="https://unpkg.com/petite-vue@0.4.1/dist/petite-vue.iife.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

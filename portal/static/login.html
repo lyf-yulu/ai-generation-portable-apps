@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Generation Portal — 登录</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:32px;width:100%;max-width:380px}
+h1{font-size:20px;font-weight:700;margin-bottom:6px;color:#f1f5f9}
+.sub{font-size:13px;color:#94a3b8;margin-bottom:24px}
+label{display:block;font-size:13px;color:#94a3b8;margin-bottom:16px}
+label span{display:block;margin-bottom:4px}
+input[type=text],input[type=password]{width:100%;padding:9px 12px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:14px;outline:none}
+input:focus{border-color:#4f46e5}
+button{width:100%;padding:10px;background:#4f46e5;color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer;margin-top:8px}
+button:hover{background:#4338ca}
+button:disabled{background:#334155;cursor:default}
+.err{color:#f87171;font-size:13px;margin-top:12px;text-align:center;min-height:20px}
+.toggle{margin-top:14px;text-align:center;font-size:13px;color:#94a3b8}
+.toggle a{color:#818cf8;cursor:pointer;text-decoration:underline}
+.toggle a:hover{color:#a5b4fc}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1 id="title">登录</h1>
+  <p class="sub" id="subtitle">AI Generation Portal</p>
+  <form id="form">
+    <label><span>用户名</span><input id="username" type="text" autocomplete="username" required></label>
+    <label><span>密码</span><input id="password" type="password" autocomplete="current-password" required></label>
+    <label id="confirmWrap" style="display:none"><span>确认密码</span><input id="confirm" type="password" autocomplete="new-password"></label>
+    <button id="btn" type="submit">登录</button>
+    <div class="err" id="err"></div>
+  </form>
+  <div class="toggle" id="toggleWrap" style="display:none">
+    <span id="toggleText">还没有账号？</span><a id="toggleLink">立即注册</a>
+  </div>
+</div>
+<script>
+(async () => {
+  const q = new URLSearchParams(location.search);
+  const next = q.get('next') || '/';
+  let mode = 'login'; // 'login' | 'register' | 'setup'
+  let signupEnabled = false;
+  let isFirstRun = false;
+
+  // Already logged in?
+  try {
+    const r = await fetch('/api/auth/me', {credentials: 'include'});
+    if (r.ok) { location.replace(next); return; }
+  } catch(_) {}
+
+  try {
+    const r = await fetch('/api/auth/first-run');
+    const d = await r.json();
+    isFirstRun = !!d?.first_run;
+    signupEnabled = !!d?.signup_enabled;
+  } catch(_) {}
+
+  if (isFirstRun) {
+    mode = 'setup';
+  }
+
+  function render() {
+    const title = document.getElementById('title');
+    const subtitle = document.getElementById('subtitle');
+    const confirmWrap = document.getElementById('confirmWrap');
+    const btn = document.getElementById('btn');
+    const toggleWrap = document.getElementById('toggleWrap');
+    const toggleText = document.getElementById('toggleText');
+    const toggleLink = document.getElementById('toggleLink');
+    const pwInput = document.getElementById('password');
+
+    if (mode === 'setup') {
+      title.textContent = '初始化管理员账号';
+      subtitle.textContent = '首次使用，请设置管理员用户名和密码';
+      confirmWrap.style.display = 'block';
+      btn.textContent = '创建管理员账号';
+      pwInput.autocomplete = 'new-password';
+      toggleWrap.style.display = 'none';
+    } else if (mode === 'register') {
+      title.textContent = '注册账号';
+      subtitle.textContent = '创建你的 AI Generation Portal 账号';
+      confirmWrap.style.display = 'block';
+      btn.textContent = '注册并登录';
+      pwInput.autocomplete = 'new-password';
+      toggleWrap.style.display = 'block';
+      toggleText.textContent = '已有账号？';
+      toggleLink.textContent = '返回登录';
+    } else {
+      title.textContent = '登录';
+      subtitle.textContent = 'AI Generation Portal';
+      confirmWrap.style.display = 'none';
+      btn.textContent = '登录';
+      pwInput.autocomplete = 'current-password';
+      toggleWrap.style.display = signupEnabled ? 'block' : 'none';
+      toggleText.textContent = '还没有账号？';
+      toggleLink.textContent = '立即注册';
+    }
+  }
+
+  document.getElementById('toggleLink').addEventListener('click', () => {
+    mode = (mode === 'register') ? 'login' : 'register';
+    document.getElementById('err').textContent = '';
+    render();
+  });
+
+  render();
+
+  document.getElementById('form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById('btn');
+    const err = document.getElementById('err');
+    const username = document.getElementById('username').value.trim();
+    const password = document.getElementById('password').value;
+    err.textContent = '';
+    if (mode === 'setup' || mode === 'register') {
+      const confirm = document.getElementById('confirm').value;
+      if (password !== confirm) { err.textContent = '两次密码不一致'; return; }
+      if (password.length < 6) { err.textContent = '密码至少 6 位'; return; }
+    }
+    const origLabel = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '请稍候...';
+    try {
+      const url = (mode === 'login') ? '/api/auth/login' : '/api/auth/register';
+      const r = await fetch(url, {
+        method: 'POST', credentials: 'include',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({username, password}),
+      });
+      const d = await r.json();
+      if (d.ok) { location.replace(next); }
+      else {
+        err.textContent = d.error || '操作失败';
+        btn.disabled = false;
+        btn.textContent = origLabel;
+      }
+    } catch(_) {
+      err.textContent = '网络错误';
+      btn.disabled = false;
+      btn.textContent = origLabel;
+    }
+  });
+})();
+</script>
+</body>
+</html>

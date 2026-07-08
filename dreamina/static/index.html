@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dreamina 生成器</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="setupView" class="setup-view">
+    <div class="setup-card">
+      <h2 id="setupTitle">环境检测中...</h2>
+      <p id="setupDesc"></p>
+      <button id="setupBtn" class="btn-primary hidden">一键安装</button>
+      <button id="loginBtn" class="btn-primary hidden">登录即梦账号</button>
+      <button id="loginCancelBtn" class="btn-secondary hidden">取消登录</button>
+      <pre id="setupLog" class="setup-log hidden"></pre>
+      <div id="setupSpinner" class="spinner hidden"></div>
+    </div>
+  </div>
+
+  <main id="mainView" class="app hidden">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <h1 class="logo">Dreamina</h1>
+        <div class="status-info">
+          <span id="statusText" class="status-badge">检测中...</span>
+          <span id="creditText" class="credit"></span>
+        </div>
+      </div>
+
+      <div class="topbar-actions">
+        <button id="switchAccountBtn" class="btn-small">切换账号</button>
+        <button id="cleanCacheBtn" class="btn-small">清理缓存</button>
+        <button id="updateCliBtn" class="btn-small">更新 CLI</button>
+      </div>
+
+      <div class="account-panel" id="accountPanel">
+        <div class="account-panel-head">
+          <label>账号池</label>
+          <button type="button" id="repairAllAccountsBtn" class="btn-small">体检全部</button>
+        </div>
+        <div id="accountList" class="account-list"></div>
+      </div>
+
+      <div class="output-section form-group">
+        <label>输出目录</label>
+        <input type="text" id="outputDir" placeholder="留空则保存到 outputs 文件夹">
+        <div class="row-buttons" style="display:flex;gap:4px;margin-top:4px">
+          <button type="button" id="chooseOutputBtn" class="btn-small">选择目录</button>
+          <button type="button" id="desktopOutputBtn" class="btn-small">桌面 outputs</button>
+          <button type="button" id="openOutputBtn" class="btn-small">打开目录</button>
+        </div>
+      </div>
+
+      <div class="tabs major-tabs">
+        <button class="tab-btn active" data-major="image">图片生成</button>
+        <button class="tab-btn" data-major="video">视频生成</button>
+      </div>
+
+      <form id="genForm">
+        <div id="imageModeSection">
+          <div class="sub-tabs">
+            <button type="button" class="sub-tab active" data-mode="text2image">文生图</button>
+            <button type="button" class="sub-tab" data-mode="image2image">图生图(多参考)</button>
+          </div>
+        </div>
+
+        <div id="videoModeSection" class="hidden">
+          <div class="sub-tabs">
+            <button type="button" class="sub-tab active" data-mode="frames2video">首尾帧</button>
+            <button type="button" class="sub-tab" data-mode="multimodal2video">全能参考</button>
+            <button type="button" class="sub-tab" data-mode="multiframe2video">智能多帧</button>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="prompt">Prompt</label>
+          <textarea id="prompt" name="prompt" rows="4" placeholder="描述你想生成的内容..."></textarea>
+        </div>
+
+        <div id="multiRefSection" class="form-group hidden">
+          <label>参考图 (最多 9 张)</label>
+          <div class="upload-grid refs" id="imageRefs"></div>
+        </div>
+
+        <div id="framesSection" class="hidden">
+          <label>首尾帧</label>
+          <div class="upload-grid two">
+            <label class="drop" id="firstFrameDrop">首帧<input type="file" name="first_frame" accept="image/*" hidden><span>未上传</span></label>
+            <label class="drop" id="lastFrameDrop">尾帧<input type="file" name="last_frame" accept="image/*" hidden><span>未上传</span></label>
+          </div>
+        </div>
+
+        <div id="multimodalSection" class="hidden">
+          <label>参考图 (最多 9 张)</label>
+          <div class="upload-grid refs" id="mmImageRefs"></div>
+          <label>参考视频 (最多 3 个)</label>
+          <div class="upload-grid three" id="mmVideoRefs"></div>
+          <label>参考音频 (最多 3 个)</label>
+          <div class="upload-grid three" id="mmAudioRefs"></div>
+        </div>
+
+        <div id="multiframeSection" class="hidden">
+          <div class="multiframe-header">
+            <label>关键帧 (2-9 帧)</label>
+            <div class="frame-controls">
+              <button type="button" id="removeFrameBtn" class="btn-icon">−</button>
+              <span id="frameCount">2</span>
+              <button type="button" id="addFrameBtn" class="btn-icon">+</button>
+            </div>
+          </div>
+          <div id="framesContainer"></div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="ratio">比例</label>
+            <select id="ratio" name="ratio">
+              <option value="1:1">1:1</option>
+              <option value="16:9">16:9</option>
+              <option value="9:16">9:16</option>
+              <option value="4:3">4:3</option>
+              <option value="3:4">3:4</option>
+              <option value="2:3">2:3</option>
+              <option value="3:2">3:2</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="resolution_type">分辨率</label>
+            <select id="resolution_type" name="resolution_type">
+              <option value="1k">1K</option>
+              <option value="2k" selected>2K</option>
+              <option value="4k">4K</option>
+            </select>
+          </div>
+        </div>
+
+        <div id="videoParams" class="hidden">
+          <div class="form-row">
+            <div class="form-group">
+              <label for="duration">时长(秒)</label>
+              <select id="duration" name="duration">
+                <option value="4">4s</option>
+                <option value="5" selected>5s</option>
+                <option value="6">6s</option>
+                <option value="7">7s</option>
+                <option value="8">8s</option>
+                <option value="9">9s</option>
+                <option value="10">10s</option>
+                <option value="11">11s</option>
+                <option value="12">12s</option>
+                <option value="13">13s</option>
+                <option value="14">14s</option>
+                <option value="15">15s</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="video_resolution">视频分辨率</label>
+              <select id="video_resolution" name="video_resolution">
+                <option value="720P" selected>720P</option>
+                <option value="1080P">1080P</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group" id="modelVersionGroup">
+            <label for="model_version">模型版本</label>
+            <select id="model_version" name="model_version">
+              <option value="seedance2.0fast_vip" selected>Seedance 2.0 Fast VIP</option>
+              <option value="seedance2.0_vip">Seedance 2.0 VIP</option>
+              <option value="seedance2.0fast">Seedance 2.0 Fast</option>
+              <option value="seedance2.0">Seedance 2.0</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="repeat_count">重复次数</label>
+            <select id="repeat_count" name="repeat_count">
+              <option value="1" selected>1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+              <option value="6">6</option>
+              <option value="8">8</option>
+              <option value="10">10</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="concurrency">并发数</label>
+            <select id="concurrency" name="concurrency">
+              <option value="1" selected>1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="outputName">输出名</label>
+          <input type="text" id="outputName" name="output_name" placeholder="留空自动命名，多并发加 -1 -2...">
+        </div>
+        <button id="submitBtn" type="submit" class="btn-primary">开始生成</button>
+      </form>
+
+      <div class="archive-section">
+        <label>项目存档</label>
+        <div class="archive-controls">
+          <input type="text" id="archiveName" placeholder="存档名称...">
+          <button id="archiveSaveBtn" class="btn-small">保存</button>
+        </div>
+        <div class="archive-list-wrap">
+          <select id="archiveSelect">
+            <option value="">选择存档...</option>
+          </select>
+          <button id="archiveLoadBtn" class="btn-small">读取</button>
+          <button id="archiveDeleteBtn" class="btn-small">删除</button>
+        </div>
+      </div>
+    </aside>
+
+    <section class="workspace">
+      <div class="workspace-panel">
+        <div class="workspace-header">
+          <h2>任务</h2>
+          <span id="runningCount" class="running-count"></span>
+        </div>
+        <div id="jobsList" class="jobs-list"></div>
+      </div>
+
+      <div class="workspace-panel">
+        <div class="workspace-header">
+          <h2>历史记录</h2>
+          <div class="filter-bar">
+            <button class="filter-btn active" data-filter="all">全部</button>
+            <button class="filter-btn" data-filter="image">图片</button>
+            <button class="filter-btn" data-filter="video">视频</button>
+          </div>
+        </div>
+        <div id="historyList" class="history-list"></div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="previewDialog" class="preview-dialog">
+    <button id="closePreview" class="close-btn">&times;</button>
+    <div id="previewContent"></div>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "app": "seedance",
+  "default_provider": "volcengine",
+  "providers": {
+    "volcengine": {
+      "label": "豆包官方 / 火山方舟",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "api_style": "ark_seedance",
+      "hint": "豆包官方火山方舟 API。本地图/视频/音频参考素材会先上传到公司 TOS bucket，再以预签名 URL 传给方舟。",
+      "defaults": {
+        "model": "doubao-seedance-2-0-260128",
+        "duration": 12,
+        "resolution": "720p",
+        "ratio": "16:9",
+        "repeat_count": 1,
+        "concurrency": 1,
+        "poll_interval": 10,
+        "timeout": 3600,
+        "vary_seed": true
+      },
+      "models": [
+        {"id": "doubao-seedance-2-0-260128", "label": "doubao-seedance-2-0-260128"},
+        {"id": "doubao-seedance-2-0-fast-260128", "label": "doubao-seedance-2-0-fast-260128"}
+      ]
+    }
+  }
+}

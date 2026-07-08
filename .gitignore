@@ -1,0 +1,84 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+.portable_python/
+.superpowers/
+
+# Runtime data — never track generated outputs, uploads, state, or logs
+outputs/
+uploads/
+archives/
+state/
+logs/
+accounts/
+certs/
+
+# Re-include portal/state/scripts/ so safe_restart.sh and friends ship with the repo
+!portal/state/
+portal/state/*
+!portal/state/scripts/
+!portal/state/scripts/**
+
+# Secrets and local configs
+*.seedance
+*.nanobanana
+*.env
+volcengine-portrait/config.json
+
+# Dreamina account session data (contains tokens)
+.dreamina_cli/
+
+# Local debug / signing-experiment scripts (may embed AK/SK or absolute desktop paths)
+volcengine-portrait/debug_sig.py
+volcengine-portrait/_cmp_sig.py
+debug_*.py
+_cmp_*.py
+
+# Runtime / archive folders that occasionally land at the repo root
+.coordination/
+portal/.launcher_pid.json
+docs/drafts/
+docs/superpowers/
+docs/FACT_AUDIT.md
+docs/pending-fixes.md
+
+# Per-app collateral that's stored alongside the code but isn't source
+seedance/SKILL.md
+seedance/docs/
+seedance/6018/
+seedance/6025/
+seedance/6026/
+seedance/60[0-9][0-9]/
+seedance/AI Tool/
+seedance/图/
+seedance/Pictures/
+seedance/图片生成合集/
+seedance/视频生成合集/
+seedance/素材/
+seedance/浏览器下载/
+nano-banana/6023/
+nano-banana/6025/
+nano-banana/6026/
+nano-banana/60[0-9][0-9]/
+nano-banana/AI Tool/
+nano-banana/图/
+nano-banana/图片生成合集/
+nano-banana/视频生成合集/
+nano-banana/素材/
+nano-banana/浏览器下载/
+volcengine-portrait/6023/
+volcengine-portrait/6025/
+volcengine-portrait/6026/
+volcengine-portrait/60[0-9][0-9]/
+volcengine-portrait/AI Tool/
+volcengine-portrait/图/
+volcengine-portrait/视频生成合集/
+
+# ---- 输出目录统一重构（2026-07-01） ----
+# outputs/ uploads/ archives/ state/ logs/ accounts/ 已由第 9-14 行通用规则覆盖，此处不再重复列绝对路径
+
+# 用户手建目录 —— 防 `git add .` 事故
+# 只放行以 ASCII 字母、下划线、点开头的目录（守住 static/、docs/、tools/、__pycache__/ 等）
+/nano-banana/[!A-Za-z_.]*/
+/seedance/[!A-Za-z_.]*/

@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>清理旧生成产物</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+    margin: 0; padding: 32px; background: #0f172a; color: #e2e8f0;
+    min-height: 100vh;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; color: #f1f5f9; }
+  .subtitle { color: #94a3b8; font-size: 13px; margin-bottom: 24px; }
+  .card {
+    background: #1e293b; border: 1px solid #334155; border-radius: 12px;
+    padding: 20px; margin-bottom: 16px;
+  }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  label { color: #cbd5e1; font-size: 13px; }
+  input[type="date"] {
+    background: #0f172a; color: #e2e8f0; border: 1px solid #475569;
+    border-radius: 6px; padding: 8px 12px; font-size: 14px;
+    font-family: inherit; color-scheme: dark;
+  }
+  input[type="date"]:focus { outline: none; border-color: #38bdf8; }
+  button {
+    background: #0284c7; color: white; border: 0; border-radius: 6px;
+    padding: 8px 16px; font-size: 14px; cursor: pointer; font-family: inherit;
+    transition: background 0.15s;
+  }
+  button:hover:not(:disabled) { background: #0369a1; }
+  button:disabled { background: #475569; cursor: not-allowed; }
+  button.danger { background: #dc2626; }
+  button.danger:hover:not(:disabled) { background: #b91c1c; }
+  .stat-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+    margin: 16px 0;
+  }
+  .stat {
+    background: #0f172a; border: 1px solid #334155; border-radius: 8px;
+    padding: 12px 16px;
+  }
+  .stat-label { color: #94a3b8; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat-value { color: #f1f5f9; font-size: 20px; font-weight: 600; margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th, td { padding: 8px 12px; text-align: left; font-size: 13px; }
+  th { color: #94a3b8; font-weight: 500; border-bottom: 1px solid #334155; }
+  td { border-bottom: 1px solid #1e293b; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; color: #cbd5e1; }
+  .warn {
+    background: #78350f; border: 1px solid #ea580c; color: #fed7aa;
+    border-radius: 8px; padding: 12px 16px; margin: 12px 0; font-size: 13px;
+  }
+  .success {
+    background: #064e3b; border: 1px solid #10b981; color: #a7f3d0;
+    border-radius: 8px; padding: 12px 16px; margin: 12px 0; font-size: 13px;
+  }
+  .error {
+    background: #7f1d1d; border: 1px solid #ef4444; color: #fecaca;
+    border-radius: 8px; padding: 12px 16px; margin: 12px 0; font-size: 13px;
+  }
+  .checkbox-row { margin: 12px 0; display: flex; align-items: center; gap: 8px; }
+  .muted { color: #64748b; font-size: 12px; margin-top: 8px; }
+  code { background: #0f172a; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>清理旧生成产物</h1>
+  <p class="subtitle">按修改日期清理 mp4 / png / jpg，移到 macOS 回收站（10 天内可恢复）。跳过 state/portal 目录。</p>
+
+  <div class="card">
+    <div class="row">
+      <label for="before">删除此日期之前修改的文件：</label>
+      <input type="date" id="before">
+      <button id="scanBtn">扫描</button>
+    </div>
+    <p class="muted">例如选 <code>2026-07-01</code>，会命中 6 月及以前的所有产物。</p>
+  </div>
+
+  <div id="result" style="display:none"></div>
+</div>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const before = $("before");
+  const scanBtn = $("scanBtn");
+  const result = $("result");
+
+  // 默认日期：7 天前
+  const d = new Date();
+  d.setDate(d.getDate() - 7);
+  before.value = d.toISOString().slice(0, 10);
+  before.max = new Date(Date.now() + 24*60*60*1000).toISOString().slice(0, 10);
+
+  let lastScan = null;
+
+  scanBtn.addEventListener("click", scan);
+
+  async function scan() {
+    if (!before.value) { alert("请选择日期"); return; }
+    scanBtn.disabled = true;
+    scanBtn.textContent = "扫描中...";
+    result.style.display = "none";
+    try {
+      const r = await fetch(`/api/scan?before=${before.value}`);
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || r.statusText);
+      lastScan = data;
+      renderResult(data);
+    } catch (e) {
+      result.innerHTML = `<div class="card"><div class="error">扫描失败：${escapeHtml(e.message)}</div></div>`;
+      result.style.display = "block";
+    } finally {
+      scanBtn.disabled = false;
+      scanBtn.textContent = "扫描";
+    }
+  }
+
+  function renderResult(data) {
+    if (data.total === 0) {
+      result.innerHTML = `<div class="card"><p>没有匹配 ${escapeHtml(before.value)} 之前修改的文件。</p></div>`;
+      result.style.display = "block";
+      return;
+    }
+
+    const rows = data.by_dir.map(d =>
+      `<tr><td>${escapeHtml(d.path)}</td><td class="num">${d.count}</td><td class="num">${escapeHtml(d.size_h)}</td></tr>`
+    ).join("");
+
+    const todayWarn = data.today_count > 0
+      ? `<div class="warn">⚠️ 命中 <strong>${data.today_count}</strong> 个 mtime==今天(${escapeHtml(data.today)}) 的文件，可能是刚完成或正在生成的产物。要删除请先勾选下面的"包含今天"。</div>`
+      : "";
+
+    const todayCheckbox = data.today_count > 0
+      ? `<div class="checkbox-row"><input type="checkbox" id="includeToday"><label for="includeToday">包含今天(${escapeHtml(data.today)})的新产出（${data.today_count} 个文件）</label></div>`
+      : "";
+
+    result.innerHTML = `
+      <div class="card">
+        <div class="stat-grid">
+          <div class="stat"><div class="stat-label">文件数</div><div class="stat-value">${data.total}</div></div>
+          <div class="stat"><div class="stat-label">总大小</div><div class="stat-value">${escapeHtml(data.total_size_h)}</div></div>
+          <div class="stat"><div class="stat-label">时间范围</div><div class="stat-value" style="font-size:14px;">${escapeHtml(data.oldest)} ~ ${escapeHtml(data.newest)}</div></div>
+        </div>
+        ${todayWarn}
+        <table>
+          <thead><tr><th>目录</th><th class="num">数量</th><th class="num">大小</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+        ${todayCheckbox}
+        <div class="row" style="margin-top:16px;">
+          <button class="danger" id="applyBtn">移到回收站</button>
+          <span class="muted">走 ~/.Trash/，可恢复</span>
+        </div>
+        <div id="applyResult"></div>
+      </div>
+    `;
+    result.style.display = "block";
+    $("applyBtn").addEventListener("click", apply);
+  }
+
+  async function apply() {
+    const btn = $("applyBtn");
+    const includeToday = $("includeToday") ? $("includeToday").checked : false;
+    if (!confirm(`确认把 ${lastScan.total} 个文件（${lastScan.total_size_h}）移到回收站？`)) return;
+    btn.disabled = true;
+    btn.textContent = "处理中...";
+    try {
+      const r = await fetch("/api/apply", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({before: before.value, include_today: includeToday}),
+      });
+      const data = await r.json();
+      const box = $("applyResult");
+      if (r.status === 409 && data.error === "today_files_present") {
+        box.innerHTML = `<div class="warn">检测到 ${data.today_count} 个今天的文件，请勾选"包含今天"再重试。</div>`;
+        btn.disabled = false;
+        btn.textContent = "移到回收站";
+        return;
+      }
+      if (!r.ok) throw new Error(data.error || r.statusText);
+      box.innerHTML = `<div class="success">✓ 已移动 ${data.moved}/${data.total} 个文件到 <code>${escapeHtml(data.trash)}</code></div>`;
+      btn.textContent = "完成";
+    } catch (e) {
+      $("applyResult").innerHTML = `<div class="error">失败：${escapeHtml(e.message)}</div>`;
+      btn.disabled = false;
+      btn.textContent = "移到回收站";
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+{
+  "api_key": "ark-your-api-key",
+  "access_key": "AKLT...",
+  "secret_key": "...",
+  "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+  "models": [
+    {
+      "id": "doubao-seedance-2-0-260128",
+      "label": "Seedance 2.0"
+    },
+    {
+      "id": "doubao-seedance-2-0-fast-260128",
+      "label": "Seedance 2.0 Fast"
+    }
+  ],
+  "defaults": {
+    "model": "doubao-seedance-2-0-260128",
+    "duration": 12,
+    "resolution": "720p",
+    "ratio": "16:9",
+    "repeat_count": 1,
+    "concurrency": 1,
+    "poll_interval": 10,
+    "timeout": 3600
+  },
+  "max_concurrent": 2,
+  "output_dir": "/path/to/output"
+}

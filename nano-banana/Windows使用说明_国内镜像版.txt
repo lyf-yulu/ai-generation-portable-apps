@@ -1,0 +1,9 @@
+Windows 国内镜像版启动器使用说明
+
+1. 把这几个启动文件放到工具主目录。
+2. 必须和 app.py、static、outputs、archives、state 在同一级目录。
+3. Windows 不要运行 .command，双击 Start_Nano_Banana.cmd 或 Start Nano Banana.bat。
+4. 首次运行会从国内镜像下载便携 Python 到 .portable_python\windows。
+5. 下载顺序：npmmirror -> 华为云镜像 -> python.org 官方源。
+6. 如果公司网络拦截下载，请让制作者提前把 .portable_python 文件夹一起打包。
+7. 出错时把 logs 文件夹里的日志发给制作者。

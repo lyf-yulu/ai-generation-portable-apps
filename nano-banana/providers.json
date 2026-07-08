@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "app": "nano-banana",
+  "default_provider": "t8star",
+  "providers": {
+    "t8star": {
+      "label": "T8Star Images API",
+      "base_url": "https://ai.t8star.org",
+      "api_style": "openai_images",
+      "defaults": {
+        "mode": "img2img",
+        "model": "gemini-3-pro-image",
+        "aspect_ratio": "auto",
+        "image_size": "2K",
+        "response_format": "url",
+        "control_after_generate": "randomize",
+        "repeat_count": 1,
+        "concurrency": 1,
+        "poll_interval": 10,
+        "timeout": 900,
+        "vary_seed": true,
+        "resize_enabled": false,
+        "resize_width": 1700,
+        "resize_height": 2500,
+        "resize_interpolation": "high",
+        "resize_method": "stretch",
+        "resize_condition": "always",
+        "resize_multiple_of": 0
+      },
+      "models": [
+        {"id": "gemini-3-pro-image", "label": "gemini-3-pro-image"},
+        {"id": "gemini-3.1-flash-image-preview", "label": "gemini-3.1-flash-image-preview"},
+        {"id": "gemini-3-pro-image-2k", "label": "gemini-3-pro-image-2k"},
+        {"id": "gemini-3-pro-image-4k", "label": "gemini-3-pro-image-4k"}
+      ]
+    },
+    "gemini": {
+      "label": "Chiyun",
+      "base_url": "https://chiyun.work",
+      "api_style": "gemini_generate_content",
+      "defaults": {
+        "mode": "img2img",
+        "model": "banana2-ssvip",
+        "aspect_ratio": "auto",
+        "image_size": "2K",
+        "response_format": "url",
+        "control_after_generate": "randomize",
+        "repeat_count": 1,
+        "concurrency": 1,
+        "poll_interval": 10,
+        "timeout": 900,
+        "vary_seed": true,
+        "resize_enabled": false,
+        "resize_width": 1700,
+        "resize_height": 2500,
+        "resize_interpolation": "high",
+        "resize_method": "stretch",
+        "resize_condition": "always",
+        "resize_multiple_of": 0
+      },
+      "models": [
+        {"id": "banana2-ssvip", "label": "banana2-ssvip"},
+        {"id": "nano-banana2[2K]-base", "label": "nano-banana2[2K]-base"},
+        {"id": "gpt-image-2", "label": "gpt-image-2"}
+      ]
+    }
+  }
+}
