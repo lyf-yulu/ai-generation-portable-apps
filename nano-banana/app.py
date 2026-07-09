@@ -4,6 +4,8 @@ from __future__ import annotations
 import base64
 import cgi
 import concurrent.futures
+import hashlib
+import hmac
 import json
 import mimetypes
 import os
@@ -81,9 +83,40 @@ def _is_local(handler: SimpleHTTPRequestHandler) -> bool:
     return ip in ("127.0.0.1", "::1", "localhost")
 
 
+PORTAL_SIG_WINDOW = int(os.environ.get("PORTAL_SIG_WINDOW", "60"))
+
+
+def _verify_portal_sig(handler) -> bool:
+    """True iff Portal's HMAC signature over (ts, is_admin, username) matches.
+
+    Prevents a client from setting X-Is-Admin: 1 directly and bypassing auth."""
+    secret = os.environ.get("PORTAL_INTERNAL_TOKEN", "")
+    if not secret:
+        return False
+    sig = handler.headers.get("X-Portal-Sig") or ""
+    ts_raw = handler.headers.get("X-Portal-Ts") or ""
+    if not sig or not ts_raw:
+        return False
+    try:
+        ts = int(ts_raw)
+    except (TypeError, ValueError):
+        return False
+    if abs(int(time.time()) - ts) > PORTAL_SIG_WINDOW:
+        return False
+    username = handler.headers.get("X-Username", "") or ""
+    is_admin_flag = "1" if handler.headers.get("X-Is-Admin") == "1" else "0"
+    msg = f"{ts}:{is_admin_flag}:{username}".encode("utf-8")
+    expected = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
+def _is_admin(handler) -> bool:
+    return handler.headers.get("X-Is-Admin") == "1" and _verify_portal_sig(handler)
+
+
 def _view_scope(handler) -> tuple[bool, str]:
     """Returns (sees_all, username) for filtering jobs/activity by owner."""
-    sees_all = handler.headers.get("X-Is-Admin", "") == "1"
+    sees_all = _is_admin(handler)
     username = _decode_username(handler)
     return sees_all, username
 

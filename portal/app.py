@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 from datetime import datetime, timedelta
 import hashlib
+import hmac
 import http.client
 import io
 import json
@@ -93,6 +94,16 @@ _ALLOWED_ORIGINS: frozenset[str] | None = None
 # malicious local user cannot retroactively decrement stats without it.
 INTERNAL_TOKEN = os.environ.get("PORTAL_INTERNAL_TOKEN") or secrets.token_hex(32)
 os.environ["PORTAL_INTERNAL_TOKEN"] = INTERNAL_TOKEN
+
+
+def _sign_admin_header(username: str, is_admin: bool, ts: int) -> str:
+    """HMAC-SHA256(INTERNAL_TOKEN, "<ts>:<is_admin_flag>:<username>").
+
+    Sub-apps verify this before trusting X-Is-Admin — without a valid sig,
+    the X-Is-Admin header is ignored. Timestamp lets sub-apps reject replays
+    older than PORTAL_SIG_WINDOW seconds (default 60)."""
+    msg = f"{ts}:{'1' if is_admin else '0'}:{username}".encode("utf-8")
+    return hmac.new(INTERNAL_TOKEN.encode("utf-8"), msg, hashlib.sha256).hexdigest()
 
 ROLE_PERMISSIONS: dict[str, set[str]] = {
     "admin": {"use_apps", "view_stats_all", "manage_users", "manage_dreamina_accounts"},
@@ -1526,10 +1537,15 @@ class Handler(SimpleHTTPRequestHandler):
             port = APPS["volcengine-portrait"]["port"]
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             payload = json.dumps(forwarded).encode("utf-8")
+            username_encoded = urllib.parse.quote(user.get("username", ""), safe="")
+            ts = int(time.time())
             conn.request("POST", "/api/config", body=payload, headers={
                 "Content-Type": "application/json",
                 "Content-Length": str(len(payload)),
                 "X-Is-Admin": "1",
+                "X-Username": username_encoded,
+                "X-Portal-Ts": str(ts),
+                "X-Portal-Sig": _sign_admin_header(username_encoded, True, ts),
             })
             resp = conn.getresponse()
             data = json.loads(resp.read()) if resp.status == 200 else {}
@@ -1765,11 +1781,20 @@ class Handler(SimpleHTTPRequestHandler):
             # http.client headers must be latin-1 safe, so URL-percent-encode
             # the username — sub-apps urllib.parse.unquote it back. Empty/ASCII
             # names pass through unchanged.
-            headers["X-Username"] = urllib.parse.quote(user.get("username", ""), safe="")
-            if user.get("role") == "admin" or auth.has_permission(user, "manage_dreamina_accounts"):
+            username_encoded = urllib.parse.quote(user.get("username", ""), safe="")
+            headers["X-Username"] = username_encoded
+            is_admin = user.get("role") == "admin" or auth.has_permission(user, "manage_dreamina_accounts")
+            if is_admin:
                 headers["X-Is-Admin"] = "1"
             if app_name == "dreamina" and auth.has_permission(user, "use_apps"):
                 headers["X-Dreamina-Manage"] = "1"
+            # HMAC-sign the (username, is_admin, ts) triple so a sub-app never
+            # trusts a raw X-Is-Admin header from an unauthenticated caller.
+            # See _sign_admin_header — sub-apps must verify with the shared
+            # PORTAL_INTERNAL_TOKEN and a small time window against replay.
+            ts = int(time.time())
+            headers["X-Portal-Ts"] = str(ts)
+            headers["X-Portal-Sig"] = _sign_admin_header(username_encoded, is_admin, ts)
 
             conn.request(method, target_path, body=body, headers=headers)
             resp = conn.getresponse()

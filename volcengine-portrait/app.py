@@ -64,8 +64,41 @@ _PORTAL_SSL_CTX.check_hostname = False
 _PORTAL_SSL_CTX.verify_mode = _ssl.CERT_NONE
 
 
+PORTAL_SIG_WINDOW = int(os.environ.get("PORTAL_SIG_WINDOW", "60"))
+
+
+def _verify_portal_sig(handler) -> bool:
+    """HMAC-verify the X-Portal-Sig header set by Portal.
+
+    Sub-apps bind to 127.0.0.1 today, but this defense-in-depth check means
+    any request without a valid signature is treated as unauthenticated even
+    if it manages to reach the sub-app directly."""
+    secret = os.environ.get("PORTAL_INTERNAL_TOKEN", "")
+    if not secret:
+        return False
+    sig = handler.headers.get("X-Portal-Sig") or ""
+    ts_raw = handler.headers.get("X-Portal-Ts") or ""
+    if not sig or not ts_raw:
+        return False
+    try:
+        ts = int(ts_raw)
+    except (TypeError, ValueError):
+        return False
+    if abs(int(time.time()) - ts) > PORTAL_SIG_WINDOW:
+        return False
+    username = handler.headers.get("X-Username", "") or ""
+    is_admin_flag = "1" if handler.headers.get("X-Is-Admin") == "1" else "0"
+    msg = f"{ts}:{is_admin_flag}:{username}".encode("utf-8")
+    expected = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
+def _is_admin(handler) -> bool:
+    return handler.headers.get("X-Is-Admin") == "1" and _verify_portal_sig(handler)
+
+
 def _view_scope(handler) -> tuple[bool, str]:
-    sees_all = handler.headers.get("X-Is-Admin", "") == "1"
+    sees_all = _is_admin(handler)
     username = _decode_username(handler)
     return sees_all, username
 
@@ -490,7 +523,7 @@ def handle_config_post(handler):
     """Update runtime config (output_dir, and admin-only api_key/access_key/secret_key)."""
     data = read_json_body(handler)
     updates = {}
-    is_admin = handler.headers.get("X-Is-Admin") == "1"
+    is_admin = _is_admin(handler)
     if "output_dir" in data:
         p = (data["output_dir"] or "").strip()
         if not p:
@@ -1210,7 +1243,7 @@ _PURGE_MAX_GROUPS = 200
 def handle_virtual_groups_purge(handler):
     """Bulk-delete AIGC groups whose ID date is strictly before `before_date`.
     Admin only. See docs/superpowers/specs/2026-07-02-portrait-purge-old-groups-design.md."""
-    if handler.headers.get("X-Is-Admin", "") != "1":
+    if not _is_admin(handler):
         json_response(handler, 403, {"ok": False, "error": "admin only"})
         return
 

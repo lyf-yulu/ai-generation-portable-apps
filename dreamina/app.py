@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
+import hmac
 import json
 import mimetypes
 import os
@@ -82,14 +83,52 @@ def _is_admin(handler: SimpleHTTPRequestHandler) -> bool:
     """Account-management gate. Dreamina account ops (login/install-cli/
     rename/delete/etc.) are intentionally open to anyone with use_apps, so
     portal also injects X-Dreamina-Manage for those users. Real admins keep
-    X-Is-Admin as before."""
-    return handler.headers.get("X-Is-Admin") == "1" or handler.headers.get("X-Dreamina-Manage") == "1"
+    X-Is-Admin as before.
+
+    Both headers require a valid Portal signature — an unsigned request that
+    just sets X-Is-Admin/X-Dreamina-Manage on the wire is treated as a
+    regular user."""
+    if not _verify_portal_sig(handler):
+        return False
+    return (
+        handler.headers.get("X-Is-Admin") == "1"
+        or handler.headers.get("X-Dreamina-Manage") == "1"
+    )
+
+
+PORTAL_SIG_WINDOW = int(os.environ.get("PORTAL_SIG_WINDOW", "60"))
+
+
+def _verify_portal_sig(handler) -> bool:
+    """HMAC-verify the X-Portal-Sig header set by Portal."""
+    secret = os.environ.get("PORTAL_INTERNAL_TOKEN", "")
+    if not secret:
+        return False
+    sig = handler.headers.get("X-Portal-Sig") or ""
+    ts_raw = handler.headers.get("X-Portal-Ts") or ""
+    if not sig or not ts_raw:
+        return False
+    try:
+        ts = int(ts_raw)
+    except (TypeError, ValueError):
+        return False
+    if abs(int(time.time()) - ts) > PORTAL_SIG_WINDOW:
+        return False
+    username = handler.headers.get("X-Username", "") or ""
+    is_admin_flag = "1" if handler.headers.get("X-Is-Admin") == "1" else "0"
+    msg = f"{ts}:{is_admin_flag}:{username}".encode("utf-8")
+    expected = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
 
 
 def _view_scope(handler) -> tuple[bool, str]:
     """Per-user task visibility for /api/jobs and activity. Only true admins
-    (X-Is-Admin=1) see everything; everyone else sees only their own jobs."""
-    sees_all = handler.headers.get("X-Is-Admin", "") == "1"
+    (X-Is-Admin=1 with a valid Portal signature) see everything; everyone
+    else sees only their own jobs."""
+    sees_all = (
+        handler.headers.get("X-Is-Admin", "") == "1"
+        and _verify_portal_sig(handler)
+    )
     username = _decode_username(handler)
     return sees_all, username
 
