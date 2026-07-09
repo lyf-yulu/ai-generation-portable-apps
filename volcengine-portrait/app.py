@@ -1721,6 +1721,10 @@ def handle_real_groups_get(handler):
 # === HTTP Handler ===
 
 class Handler(SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        super().end_headers()
+
     def _reject_oversized_upload(self) -> bool:
         raw = self.headers.get("Content-Length")
         if not raw:

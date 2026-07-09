@@ -52,6 +52,30 @@ def _safe_join_or_root(base: Path, rel: str) -> str:
     return str(base)
 
 
+def sniff_is_image(head: bytes) -> bool:
+    """Return True iff head looks like a supported image format.
+
+    Used at upload time to reject evil.jpg-with-SVG-body — nano-banana only
+    accepts images, so this is a strict allowlist."""
+    if not head:
+        return False
+    if head.startswith(b"\xff\xd8\xff"):
+        return True  # JPEG
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True  # PNG
+    if head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
+        return True
+    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return True
+    if head.startswith(b"BM"):
+        return True  # BMP
+    if head.startswith(b"II*\x00") or head.startswith(b"MM\x00*"):
+        return True  # TIFF
+    if head[4:12] in (b"ftypheic", b"ftypheix", b"ftypmif1"):
+        return True  # HEIC
+    return False
+
+
 def _is_local(handler: SimpleHTTPRequestHandler) -> bool:
     ip = (handler.headers.get("X-Forwarded-For") or handler.client_address[0] or "").strip()
     return ip in ("127.0.0.1", "::1", "localhost")
@@ -1477,6 +1501,10 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)
 
 
 class Handler(SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        super().end_headers()
+
     def _reject_oversized_upload(self) -> bool:
         raw = self.headers.get("Content-Length")
         if not raw:
@@ -1762,6 +1790,12 @@ class Handler(SimpleHTTPRequestHandler):
             data = file_item.file.read()
             if not data:
                 json_response(self, 400, {"error": "empty file"})
+                return
+            if not sniff_is_image(data[:16]):
+                json_response(self, 415, {
+                    "ok": False,
+                    "error": "uploaded file is not a recognized image format",
+                })
                 return
             suffix = Path(filename).suffix.lower()
             stored = f"{uuid.uuid4().hex}_{field_name}{suffix}"

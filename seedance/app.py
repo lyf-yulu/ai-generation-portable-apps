@@ -60,6 +60,64 @@ def _safe_join_or_root(base: Path, rel: str) -> str:
     return str(base)
 
 
+# Magic bytes for common formats; used to verify uploads instead of trusting the
+# client's declared extension / Content-Type. An attacker who uploads evil.jpg
+# with SVG-plus-<script> body would slip past extension checks and (without
+# nosniff) execute in the victim's browser.
+_MAGIC_IMAGE = {
+    "image/jpeg": [b"\xff\xd8\xff"],
+    "image/png": [b"\x89PNG\r\n\x1a\n"],
+    "image/gif": [b"GIF87a", b"GIF89a"],
+    "image/webp": [b"RIFF"],  # + "WEBP" at offset 8; checked below
+    "image/bmp": [b"BM"],
+    "image/tiff": [b"II*\x00", b"MM\x00*"],
+    "image/heic": [b"ftypheic", b"ftypheix", b"ftypmif1"],  # matched at offset 4
+}
+_MAGIC_VIDEO = {
+    "video/mp4": [b"ftypmp4", b"ftypisom", b"ftypM4V", b"ftypavc1"],  # offset 4
+    "video/quicktime": [b"ftypqt"],  # offset 4
+    "video/webm": [b"\x1a\x45\xdf\xa3"],
+}
+_MAGIC_AUDIO = {
+    "audio/mpeg": [b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"],
+    "audio/wav": [b"RIFF"],  # + "WAVE" at offset 8
+    "audio/ogg": [b"OggS"],
+}
+
+
+def sniff_kind(head: bytes) -> str | None:
+    """Return the top-level media kind ('image' | 'video' | 'audio') detected
+    from the file header, or None if unrecognized. Uses first ~16 bytes so
+    callers should pass at least that many."""
+    if not head:
+        return None
+    for magics in _MAGIC_IMAGE.values():
+        for m in magics:
+            if head.startswith(m):
+                if m == b"RIFF" and head[8:12] != b"WEBP":
+                    continue
+                return "image"
+        # heic/tiff family: bytes 4-11 marker
+    if head[4:12] in (b"ftypheic", b"ftypheix", b"ftypmif1"):
+        return "image"
+    if head[4:8] in (b"ftyp",) and head[8:12] in (b"heic", b"heix", b"mif1"):
+        return "image"
+    for magics in _MAGIC_VIDEO.values():
+        for m in magics:
+            if m.startswith(b"ftyp"):
+                if head[4:4 + len(m)] == m:
+                    return "video"
+            elif head.startswith(m):
+                return "video"
+    for magics in _MAGIC_AUDIO.values():
+        for m in magics:
+            if head.startswith(m):
+                if m == b"RIFF" and head[8:12] != b"WAVE":
+                    continue
+                return "audio"
+    return None
+
+
 def load_secrets() -> dict[str, str]:
     """Server-managed API keys (currently: volcengine).
     Fail-fast: missing file or empty required keys raises at import time so the
@@ -1840,6 +1898,13 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)
 
 
 class Handler(SimpleHTTPRequestHandler):
+    def end_headers(self):
+        # Injected globally so every response carries nosniff without touching
+        # each send_header site. Prevents browsers from executing an uploaded
+        # .jpg whose bytes are actually HTML/SVG+JS.
+        self.send_header("X-Content-Type-Options", "nosniff")
+        super().end_headers()
+
     def _reject_oversized_upload(self) -> bool:
         raw = self.headers.get("Content-Length")
         if not raw:
@@ -2163,6 +2228,25 @@ class Handler(SimpleHTTPRequestHandler):
             if not data:
                 json_response(self, 400, {"error": "empty file"})
                 return
+            # Enforce that the actual file bytes match the field's declared
+            # media kind. Prevents evil.jpg-with-SVG-body upload → XSS on
+            # any client that ever renders it as image.
+            expected_kind = None
+            if field_name.startswith("ref_image_"):
+                expected_kind = "image"
+            elif field_name.startswith("ref_video_"):
+                expected_kind = "video"
+            elif field_name.startswith("ref_audio_"):
+                expected_kind = "audio"
+            if expected_kind:
+                actual = sniff_kind(data[:16])
+                if actual != expected_kind:
+                    json_response(self, 415, {
+                        "ok": False,
+                        "error": f"content does not match {expected_kind}: "
+                                 f"detected {actual or 'unknown'}",
+                    })
+                    return
             suffix = Path(filename).suffix.lower()
             stored = f"{uuid.uuid4().hex}_{field_name}{suffix}"
             media_dir = _ws_media_dir(ws)
