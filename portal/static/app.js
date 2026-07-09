@@ -455,46 +455,194 @@ function DreaminaApp() {
         const tt = item.task_type || '';
         return this.historyFilter === 'video' ? tt.includes('video') || tt.includes('frame') : tt.includes('image');
       });
-      if (!filtered.length) { list.innerHTML = '<div style="color:#697386;font-size:12px">暂无历史</div>'; return; }
+      list.innerHTML = '';
+      if (!filtered.length) {
+        const empty = document.createElement('div');
+        empty.className = 'dm-hist-empty';
+        empty.textContent = '暂无历史';
+        list.appendChild(empty);
+        return;
+      }
       const limit = this.historyLimit || 8;
       const visible = filtered.slice(0, limit);
-      const cardsHtml = visible.map(item => {
-        const files = item.result?.files || [];
-        const thumb = files[0] ? '/dreamina/' + files[0].replace(/^\//, '') : '';
-        const isVid = thumb && /\.(mp4|mov|webm)$/i.test(thumb);
-        const prompt = item.params?.prompt || '';
-        const status = item.status || '';
-        const statusColor = status === 'completed' ? '#10b981' : status === 'failed' ? '#ef4444' : '#697386';
-        let preview = '';
-        if (thumb) {
-          if (isVid) preview = `<video src="${thumb}" style="width:100%;max-height:120px;border-radius:5px;margin-top:4px" preload="none"></video>`;
-          else preview = `<img src="${thumb}" loading="lazy" style="width:100%;max-height:120px;object-fit:contain;border-radius:5px;margin-top:4px;cursor:zoom-in" onclick="event.stopPropagation();openPreview('image','${thumb}')">`;
-        }
-        const logs = item.cli_logs || [];
-        const logId = 'cli-log-' + item.job_id;
-        let logSection = '';
-        if (logs.length) {
-          const logHtml = logs.map(l => {
-            const cmdDisp = escHtml(l.command || '');
-            const outDisp = escHtml((l.stdout || '').slice(0, 800));
-            const errDisp = l.stderr ? escHtml(l.stderr.slice(0, 300)) : '';
-            return `<div style="margin-bottom:6px"><div style="color:#a78bfa">$ ${cmdDisp}</div><div style="color:#6ee7b7">exitcode: ${l.returncode}</div>${outDisp ? `<div style="color:#e2e8f0;white-space:pre-wrap;word-break:break-all">${outDisp}</div>` : ''}${errDisp ? `<div style="color:#fca5a5">${errDisp}</div>` : ''}</div>`;
-          }).join('');
-          logSection = `<div style="margin-top:4px"><span class="meta" style="cursor:pointer;color:#818cf8;user-select:none" onclick="event.stopPropagation();var el=document.getElementById('${logId}');el.style.display=el.style.display==='none'?'block':'none'">CLI 详情 ▾</span><div id="${logId}" style="display:none;margin-top:4px;background:#1e1b2e;color:#e2e8f0;font-family:monospace;font-size:11px;padding:8px;border-radius:6px;max-height:240px;overflow:auto">${logHtml}</div></div>`;
-        }
-        return `<div class="result" style="cursor:pointer" onclick="window._dmRestore('${item.job_id}')">
-          <div class="meta"><span style="color:${statusColor}">${escHtml(status)}</span> · ${escHtml(item.task_type || '')} · ${escHtml((item.created_at || '').slice(5, 16))}</div>
-          <div class="meta" style="margin-top:2px">${escHtml(prompt.slice(0, 60))}${prompt.length > 60 ? '...' : ''}</div>
-          ${preview}
-          ${files.length > 1 ? `<div class="meta" style="margin-top:2px">共 ${files.length} 个文件</div>` : ''}
-          ${logSection}
-        </div>`;
-      }).join('');
+      for (const item of visible) {
+        list.appendChild(this._dmBuildHistCard(item));
+      }
       const remaining = filtered.length - visible.length;
-      const moreBtn = remaining > 0
-        ? `<button type="button" style="width:100%;margin-top:8px;padding:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;color:#e2e8f0;cursor:pointer;font-size:12px" onclick="window._dmApp.loadMoreHistory()">加载更多 (${remaining})</button>`
-        : '';
-      list.innerHTML = cardsHtml + moreBtn;
+      if (remaining > 0) {
+        const moreBtn = document.createElement('button');
+        moreBtn.type = 'button';
+        moreBtn.className = 'dm-hist-more';
+        moreBtn.textContent = `加载更多 (${remaining})`;
+        moreBtn.addEventListener('click', () => this.loadMoreHistory());
+        list.appendChild(moreBtn);
+      }
+    },
+
+    _dmBuildHistCard(item) {
+      const files = item.result?.files || [];
+      const thumb = files[0] ? '/dreamina/' + files[0].replace(/^\//, '') : '';
+      const isVid = thumb && /\.(mp4|mov|webm)$/i.test(thumb);
+      const prompt = item.params?.prompt || '';
+      const status = item.status || '';
+      const logs = item.cli_logs || [];
+      const timeText = (item.created_at || '').slice(5, 16);
+      const taskType = item.task_type || '';
+
+      const card = document.createElement('div');
+      card.className = 'dm-hist-card';
+      if (status) card.dataset.status = status;
+
+      // head: status badge + meta + actions
+      const head = document.createElement('div');
+      head.className = 'dm-hist-head';
+      const badge = document.createElement('span');
+      badge.className = `status-badge ${status || ''}`.trim();
+      badge.textContent = status || '?';
+      head.appendChild(badge);
+      const metaText = document.createElement('span');
+      metaText.className = 'dm-hist-meta';
+      metaText.textContent = [taskType, timeText].filter(Boolean).join(' · ');
+      head.appendChild(metaText);
+      const actions = document.createElement('div');
+      actions.className = 'dm-hist-actions';
+      let logPanel = null;
+      if (logs.length) {
+        const cliBtn = document.createElement('button');
+        cliBtn.type = 'button';
+        cliBtn.className = 'btn-small dm-hist-cli-btn';
+        cliBtn.textContent = 'CLI 详情';
+        cliBtn.addEventListener('click', () => {
+          if (logPanel) logPanel.hidden = !logPanel.hidden;
+        });
+        actions.appendChild(cliBtn);
+      }
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'btn-small dm-hist-copy-btn';
+      copyBtn.textContent = '复制提示词';
+      copyBtn.addEventListener('click', () => this._dmCopyPrompt(prompt));
+      actions.appendChild(copyBtn);
+      head.appendChild(actions);
+      card.appendChild(head);
+
+      // prompt (2-line clamp)
+      if (prompt) {
+        const promptEl = document.createElement('div');
+        promptEl.className = 'dm-hist-prompt';
+        promptEl.textContent = prompt;
+        promptEl.title = prompt;
+        card.appendChild(promptEl);
+      }
+
+      // preview
+      if (thumb) {
+        const previewWrap = document.createElement('div');
+        previewWrap.className = 'dm-hist-preview';
+        if (isVid) {
+          const v = document.createElement('video');
+          v.className = 'dm-hist-thumb';
+          v.src = thumb;
+          v.preload = 'metadata';
+          v.muted = true;
+          v.playsInline = true;
+          v.controls = true;
+          previewWrap.appendChild(v);
+        } else {
+          const img = document.createElement('img');
+          img.className = 'dm-hist-thumb';
+          img.src = thumb;
+          img.loading = 'lazy';
+          img.alt = 'result thumbnail';
+          img.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (typeof openPreview === 'function') openPreview('image', thumb);
+          });
+          previewWrap.appendChild(img);
+        }
+        card.appendChild(previewWrap);
+      }
+
+      if (files.length > 1) {
+        const count = document.createElement('div');
+        count.className = 'dm-hist-count';
+        count.textContent = `共 ${files.length} 个文件`;
+        card.appendChild(count);
+      }
+
+      // log panel (hidden by default)
+      if (logs.length) {
+        logPanel = document.createElement('div');
+        logPanel.className = 'dm-hist-log-panel';
+        logPanel.hidden = true;
+        for (const l of logs) {
+          const entry = document.createElement('div');
+          entry.className = 'dm-hist-log-entry';
+          const cmdEl = document.createElement('div');
+          cmdEl.className = 'dm-hist-log-cmd';
+          cmdEl.textContent = `$ ${l.command || ''}`;
+          entry.appendChild(cmdEl);
+          const codeEl = document.createElement('div');
+          codeEl.className = 'dm-hist-log-code';
+          codeEl.textContent = `exitcode: ${l.returncode}`;
+          entry.appendChild(codeEl);
+          if (l.stdout) {
+            const out = document.createElement('pre');
+            out.className = 'dm-hist-log-stdout';
+            out.textContent = String(l.stdout).slice(0, 800);
+            entry.appendChild(out);
+          }
+          if (l.stderr) {
+            const err = document.createElement('pre');
+            err.className = 'dm-hist-log-stderr';
+            err.textContent = String(l.stderr).slice(0, 300);
+            entry.appendChild(err);
+          }
+          logPanel.appendChild(entry);
+        }
+        card.appendChild(logPanel);
+      }
+
+      return card;
+    },
+
+    async _dmCopyPrompt(text) {
+      const value = String(text || '');
+      if (!value) { this._dmToast('提示词为空'); return; }
+      let ok = false;
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(value);
+          ok = true;
+        }
+      } catch (_) { /* fall through */ }
+      if (!ok) {
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = value;
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          ok = document.execCommand('copy');
+          document.body.removeChild(ta);
+        } catch (_) { ok = false; }
+      }
+      this._dmToast(ok ? '提示词已复制' : '复制失败');
+    },
+
+    _dmToast(msg) {
+      let el = document.getElementById('dm-hist-toast');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'dm-hist-toast';
+        el.className = 'dm-hist-toast';
+        document.body.appendChild(el);
+      }
+      el.textContent = msg;
+      el.classList.add('show');
+      clearTimeout(this._dmToastTimer);
+      this._dmToastTimer = setTimeout(() => el.classList.remove('show'), 1500);
     },
 
     loadMoreHistory() {

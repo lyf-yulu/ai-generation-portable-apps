@@ -682,3 +682,125 @@ button:disabled,
 .btn-copy:hover { background: var(--accent); color: var(--surface); border-color: var(--accent); }
 .btn-delete { background: var(--surface); color: var(--danger-text); border-color: var(--border-strong); }
 .btn-delete:hover { background: var(--danger-soft); border-color: var(--danger); color: var(--danger-text); }
+
+/* ==== dreamina history cards ==== */
+.dm-hist-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  background: #fbfcfe;
+  transition: border-color var(--transition-base), box-shadow var(--transition-base);
+  margin-bottom: 10px;
+}
+.dm-hist-card:hover { border-color: #c8d2df; box-shadow: var(--shadow-md); }
+.dm-hist-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dm-hist-meta { color: var(--muted); font-size: 11px; flex: 1; min-width: 0; }
+.dm-hist-actions { display: flex; gap: 6px; flex-shrink: 0; }
+
+.status-badge.completed,
+.status-badge.succeeded { background: var(--success-soft); color: var(--success-text); }
+.status-badge.failed    { background: var(--danger-soft);  color: var(--danger-text); }
+.status-badge.running,
+.status-badge.querying,
+.status-badge.pending   { background: var(--info-soft);    color: var(--info-text); }
+
+.dm-hist-card .btn-small,
+.btn-small {
+  width: auto;
+  height: auto;
+  padding: 3px 10px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: color var(--transition-base), background var(--transition-base), border-color var(--transition-base);
+}
+.dm-hist-card .btn-small:hover,
+.btn-small:hover {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.dm-hist-card .btn-small:active,
+.btn-small:active { transform: translateY(1px); }
+
+.dm-hist-prompt {
+  color: var(--text);
+  font-size: 12px;
+  margin-top: 6px;
+  line-height: 1.4;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.dm-hist-preview { margin-top: 8px; }
+.dm-hist-thumb {
+  width: 100%;
+  max-height: 180px;
+  object-fit: contain;
+  border: 1px solid var(--border);
+  background: #edf2f8;
+  border-radius: 6px;
+  display: block;
+}
+video.dm-hist-thumb { background: transparent; }
+img.dm-hist-thumb { cursor: zoom-in; }
+
+.dm-hist-log-panel {
+  display: block;
+  margin-top: 8px;
+  background: #111827;
+  color: #dbe7ff;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  padding: 10px;
+  border-radius: var(--radius-md);
+  max-height: 240px;
+  overflow: auto;
+}
+.dm-hist-log-panel[hidden] { display: none !important; }
+.dm-hist-log-entry { margin-bottom: 6px; }
+.dm-hist-log-cmd    { color: #a78bfa; word-break: break-all; }
+.dm-hist-log-code   { color: #6ee7b7; }
+.dm-hist-log-stdout { color: #e2e8f0; white-space: pre-wrap; word-break: break-all; margin: 4px 0 0; font: inherit; }
+.dm-hist-log-stderr { color: #fca5a5; margin: 4px 0 0; font: inherit; white-space: pre-wrap; word-break: break-all; }
+
+.dm-hist-count { color: var(--muted); font-size: 11px; margin-top: 4px; }
+.dm-hist-more {
+  width: 100%;
+  margin-top: 10px;
+  padding: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+  height: auto;
+  font-weight: 500;
+  transition: color var(--transition-base), background var(--transition-base), border-color var(--transition-base);
+}
+.dm-hist-more:hover { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
+
+.dm-hist-empty { color: var(--muted); font-size: 12px; }
+.dm-hist-toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(17, 24, 39, 0.92);
+  color: #fff;
+  padding: 8px 14px;
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  z-index: var(--z-toast, 2000);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+.dm-hist-toast.show { opacity: 1; }

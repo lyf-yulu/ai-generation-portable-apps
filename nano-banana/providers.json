@@ -9,7 +9,7 @@
       "api_style": "openai_images",
       "defaults": {
         "mode": "img2img",
-        "model": "nano-banana-2",
+        "model": "gemini-3-pro-image",
         "aspect_ratio": "auto",
         "image_size": "2K",
         "response_format": "url",
@@ -28,7 +28,7 @@
         "resize_multiple_of": 0
       },
       "models": [
-        {"id": "nano-banana-2", "label": "nano-banana-2"},
+        {"id": "gemini-3-pro-image", "label": "gemini-3-pro-image"},
         {"id": "gemini-3.1-flash-image-preview", "label": "gemini-3.1-flash-image-preview"},
         {"id": "gemini-3-pro-image-2k", "label": "gemini-3-pro-image-2k"},
         {"id": "gemini-3-pro-image-4k", "label": "gemini-3-pro-image-4k"}

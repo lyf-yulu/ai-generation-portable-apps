@@ -1095,8 +1095,18 @@ def _execute_task_impl(job_id: str, task_type: str, args: list[str], params: dic
                                         output_name=job.get("output_name", ""),
                                         output_dir=job.get("output_dir", ""),
                                         sub_index=index, total=total,
-                                        env_override=env_override)
+                                        env_override=env_override,
+                                        on_cli_log=add_cli_log)
                 if dl:
+                    # download_if_needed 在 poll 超时 / CDN 下载失败 / gen_status=fail 时
+                    # 会返回 {files: [], error: ...}。这类结果不能算 completed，
+                    # 否则活动列表里会出现「completed 但无缩略」的假成功。
+                    if dl.get("error") or not dl.get("files"):
+                        err = dl.get("error") or "no files produced"
+                        with LOCK:
+                            job["errors"].append(f"[{index}] {err}")
+                        add_event(f"子任务 {index}/{total} 失败: {err[:80]}")
+                        return
                     with LOCK:
                         job["results"].append(dl)
                     add_event(f"子任务 {index}/{total} 完成")
@@ -1240,7 +1250,7 @@ def cleanup_cache(media_days: int = 30, log_days: int = 14) -> dict[str, Any]:
     return stats
 
 
-def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str, output_name: str = "", output_dir: str = "", sub_index: int = 1, total: int = 1, env_override: dict | None = None) -> dict | None:
+def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str, output_name: str = "", output_dir: str = "", sub_index: int = 1, total: int = 1, env_override: dict | None = None, on_cli_log=None) -> dict | None:
     if not submit_id:
         return None
     if output_dir:
@@ -1269,8 +1279,14 @@ def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str, 
     interval = 10
 
     while True:
-        r = run_cmd(["dreamina", "query_result", f"--submit_id={submit_id}",
-                     f"--download_dir={dl_dir}"], timeout=60, env_override=env_override)
+        query_args = ["dreamina", "query_result", f"--submit_id={submit_id}",
+                      f"--download_dir={dl_dir}"]
+        r = run_cmd(query_args, timeout=60, env_override=env_override)
+        if on_cli_log:
+            try:
+                on_cli_log(query_args, r)
+            except Exception:
+                pass
         if r["returncode"] != 0:
             return {"download_dir": str(dl_dir.relative_to(ROOT)), "files": [],
                     "error": r["stderr"] or "query_result failed"}
@@ -2429,6 +2445,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "total": rec.get("total"),
                 "done": rec.get("done"),
                 "retryable": rec.get("status") == "failed",
+                "cli_logs": rec.get("cli_logs") or [],
             }
 
         legacy_items = [to_legacy(rec) for rec in items]
@@ -2629,12 +2646,66 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error(404)
             return
         mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
-        content = file_path.read_bytes()
+        st = file_path.stat()
+        size = st.st_size
         filename = file_path.name
+        etag = f'"{st.st_mtime_ns:x}-{size:x}"'
+        # 媒体类型（image/video/audio）用 inline 让 <img>/<video>/<audio> 能直接渲染/播放
+        # 其它类型保留 attachment 让浏览器触发下载
+        inline = mime.startswith("image/") or mime.startswith("video/") or mime.startswith("audio/")
+
+        # If-None-Match 短路：无论 Range 与否，命中就返 304
+        if self.headers.get("If-None-Match", "") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "private, max-age=3600")
+            self.end_headers()
+            return
+
+        # 处理 Range 请求（视频首帧预览必需）
+        range_header = self.headers.get("Range", "")
+        if range_header.startswith("bytes="):
+            try:
+                spec = range_header[len("bytes="):].strip()
+                start_s, _, end_s = spec.partition("-")
+                start = int(start_s) if start_s else 0
+                end = int(end_s) if end_s else size - 1
+                if start < 0 or end >= size or start > end:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.end_headers()
+                    return
+                length = end - start + 1
+                with file_path.open("rb") as fh:
+                    fh.seek(start)
+                    chunk = fh.read(length)
+                self.send_response(206)
+                self.send_header("Content-Type", mime)
+                self.send_header("Content-Length", str(length))
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "private, max-age=3600")
+                if not inline:
+                    self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.end_headers()
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                return
+            except (ValueError, OSError):
+                pass  # 落到全量响应
+
+        content = file_path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(content)))
-        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "private, max-age=3600")
+        if not inline:
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.end_headers()
         try:
             self.wfile.write(content)

@@ -2,6 +2,14 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## 项目定位
+
+这是一个部署在**服务机**（用户本机 Mac）上的多子应用聚合平台，聚合 Seedance / Nano Banana / Dreamina / Volcengine Portrait 等 AI 生成能力，统一 Portal 前端 + 反向代理暴露给使用者。
+
+**当前部署**：服务机通过局域网 HTTPS（`https://192.168.30.5:9090`，自签证书）向公司同事提供服务，同事只需浏览器即可使用，不需要在自己电脑上安装任何环境。
+
+**后续演进方向**：可能迁移到公网服务器，让外部客户通过域名访问。因此设计上应尽量避免绑死「本机路径 / 本机 IP / 单机 launchd」这类假设——涉及主机名、证书、端口、路径的代码要留出配置化的余地，方便日后切换到域名 + 反向代理 + 正式证书的部署形态。
+
 ## Running
 
 ```bash
@@ -20,7 +28,7 @@ cd nano-banana && python3 app.py # port 8797
 cd dreamina && python3 app.py    # port 8888
 ```
 
-No third-party Python packages. Pure stdlib (`http.server`, `threading`, `concurrent.futures`, `subprocess`).
+当前后端主要使用 stdlib（`http.server`、`threading`、`concurrent.futures`、`subprocess`），但**不是硬约束**。项目部署模型：用户本机（Mac）作为唯一后端服务器，公司其他电脑通过局域网浏览器访问，不分发后端代码给客户端。因此可以按需引入 pip 库；新加依赖时先与用户确认，并装到 launchd 使用的解释器（`/opt/homebrew/bin/python3.12`）下。客户端侧（浏览器里跑的 HTML/JS/CSS）才需要「无环境依赖」——不能引入构建工具链。
 
 ## Architecture
 
@@ -71,7 +79,7 @@ dreamina/         → Image/video via Dreamina CLI wrapper
 ## Important Constraints
 
 - **Never overwrite git history** — always create new commits, never amend/force-push
-- **No pip dependencies** — everything uses Python stdlib only
+- **第三方库按需使用** — 后端跑在用户本机，不分发；引入 pip 库前确认并装到 `/opt/homebrew/bin/python3.12`。客户端浏览器代码仍需零构建依赖
 - **Jobs are in-memory** — restarting kills running tasks; coordinate with users before restart
 - **Frontend changes are instant** — Portal serves with `Cache-Control: no-cache, no-store, must-revalidate`, clients get new version on refresh without restart
 - **Backend changes require restart** — which terminates all sub-app processes and running jobs
@@ -172,6 +180,9 @@ dreamina/         → Image/video via Dreamina CLI wrapper
 - Handler 必须双兼容：参照 `handle_preset_save` 检测 Content-Type 分流
 - 字段名也要兼容：Portal FormData 用 `archive_name`，独立前端 JSON 用 `name`
 - seedance/nano-banana 无此问题（两套前端都发 FormData）
+- **生产用户看到的是 Portal 前端**（Portal 原生 Vue 组件，不是 iframe；seedance/nano-banana 才是 iframe）——改 dreamina UI 前先确认改的是 `portal/static/app.js` 还是 `dreamina/static/app.js`。直连 8888 的独立前端正常没人访问，改错位置会「代码改了但用户没反应」
+- **媒体 URL 前缀**：Portal 前端里 dreamina 视频/图片 src 拼成 `/dreamina/outputs/xxx`，走 Portal `_proxy` 转发到 dreamina 8888 的 `serve_file`；独立前端拼 `/outputs/xxx`（走 dreamina 后端直接 dispatch）——两种都过 `serve_file`，Range 支持是必须的（视频 `<video>` 元素需要 Range 拿 metadata 才能画首帧）
+- **`<video>` preload 陷阱**：默认 `preload="none"` = 灰底占位，浏览器不会 fetch metadata；缩略图预览要写 `preload="metadata" muted playsinline`；`<img>` 无此问题
 
 ### Seedance 提示词优化
 
