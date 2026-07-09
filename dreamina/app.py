@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import mimetypes
 import os
@@ -29,6 +30,32 @@ STATIC_DIR = ROOT / "static"
 _POPEN_EXTRA: dict[str, Any] = {}
 if hasattr(subprocess, "CREATE_NO_WINDOW"):
     _POPEN_EXTRA["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+# Upstream install script for the Dreamina CLI. Verified by SHA-256 before
+# being fed to bash — see handle_install_cli.
+DREAMINA_CLI_URL = "https://jimeng.jianying.com/cli"
+
+# Known-good SHA-256 digests. Add new ones here (comma-separated in
+# DREAMINA_CLI_TRUSTED_SHA256 env var) when upstream releases a new script.
+_DEFAULT_TRUSTED_CLI_HASHES = frozenset({
+    # 2026-07-09 snapshot — verified in-context against jimeng.jianying.com/cli
+    "3d9a5cade9c94420b13c46f1a425d657e22225c926b06a4608eae32065d7e158",
+})
+
+
+def _trusted_cli_hashes() -> frozenset[str]:
+    """Return the set of accepted SHA-256 hashes for the install script.
+
+    Priority: env override > compiled-in defaults. Setting
+    DREAMINA_CLI_TRUST_UPSTREAM=1 accepts any hash (emergency bypass — use
+    only if the operator has out-of-band verified the upstream release)."""
+    if os.environ.get("DREAMINA_CLI_TRUST_UPSTREAM") == "1":
+        return frozenset()  # signal-value; handle_install_cli checks below
+    override = os.environ.get("DREAMINA_CLI_TRUSTED_SHA256", "").strip()
+    if override:
+        extras = {h.strip().lower() for h in override.split(",") if h.strip()}
+        return _DEFAULT_TRUSTED_CLI_HASHES | frozenset(extras)
+    return _DEFAULT_TRUSTED_CLI_HASHES
 
 # ---- Client IP helpers ----
 
@@ -2002,18 +2029,54 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.flush()
 
         try:
+            # Fetch → verify SHA-256 → exec. Previously this was
+            # `curl | bash`, which becomes RCE the day upstream is
+            # compromised or MITM'd. See DREAMINA_CLI_TRUSTED_SHA256 below.
+            send_event(json.dumps({"type": "log", "text": f"Downloading {DREAMINA_CLI_URL}..."}))
+            with urllib.request.urlopen(DREAMINA_CLI_URL, timeout=30) as resp:
+                script_bytes = resp.read()
+            actual = hashlib.sha256(script_bytes).hexdigest()
+            trusted = _trusted_cli_hashes()
+            bypass = os.environ.get("DREAMINA_CLI_TRUST_UPSTREAM") == "1"
+            if not bypass and actual not in trusted:
+                send_event(json.dumps({
+                    "type": "done", "success": False,
+                    "error": (
+                        f"install script SHA-256 mismatch: got {actual}, "
+                        f"expected one of {sorted(trusted)}. Upstream may have "
+                        "released a new version. Ask an operator to update "
+                        "DREAMINA_CLI_TRUSTED_SHA256 (or set "
+                        "DREAMINA_CLI_TRUST_UPSTREAM=1 for a one-time bypass)."
+                    ),
+                }))
+                return
+            send_event(json.dumps({
+                "type": "log",
+                "text": f"SHA-256 {actual[:12]}... verified, executing...",
+            }))
+            # Feed the verified bytes to bash on stdin — no shell interpolation
+            # of the payload, no cache reuse issues.
             proc = subprocess.Popen(
-                ["bash", "-c", "curl -fsSL https://jimeng.jianying.com/cli | bash"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                ["bash"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=False,
                 **_POPEN_EXTRA,
             )
-            for line in proc.stdout:
-                send_event(json.dumps({"type": "log", "text": line.rstrip()}))
+            proc.stdin.write(script_bytes)
+            proc.stdin.close()
+            for raw in proc.stdout:
+                send_event(json.dumps({
+                    "type": "log",
+                    "text": raw.decode("utf-8", errors="replace").rstrip(),
+                }))
             proc.wait()
             if proc.returncode == 0:
                 send_event(json.dumps({"type": "done", "success": True}))
             else:
-                send_event(json.dumps({"type": "done", "success": False, "error": f"exit code {proc.returncode}"}))
+                send_event(json.dumps({
+                    "type": "done", "success": False,
+                    "error": f"exit code {proc.returncode}",
+                }))
         except Exception as e:
             send_event(json.dumps({"type": "done", "success": False, "error": str(e)}))
 
