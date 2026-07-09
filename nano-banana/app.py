@@ -37,6 +37,21 @@ ARCHIVE_DIR = _DATA_BASE / "archives"
 PROVIDERS_PATH = ROOT / "providers.json"
 
 
+def _safe_join_or_root(base: Path, rel: str) -> str:
+    """Join base/rel and reject any result outside base (path-traversal guard).
+
+    Illegal input returns base itself, which SimpleHTTPRequestHandler treats as
+    a safer failure than serving arbitrary files."""
+    try:
+        base_resolved = base.resolve()
+        target = (base / rel).resolve()
+    except (OSError, ValueError):
+        return str(base)
+    if target == base_resolved or target.is_relative_to(base_resolved):
+        return str(target)
+    return str(base)
+
+
 def _is_local(handler: SimpleHTTPRequestHandler) -> bool:
     ip = (handler.headers.get("X-Forwarded-For") or handler.client_address[0] or "").strip()
     return ip in ("127.0.0.1", "::1", "localhost")
@@ -1463,7 +1478,7 @@ class Handler(SimpleHTTPRequestHandler):
         path = urllib.parse.urlparse(path).path
         if path in {"/", "/index.html"}:
             return str(STATIC_DIR / "index.html")
-        return str((STATIC_DIR / path.lstrip("/")).resolve())
+        return _safe_join_or_root(STATIC_DIR, path.lstrip("/"))
 
     def do_GET(self) -> None:
         self._raw_path = self.path
@@ -1516,7 +1531,8 @@ class Handler(SimpleHTTPRequestHandler):
             field = self.path.rsplit("/", 1)[-1]
             ws = _workspace_id(self)
             item = read_preset(ws).get("media", {}).get(field)
-            path = _ws_media_dir(ws) / item.get("stored", "") if item else None
+            stored_name = Path(item.get("stored", "")).name if item else ""
+            path = _ws_media_dir(ws) / stored_name if stored_name else None
             if not item or not path or not path.exists():
                 json_response(self, 404, {"error": "media not found"})
                 return

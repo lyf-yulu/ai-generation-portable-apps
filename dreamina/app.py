@@ -2641,7 +2641,15 @@ class Handler(SimpleHTTPRequestHandler):
             pass
 
     def serve_file(self, base_dir: Path, rel_path: str):
-        file_path = base_dir / urllib.parse.unquote(rel_path)
+        try:
+            base_resolved = base_dir.resolve()
+            file_path = (base_dir / urllib.parse.unquote(rel_path)).resolve()
+        except (OSError, ValueError):
+            self.send_error(404)
+            return
+        if not (file_path == base_resolved or file_path.is_relative_to(base_resolved)):
+            self.send_error(403)
+            return
         if not file_path.exists() or not file_path.is_file():
             self.send_error(404)
             return

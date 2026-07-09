@@ -44,6 +44,22 @@ DEEPSEEK_KEY_PATH = STATE_DIR / "deepseek.key"
 SECRETS_PATH = STATE_DIR / "secrets.json"
 
 
+def _safe_join_or_root(base: Path, rel: str) -> str:
+    """Join base/rel and reject any result outside base (path-traversal guard).
+
+    Falls back to returning base itself for illegal input; SimpleHTTPRequestHandler
+    then serves a directory listing (or 403 if listing disabled), which is a safer
+    failure mode than serving arbitrary files."""
+    try:
+        base_resolved = base.resolve()
+        target = (base / rel).resolve()
+    except (OSError, ValueError):
+        return str(base)
+    if target == base_resolved or target.is_relative_to(base_resolved):
+        return str(target)
+    return str(base)
+
+
 def load_secrets() -> dict[str, str]:
     """Server-managed API keys (currently: volcengine).
     Fail-fast: missing file or empty required keys raises at import time so the
@@ -1824,10 +1840,10 @@ class Handler(SimpleHTTPRequestHandler):
     def translate_path(self, path: str) -> str:
         path = urllib.parse.urlparse(path).path
         if path.startswith("/outputs/"):
-            return str((OUTPUT_DIR / path.removeprefix("/outputs/")).resolve())
+            return _safe_join_or_root(OUTPUT_DIR, path.removeprefix("/outputs/"))
         if path in {"/", "/index.html"}:
             return str(STATIC_DIR / "index.html")
-        return str((STATIC_DIR / path.lstrip("/")).resolve())
+        return _safe_join_or_root(STATIC_DIR, path.lstrip("/"))
 
     def do_GET(self) -> None:
         self._raw_path = self.path
@@ -1916,7 +1932,10 @@ class Handler(SimpleHTTPRequestHandler):
             ws = _workspace_id(self)
             preset = read_preset(ws)
             item = preset.get("media", {}).get(field)
-            path = _ws_media_dir(ws) / item.get("stored", "") if item else None
+            # Collapse stored to bare basename — preset.json is normally written
+            # by our own upload path but treat it as untrusted anyway.
+            stored_name = Path(item.get("stored", "")).name if item else ""
+            path = _ws_media_dir(ws) / stored_name if stored_name else None
             if not item or not path or not path.exists():
                 json_response(self, 404, {"error": "media not found"})
                 return

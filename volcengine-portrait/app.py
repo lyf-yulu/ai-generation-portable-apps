@@ -1810,8 +1810,17 @@ class Handler(SimpleHTTPRequestHandler):
             self._serve_file(fpath)
             return
         if path.startswith("/uploads/"):
-            fpath = UPLOAD_DIR / path.removeprefix("/uploads/")
-            if fpath.exists():
+            rel = urllib.parse.unquote(path.removeprefix("/uploads/"))
+            try:
+                base_resolved = UPLOAD_DIR.resolve()
+                fpath = (UPLOAD_DIR / rel).resolve()
+            except (OSError, ValueError):
+                self.send_error(404)
+                return
+            if not (fpath == base_resolved or fpath.is_relative_to(base_resolved)):
+                self.send_error(403)
+                return
+            if fpath.exists() and fpath.is_file():
                 self._serve_file(fpath)
                 return
 
