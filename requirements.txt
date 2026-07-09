@@ -1,0 +1,14 @@
+# Stage 2 dependencies. Install with:
+#   python3.12 -m venv .venv
+#   DYLD_LIBRARY_PATH=/opt/homebrew/opt/expat/lib .venv/bin/pip install -r requirements.txt
+#
+# DYLD_LIBRARY_PATH is required because Homebrew Python 3.12's pyexpat.so
+# expects libexpat symbols not available in macOS's dyld shared cache;
+# pointing it at Homebrew's own expat (2.8.1+) fixes the ImportError.
+fastapi>=0.115
+uvicorn[standard]>=0.30
+httpx>=0.27
+python-multipart>=0.0.9
+pillow>=10.0
+pillow-heif>=0.16
+tenacity>=8.5
