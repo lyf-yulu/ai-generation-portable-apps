@@ -2794,11 +2794,21 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error(404)
             return
         mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
-        size = file_path.stat().st_size
+        st = file_path.stat()
+        size = st.st_size
         filename = file_path.name
+        etag = f'"{st.st_mtime_ns:x}-{size:x}"'
         # 媒体类型（image/video/audio）用 inline 让 <img>/<video>/<audio> 能直接渲染/播放
         # 其它类型保留 attachment 让浏览器触发下载
         inline = mime.startswith("image/") or mime.startswith("video/") or mime.startswith("audio/")
+
+        # If-None-Match 短路：无论 Range 与否,命中就返 304
+        if self.headers.get("If-None-Match", "") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "private, max-age=3600")
+            self.end_headers()
+            return
 
         # 处理 Range 请求（视频首帧预览必需）
         range_header = self.headers.get("Range", "")
@@ -2822,6 +2832,8 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_header("Content-Length", str(length))
                 self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
                 self.send_header("Accept-Ranges", "bytes")
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "private, max-age=3600")
                 if not inline:
                     self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
                 self.end_headers()
@@ -2838,6 +2850,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Accept-Ranges", "bytes")
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "private, max-age=3600")
         if not inline:
             self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.end_headers()

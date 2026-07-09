@@ -545,7 +545,7 @@ def mask_key(key: str) -> str:
     return f"{key[:5]}...{key[-4:]}" if key and len(key) > 12 else ("***" if key else "")
 
 
-def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | None = None, timeout: int = 600) -> dict[str, Any]:
+def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | None = None, timeout: int = 900) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {api_key}"}
     data = None
     if body is not None:
@@ -563,11 +563,11 @@ def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | Non
         raise RuntimeError(f"API 请求超时或连接失败 ({exc.__class__.__name__}: {exc})") from exc
 
 
-def request_gemini_generate(url: str, api_key: str, payload: dict[str, Any], timeout: int = 300) -> dict[str, Any]:
+def request_gemini_generate(url: str, api_key: str, payload: dict[str, Any], timeout: int = 900) -> dict[str, Any]:
     return request_json("POST", url, api_key, payload, timeout=timeout)
 
 
-def request_chat_completion(url: str, api_key: str, payload: dict[str, Any], timeout: int = 300) -> dict[str, Any]:
+def request_chat_completion(url: str, api_key: str, payload: dict[str, Any], timeout: int = 900) -> dict[str, Any]:
     return request_json("POST", url, api_key, payload, timeout=timeout)
 
 
@@ -1518,7 +1518,9 @@ def run_job(job_id: str, values: dict[str, Any], files: dict[str, tuple[str, byt
         final_status = "failed" if errors else "succeeded"
         set_job(job_id, status=final_status, finished_at=time.time())
         final_job["status"] = final_status
-        update_activity(activity_id, status=final_status, result=final_job, finished_at=time.time())
+        error_summary = "; ".join(errors[:3])[:500] if errors else None
+        update_activity(activity_id, status=final_status, result=final_job, finished_at=time.time(),
+                        **({"error": error_summary} if error_summary else {}))
         add_event(job_id, "Finished")
         report_final_to_portal(job_id, final_status)
     except Exception as exc:
@@ -1708,10 +1710,20 @@ class Handler(SimpleHTTPRequestHandler):
             if not path or not path.exists():
                 json_response(self, 404, {"error": "file not found"})
                 return
+            st = path.stat()
+            etag = f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
+            if self.headers.get("If-None-Match", "") == etag:
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "private, max-age=3600")
+                self.end_headers()
+                return
             self.send_response(200)
             self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
             self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
-            self.send_header("Content-Length", str(path.stat().st_size))
+            self.send_header("Content-Length", str(st.st_size))
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "private, max-age=3600")
             self.end_headers()
             try:
                 self.wfile.write(path.read_bytes())

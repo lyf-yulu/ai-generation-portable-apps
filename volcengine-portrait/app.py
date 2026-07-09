@@ -1903,10 +1903,22 @@ class Handler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def _serve_file(self, fpath):
+        st = fpath.stat()
+        etag = f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
+        if self.headers.get("If-None-Match", "") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "private, max-age=3600")
+            if CORS:
+                self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            return
         self.send_response(200)
         self.send_header("Content-Type", mimetypes.guess_type(fpath.name)[0] or "application/octet-stream")
         self.send_header("Content-Disposition", f'attachment; filename="{fpath.name}"')
-        self.send_header("Content-Length", str(fpath.stat().st_size))
+        self.send_header("Content-Length", str(st.st_size))
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "private, max-age=3600")
         if CORS:
             self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()

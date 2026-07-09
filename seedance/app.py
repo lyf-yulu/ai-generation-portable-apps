@@ -2131,10 +2131,20 @@ class Handler(SimpleHTTPRequestHandler):
             if not path or not path.exists():
                 json_response(self, 404, {"error": "file not found"})
                 return
+            st = path.stat()
+            etag = f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
+            if self.headers.get("If-None-Match", "") == etag:
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "private, max-age=3600")
+                self.end_headers()
+                return
             self.send_response(200)
             self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
             self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
-            self.send_header("Content-Length", str(path.stat().st_size))
+            self.send_header("Content-Length", str(st.st_size))
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "private, max-age=3600")
             self.end_headers()
             try:
                 self.wfile.write(path.read_bytes())
