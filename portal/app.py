@@ -59,6 +59,35 @@ APPS = {
 PORTAL_PORT = int(os.environ.get("PORTAL_PORT", "9090"))
 REDIRECT_PORT = int(os.environ.get("REDIRECT_PORT", "9089"))
 
+
+def _default_allowed_origins() -> frozenset[str]:
+    """Origins allowed to make credentialed cross-origin requests.
+
+    Defaults cover LAN IPs (auto-discovered) + loopback. Public deployments
+    should set ALLOWED_ORIGINS explicitly (comma-separated), e.g.
+    'https://apps.company.com,https://portal.company.com'."""
+    override = os.environ.get("ALLOWED_ORIGINS", "").strip()
+    if override:
+        return frozenset(o.strip() for o in override.split(",") if o.strip())
+    # Auto-discover: LAN IP (may fail early during startup — get_lan_ip is safe)
+    origins: set[str] = set()
+    try:
+        lan = get_lan_ip()
+        if lan:
+            origins.add(f"https://{lan}:{PORTAL_PORT}")
+            origins.add(f"http://{lan}:{PORTAL_PORT}")
+    except Exception:
+        pass
+    for host in ("127.0.0.1", "localhost"):
+        origins.add(f"https://{host}:{PORTAL_PORT}")
+        origins.add(f"http://{host}:{PORTAL_PORT}")
+    return frozenset(origins)
+
+
+# Lazy — get_lan_ip needs ifconfig/ipconfig which may take a beat.
+# Refreshed on each _cors_headers call if unset, so LAN IP changes get picked up.
+_ALLOWED_ORIGINS: frozenset[str] | None = None
+
 # Shared secret between portal and sub-apps for the internal finalize callback.
 # Generated fresh per portal launch; injected into each sub-app's env so a
 # malicious local user cannot retroactively decrement stats without it.
@@ -1858,11 +1887,20 @@ class Handler(SimpleHTTPRequestHandler):
         self._json(200, {"ok": True, "rolled_back": rolled})
 
     def _cors_headers(self):
-        self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin") or "*")
+        global _ALLOWED_ORIGINS
+        if _ALLOWED_ORIGINS is None:
+            _ALLOWED_ORIGINS = _default_allowed_origins()
+        origin = self.headers.get("Origin") or ""
+        # Only echo Origin back if it is in the whitelist. Missing or foreign
+        # origins get no ACAO header at all, so browsers block the response
+        # from any cross-origin script that expected it.
+        if origin and origin in _ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Credentials", "true")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers",
                          "Content-Type, X-Workspace-Id, X-Api-Key, X-Access-Key, X-Secret-Key, X-Key-Id")
-        self.send_header("Access-Control-Allow-Credentials", "true")
 
     def _read_json(self) -> dict | None:
         try:
