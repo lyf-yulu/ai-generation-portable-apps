@@ -48,6 +48,14 @@ export DREAMINA_PORT=8890
 export VOLCENGINE_PORTRAIT_PORT=8892
 export DATA_DIR="$DIR/portal/test-data"
 
+# Stage 2: sub-app engine switch. Set to `fastapi` to launch app_fastapi.py
+# via uvicorn (requires .venv from requirements.txt); default `stdlib` runs
+# the legacy app.py directly. Per-app override so we can flip one at a time.
+export NANO_BANANA_ENGINE=fastapi
+export SEEDANCE_ENGINE=${SEEDANCE_ENGINE:-stdlib}
+export DREAMINA_ENGINE=${DREAMINA_ENGINE:-stdlib}
+export VOLCENGINE_PORTRAIT_ENGINE=${VOLCENGINE_PORTRAIT_ENGINE:-stdlib}
+
 echo ""
 echo "端口分配:"
 echo "  Portal HTTPS:      https://127.0.0.1:9190"

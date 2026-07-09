@@ -565,9 +565,30 @@ class AppManager:
         popen_kwargs = dict(_POPEN_EXTRA)
         if hasattr(os, "setsid"):
             popen_kwargs["preexec_fn"] = os.setsid
+        # Per-app engine switch: FastAPI variants live in app_fastapi.py and
+        # are launched via uvicorn from the shared .venv. Falls back to the
+        # stdlib app.py when app_fastapi.py is missing or the env opts out.
+        engine_env = f"{name.upper().replace('-', '_')}_ENGINE"
+        engine = env.get(engine_env, os.environ.get(engine_env, "stdlib")).lower()
+        fastapi_path = app_dir / "app_fastapi.py"
+        venv_uvicorn = ROOT.parent / ".venv" / "bin" / "uvicorn"
+        expat_lib = "/opt/homebrew/opt/expat/lib"
+        if engine == "fastapi" and fastapi_path.exists() and venv_uvicorn.exists():
+            # DYLD lets Homebrew Python 3.12 load Homebrew expat rather than
+            # the (broken) system libexpat. See requirements.txt.
+            env["DYLD_LIBRARY_PATH"] = expat_lib + (":" + env["DYLD_LIBRARY_PATH"] if env.get("DYLD_LIBRARY_PATH") else "")
+            cmd = [
+                str(venv_uvicorn),
+                "app_fastapi:app",
+                "--host", "127.0.0.1",
+                "--port", str(config["port"]),
+                "--log-level", "warning",
+            ]
+        else:
+            cmd = [sys.executable, "app.py"]
         try:
             proc = subprocess.Popen(
-                [sys.executable, "app.py"], cwd=str(app_dir), env=env,
+                cmd, cwd=str(app_dir), env=env,
                 stdout=log_file, stderr=subprocess.STDOUT, **popen_kwargs,
             )
         except Exception as exc:
