@@ -1473,7 +1473,34 @@ def run_job(job_id: str, values: dict[str, Any], files: dict[str, tuple[str, byt
         report_final_to_portal(job_id, "failed")
 
 
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
+
+
 class Handler(SimpleHTTPRequestHandler):
+    def _reject_oversized_upload(self) -> bool:
+        raw = self.headers.get("Content-Length")
+        if not raw:
+            return False
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return False
+        if n > MAX_UPLOAD_BYTES:
+            body = json.dumps({
+                "ok": False,
+                "error": f"upload too large: {n} bytes (limit {MAX_UPLOAD_BYTES})",
+            }).encode("utf-8")
+            self.send_response(413)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return True
+        return False
+
     def translate_path(self, path: str) -> str:
         path = urllib.parse.urlparse(path).path
         if path in {"/", "/index.html"}:
@@ -1643,6 +1670,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:
+        if self._reject_oversized_upload():
+            return
         self._raw_path = self.path
         self.path = urllib.parse.urlparse(self.path).path
         if self.path == "/api/choose-output-dir":

@@ -36,6 +36,21 @@ UPLOAD_DIR = _DATA_BASE / "uploads"
 for d in [OUTPUT_DIR, STATE_DIR, LOG_DIR, UPLOAD_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
+
+
+def _safe_join_or_root(base: Path, rel: str) -> str:
+    """Traversal guard: join base/rel and reject anything outside base."""
+    try:
+        base_resolved = base.resolve()
+        target = (base / rel).resolve()
+    except (OSError, ValueError):
+        return str(base)
+    if target == base_resolved or target.is_relative_to(base_resolved):
+        return str(target)
+    return str(base)
+
+
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8891"))
 CORS = os.environ.get("CORS") == "1"
@@ -1706,15 +1721,39 @@ def handle_real_groups_get(handler):
 # === HTTP Handler ===
 
 class Handler(SimpleHTTPRequestHandler):
+    def _reject_oversized_upload(self) -> bool:
+        raw = self.headers.get("Content-Length")
+        if not raw:
+            return False
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return False
+        if n > MAX_UPLOAD_BYTES:
+            body = json.dumps({
+                "ok": False,
+                "error": f"upload too large: {n} bytes (limit {MAX_UPLOAD_BYTES})",
+            }).encode("utf-8")
+            self.send_response(413)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return True
+        return False
+
     def translate_path(self, path: str) -> str:
         path = urllib.parse.urlparse(path).path
         if path.startswith("/outputs/"):
-            return str((OUTPUT_DIR / path.removeprefix("/outputs/")).resolve())
+            return _safe_join_or_root(OUTPUT_DIR, path.removeprefix("/outputs/"))
         if path.startswith("/uploads/"):
-            return str((UPLOAD_DIR / path.removeprefix("/uploads/")).resolve())
+            return _safe_join_or_root(UPLOAD_DIR, path.removeprefix("/uploads/"))
         if path in {"/", "/index.html"}:
             return str(STATIC_DIR / "index.html")
-        return str((STATIC_DIR / path.lstrip("/")).resolve())
+        return _safe_join_or_root(STATIC_DIR, path.lstrip("/"))
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -1840,6 +1879,8 @@ class Handler(SimpleHTTPRequestHandler):
             pass
 
     def do_POST(self):
+        if self._reject_oversized_upload():
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 

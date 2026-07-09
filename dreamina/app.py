@@ -1541,9 +1541,41 @@ def delete_archive(name: str, handler: SimpleHTTPRequestHandler | None = None) -
     return False
 
 
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
+
+
 class Handler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
+
+    def _reject_oversized_upload(self) -> bool:
+        """Return True (and send 413) if Content-Length exceeds MAX_UPLOAD_BYTES.
+
+        Called at the top of do_POST/do_PUT before any body read. Returns False
+        (proceed) for missing or unparseable headers — those are handled by the
+        downstream reader with a smaller effective limit."""
+        raw = self.headers.get("Content-Length")
+        if not raw:
+            return False
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return False
+        if n > MAX_UPLOAD_BYTES:
+            body = json.dumps({
+                "ok": False,
+                "error": f"upload too large: {n} bytes (limit {MAX_UPLOAD_BYTES})",
+            }).encode("utf-8")
+            self.send_response(413)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return True
+        return False
 
     def _client_ip(self) -> str:
         forwarded = self.headers.get("X-Forwarded-For")
@@ -1607,6 +1639,8 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
+        if self._reject_oversized_upload():
+            return
 
         if path == "/api/env/install-cli":
             if not _is_admin(self):

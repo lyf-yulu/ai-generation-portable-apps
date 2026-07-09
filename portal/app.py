@@ -1051,9 +1051,36 @@ tracker = UsageTracker()
 _AUTH_EXEMPT = {"/login", "/api/auth/login", "/api/auth/register"}
 
 
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
+
+
 class Handler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
+
+    def _reject_oversized_upload(self) -> bool:
+        raw = self.headers.get("Content-Length")
+        if not raw:
+            return False
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return False
+        if n > MAX_UPLOAD_BYTES:
+            body = json.dumps({
+                "ok": False,
+                "error": f"upload too large: {n} bytes (limit {MAX_UPLOAD_BYTES})",
+            }).encode("utf-8")
+            self.send_response(413)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return True
+        return False
 
     def handle_one_request(self):
         try:
@@ -1162,6 +1189,8 @@ class Handler(SimpleHTTPRequestHandler):
             self._serve_portal(path)
 
     def do_POST(self):
+        if self._reject_oversized_upload():
+            return
         path = urllib.parse.urlparse(self.path).path
         if path == "/api/auth/login":
             self._auth_login()
