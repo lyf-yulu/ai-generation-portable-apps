@@ -579,6 +579,31 @@ async def api_jobs_json(request: Request):
         return JSONResponse(status_code=400, content=legacy.api_error("invalid_request", str(exc)))
     try:
         values, files = legacy.values_files_from_json(payload)
+        # Provider is locked to volcengine — always inject the company key.
+        values["provider"] = "volcengine"
+        api_key = legacy.SECRETS.get("volcengine_api_key", "")
+        if not api_key and not payload.get("dry_run"):
+            return JSONResponse(status_code=400,
+                                content=legacy.api_error("invalid_request", "API key is required"))
+        if api_key:
+            values["api_key"] = api_key
+        if payload.get("dry_run"):
+            response = {
+                "ok": True,
+                "dry_run": True,
+                "values": {k: ("***" if k == "api_key" else v) for k, v in values.items()},
+                "files": {k: {"filename": v[0], "bytes": len(v[1])} for k, v in files.items()},
+            }
+            legacy.record_activity({
+                "source": "api",
+                "request_kind": "json_dry_run",
+                "status": "succeeded",
+                "title": str(values.get("prompt") or "")[:80] or "Seedance dry run",
+                "request": legacy.summarize_payload(payload),
+                "response": response,
+                "username": legacy._decode_username(_HandlerShim(request)),
+            })
+            return response
         request_data = {
             "raw": legacy.summarize_payload(payload),
             "parsed": legacy.summarize_values_files(values, files),
@@ -594,7 +619,15 @@ async def api_jobs_json(request: Request):
 @app.post("/api/jobs")
 async def api_jobs_create(request: Request):
     values, files = await _parse_multipart(request)
+    # Provider is locked to volcengine — always use the company SECRETS key,
+    # ignore client-supplied api_key/provider. Matches stdlib do_POST behaviour.
+    api_key = legacy.SECRETS.get("volcengine_api_key", "")
+    if not api_key:
+        return JSONResponse(status_code=400,
+                            content=legacy.api_error("invalid_request", "API key is required"))
     submit_values = {k: v for k, v in values.items() if k not in files}
+    submit_values["api_key"] = api_key
+    submit_values["provider"] = "volcengine"
     submit_files = {k: v for k, v in files.items() if v and v[1]}
     request_data = legacy.summarize_values_files(submit_values, submit_files)
     ws = _ws_id(request)
