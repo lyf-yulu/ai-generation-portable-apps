@@ -53,7 +53,7 @@ export DATA_DIR="$DIR/portal/test-data"
 # the legacy app.py directly. Per-app override so we can flip one at a time.
 export NANO_BANANA_ENGINE=fastapi
 export SEEDANCE_ENGINE=${SEEDANCE_ENGINE:-fastapi}
-export DREAMINA_ENGINE=${DREAMINA_ENGINE:-stdlib}
+export DREAMINA_ENGINE=${DREAMINA_ENGINE:-fastapi}
 export VOLCENGINE_PORTRAIT_ENGINE=${VOLCENGINE_PORTRAIT_ENGINE:-fastapi}
 
 echo ""
