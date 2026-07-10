@@ -54,7 +54,7 @@ export DATA_DIR="$DIR/portal/test-data"
 export NANO_BANANA_ENGINE=fastapi
 export SEEDANCE_ENGINE=${SEEDANCE_ENGINE:-fastapi}
 export DREAMINA_ENGINE=${DREAMINA_ENGINE:-stdlib}
-export VOLCENGINE_PORTRAIT_ENGINE=${VOLCENGINE_PORTRAIT_ENGINE:-stdlib}
+export VOLCENGINE_PORTRAIT_ENGINE=${VOLCENGINE_PORTRAIT_ENGINE:-fastapi}
 
 echo ""
 echo "端口分配:"
