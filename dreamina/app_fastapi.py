@@ -34,6 +34,28 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 import app as legacy
 
+# stdlib app.py initializes EXECUTOR / dirs / migrations inside main(), which
+# we don't call. Do the same setup here so handle_generate can dispatch to
+# EXECUTOR.submit() without hitting None.
+import concurrent.futures
+if legacy.EXECUTOR is None:
+    try:
+        legacy.ensure_dirs()
+    except Exception:
+        pass
+    try:
+        legacy.cleanup_old_uploads()
+    except Exception:
+        pass
+    try:
+        legacy.migrate_default_account()
+    except Exception:
+        pass
+    _cfg = legacy.load_config()
+    legacy.EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+        max_workers=_cfg.get("max_concurrent", 5)
+    )
+
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response as FastResponse, StreamingResponse
