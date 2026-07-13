@@ -167,11 +167,15 @@ async def _parse_multipart(request: Request) -> tuple[dict[str, str], dict[str, 
 
 
 def _ws_id(request: Request) -> str:
+    """Match stdlib seedance._workspace_id: header first, then query, sanitized."""
+    import re as _re
+    ws = (request.headers.get("X-Workspace-Id") or "").strip()
+    if ws:
+        return _re.sub(r"[^a-zA-Z0-9_\-]", "_", ws)[:64]
     ws = (request.query_params.get("ws") or "").strip()
     if ws:
-        return ws
-    ws = (request.headers.get("X-Workspace-Id") or "").strip()
-    return ws or "localhost"
+        return _re.sub(r"[^a-zA-Z0-9_\-]", "_", ws)[:64]
+    return "localhost"
 
 
 def _is_local_req(request: Request) -> bool:
