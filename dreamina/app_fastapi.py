@@ -94,7 +94,13 @@ class _LegacyBridge:
     Exposes the same surface as _LegacyBridge in volcengine's port, plus
     the two attrs the parse_multipart helper reads (rfile + Content-Length
     via .headers) and streaming write support for SSE (install-cli logs
-    are streamed line-by-line through wfile.write + wfile.flush)."""
+    are streamed line-by-line through wfile.write + wfile.flush).
+
+    __getattr__ falls back to legacy.Handler for any method we haven't
+    stubbed — this is what lets handle_generate(self) call self.build_cli_args(...)
+    or self._decode_username() unchanged: the attribute is fetched off the
+    legacy Handler class and rebound to *this* bridge instance so `self`
+    references still work correctly."""
 
     def __init__(self, request: Request, body: bytes = b""):
         self.headers = request.headers
@@ -111,6 +117,19 @@ class _LegacyBridge:
         self._headers: list[tuple[str, str]] = []
         self._body = io.BytesIO()
         self.wfile = self._body
+
+    def __getattr__(self, name: str):
+        # Called only when the normal attribute lookup fails. Any Handler
+        # method we haven't overridden bounces here — grab it off the class
+        # and rebind to this bridge so `self` inside it points at us.
+        try:
+            attr = getattr(legacy.Handler, name)
+        except AttributeError:
+            raise AttributeError(f"'_LegacyBridge' object has no attribute {name!r}") from None
+        if callable(attr):
+            # Bind the unbound function/method to this instance
+            return attr.__get__(self, type(self))
+        return attr
 
     def send_response(self, status: int, message: str | None = None):
         self._status = status
