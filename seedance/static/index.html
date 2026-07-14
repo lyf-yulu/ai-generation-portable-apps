@@ -181,7 +181,7 @@
                   <span style="font-size:11px;color:#697386;white-space:nowrap">{{ j.created_at }}</span>
                 </div>
                 <div v-if="j.errors && j.errors.length" style="font-size:11px;color:#dc2626;margin-top:4px">{{ j.errors.join('; ') }}</div>
-                <div v-for="r in (j.results||[]).filter(x => x.download_url)" style="display:flex;align-items:center;margin-top:6px;padding-top:6px;border-top:1px solid #f1f5f9;gap:8px">
+                <div v-for="r in (j.results||[]).filter(function(x){ return x.download_url; })" style="display:flex;align-items:center;margin-top:6px;padding-top:6px;border-top:1px solid #f1f5f9;gap:8px">
                   <video :src="appPath + r.download_url" controls style="width:120px;height:68px;border-radius:4px;object-fit:cover;flex-shrink:0"></video>
                   <span style="font-size:11px;color:#697386;flex:1">{{ r.filename || 'video' }}</span>
                   <button @click="_blobDownload(appPath + r.download_url, r.filename || 'video')" style="background:#2563eb;color:#fff;border:1px solid #2563eb;font-size:11px;padding:3px 10px;border-radius:4px;cursor:pointer">下载</button>
@@ -227,7 +227,7 @@
 
     <div v-if="_closeConfirmTabId" class="modal-overlay" @click.self="_closeConfirmTabId = null">
       <div class="modal">
-        <div class="modal-title">关闭「{{ (tabs.find(t => t.id === _closeConfirmTabId) || {}).name }}」？</div>
+        <div class="modal-title">关闭「{{ (tabs.find(function(t){ return t.id === _closeConfirmTabId; }) || {}).name }}」？</div>
         <div class="modal-body">该主题有任务正在跑。关闭后任务会在后台继续，可从运行历史面板查看结果。</div>
         <div class="modal-btns">
           <button type="button" @click="_closeConfirmTabId = null">取消</button>
