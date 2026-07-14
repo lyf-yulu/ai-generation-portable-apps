@@ -1353,8 +1353,19 @@ def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str, 
                 on_cli_log(query_args, r)
             except Exception:
                 pass
+        # Files are stored as paths relative to _DATA_BASE (the DATA_DIR root),
+        # so the frontend can prefix them with '/dreamina/' and the URL resolves
+        # to the /outputs/ or /uploads/ dispatch regardless of whether DATA_DIR
+        # is the repo root (prod) or a test-data subdir. Using relative_to(ROOT)
+        # broke test env because the paths came back as 'test-data/outputs/...'
+        # which the serve dispatch does not match.
+        def _rel(p):
+            try:
+                return str(p.relative_to(_DATA_BASE))
+            except ValueError:
+                return str(p)
         if r["returncode"] != 0:
-            return {"download_dir": str(dl_dir.relative_to(ROOT)), "files": [],
+            return {"download_dir": _rel(dl_dir), "files": [],
                     "error": r["stderr"] or "query_result failed"}
 
         result_data = parse_cli_json(r["stdout"])
@@ -1362,12 +1373,12 @@ def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str, 
 
         if gs == "fail":
             reason = result_data.get("fail_reason", "generation failed")
-            return {"download_dir": str(dl_dir.relative_to(ROOT)), "files": [],
+            return {"download_dir": _rel(dl_dir), "files": [],
                     "error": reason, "gen_status": "fail"}
 
         if gs != "querying":
-            files = [str(f.relative_to(ROOT)) for f in dl_dir.iterdir() if f.is_file()]
-            return {"download_dir": str(dl_dir.relative_to(ROOT)), "files": files,
+            files = [_rel(f) for f in dl_dir.iterdir() if f.is_file()]
+            return {"download_dir": _rel(dl_dir), "files": files,
                     "cli_output": r["stdout"], "gen_status": gs}
 
         # Report queue progress to job events
@@ -1693,6 +1704,14 @@ class Handler(SimpleHTTPRequestHandler):
             self.serve_file(OUTPUT_DIR, path[len("/outputs/"):])
         elif path.startswith("/uploads/"):
             self.serve_file(UPLOAD_DIR, path[len("/uploads/"):])
+        # Backwards-compat: older activity records logged file paths as
+        # 'test-data/outputs/...' relative to ROOT (broken in test env). Frontend
+        # requests /dreamina/test-data/outputs/... — resolve those against
+        # _DATA_BASE so historical thumbnails keep working after the fix.
+        elif path.startswith("/test-data/outputs/"):
+            self.serve_file(OUTPUT_DIR, path[len("/test-data/outputs/"):])
+        elif path.startswith("/test-data/uploads/"):
+            self.serve_file(UPLOAD_DIR, path[len("/test-data/uploads/"):])
         else:
             self.serve_static(path)
 

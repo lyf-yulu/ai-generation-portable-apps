@@ -516,6 +516,18 @@ def serve_upload(path: str):
                         media_type=mimetypes.guess_type(target.name)[0] or "application/octet-stream")
 
 
+# Backwards-compat: activity records from before the DATA_BASE fix logged file
+# paths as 'test-data/outputs/...' — accept them and route to OUTPUT_DIR.
+@app.get("/test-data/outputs/{path:path}")
+def serve_output_legacy(path: str):
+    return serve_output(path)
+
+
+@app.get("/test-data/uploads/{path:path}")
+def serve_upload_legacy(path: str):
+    return serve_upload(path)
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "ts": int(time.time())}
