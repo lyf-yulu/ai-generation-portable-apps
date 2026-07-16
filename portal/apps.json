@@ -1,0 +1,82 @@
+[
+  {
+    "name": "seedance",
+    "display_name": "Seedance",
+    "port_env": "SEEDANCE_PORT",
+    "port_default": 8787,
+    "mount": "iframe",
+    "iframe_url": "/seedance/index.html",
+    "color": "#2563eb",
+    "credential_scheme": "api_key",
+    "needs_tos_creds": true,
+    "job_type": "video",
+    "metrics": ["seconds"],
+    "unit_label": "秒",
+    "stats_combine": "images_or_seconds"
+  },
+  {
+    "name": "nano-banana",
+    "display_name": "Nano Banana",
+    "port_env": "NANO_PORT",
+    "port_default": 8797,
+    "mount": "iframe",
+    "iframe_url": "/nano-banana/index.html",
+    "color": "#10b981",
+    "credential_scheme": "api_key",
+    "job_type": "image",
+    "metrics": ["images"],
+    "unit_label": "张",
+    "stats_combine": "images_or_seconds"
+  },
+  {
+    "name": "dreamina",
+    "display_name": "Dreamina",
+    "port_env": "DREAMINA_PORT",
+    "port_default": 8888,
+    "mount": "component",
+    "component_factory": "DreaminaApp",
+    "color": "#a855f7",
+    "admin_permission": "manage_dreamina_accounts",
+    "extra_headers": {"X-Dreamina-Manage": "{perm:use_apps}"},
+    "credential_scheme": "none",
+    "job_type": "dynamic",
+    "job_type_rules": [
+      {"keywords": ["text2image", "image2image"], "type": "image"}
+    ],
+    "metrics": ["images", "seconds"],
+    "unit_label": "张+秒",
+    "stats_combine": "images_and_seconds"
+  },
+  {
+    "name": "volcengine-portrait",
+    "display_name": "人像生成",
+    "port_env": "VOLCENGINE_PORTRAIT_PORT",
+    "port_default": 8891,
+    "mount": "component",
+    "component_factory": "VolcenginePortraitApp",
+    "color": "#f59e0b",
+    "personal_key_disabled": true,
+    "credential_scheme": "ak_sk",
+    "company_key_endpoint": "portrait-key",
+    "needs_tos_creds": true,
+    "is_tos_source": true,
+    "job_type": "video",
+    "metrics": ["seconds"],
+    "unit_label": "秒",
+    "stats_combine": "images_or_seconds"
+  },
+  {
+    "name": "hello-world",
+    "display_name": "Hello",
+    "port_env": "HELLO_WORLD_PORT",
+    "port_default": 8899,
+    "mount": "iframe",
+    "iframe_url": "/hello-world/index.html",
+    "color": "#6366f1",
+    "credential_scheme": "none",
+    "job_type": "image",
+    "metrics": ["images"],
+    "unit_label": "次",
+    "stats_combine": "images_or_seconds"
+  }
+]

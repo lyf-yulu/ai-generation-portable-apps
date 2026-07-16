@@ -50,12 +50,42 @@ USER_KEYS_PATH = STATE_DIR / "user_keys.json"
 
 SESSION_MAX_AGE = 86400 * 30  # 30 days
 
-APPS = {
-    "seedance": {"dir": ROOT.parent / "seedance", "port": int(os.environ.get("SEEDANCE_PORT", "8787"))},
-    "nano-banana": {"dir": ROOT.parent / "nano-banana", "port": int(os.environ.get("NANO_PORT", "8797"))},
-    "dreamina": {"dir": ROOT.parent / "dreamina", "port": int(os.environ.get("DREAMINA_PORT", "8888"))},
-    "volcengine-portrait": {"dir": ROOT.parent / "volcengine-portrait", "port": int(os.environ.get("VOLCENGINE_PORTRAIT_PORT", "8891"))},
-}
+# Sub-app registry — read once from portal/apps.json. See portal/app_spec.py
+# for the AppSpec schema. Adding a new sub-app is one JSON entry + one folder.
+from app_spec import (
+    AppSpec,
+    classify_job_type,
+    load_specs,
+    resolve_extra_headers,
+)
+
+APPS_JSON = ROOT / "apps.json"
+SPECS: list[AppSpec] = load_specs(APPS_JSON, ROOT.parent)
+SPEC_BY_NAME: dict[str, AppSpec] = {s.name: s for s in SPECS}
+
+# Legacy dict view — keeps existing `APPS[name]["dir"]` / `APPS[name]["port"]`
+# / `APPS.items()` callers working without churn. Values are recomputed lazily
+# via AppSpec.port so env overrides at runtime still take effect.
+class _AppsView:
+    def __init__(self, specs: list[AppSpec]):
+        self._specs = specs
+        self._by_name = {s.name: s for s in specs}
+    def __getitem__(self, name: str) -> dict[str, Any]:
+        s = self._by_name[name]
+        return {"dir": s.dir_path, "port": s.port, "spec": s}
+    def __contains__(self, name: str) -> bool:
+        return name in self._by_name
+    def __iter__(self):
+        return iter(self._by_name)
+    def keys(self):
+        return self._by_name.keys()
+    def items(self):
+        for s in self._specs:
+            yield s.name, {"dir": s.dir_path, "port": s.port, "spec": s}
+    def get(self, name: str, default=None):
+        return self[name] if name in self._by_name else default
+
+APPS = _AppsView(SPECS)
 
 PORTAL_PORT = int(os.environ.get("PORTAL_PORT", "9090"))
 REDIRECT_PORT = int(os.environ.get("REDIRECT_PORT", "9089"))
