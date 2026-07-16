@@ -239,8 +239,18 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "job_id": job_id}, extra_headers={"X-Job-Id": job_id})
 
 
+class _ReuseAddrServer(ThreadingHTTPServer):
+    # Portal's watchdog kills + respawns sub-apps; without SO_REUSEADDR the
+    # freshly-spawned process hits "Address already in use" while the old
+    # socket lingers in TIME_WAIT, crashes with code -9, and the watchdog
+    # respawns it into the same failure — an infinite restart loop. uvicorn
+    # (the 4 golden apps) sets this by default; stdlib HTTPServer does not.
+    allow_reuse_address = True
+    daemon_threads = True
+
+
 def main():
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    server = _ReuseAddrServer((HOST, PORT), Handler)
     print(f"hello-world echo listening on http://{HOST}:{PORT}", flush=True)
     try:
         server.serve_forever()
