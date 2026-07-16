@@ -40,9 +40,15 @@ class AppSpecLoaderTests(unittest.TestCase):
         expected_head = ["seedance", "nano-banana", "dreamina", "volcengine-portrait"]
         self.assertEqual([s.name for s in self.specs][:4], expected_head)
 
-    def test_hello_world_registered_last(self):
-        # New apps append; keeps golden columns stable.
-        self.assertEqual(self.specs[-1].name, "hello-world")
+    def test_golden_set_is_exactly_four(self):
+        # Production apps.json holds only the 4 golden apps. hello-world is a
+        # reference sub-app kept in the repo for the 9190 canary but NOT
+        # registered in production (its stdlib launch tripped port-cleanup's
+        # orphan killer — see portal/app.py _kill_port_squatter).
+        self.assertEqual(
+            [s.name for s in self.specs],
+            ["seedance", "nano-banana", "dreamina", "volcengine-portrait"],
+        )
 
     def test_no_duplicate_names(self):
         names = [s.name for s in self.specs]
@@ -91,15 +97,42 @@ class AppSpecLoaderTests(unittest.TestCase):
         self.assertEqual(s.display_name, "人像生成")
         self.assertEqual(s.component_factory, "VolcenginePortraitApp")
 
-    def test_hello_world_minimal(self):
-        s = self.by_name["hello-world"]
-        self.assertEqual(s.mount, "iframe")
-        self.assertEqual(s.credential_scheme, "none")
-        self.assertFalse(s.needs_tos_creds)
-        self.assertFalse(s.personal_key_disabled)
-        self.assertIsNone(s.admin_permission)
-        self.assertIsNone(s.company_key_endpoint)
-        self.assertEqual(s.job_type, "image")
+    def test_minimal_iframe_app_defaults(self):
+        # Loader must decode a minimal iframe app (all optional flags omitted)
+        # to safe defaults. Uses a temp fixture, not production apps.json —
+        # hello-world is no longer registered in prod but stays as the
+        # canonical "simplest sub-app" shape a new app author copies.
+        import json
+        import tempfile
+        fixture = [{
+            "name": "demo-echo",
+            "display_name": "Demo",
+            "port_env": "DEMO_PORT",
+            "port_default": 8899,
+            "mount": "iframe",
+            "iframe_url": "/demo-echo/index.html",
+            "color": "#6366f1",
+            "credential_scheme": "none",
+            "job_type": "image",
+            "metrics": ["images"],
+            "unit_label": "次",
+        }]
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(fixture, f)
+            fpath = Path(f.name)
+        try:
+            specs = load_specs(fpath, ROOT)
+            s = {sp.name: sp for sp in specs}["demo-echo"]
+            self.assertEqual(s.mount, "iframe")
+            self.assertEqual(s.credential_scheme, "none")
+            self.assertFalse(s.needs_tos_creds)
+            self.assertFalse(s.personal_key_disabled)
+            self.assertIsNone(s.admin_permission)
+            self.assertIsNone(s.company_key_endpoint)
+            self.assertEqual(s.job_type, "image")
+            self.assertEqual(s.extra_headers, {})
+        finally:
+            fpath.unlink()
 
     def test_dir_path_is_absolute(self):
         for s in self.specs:
@@ -157,10 +190,7 @@ class ClassifyJobTypeTests(unittest.TestCase):
     def test_dreamina_generic_video_is_video(self):
         s = self.by_name["dreamina"]
         self.assertEqual(classify_job_type(s, "/api/video-generate"), "video")
-
-    def test_hello_world_always_image(self):
-        s = self.by_name["hello-world"]
-        self.assertEqual(classify_job_type(s, "/api/jobs"), "image")
+        # (a static job_type="image" app is covered by test_nano_banana_always_image)
 
 
 class ExtraHeadersTests(unittest.TestCase):

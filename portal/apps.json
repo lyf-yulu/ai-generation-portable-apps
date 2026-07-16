@@ -64,19 +64,5 @@
     "metrics": ["seconds"],
     "unit_label": "秒",
     "stats_combine": "images_or_seconds"
-  },
-  {
-    "name": "hello-world",
-    "display_name": "Hello",
-    "port_env": "HELLO_WORLD_PORT",
-    "port_default": 8899,
-    "mount": "iframe",
-    "iframe_url": "/hello-world/index.html",
-    "color": "#6366f1",
-    "credential_scheme": "none",
-    "job_type": "image",
-    "metrics": ["images"],
-    "unit_label": "次",
-    "stats_combine": "images_or_seconds"
   }
 ]
