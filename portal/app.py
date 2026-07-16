@@ -1282,6 +1282,8 @@ class Handler(SimpleHTTPRequestHandler):
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             provider = qs.get("provider", [None])[0]
             self._json(200, {"ok": True, "keys": key_manager.list_keys(user["user_id"], provider)})
+        elif path == "/api/apps":
+            self._apps_meta()
         elif self._try_proxy(path, "GET", user):
             pass
         else:
@@ -1618,6 +1620,26 @@ class Handler(SimpleHTTPRequestHandler):
             "has_access_key": bool(data.get("has_access_key")),
             "has_secret_key": bool(data.get("has_secret_key")),
         })
+
+    def _apps_meta(self):
+        """Return sub-app metadata that the frontend needs to render tabs
+        and stats tables. Excludes backend-sensitive fields (credentials,
+        admin permissions, extra headers) — those are enforced server-side."""
+        payload = [
+            {
+                "name": s.name,
+                "display_name": s.display_name,
+                "mount": s.mount,
+                "iframe_url": s.iframe_url,
+                "component_factory": s.component_factory,
+                "color": s.color,
+                "metrics": list(s.metrics),
+                "unit_label": s.unit_label,
+                "stats_combine": s.stats_combine,
+            }
+            for s in SPECS
+        ]
+        self._json(200, {"ok": True, "apps": payload})
 
     def _try_company_key_route(self, path: str, method: str, user: dict) -> bool:
         """Dispatch /api/platform/<endpoint> if any spec declares that
