@@ -129,6 +129,10 @@ cat > "$PLIST" <<PLIST_EOF
     <string>fastapi</string>
     <key>SEEDANCE_ENGINE</key>
     <string>fastapi</string>
+    <key>DREAMINA_ENGINE</key>
+    <string>fastapi</string>
+    <key>VOLCENGINE_PORTRAIT_ENGINE</key>
+    <string>fastapi</string>
   </dict>
 
   <key>RunAtLoad</key>
