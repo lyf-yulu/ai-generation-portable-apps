@@ -351,11 +351,28 @@ function SeedanceApp() {
       if (dlContainer) {
         dlContainer.addEventListener('click', (e) => {
           const btn = e.target.closest('.dl-btn');
-          if (!btn) return;
-          e.preventDefault();
-          const u = btn.dataset.url;
-          const fn = btn.dataset.filename || 'video';
-          if (u) this._blobDownload(u, fn);
+          if (btn) {
+            e.preventDefault();
+            const u = btn.dataset.url;
+            const fn = btn.dataset.filename || 'video';
+            if (u) this._blobDownload(u, fn);
+            return;
+          }
+          // Click-to-play: replace the lazy placeholder with a real <video>.
+          // Only fires ONE SSL fetch to the portal proxy at a time (per click)
+          // — avoids the 21-way concurrent-fetch ERR_TOO_MANY_RETRIES storm.
+          const lazy = e.target.closest('.video-lazy');
+          if (lazy && lazy.dataset.src) {
+            const url = lazy.dataset.src;
+            const vid = document.createElement('video');
+            vid.controls = true; vid.muted = true; vid.autoplay = true;
+            vid.playsInline = true;
+            vid.style.maxHeight = '200px';
+            vid.style.width = '100%';
+            vid.style.borderRadius = '6px';
+            vid.src = url;
+            lazy.replaceWith(vid);
+          }
         });
       }
 
@@ -794,9 +811,19 @@ function SeedanceApp() {
 
         for (const r of job.results || []) {
           const url = APP_PATH + (r.download_url || '');
+          // Lazy: render a click-to-play placeholder instead of <video preload="metadata">.
+          // 20+ videos in one job otherwise fire 20+ concurrent SSL fetches
+          // through the portal proxy → Chrome's per-host cap and portal's
+          // buffer-then-forward path combine into ERR_TOO_MANY_RETRIES.
           resultsEl.innerHTML +=
             '<article class="result">'
-            + '<video controls preload="metadata" muted playsinline src="' + url + '" style="max-height:200px"></video>'
+            + '<div class="video-lazy" data-src="' + url + '" tabindex="0" role="button" aria-label="播放视频"'
+            + ' style="max-height:200px;min-height:120px;background:#0f172a;border:1px solid #334155;border-radius:6px;'
+            + 'display:flex;align-items:center;justify-content:center;cursor:pointer;position:relative">'
+            + '<div style="display:flex;flex-direction:column;align-items:center;gap:6px;color:#94a3b8">'
+            + '<div style="width:40px;height:40px;border-radius:50%;background:#334155;display:flex;align-items:center;justify-content:center;font-size:18px;color:#e2e8f0">▶</div>'
+            + '<div style="font-size:11px">点击加载视频</div>'
+            + '</div></div>'
             + '<a href="' + url + '" class="dl-btn" data-url="' + url + '" data-filename="' + escHtml(r.filename || 'video') + '">下载</a>'
             + '<div class="meta">Run ' + (r.index || '') + ' · ' + (r.task_id || '') + '</div>'
             + '</article>';
