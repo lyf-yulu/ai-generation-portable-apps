@@ -841,6 +841,10 @@ function StatsApp() {
     todayRequests: 0,
     byApp: {},
     byUser: {},
+    // AppSpec metadata: name → {display_name, mount, iframe_url, color, metrics, unit_label, stats_combine}
+    // Loaded from /api/apps at init(); helpers appColor/appUnit/appLabel/pickAppValues
+    // consult this first, fall back to hardcoded golden set if fetch failed.
+    appsMeta: {},
     recentActivity: [],
     isAdmin: false,
     users: [],
@@ -894,6 +898,8 @@ function StatsApp() {
     async init() {
       const me = await api('/api/auth/me');
       this.isAdmin = me?.role === 'admin';
+      // Load app metadata before rendering stats — pickAppValues/appColor/etc read from it.
+      await this.initAppsMeta();
       // Default day-picker to today (local date string)
       const today = new Date();
       const tz = today.getTimezoneOffset() * 60000;
@@ -1073,12 +1079,26 @@ function StatsApp() {
       this.loadHistory();
     },
 
-    // Pick the metric series most relevant to each subapp.
-    // seedance / volcengine-portrait: seconds (video)
-    // nano-banana: images
-    // dreamina: images + seconds elementwise (mixed media)
+    // Pick the metric series most relevant to each subapp. Driven by
+    // appsMeta.metrics + stats_combine loaded from /api/apps — see initAppsMeta().
+    // Fallback preserves legacy behavior if /api/apps failed.
     pickAppValues(stats, app) {
       if (!stats) return [];
+      const meta = this.appsMeta[app];
+      if (meta) {
+        if (meta.stats_combine === 'images_and_seconds') {
+          const a = stats.images || [];
+          const b = stats.seconds || [];
+          const n = Math.max(a.length, b.length);
+          const out = [];
+          for (let i = 0; i < n; i++) out.push((a[i] || 0) + (b[i] || 0));
+          return out;
+        }
+        // stats_combine === 'images_or_seconds': first-listed metric wins
+        const metric = (meta.metrics && meta.metrics[0]) || 'images';
+        return stats[metric] || [];
+      }
+      // Fallback (pre-appsMeta) — matches legacy hardcoded logic byte-for-byte
       if (app === 'nano-banana') return stats.images || [];
       if (app === 'dreamina') {
         const a = stats.images || [];
@@ -1092,12 +1112,16 @@ function StatsApp() {
     },
 
     appUnit(app) {
+      const meta = this.appsMeta[app];
+      if (meta) return meta.unit_label || '';
       if (app === 'nano-banana') return '张';
       if (app === 'dreamina') return '张+秒';
       return '秒';
     },
 
     appColor(app) {
+      const meta = this.appsMeta[app];
+      if (meta && meta.color) return meta.color;
       return {
         'seedance': '#2563eb',
         'nano-banana': '#10b981',
@@ -1107,12 +1131,29 @@ function StatsApp() {
     },
 
     appLabel(app) {
+      const meta = this.appsMeta[app];
+      if (meta && meta.display_name) return meta.display_name;
       return {
         'seedance': 'Seedance',
         'nano-banana': 'Nano Banana',
         'dreamina': 'Dreamina',
         'volcengine-portrait': '人像生成',
       }[app] || app;
+    },
+
+    async initAppsMeta() {
+      // Loaded once at init(); backend list drives display metadata but
+      // NEVER security decisions (those stay server-side in AppSpec).
+      try {
+        const res = await api('/api/apps');
+        if (res?.ok && Array.isArray(res.apps)) {
+          const map = {};
+          for (const a of res.apps) map[a.name] = a;
+          this.appsMeta = map;
+        }
+      } catch (e) {
+        // Silent fallback — helpers above degrade to hardcoded golden set.
+      }
     },
 
     svgSpark(values, app) {
