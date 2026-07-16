@@ -1257,8 +1257,8 @@ class Handler(SimpleHTTPRequestHandler):
             self._platform_stats_export(user)
         elif path == "/api/platform/activity":
             self._platform_activity(user)
-        elif path == "/api/platform/portrait-key":
-            self._platform_portrait_key_get(user)
+        elif self._try_company_key_route(path, "GET", user):
+            pass
         elif path == "/api/feishu/config":
             self._feishu_config_get(user)
         elif path.startswith("/api/reports/daily/") and path.endswith(".csv"):
@@ -1357,8 +1357,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             self._json(200, {"ok": True, "key": entry})
             return
-        if path == "/api/platform/portrait-key":
-            self._platform_portrait_key_set(user)
+        if self._try_company_key_route(path, "POST", user):
             return
         if path == "/api/reports/send":
             self._report_send(user)
@@ -1548,15 +1547,16 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _platform_portrait_key_get(self, user: dict):
-        """Admin-only: returns whether the company-wide volcengine-portrait key is set.
-        Never returns the plaintext."""
+    def _company_key_get(self, spec: AppSpec, user: dict):
+        """Admin-only: returns whether the company-wide key for `spec` is set.
+        Never returns the plaintext. Strict role check — do NOT go through
+        spec.admin_permission (which would let manage_dreamina_accounts read
+        another app's admin key)."""
         if user.get("role") != "admin":
             self._json(403, {"ok": False, "error": "admin only"})
             return
         try:
-            port = APPS["volcengine-portrait"]["port"]
-            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn = http.client.HTTPConnection("127.0.0.1", spec.port, timeout=5)
             conn.request("GET", "/api/config")
             resp = conn.getresponse()
             data = json.loads(resp.read()) if resp.status == 200 else {}
@@ -1571,9 +1571,10 @@ class Handler(SimpleHTTPRequestHandler):
             "has_secret_key": bool(data.get("has_secret_key")),
         })
 
-    def _platform_portrait_key_set(self, user: dict):
-        """Admin-only: write the company-wide volcengine-portrait key/AK/SK.
-        Empty fields are silently ignored (treated as 'do not modify')."""
+    def _company_key_set(self, spec: AppSpec, user: dict):
+        """Admin-only: write the company-wide key/AK/SK for `spec` via its
+        /api/config. Empty fields silently ignored ('do not modify'). Strict
+        role check (see _company_key_get)."""
         if user.get("role") != "admin":
             self._json(403, {"ok": False, "error": "admin only"})
             return
@@ -1589,8 +1590,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(400, {"ok": False, "error": "no key field provided"})
             return
         try:
-            port = APPS["volcengine-portrait"]["port"]
-            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn = http.client.HTTPConnection("127.0.0.1", spec.port, timeout=5)
             payload = json.dumps(forwarded).encode("utf-8")
             username_encoded = urllib.parse.quote(user.get("username", ""), safe="")
             ts = int(time.time())
@@ -1618,6 +1618,25 @@ class Handler(SimpleHTTPRequestHandler):
             "has_access_key": bool(data.get("has_access_key")),
             "has_secret_key": bool(data.get("has_secret_key")),
         })
+
+    def _try_company_key_route(self, path: str, method: str, user: dict) -> bool:
+        """Dispatch /api/platform/<endpoint> if any spec declares that
+        endpoint. Returns True if handled. `/api/platform/portrait-key`
+        stays wired via the spec so old bookmarks/API clients keep working."""
+        prefix = "/api/platform/"
+        if not path.startswith(prefix):
+            return False
+        endpoint = path[len(prefix):]
+        for spec in SPECS:
+            if spec.company_key_endpoint == endpoint:
+                if method == "GET":
+                    self._company_key_get(spec, user)
+                elif method == "POST":
+                    self._company_key_set(spec, user)
+                else:
+                    self._json(405, {"ok": False, "error": "method not allowed"})
+                return True
+        return False
 
     def _valid_report_date(self, date: str) -> bool:
         """Accept YYYY-MM-DD strictly, reject future dates. Emits 400 on failure."""
