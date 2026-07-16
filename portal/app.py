@@ -432,11 +432,12 @@ class KeyManager:
                      "note": k.get("note", ""), "key_hint": self._mask(k["key"])} for k in keys]
 
     def add_key(self, user_id: str, name: str, provider: str, key: str, note: str = "") -> dict:
-        # The volcengine-portrait subapp uses a single company-wide key managed by admin
-        # (POST /api/platform/portrait-key). Per-user personal keys are explicitly disabled
-        # to avoid drift between accounts.
-        if provider == "volcengine-portrait":
-            raise ValueError("人像生成由 admin 统一配置,不支持个人密钥")
+        # Sub-apps that declare `personal_key_disabled` use a company-wide key
+        # managed by admin (POST /api/platform/<endpoint>) — reject personal
+        # keys to avoid drift between accounts.
+        spec = SPEC_BY_NAME.get(provider)
+        if spec is not None and spec.personal_key_disabled:
+            raise ValueError(f"{spec.display_name}由 admin 统一配置,不支持个人密钥")
         with self._lock:
             data = self._load()
             entry = {
@@ -554,13 +555,15 @@ class AppManager:
                 print(f"  [log-rotate] loop error: {exc}", flush=True)
             self._stop_event.wait(3600)
 
-    def _read_portrait_keys(self) -> tuple[str, str]:
-        """Read volcengine AK/SK from the portrait sub-app's config.json so
-        seedance can inherit the same credentials for TOS uploads. Portrait
-        stores keys at <portrait_dir>/config.json (note: not in state/, see
-        volcengine-portrait/app.py load_config). Empty on any failure."""
+    def _read_tos_source_keys(self) -> tuple[str, str]:
+        """Read TOS AK/SK from whichever sub-app is declared `is_tos_source`
+        in apps.json (currently volcengine-portrait). Sub-apps with
+        `needs_tos_creds` get these injected via env at start_app time."""
+        source_spec = next((s for s in SPECS if s.is_tos_source), None)
+        if source_spec is None:
+            return "", ""
         try:
-            cfg_path = APPS["volcengine-portrait"]["dir"] / "config.json"
+            cfg_path = source_spec.dir_path / "config.json"
             if not cfg_path.exists():
                 return "", ""
             data = json.loads(cfg_path.read_text("utf-8"))
@@ -580,8 +583,9 @@ class AppManager:
         env["CORS"] = "1"
         if "DATA_DIR" in os.environ:
             env["DATA_DIR"] = str(app_dir / "test-data")
-        if name in ("seedance", "volcengine-portrait"):
-            ak, sk = self._read_portrait_keys()
+        spec: AppSpec | None = config.get("spec")
+        if spec is not None and spec.needs_tos_creds:
+            ak, sk = self._read_tos_source_keys()
             if ak and sk:
                 env["TOS_ACCESS_KEY"] = ak
                 env["TOS_SECRET_KEY"] = sk
@@ -1778,13 +1782,11 @@ class Handler(SimpleHTTPRequestHandler):
 
         # Detect job type for usage stats. Video duration is read later from
         # /api/jobs/<id> directly, so we don't need to parse the request body.
+        # See app_spec.classify_job_type() for the per-app rules.
+        spec = SPEC_BY_NAME.get(app_name)
         job_type = "image"
-        if is_job:
-            if app_name in ("seedance", "volcengine-portrait"):
-                job_type = "video"
-            elif app_name == "dreamina":
-                # Mode is encoded in the path: /api/text2image, /api/frames2video, etc.
-                job_type = "image" if any(x in target_path for x in ("text2image", "image2image")) else "video"
+        if is_job and spec is not None:
+            job_type = classify_job_type(spec, target_path)
 
         try:
             body = None
@@ -1801,17 +1803,23 @@ class Handler(SimpleHTTPRequestHandler):
                 if val:
                     headers[key] = val
 
-            # Resolve stored key by ID if client sent X-Key-Id
+            # Resolve stored key by ID if client sent X-Key-Id.
+            # Header wiring is driven by spec.credential_scheme:
+            #   api_key -> X-Api-Key: <key>
+            #   ak_sk   -> "<ak>:::<sk>" split into X-Access-Key + X-Secret-Key
+            #   none    -> skip
             key_id = self.headers.get("X-Key-Id", "").strip()
             if key_id:
                 key_val = key_manager.resolve(user["user_id"], key_id)
                 if key_val:
-                    if app_name == "volcengine-portrait" and ":::" in key_val:
+                    scheme = spec.credential_scheme if spec else "api_key"
+                    if scheme == "ak_sk" and ":::" in key_val:
                         ak, sk = key_val.split(":::", 1)
                         headers["X-Access-Key"] = ak
                         headers["X-Secret-Key"] = sk
-                    else:
+                    elif scheme == "api_key":
                         headers["X-Api-Key"] = key_val
+                    # scheme == "none": ignore any provided key
 
             headers["X-Forwarded-For"] = client_ip
             # Propagate public-facing host/proto so subapps can build absolute URLs
@@ -1834,11 +1842,20 @@ class Handler(SimpleHTTPRequestHandler):
             # names pass through unchanged.
             username_encoded = urllib.parse.quote(user.get("username", ""), safe="")
             headers["X-Username"] = username_encoded
-            is_admin = user.get("role") == "admin" or auth.has_permission(user, "manage_dreamina_accounts")
+            # X-Is-Admin: raised for the admin role and also for any spec that
+            # declares an `admin_permission` and the user has that permission
+            # (dreamina lets `manage_dreamina_accounts` proxy admin so ops folks
+            # can add accounts without full portal admin).
+            is_admin = user.get("role") == "admin"
+            if not is_admin and spec is not None and spec.admin_permission:
+                is_admin = auth.has_permission(user, spec.admin_permission)
             if is_admin:
                 headers["X-Is-Admin"] = "1"
-            if app_name == "dreamina" and auth.has_permission(user, "use_apps"):
-                headers["X-Dreamina-Manage"] = "1"
+            # Static extra headers with {perm:xxx} placeholders — e.g. dreamina
+            # emits X-Dreamina-Manage=1 when the caller has use_apps.
+            if spec is not None and spec.extra_headers:
+                for hk, hv in resolve_extra_headers(spec, user, auth.has_permission).items():
+                    headers[hk] = hv
             # HMAC-sign the (username, is_admin, ts) triple so a sub-app never
             # trusts a raw X-Is-Admin header from an unauthenticated caller.
             # See _sign_admin_header — sub-apps must verify with the shared
