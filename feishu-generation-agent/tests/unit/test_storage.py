@@ -1,6 +1,8 @@
+import asyncio
 import base64
 import json
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 import pytest
@@ -13,6 +15,114 @@ from feishu_generation_agent.storage.repository import Repository
 PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
+
+
+class _ControlledWriteConnection:
+    def __init__(self) -> None:
+        self.execute_calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.first_commit_started = asyncio.Event()
+        self.release_first_commit = asyncio.Event()
+        self.second_execute_started = asyncio.Event()
+        self.commit_count = 0
+        self.rollback_count = 0
+
+    async def execute(self, sql: str, parameters: tuple[Any, ...]) -> None:
+        self.execute_calls.append((sql, parameters))
+        if len(self.execute_calls) == 2:
+            self.second_execute_started.set()
+
+    async def commit(self) -> None:
+        self.commit_count += 1
+        if self.commit_count == 1:
+            self.first_commit_started.set()
+            await self.release_first_commit.wait()
+
+    async def rollback(self) -> None:
+        self.rollback_count += 1
+
+
+class _CommitFailureConnection:
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.rollback_count = 0
+
+    async def execute(self, sql: str, parameters: tuple[Any, ...]) -> None:
+        return None
+
+    async def commit(self) -> None:
+        raise self.error
+
+    async def rollback(self) -> None:
+        self.rollback_count += 1
+
+
+class _CancellableCommitConnection:
+    def __init__(self) -> None:
+        self.commit_started = asyncio.Event()
+        self.rollback_count = 0
+
+    async def execute(self, sql: str, parameters: tuple[Any, ...]) -> None:
+        return None
+
+    async def commit(self) -> None:
+        self.commit_started.set()
+        await asyncio.Event().wait()
+
+    async def rollback(self) -> None:
+        self.rollback_count += 1
+
+
+async def test_repository_serializes_writes_through_commit():
+    connection = _ControlledWriteConnection()
+    repo = Repository(connection)  # type: ignore[arg-type]
+
+    first_write = asyncio.create_task(
+        repo.create_run("run-1", "thread-1", "https://example.test/one")
+    )
+    await connection.first_commit_started.wait()
+    second_write = asyncio.create_task(
+        repo.append_event("run-1", "download", "running", "started")
+    )
+
+    second_started_while_first_was_uncommitted = False
+    try:
+        await asyncio.wait_for(
+            connection.second_execute_started.wait(), timeout=0.05
+        )
+        second_started_while_first_was_uncommitted = True
+    except TimeoutError:
+        pass
+    finally:
+        connection.release_first_commit.set()
+        await asyncio.gather(first_write, second_write)
+
+    assert not second_started_while_first_was_uncommitted
+    assert connection.commit_count == 2
+
+
+async def test_repository_rolls_back_when_commit_fails():
+    connection = _CommitFailureConnection(RuntimeError("commit failed"))
+    repo = Repository(connection)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await repo.append_event("run-1", "download", "failed", "failed")
+
+    assert connection.rollback_count == 1
+
+
+async def test_repository_rolls_back_when_write_is_cancelled():
+    connection = _CancellableCommitConnection()
+    repo = Repository(connection)  # type: ignore[arg-type]
+    write = asyncio.create_task(
+        repo.append_event("run-1", "download", "running", "started")
+    )
+    await connection.commit_started.wait()
+
+    write.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await write
+
+    assert connection.rollback_count == 1
 
 
 async def test_operation_is_unique_by_run_task_and_name(tmp_path: Path):
@@ -209,3 +319,23 @@ def test_download_accepts_chunks_and_reuses_content_path(tmp_path: Path):
     assert first.local_path == second.local_path
     assert first.size == len(PNG_1X1)
     assert not list((tmp_path / "outputs").rglob("*.part"))
+
+
+def test_chunked_image_download_does_not_read_entire_part_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store = FileStore(tmp_path / "data", tmp_path / "outputs", max_bytes=1024)
+    chunks = [PNG_1X1[:11], PNG_1X1[11:37], PNG_1X1[37:]]
+
+    def reject_read_bytes(path: Path) -> bytes:
+        raise AssertionError(f"unexpected whole-file read: {path}")
+
+    monkeypatch.setattr(Path, "read_bytes", reject_read_bytes)
+
+    stored = store.save_download(
+        "run-1", "task-1", "streamed.png", chunks, "image/png"
+    )
+
+    assert stored.size == len(PNG_1X1)
+    assert stored.mime_type == "image/png"
+    assert stored.local_path.exists()

@@ -113,13 +113,7 @@ class FileStore:
                 raise ValueError("unsupported or invalid media content") from None
             mime_type, extension = video_type
 
-        if declared_content_type is not None:
-            declared = declared_content_type.split(";", 1)[0].strip().lower()
-            declared = _CONTENT_TYPE_ALIASES.get(declared, declared)
-            if declared != mime_type:
-                raise ValueError(
-                    "declared Content-Type does not match verified media content"
-                )
+        self._validate_content_type(mime_type, declared_content_type)
 
         return _VerifiedMedia(
             mime_type=mime_type,
@@ -141,6 +135,8 @@ class FileStore:
         part_path = directory / f".{uuid4().hex}.part"
         try:
             size = 0
+            digest = sha256()
+            header = bytearray()
             with part_path.open("xb") as output:
                 for chunk in self._chunks(content):
                     size += len(chunk)
@@ -149,10 +145,18 @@ class FileStore:
                             "media exceeds configured size limit of "
                             f"{self._max_bytes} bytes"
                         )
+                    digest.update(chunk)
+                    if len(header) < 128:
+                        header.extend(chunk[: 128 - len(header)])
                     output.write(chunk)
 
-            raw = part_path.read_bytes()
-            verified = self.validate(raw, declared_content_type)
+            verified = self._validate_path(
+                part_path,
+                part_path.stat().st_size,
+                digest.hexdigest(),
+                bytes(header),
+                declared_content_type,
+            )
             final_path = directory / (
                 f"{verified.sha256}.{verified.extension}"
             )
@@ -172,6 +176,55 @@ class FileStore:
         except BaseException:
             part_path.unlink(missing_ok=True)
             raise
+
+    def _validate_path(
+        self,
+        path: Path,
+        size: int,
+        digest: str,
+        header: bytes,
+        declared_content_type: str | None,
+    ) -> _VerifiedMedia:
+        mime_type: str
+        extension: str
+        width: int | None = None
+        height: int | None = None
+        try:
+            with Image.open(path) as image:
+                image_format = image.format
+                width, height = image.size
+                image.verify()
+            if image_format not in _IMAGE_FORMATS:
+                raise ValueError("unsupported or invalid media content")
+            mime_type, extension = _IMAGE_FORMATS[image_format]
+        except (OSError, SyntaxError, UnidentifiedImageError):
+            video_type = self._identify_video(header)
+            if video_type is None:
+                raise ValueError("unsupported or invalid media content") from None
+            mime_type, extension = video_type
+
+        self._validate_content_type(mime_type, declared_content_type)
+        return _VerifiedMedia(
+            mime_type=mime_type,
+            extension=extension,
+            size=size,
+            sha256=digest,
+            width=width,
+            height=height,
+        )
+
+    @staticmethod
+    def _validate_content_type(
+        mime_type: str, declared_content_type: str | None
+    ) -> None:
+        if declared_content_type is None:
+            return
+        declared = declared_content_type.split(";", 1)[0].strip().lower()
+        declared = _CONTENT_TYPE_ALIASES.get(declared, declared)
+        if declared != mime_type:
+            raise ValueError(
+                "declared Content-Type does not match verified media content"
+            )
 
     @staticmethod
     def _chunks(content: bytes | Iterable[bytes]) -> Iterable[bytes]:

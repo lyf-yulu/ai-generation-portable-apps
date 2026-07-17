@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 from datetime import UTC, datetime
@@ -68,6 +69,7 @@ def _safe_summary(summary: str) -> str:
 class Repository:
     def __init__(self, connection: aiosqlite.Connection) -> None:
         self._connection = connection
+        self._write_lock = asyncio.Lock()
 
     @classmethod
     async def open(cls, path: Path) -> "Repository":
@@ -93,7 +95,7 @@ class Repository:
         status: str = "pending",
     ) -> None:
         timestamp = _now()
-        await self._connection.execute(
+        await self._write(
             """
             INSERT INTO runs (
               run_id, thread_id, source_url, status, created_at, updated_at
@@ -106,7 +108,6 @@ class Repository:
             """,
             (run_id, thread_id, source_url, status, timestamp, timestamp),
         )
-        await self._connection.commit()
 
     async def append_event(
         self,
@@ -115,14 +116,13 @@ class Repository:
         status: str,
         summary: str,
     ) -> None:
-        await self._connection.execute(
+        await self._write(
             """
             INSERT INTO events (run_id, node, status, summary, created_at)
             VALUES (?, ?, ?, ?, ?)
             """,
             (run_id, node, status, _safe_summary(summary), _now()),
         )
-        await self._connection.commit()
 
     async def list_events(self, run_id: str) -> list[dict[str, Any]]:
         cursor = await self._connection.execute(
@@ -150,7 +150,7 @@ class Repository:
         payload_json = json.dumps(
             payload or {}, ensure_ascii=False, separators=(",", ":")
         )
-        await self._connection.execute(
+        await self._write(
             """
             INSERT INTO operations (
               run_id, task_id, operation, provider_id, status,
@@ -172,7 +172,6 @@ class Repository:
                 _now(),
             ),
         )
-        await self._connection.commit()
 
     async def get_operation(
         self,
@@ -211,7 +210,7 @@ class Repository:
         artifact: Artifact,
     ) -> None:
         artifact_json = artifact.model_dump_json()
-        await self._connection.execute(
+        await self._write(
             """
             INSERT INTO artifacts (
               artifact_id, run_id, task_id, artifact_json, sha256, updated_at
@@ -232,4 +231,12 @@ class Repository:
                 _now(),
             ),
         )
-        await self._connection.commit()
+
+    async def _write(self, sql: str, parameters: tuple[Any, ...]) -> None:
+        async with self._write_lock:
+            try:
+                await self._connection.execute(sql, parameters)
+                await self._connection.commit()
+            except BaseException:
+                await self._connection.rollback()
+                raise
