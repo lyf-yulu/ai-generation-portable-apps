@@ -1,0 +1,37 @@
+[project]
+name = "feishu-generation-agent"
+version = "0.1.0"
+description = "Local LangGraph agent for Feishu image and video generation requirements"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "aiosqlite>=0.21,<1",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "langchain>=1.3,<1.4",
+  "langchain-anthropic>=1,<2",
+  "langchain-openai>=1,<2",
+  "langgraph>=1.2,<1.3",
+  "langgraph-checkpoint-sqlite>=3.1,<3.2",
+  "pillow>=11,<13",
+  "pydantic-settings>=2.7,<3",
+  "python-multipart>=0.0.20,<1",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/feishu_generation_agent"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8,<10",
+  "pytest-asyncio>=0.25,<2",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]
