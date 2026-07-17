@@ -471,6 +471,89 @@ async def test_second_invalid_response_raises_safe_error_without_third_call(
     assert raised.value.__context__ is None
 
 
+async def test_non_string_task_type_is_repaired_once(
+    narrative_document: NormalizedDocument,
+    vision_descriptions: list[VisionDescription],
+):
+    invalid = json.loads(_plan_json(_video_task()))
+    invalid["tasks"][0]["task_type"] = []
+    model = FakeDeepSeekModel(
+        [json.dumps(invalid, ensure_ascii=False), _plan_json(_video_task())]
+    )
+    planner = DeepSeekPlanner(model, max_output_count=4)
+
+    plan = await planner.plan(narrative_document, vision_descriptions)
+
+    assert len(plan.tasks) == 1
+    assert model.calls == 2
+    assert "task_type" in model.requests[1][-1]["content"]
+
+
+async def test_two_non_string_task_types_raise_safe_validation_error(
+    narrative_document: NormalizedDocument,
+    vision_descriptions: list[VisionDescription],
+):
+    first = json.loads(_plan_json(_video_task()))
+    first["tasks"][0]["task_type"] = []
+    second = json.loads(_plan_json(_video_task()))
+    second["tasks"][0]["task_type"] = {}
+    model = FakeDeepSeekModel(
+        [
+            json.dumps(first, ensure_ascii=False),
+            json.dumps(second, ensure_ascii=False),
+        ]
+    )
+    planner = DeepSeekPlanner(model, max_output_count=4)
+
+    with pytest.raises(AgentError) as raised:
+        await planner.plan(narrative_document, vision_descriptions)
+
+    assert model.calls == 2
+    detail = raised.value.detail
+    serialized = json.dumps(detail.model_dump(mode="json"))
+    assert detail.category == ErrorCategory.VALIDATION
+    assert detail.retryable is False
+    assert "fictional private chain of thought" not in serialized
+    assert model.api_key not in serialized
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+async def test_empty_plan_is_repaired_once(
+    narrative_document: NormalizedDocument,
+    vision_descriptions: list[VisionDescription],
+):
+    model = FakeDeepSeekModel([_plan_json(), _plan_json(_video_task())])
+    planner = DeepSeekPlanner(model, max_output_count=4)
+
+    plan = await planner.plan(narrative_document, vision_descriptions)
+
+    assert len(plan.tasks) == 1
+    assert model.calls == 2
+    assert "at least one generation task" in model.requests[1][-1]["content"]
+
+
+async def test_two_empty_plans_raise_safe_validation_error(
+    narrative_document: NormalizedDocument,
+    vision_descriptions: list[VisionDescription],
+):
+    model = FakeDeepSeekModel([_plan_json(), _plan_json()])
+    planner = DeepSeekPlanner(model, max_output_count=4)
+
+    with pytest.raises(AgentError) as raised:
+        await planner.plan(narrative_document, vision_descriptions)
+
+    assert model.calls == 2
+    detail = raised.value.detail
+    serialized = json.dumps(detail.model_dump(mode="json"))
+    assert detail.category == ErrorCategory.VALIDATION
+    assert detail.retryable is False
+    assert "fictional private chain of thought" not in serialized
+    assert model.api_key not in serialized
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
 @pytest.mark.parametrize(
     "failure",
     [
@@ -555,6 +638,61 @@ def test_validator_reports_stable_raw_plan_issues(
     assert issues == validate_plan(raw_plan, narrative_document, 4)
 
 
+@pytest.mark.parametrize("raw_task_type", [[], {}, None, ""])
+def test_validator_handles_non_string_or_empty_task_type(
+    narrative_document: NormalizedDocument,
+    raw_task_type: object,
+):
+    raw_plan = json.loads(_plan_json(_video_task()))
+    raw_plan["tasks"][0]["task_type"] = raw_task_type
+
+    issues = validate_plan(raw_plan, narrative_document, 4)
+
+    assert "tasks[0].task_type" in " ".join(issues)
+    assert issues == validate_plan(raw_plan, narrative_document, 4)
+
+
+@pytest.mark.parametrize(
+    "raw_plan",
+    [
+        {"unexpected": {}},
+        {"tasks": [[]]},
+        {
+            "tasks": [
+                {
+                    "task_id": {},
+                    "task_type": "image_to_video",
+                    "source_block_ids": [{}],
+                    "reference_images": [{"asset_id": {}}],
+                    "duration": {},
+                    "resolution": [],
+                    "generate_audio": [],
+                    "output_count": {},
+                }
+            ]
+        },
+    ],
+)
+def test_validator_returns_issues_for_arbitrary_json_objects(
+    narrative_document: NormalizedDocument,
+    raw_plan: dict[str, Any],
+):
+    issues = validate_plan(raw_plan, narrative_document, 4)
+
+    assert issues
+    assert issues == validate_plan(raw_plan, narrative_document, 4)
+
+
+def test_validator_rejects_empty_generation_plan(
+    narrative_document: NormalizedDocument,
+):
+    raw_plan = json.loads(_plan_json())
+
+    issues = validate_plan(raw_plan, narrative_document, 4)
+
+    assert issues == ["plan.tasks: at least one generation task is required"]
+
+
 def test_validator_rejects_failed_or_non_image_assets(
     narrative_document: NormalizedDocument,
 ):
@@ -617,7 +755,135 @@ def test_validator_requires_storyboard_rows_to_merge(
     issues = validate_plan(raw_plan, storyboard_document, 4)
 
     assert "storyboard" in " ".join(issues)
-    assert "merge" in " ".join(issues)
+    assert "exactly one image_to_video" in " ".join(issues)
+
+
+def test_validator_accepts_one_video_covering_every_storyboard_row(
+    storyboard_document: NormalizedDocument,
+):
+    task = _video_task(
+        source_block_ids=[f"shot-{index}" for index in range(1, 5)]
+    )
+
+    assert validate_plan(
+        json.loads(_plan_json(task)), storyboard_document, 4
+    ) == []
+
+
+def test_validator_rejects_one_video_missing_storyboard_rows(
+    storyboard_document: NormalizedDocument,
+):
+    task = _video_task(source_block_ids=["shot-1"])
+
+    issues = validate_plan(
+        json.loads(_plan_json(task)), storyboard_document, 4
+    )
+
+    joined = " ".join(issues)
+    assert "storyboard table table-1" in joined
+    assert "missing source_block_ids" in joined
+    assert "shot-2" in joined and "shot-3" in joined and "shot-4" in joined
+
+
+def test_validator_requires_every_content_block_in_storyboard_rows(
+    storyboard_document: NormalizedDocument,
+):
+    detail = DocumentBlock(
+        block_id="shot-detail-1",
+        parent_id="cell-0",
+        block_type="text",
+        order=4,
+        path=["page-1", "table-1", "cell-0", "shot-detail-1"],
+        text="持续 2 秒，画面保持稳定。",
+    )
+    document = storyboard_document.model_copy(
+        update={"blocks": [*storyboard_document.blocks, detail]}
+    )
+    base_sources = [f"shot-{index}" for index in range(1, 5)]
+
+    incomplete = validate_plan(
+        json.loads(_plan_json(_video_task(source_block_ids=base_sources))),
+        document,
+        4,
+    )
+    complete = validate_plan(
+        json.loads(
+            _plan_json(
+                _video_task(
+                    source_block_ids=[*base_sources, "shot-detail-1"]
+                )
+            )
+        ),
+        document,
+        4,
+    )
+
+    assert "shot-detail-1" in " ".join(incomplete)
+    assert complete == []
+
+
+def test_validator_rejects_image_task_for_storyboard_rows(
+    storyboard_document: NormalizedDocument,
+):
+    task = _image_task()
+    task["source_block_ids"] = [f"shot-{index}" for index in range(1, 5)]
+
+    issues = validate_plan(
+        json.loads(_plan_json(task)), storyboard_document, 4
+    )
+
+    joined = " ".join(issues)
+    assert "storyboard table table-1" in joined
+    assert "must be image_to_video" in joined
+
+
+def test_validator_rejects_storyboard_split_across_image_and_video_tasks(
+    storyboard_document: NormalizedDocument,
+):
+    image = _image_task("task-image")
+    image["source_block_ids"] = ["shot-1"]
+    video = _video_task(
+        "task-video", source_block_ids=["shot-2", "shot-3", "shot-4"]
+    )
+
+    issues = validate_plan(
+        json.loads(_plan_json(image, video)), storyboard_document, 4
+    )
+
+    joined = " ".join(issues)
+    assert "storyboard table table-1" in joined
+    assert "exactly one image_to_video" in joined
+    assert "found 2" in joined
+
+
+def test_validator_does_not_treat_ordinary_table_as_storyboard(
+    storyboard_document: NormalizedDocument,
+):
+    ordinary_blocks = [
+        block.model_copy(
+            update={
+                "text": block.text.replace("镜头", "参数")
+                if block.text
+                else block.text
+            }
+        )
+        for block in storyboard_document.blocks
+    ]
+    ordinary_document = storyboard_document.model_copy(
+        update={
+            "title": "渲染参数表",
+            "blocks": ordinary_blocks,
+            "text_view": storyboard_document.text_view.replace("镜头", "参数"),
+        }
+    )
+    task = _image_task()
+    task["source_block_ids"] = ["shot-1"]
+
+    issues = validate_plan(
+        json.loads(_plan_json(task)), ordinary_document, 4
+    )
+
+    assert not any("storyboard" in issue for issue in issues)
 
 
 async def test_audit_uses_independent_prompt_and_does_not_rewrite_plan(

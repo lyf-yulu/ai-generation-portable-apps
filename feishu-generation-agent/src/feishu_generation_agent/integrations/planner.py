@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Any, Callable
 
 import httpx
@@ -17,6 +18,9 @@ from feishu_generation_agent.domain.plan import AuditReport, TaskPlan
 
 
 _ALLOWED_TASK_TYPES = {"image_to_image", "image_to_video"}
+_STORYBOARD_ROW_MARKER = re.compile(
+    r"^\s*镜头\s*(?:\d+|[一二三四五六七八九十百]+)\s*[：:]?"
+)
 _PLAN_SYSTEM_PROMPT = """你是 AI 图片与视频生成需求规划器。
 只根据给定文档、稳定引用和视觉描述输出 TaskPlan JSON，不得虚构素材或需求。
 不要输出思维过程、推理原文、Markdown 或 JSON 之外的说明。
@@ -33,6 +37,75 @@ def _compact_json(value: Any) -> str:
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+def _storyboard_requirements(
+    document: NormalizedDocument,
+) -> dict[str, list[str]]:
+    """Return content block IDs for explicitly marked storyboard tables.
+
+    A table is treated as a storyboard only when it has at least two non-empty
+    rows and every non-empty row contains text beginning with an explicit
+    ``镜头 N`` marker. This deliberately excludes ordinary parameter tables.
+    """
+    requirements: dict[str, list[str]] = {}
+    tables = sorted(
+        (
+            block
+            for block in document.blocks
+            if block.block_type == "table"
+        ),
+        key=lambda block: (block.order, block.block_id),
+    )
+    for table in tables:
+        cells = {
+            block.block_id: block.table_row
+            for block in document.blocks
+            if block.block_type == "table_cell"
+            and block.parent_id == table.block_id
+            and isinstance(block.table_row, int)
+        }
+        row_content: dict[int, list[Any]] = {}
+        for block in document.blocks:
+            if block.block_type in {"table", "table_cell"}:
+                continue
+            row = next(
+                (
+                    cells[path_part]
+                    for path_part in block.path
+                    if path_part in cells
+                ),
+                None,
+            )
+            if row is not None:
+                row_content.setdefault(row, []).append(block)
+
+        if len(row_content) < 2:
+            continue
+        marker_rows = {
+            row
+            for row, blocks in row_content.items()
+            if any(
+                block.block_type == "text"
+                and bool(_STORYBOARD_ROW_MARKER.match(block.text))
+                for block in blocks
+            )
+        }
+        if marker_rows != set(row_content):
+            continue
+
+        content_blocks = sorted(
+            (
+                block
+                for blocks in row_content.values()
+                for block in blocks
+            ),
+            key=lambda block: (block.order, block.block_id),
+        )
+        requirements[table.block_id] = [
+            block.block_id for block in content_blocks
+        ]
+    return requirements
 
 
 def validate_plan(
@@ -52,21 +125,15 @@ def validate_plan(
     tasks = payload.get("tasks")
     if not isinstance(tasks, list):
         return ["plan.tasks: must be a list"]
+    if not tasks:
+        return ["plan.tasks: at least one generation task is required"]
 
     block_ids = {block.block_id for block in document.blocks}
     assets = {asset.asset_id: asset for asset in document.media_assets}
-    table_ids = {
-        block.block_id
-        for block in document.blocks
-        if block.block_type == "table"
-    }
-    block_tables = {
-        block.block_id: [part for part in block.path if part in table_ids]
-        for block in document.blocks
-    }
+    storyboard_requirements = _storyboard_requirements(document)
     task_ids: set[str] = set()
     total_output_count = 0
-    storyboard_tasks: dict[str, list[str]] = {}
+    task_sources: list[tuple[str, str | None, set[str]]] = []
 
     for index, task in enumerate(tasks):
         prefix = f"tasks[{index}]"
@@ -84,7 +151,10 @@ def validate_plan(
             task_ids.add(task_id)
 
         task_type = task.get("task_type")
-        if task_type not in _ALLOWED_TASK_TYPES:
+        if (
+            not isinstance(task_type, str)
+            or task_type not in _ALLOWED_TASK_TYPES
+        ):
             issues.append(
                 f"{prefix}.task_type: must be image_to_image or image_to_video"
             )
@@ -101,6 +171,18 @@ def validate_plan(
                     issues.append(
                         f"{prefix}.source_block_ids: unknown block_id {block_id!r}"
                     )
+        valid_source_ids = {
+            block_id
+            for block_id in source_block_ids
+            if isinstance(block_id, str) and block_id in block_ids
+        }
+        task_sources.append(
+            (
+                display_id,
+                task_type if isinstance(task_type, str) else None,
+                valid_source_ids,
+            )
+        )
 
         references = task.get("reference_images")
         if not isinstance(references, list) or not references:
@@ -178,15 +260,6 @@ def validate_plan(
                     f"{prefix}.generate_audio: must be true, false, or omitted"
                 )
 
-            tables_for_task = {
-                table_id
-                for block_id in source_block_ids
-                if isinstance(block_id, str)
-                for table_id in block_tables.get(block_id, [])
-            }
-            for table_id in sorted(tables_for_task):
-                storyboard_tasks.setdefault(table_id, []).append(display_id)
-
         output_count = task.get("output_count", 1)
         if (
             not isinstance(output_count, int)
@@ -203,11 +276,36 @@ def validate_plan(
             f"{total_output_count} exceeds max_output_count {max_output_count}"
         )
 
-    for table_id in sorted(storyboard_tasks):
-        task_names = storyboard_tasks[table_id]
-        if len(task_names) > 1:
+    for table_id, required_ids in storyboard_requirements.items():
+        relevant_ids = {table_id, *required_ids}
+        relevant_tasks = [
+            task
+            for task in task_sources
+            if task[2].intersection(relevant_ids)
+        ]
+        if len(relevant_tasks) != 1:
             issues.append(
-                f"storyboard table {table_id}: merge rows into one image_to_video task"
+                f"storyboard table {table_id}: exactly one image_to_video task "
+                f"must cover all content blocks {required_ids!r}; "
+                f"found {len(relevant_tasks)}"
+            )
+            continue
+
+        task_name, task_type, source_ids = relevant_tasks[0]
+        if task_type != "image_to_video":
+            issues.append(
+                f"storyboard table {table_id}: task {task_name} must be "
+                "image_to_video"
+            )
+        missing_ids = [
+            block_id
+            for block_id in required_ids
+            if block_id not in source_ids
+        ]
+        if missing_ids:
+            issues.append(
+                f"storyboard table {table_id}: task {task_name} missing "
+                f"source_block_ids {missing_ids!r}"
             )
 
     return issues
