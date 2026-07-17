@@ -9,6 +9,12 @@
               "mimeType": "image/png",
               "data": "ZmljdGlvbmFsLWltYWdlLXJlc3VsdA=="
             }
+          },
+          {
+            "inlineData": {
+              "mimeType": "image/png",
+              "data": "ZmljdGlvbmFsLWltYWdlLXJlc3VsdC0y"
+            }
           }
         ]
       }

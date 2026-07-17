@@ -1,13 +1,46 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ProviderResult(BaseModel):
     url: str | None = None
+    url_trust: Literal["untrusted"] | None = None
     base64_data: str | None = None
+    local_path: Path | None = None
     mime_type: str
+    size: int | None = None
+    sha256: str | None = None
+
+    @model_validator(mode="after")
+    def validate_source_boundary(self) -> "ProviderResult":
+        sources = [
+            self.url is not None,
+            self.base64_data is not None,
+            self.local_path is not None,
+        ]
+        if sum(sources) != 1:
+            raise ValueError("provider result must have exactly one result source")
+        if self.url is not None:
+            if self.url_trust != "untrusted":
+                raise ValueError("url_trust must mark provider URLs as untrusted")
+            if self.size is not None or self.sha256 is not None:
+                raise ValueError("untrusted URL cannot claim local integrity metadata")
+        elif self.url_trust is not None:
+            raise ValueError("url_trust is only valid for URL results")
+        if self.local_path is not None:
+            if self.size is None or self.size <= 0:
+                raise ValueError("local provider result requires positive size")
+            if (
+                not isinstance(self.sha256, str)
+                or len(self.sha256) != 64
+                or any(character not in "0123456789abcdef" for character in self.sha256)
+            ):
+                raise ValueError("local provider result requires lowercase sha256")
+        elif self.size is not None or self.sha256 is not None:
+            raise ValueError("integrity metadata requires local_path")
+        return self
 
 
 class ProviderSubmission(BaseModel):

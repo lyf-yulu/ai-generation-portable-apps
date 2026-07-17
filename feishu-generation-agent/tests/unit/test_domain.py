@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from feishu_generation_agent.domain.artifact import Artifact
+from feishu_generation_agent.domain.artifact import Artifact, ProviderResult
 from feishu_generation_agent.domain.document import MediaAsset, SourceType
 from feishu_generation_agent.domain.errors import AgentError, ErrorCategory, ErrorDetail
 from feishu_generation_agent.domain.plan import GenerationTask, TaskPlan
@@ -170,6 +170,33 @@ def test_agent_error_exposes_serializable_detail():
 
     assert str(error) == "任务无效"
     assert error.detail.model_dump(mode="json")["category"] == "validation_error"
+
+
+def test_provider_result_url_requires_explicit_untrusted_boundary() -> None:
+    with pytest.raises(ValidationError, match="url_trust"):
+        ProviderResult(url="https://cdn.example/result.png", mime_type="image/png")
+
+    result = ProviderResult(
+        url="https://cdn.example/result.png",
+        url_trust="untrusted",
+        mime_type="image/png",
+    )
+    assert result.url_trust == "untrusted"
+
+
+def test_provider_result_local_file_requires_integrity_metadata(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValidationError, match="size"):
+        ProviderResult(local_path=tmp_path / "result.png", mime_type="image/png")
+
+    result = ProviderResult(
+        local_path=tmp_path / "result.png",
+        mime_type="image/png",
+        size=12,
+        sha256="a" * 64,
+    )
+    assert result.local_path == tmp_path / "result.png"
 
 
 def test_all_six_adapter_protocols_are_public():

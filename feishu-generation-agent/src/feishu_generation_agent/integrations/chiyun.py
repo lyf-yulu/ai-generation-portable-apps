@@ -1,8 +1,12 @@
 import base64
 import binascii
+from dataclasses import dataclass
 from hashlib import sha256
 import json
 import logging
+import os
+from pathlib import Path
+import stat
 from typing import Any, Literal
 from urllib.parse import quote, urlsplit
 
@@ -20,6 +24,15 @@ from feishu_generation_agent.domain.errors import (
     ErrorDetail,
 )
 from feishu_generation_agent.domain.plan import GenerationTask
+from feishu_generation_agent.integrations.safe_download import (
+    HostResolver,
+    SafeResultDownloader,
+)
+from feishu_generation_agent.storage.provider_results import (
+    ProviderResultStagingError,
+    ProviderResultStore,
+    StagedProviderResult,
+)
 
 
 _IMAGE_MIME_TYPES = frozenset(
@@ -28,6 +41,16 @@ _IMAGE_MIME_TYPES = frozenset(
 _LOGGER = logging.getLogger(__name__)
 _DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 _DEFAULT_MAX_RESULT_BYTES = 32 * 1024 * 1024
+_DEFAULT_MAX_INPUT_BYTES = 32 * 1024 * 1024
+_DEFAULT_MAX_TOTAL_INPUT_BYTES = 64 * 1024 * 1024
+_READ_CHUNK_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingResult:
+    mime_type: str
+    data: bytes | None = None
+    url: str | None = None
 
 
 class ModelProbeResult(BaseModel):
@@ -42,51 +65,89 @@ class ChiyunImageGenerator:
         self,
         http_client: httpx.AsyncClient,
         *,
-        base_url: str,
-        api_key: str | SecretStr,
-        model: str,
+        base_url: str | None,
+        api_key: str | SecretStr | None,
+        model: str | None,
+        staging_dir: Path,
+        result_http_client: httpx.AsyncClient | None = None,
+        result_host_resolver: HostResolver | None = None,
         max_response_bytes: int = _DEFAULT_MAX_RESPONSE_BYTES,
         max_result_bytes: int = _DEFAULT_MAX_RESULT_BYTES,
+        max_input_bytes: int = _DEFAULT_MAX_INPUT_BYTES,
+        max_total_input_bytes: int = _DEFAULT_MAX_TOTAL_INPUT_BYTES,
     ) -> None:
-        parsed = urlsplit(base_url.strip())
+        if not isinstance(base_url, str):
+            raise self._configuration_error("base_url", "expected=https origin")
+        try:
+            parsed = urlsplit(base_url.strip())
+            port = parsed.port
+        except (TypeError, ValueError):
+            raise self._configuration_error(
+                "base_url", "expected=https origin"
+            ) from None
         if (
             parsed.scheme != "https"
             or not parsed.hostname
+            or port not in {None, 443}
             or parsed.username is not None
             or parsed.password is not None
             or parsed.query
             or parsed.fragment
             or parsed.path not in {"", "/"}
         ):
-            raise self._error(
-                ErrorCategory.CONFIGURATION,
-                "Chiyun 服务地址配置无效",
-                "field=base_url; expected=https origin",
-            )
+            raise self._configuration_error("base_url", "expected=https origin")
         secret = (
             api_key.get_secret_value()
             if isinstance(api_key, SecretStr)
             else api_key
         )
-        if not secret.strip():
-            raise self._error(
-                ErrorCategory.CONFIGURATION,
-                "Chiyun API Key 未配置",
-                "field=api_key; cause=empty",
+        if not isinstance(secret, str) or not secret.strip():
+            raise self._configuration_error("api_key", "cause=empty")
+        if not isinstance(model, str) or not model.strip():
+            raise self._configuration_error("model", "cause=empty")
+        limits = {
+            "max_response_bytes": max_response_bytes,
+            "max_result_bytes": max_result_bytes,
+            "max_input_bytes": max_input_bytes,
+            "max_total_input_bytes": max_total_input_bytes,
+        }
+        for field_name, value in limits.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise self._configuration_error(field_name, "cause=not_positive")
+        if max_total_input_bytes < max_input_bytes:
+            raise self._configuration_error(
+                "max_total_input_bytes", "cause=less_than_single_limit"
             )
-        if not model.strip():
-            raise self._error(
-                ErrorCategory.CONFIGURATION,
-                "Chiyun 模型未配置",
-                "field=model; cause=empty",
+        if not isinstance(staging_dir, Path):
+            raise self._configuration_error("staging_dir", "cause=not_path")
+        try:
+            result_store = ProviderResultStore(
+                staging_dir,
+                max_item_bytes=max_result_bytes,
             )
+        except (OSError, ValueError):
+            raise self._configuration_error(
+                "staging_dir", "cause=unavailable"
+            ) from None
         self._http_client = http_client
         self._base_url = f"https://{parsed.netloc}"
         self._api_key = SecretStr(secret.strip())
         self._model = model.strip()
         self._max_response_bytes = max_response_bytes
         self._max_result_bytes = max_result_bytes
+        self._max_input_bytes = max_input_bytes
+        self._max_total_input_bytes = max_total_input_bytes
         self._timeout = httpx.Timeout(120, connect=10)
+        self._result_store = result_store
+        self._result_downloader = (
+            SafeResultDownloader(
+                result_http_client,
+                resolver=result_host_resolver,
+                max_bytes=max_result_bytes,
+            )
+            if result_http_client is not None
+            else None
+        )
 
     async def submit(
         self,
@@ -128,22 +189,55 @@ class ChiyunImageGenerator:
                 "Chiyun 未返回图片结果",
                 "operation=generate; cause=missing_result",
             )
+        if len(results) < task.output_count:
+            raise self._provider_error(
+                "Chiyun 返回的图片数量不足",
+                (
+                    "operation=generate; cause=result_count_mismatch; "
+                    f"expected={task.output_count}; actual={len(results)}"
+                ),
+            )
+        results = results[: task.output_count]
+        materialized: list[tuple[bytes, str]] = []
+        for result in results:
+            if result.data is not None:
+                content = result.data
+            else:
+                if result.url is None:
+                    raise AssertionError("pending result has no source")
+                if self._result_downloader is None:
+                    raise self._provider_error(
+                        "Chiyun 返回了未配置下载器的图片地址",
+                        (
+                            "operation=generate; "
+                            "cause=url_download_not_configured"
+                        ),
+                    )
+                content = await self._result_downloader.download(
+                    result.url,
+                    expected_mime_type=result.mime_type,
+                )
+            materialized.append((content, result.mime_type))
+        try:
+            provider_task_id, staged_results = self._result_store.save(
+                materialized
+            )
+        except (OSError, ProviderResultStagingError):
+            raise self._provider_error(
+                "Chiyun 图片结果无法安全落盘",
+                "operation=generate; cause=staging_write_failed",
+            ) from None
+        provider_results = self._provider_results(staged_results)
         _LOGGER.info(
             "Chiyun generation completed result_count=%d mime_types=%s",
-            len(results),
-            ",".join(result.mime_type for result in results),
-        )
-        response_id = body.get("responseId")
-        provider_task_id = (
-            response_id
-            if isinstance(response_id, str) and response_id
-            else "chiyun-synchronous"
+            len(provider_results),
+            ",".join(result.mime_type for result in provider_results),
         )
         return ProviderSubmission(
             provider="chiyun",
             provider_task_id=provider_task_id,
             status="succeeded",
-            result_items=results,
+            result_items=provider_results,
         )
 
     async def poll(
@@ -156,7 +250,21 @@ class ChiyunImageGenerator:
                 "Chiyun 同步任务只能轮询已成功的提交",
                 "operation=poll; cause=nonterminal_submission",
             )
-        return submission
+        try:
+            staged_results = self._result_store.load(
+                submission.provider_task_id
+            )
+        except (OSError, ProviderResultStagingError):
+            raise self._provider_error(
+                "Chiyun 已落盘的图片结果无效",
+                "operation=poll; cause=staging_invalid",
+            ) from None
+        return ProviderSubmission(
+            provider="chiyun",
+            provider_task_id=submission.provider_task_id,
+            status="succeeded",
+            result_items=self._provider_results(staged_results),
+        )
 
     async def probe_models(self) -> ModelProbeResult:
         payload = await self._request_json(
@@ -325,7 +433,8 @@ class ChiyunImageGenerator:
                 "cause=asset_order_mismatch",
             )
 
-        contents: list[bytes] = []
+        file_stats: list[os.stat_result] = []
+        total_size = 0
         for asset in assets:
             if asset.mime_type not in _IMAGE_MIME_TYPES:
                 raise self._validation_error(
@@ -346,24 +455,130 @@ class ChiyunImageGenerator:
                     "cause=invalid_metadata",
                 )
             try:
-                content = asset.local_path.read_bytes()
+                file_stat = asset.local_path.lstat()
             except OSError as exc:
                 raise self._document_error(
                     asset.asset_id,
                     "无法读取参考图片",
                     f"cause={type(exc).__name__}",
                 ) from None
-            if (
-                len(content) != asset.size
-                or sha256(content).hexdigest() != asset.sha256
-            ):
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise self._document_error(
+                    asset.asset_id,
+                    "参考图片路径不安全",
+                    "cause=unsafe_file",
+                )
+            if file_stat.st_size > self._max_input_bytes:
+                raise self._document_error(
+                    asset.asset_id,
+                    "参考图片超过大小限制",
+                    "cause=input_too_large",
+                )
+            if file_stat.st_size != asset.size:
                 raise self._document_error(
                     asset.asset_id,
                     "参考图片完整性校验失败",
                     "cause=content_mismatch",
                 )
+            total_size += file_stat.st_size
+            if total_size > self._max_total_input_bytes:
+                raise self._document_error(
+                    asset.asset_id,
+                    "参考图片总量超过大小限制",
+                    "cause=total_input_too_large",
+                )
+            file_stats.append(file_stat)
+
+        contents: list[bytes] = []
+        for asset, expected_stat in zip(assets, file_stats, strict=True):
+            content = self._read_verified_asset(asset, expected_stat)
             contents.append(content)
         return contents
+
+    def _read_verified_asset(
+        self,
+        asset: MediaAsset,
+        expected_stat: os.stat_result,
+    ) -> bytes:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
+            os, "O_NOFOLLOW", 0
+        )
+        try:
+            descriptor = os.open(asset.local_path, flags)
+        except OSError as exc:
+            raise self._document_error(
+                asset.asset_id,
+                "无法读取参考图片",
+                f"cause={type(exc).__name__}",
+            ) from None
+        try:
+            opened_stat = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened_stat.st_mode)
+                or self._file_identity(opened_stat)
+                != self._file_identity(expected_stat)
+            ):
+                raise self._document_error(
+                    asset.asset_id,
+                    "参考图片路径不安全",
+                    "cause=file_replaced",
+                )
+            content = bytearray()
+            digest = sha256()
+            while True:
+                chunk = os.read(descriptor, _READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                if len(content) + len(chunk) > self._max_input_bytes:
+                    raise self._document_error(
+                        asset.asset_id,
+                        "参考图片超过大小限制",
+                        "cause=input_too_large",
+                    )
+                content.extend(chunk)
+                digest.update(chunk)
+            final_stat = os.fstat(descriptor)
+        except AgentError:
+            raise
+        except OSError as exc:
+            raise self._document_error(
+                asset.asset_id,
+                "无法读取参考图片",
+                f"cause={type(exc).__name__}",
+            ) from None
+        finally:
+            os.close(descriptor)
+
+        try:
+            path_stat = asset.local_path.lstat()
+        except OSError as exc:
+            raise self._document_error(
+                asset.asset_id,
+                "参考图片路径在读取期间发生变化",
+                f"cause={type(exc).__name__}",
+            ) from None
+        if (
+            self._file_identity(final_stat) != self._file_identity(expected_stat)
+            or self._file_identity(path_stat) != self._file_identity(expected_stat)
+            or len(content) != asset.size
+            or digest.hexdigest() != asset.sha256
+        ):
+            raise self._document_error(
+                asset.asset_id,
+                "参考图片完整性校验失败",
+                "cause=content_mismatch",
+            )
+        return bytes(content)
+
+    @staticmethod
+    def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_size,
+            value.st_mtime_ns,
+        )
 
     @staticmethod
     def _prompt(task: GenerationTask) -> str:
@@ -374,8 +589,8 @@ class ChiyunImageGenerator:
             lines.append(f"请生成 {task.output_count} 张结果图片。")
         return "\n\n".join(lines)
 
-    def _result_items(self, payload: dict[str, Any]) -> list[ProviderResult]:
-        results: list[ProviderResult] = []
+    def _result_items(self, payload: dict[str, Any]) -> list[_PendingResult]:
+        results: list[_PendingResult] = []
         candidates = payload.get("candidates")
         if not isinstance(candidates, list):
             raise self._provider_error(
@@ -419,7 +634,7 @@ class ChiyunImageGenerator:
                     results.append(self._url_result(part))
         return results
 
-    def _inline_result(self, value: Any) -> ProviderResult:
+    def _inline_result(self, value: Any) -> _PendingResult:
         if not isinstance(value, dict):
             raise self._invalid_result("inline_not_object")
         mime_type = value.get("mimeType") or value.get("mime_type")
@@ -436,9 +651,9 @@ class ChiyunImageGenerator:
             raise self._invalid_result("empty_decoded_result")
         if len(decoded) > self._max_result_bytes:
             raise self._invalid_result("decoded_result_too_large")
-        return ProviderResult(base64_data=data, mime_type=mime_type)
+        return _PendingResult(mime_type=mime_type, data=decoded)
 
-    def _url_result(self, value: Any) -> ProviderResult:
+    def _url_result(self, value: Any) -> _PendingResult:
         if not isinstance(value, dict):
             raise self._invalid_result("url_not_object")
         mime_type = value.get("mimeType") or value.get("mime_type")
@@ -451,7 +666,10 @@ class ChiyunImageGenerator:
             url = image_url.get("url")
         if not isinstance(url, str):
             raise self._invalid_result("missing_url")
-        parsed = urlsplit(url)
+        try:
+            parsed = urlsplit(url)
+        except (TypeError, ValueError):
+            raise self._invalid_result("unsafe_url") from None
         if (
             parsed.scheme != "https"
             or not parsed.hostname
@@ -459,7 +677,29 @@ class ChiyunImageGenerator:
             or parsed.password is not None
         ):
             raise self._invalid_result("unsafe_url")
-        return ProviderResult(url=url, mime_type=mime_type)
+        provider_result = ProviderResult(
+            url=url,
+            url_trust="untrusted",
+            mime_type=mime_type,
+        )
+        return _PendingResult(
+            mime_type=provider_result.mime_type,
+            url=provider_result.url,
+        )
+
+    @staticmethod
+    def _provider_results(
+        staged_results: list[StagedProviderResult],
+    ) -> list[ProviderResult]:
+        return [
+            ProviderResult(
+                local_path=result.local_path,
+                mime_type=result.mime_type,
+                size=result.size,
+                sha256=result.sha256,
+            )
+            for result in staged_results
+        ]
 
     def _validate_result_mime(self, value: Any) -> None:
         if not isinstance(value, str) or value not in _IMAGE_MIME_TYPES:
@@ -520,6 +760,19 @@ class ChiyunImageGenerator:
                 technical_detail=technical_detail,
                 retryable=False,
             )
+        )
+
+    @classmethod
+    def _configuration_error(cls, field_name: str, cause: str) -> AgentError:
+        messages = {
+            "base_url": "Chiyun 服务地址配置无效",
+            "api_key": "Chiyun API Key 未配置",
+            "model": "Chiyun 模型未配置",
+        }
+        return cls._error(
+            ErrorCategory.CONFIGURATION,
+            messages.get(field_name, "Chiyun 大小限制配置无效"),
+            f"field={field_name}; {cause}",
         )
 
     @classmethod

@@ -93,9 +93,11 @@ async def _submit_payload(
     payload: dict[str, Any],
     *,
     status_code: int = 200,
+    task_output_count: int = 1,
     **generator_options: Any,
 ):
     requests: list[httpx.Request] = []
+    generator_options.setdefault("staging_dir", tmp_path / "staging")
 
     def respond(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -112,7 +114,7 @@ async def _submit_payload(
             **generator_options,
         )
         submission = await generator.submit(
-            _task(output_count=1),
+            _task(output_count=task_output_count),
             [_asset(tmp_path, "asset-blue"), _asset(tmp_path, "asset-green")],
         )
     return submission, requests
@@ -136,6 +138,7 @@ async def test_submit_uses_generate_content_original_mime_and_explicit_order(
             base_url="https://fictional-chiyun.test",
             api_key="fixture-key-never-sent-externally",
             model="verified/model preview",
+            staging_dir=tmp_path / "staging",
         )
         assets = [
             _asset(tmp_path, "asset-blue"),
@@ -175,12 +178,82 @@ async def test_submit_uses_generate_content_original_mime_and_explicit_order(
         "imageConfig": {"aspectRatio": "9:16", "imageSize": "2K"}
     }
     assert submission.provider == "chiyun"
-    assert submission.provider_task_id == "fictional-response-001"
+    assert submission.provider_task_id != "fictional-response-001"
+    assert len(submission.provider_task_id) == 32
     assert submission.status == "succeeded"
+    assert len(submission.result_items) == 2
     assert submission.result_items[0].mime_type == "image/png"
-    assert submission.result_items[0].base64_data == (
-        "ZmljdGlvbmFsLWltYWdlLXJlc3VsdA=="
+    assert submission.result_items[0].base64_data is None
+    assert submission.result_items[0].url is None
+    assert submission.result_items[0].local_path is not None
+    assert submission.result_items[0].local_path.read_bytes() == b"fictional-image-result"
+
+
+@pytest.mark.asyncio
+async def test_submit_rejects_fewer_results_than_output_count(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "inlineData": {
+                                "mimeType": "image/png",
+                                "data": base64.b64encode(b"only-one").decode("ascii"),
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+
+    with pytest.raises(AgentError) as caught:
+        await _submit_payload(tmp_path, payload, task_output_count=2)
+
+    assert caught.value.detail.category == ErrorCategory.PROVIDER_TERMINAL
+    assert caught.value.detail.retryable is False
+    assert "result_count_mismatch" in caught.value.detail.technical_detail
+
+
+@pytest.mark.asyncio
+async def test_submit_truncates_extra_results_to_exact_output_count(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "inlineData": {
+                                "mimeType": "image/png",
+                                "data": base64.b64encode(f"result-{index}".encode()).decode("ascii"),
+                            }
+                        }
+                        for index in range(3)
+                    ]
+                }
+            }
+        ]
+    }
+
+    submission, _ = await _submit_payload(
+        tmp_path,
+        payload,
+        task_output_count=2,
     )
+
+    assert submission.status == "succeeded"
+    assert len(submission.result_items) == 2
+    assert [
+        item.local_path.read_bytes() for item in submission.result_items
+    ] == [
+        b"result-0",
+        b"result-1",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -193,6 +266,7 @@ async def test_submit_uses_generate_content_original_mime_and_explicit_order(
     ],
 )
 def test_constructor_rejects_unsafe_or_empty_configuration(
+    tmp_path: Path,
     updates: dict[str, str],
     field_name: str,
 ) -> None:
@@ -200,6 +274,7 @@ def test_constructor_rejects_unsafe_or_empty_configuration(
         "base_url": "https://fictional-chiyun.test",
         "api_key": "fixture-key-never-sent-externally",
         "model": "fictional-model",
+        "staging_dir": tmp_path / "staging",
     }
     values.update(updates)
 
@@ -213,17 +288,156 @@ def test_constructor_rejects_unsafe_or_empty_configuration(
         assert values["api_key"] not in str(caught.value.detail)
 
 
-def test_constructor_keeps_api_key_secret_and_out_of_repr() -> None:
+def test_constructor_keeps_api_key_secret_and_out_of_repr(
+    tmp_path: Path,
+) -> None:
     api_key = "fixture-secret-key-for-repr-test"
     generator = ChiyunImageGenerator(
         httpx.AsyncClient(),
         base_url="https://fictional-chiyun.test",
         api_key=SecretStr(api_key),
         model="fictional-model",
+        staging_dir=tmp_path / "staging",
     )
 
     assert api_key not in repr(generator)
     assert api_key not in repr(vars(generator))
+
+
+@pytest.mark.parametrize(
+    ("updates", "field_name"),
+    [
+        ({"base_url": None}, "base_url"),
+        ({"api_key": None}, "api_key"),
+        ({"model": None}, "model"),
+        ({"staging_dir": None}, "staging_dir"),
+        ({"base_url": "https://[::1"}, "base_url"),
+        ({"base_url": "https://fictional.test:invalid"}, "base_url"),
+        ({"base_url": "https://fictional.test:70000"}, "base_url"),
+        ({"base_url": "https://user@fictional.test"}, "base_url"),
+        ({"base_url": "https://fictional.test/path"}, "base_url"),
+        ({"base_url": "https://fictional.test?query=1"}, "base_url"),
+        ({"max_response_bytes": 0}, "max_response_bytes"),
+        ({"max_result_bytes": -1}, "max_result_bytes"),
+        ({"max_input_bytes": 0}, "max_input_bytes"),
+        ({"max_total_input_bytes": -1}, "max_total_input_bytes"),
+        (
+            {"max_input_bytes": 1024, "max_total_input_bytes": 512},
+            "max_total_input_bytes",
+        ),
+    ],
+)
+def test_constructor_maps_none_and_malformed_configuration_to_agent_error(
+    tmp_path: Path,
+    updates: dict[str, Any],
+    field_name: str,
+) -> None:
+    key = "fixture-secret-never-in-errors"
+    values: dict[str, Any] = {
+        "base_url": "https://fictional-chiyun.test",
+        "api_key": key,
+        "model": "fictional-model",
+        "staging_dir": tmp_path / "staging",
+    }
+    values.update(updates)
+
+    with pytest.raises(AgentError) as caught:
+        ChiyunImageGenerator(httpx.AsyncClient(), **values)
+
+    assert caught.value.detail.category == ErrorCategory.CONFIGURATION
+    assert caught.value.detail.retryable is False
+    assert field_name in caught.value.detail.technical_detail
+    assert key not in str(caught.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_submit_rejects_single_input_over_limit_before_http(
+    tmp_path: Path,
+) -> None:
+    first = _asset(tmp_path, "asset-blue", b"x" * 65)
+    second = _asset(tmp_path, "asset-green", b"y" * 8)
+    requests: list[httpx.Request] = []
+    async with _recording_client(requests) as client:
+        generator = ChiyunImageGenerator(
+            client,
+            base_url="https://fictional-chiyun.test",
+            api_key="fixture-key",
+            model="fictional-model",
+            staging_dir=tmp_path / "staging",
+            max_input_bytes=64,
+            max_total_input_bytes=128,
+        )
+        with pytest.raises(AgentError) as caught:
+            await generator.submit(_task(output_count=1), [first, second])
+
+    assert caught.value.detail.category == ErrorCategory.DOCUMENT
+    assert "input_too_large" in caught.value.detail.technical_detail
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_submit_rejects_total_inputs_before_read_bytes_or_http(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _asset(tmp_path, "asset-blue", b"x" * 60)
+    second = _asset(tmp_path, "asset-green", b"y" * 60)
+
+    def forbidden_read_bytes(path: Path) -> bytes:
+        raise AssertionError(f"unbounded read_bytes used for {path.name}")
+
+    monkeypatch.setattr(Path, "read_bytes", forbidden_read_bytes)
+    requests: list[httpx.Request] = []
+    async with _recording_client(requests) as client:
+        generator = ChiyunImageGenerator(
+            client,
+            base_url="https://fictional-chiyun.test",
+            api_key="fixture-key",
+            model="fictional-model",
+            staging_dir=tmp_path / "staging",
+            max_input_bytes=100,
+            max_total_input_bytes=100,
+        )
+        with pytest.raises(AgentError) as caught:
+            await generator.submit(_task(output_count=1), [first, second])
+
+    assert caught.value.detail.category == ErrorCategory.DOCUMENT
+    assert "total_input_too_large" in caught.value.detail.technical_detail
+    assert requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["declared_size", "symlink_replacement"])
+async def test_submit_rejects_forged_or_replaced_input_file(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    first = _asset(tmp_path, "asset-blue")
+    second = _asset(tmp_path, "asset-green")
+    if case == "declared_size":
+        first = first.model_copy(update={"size": first.size - 1})
+    else:
+        target = tmp_path / "replacement.png"
+        target.write_bytes(PNG_1X1)
+        first.local_path.unlink()
+        first.local_path.symlink_to(target)
+
+    requests: list[httpx.Request] = []
+    async with _recording_client(requests) as client:
+        generator = ChiyunImageGenerator(
+            client,
+            base_url="https://fictional-chiyun.test",
+            api_key="fixture-key",
+            model="fictional-model",
+            staging_dir=tmp_path / "staging",
+            max_input_bytes=1024,
+            max_total_input_bytes=2048,
+        )
+        with pytest.raises(AgentError) as caught:
+            await generator.submit(_task(output_count=1), [first, second])
+
+    assert caught.value.detail.category == ErrorCategory.DOCUMENT
+    assert requests == []
 
 
 @pytest.mark.asyncio
@@ -246,6 +460,7 @@ async def test_submit_rejects_non_image_task_before_http(tmp_path: Path) -> None
             base_url="https://fictional-chiyun.test",
             api_key="fixture-key",
             model="fictional-model",
+            staging_dir=tmp_path / "staging",
         )
         with pytest.raises(AgentError) as caught:
             await generator.submit(
@@ -329,6 +544,7 @@ async def test_submit_rejects_reference_identity_and_order_mismatch(
             base_url="https://fictional-chiyun.test",
             api_key="fixture-key",
             model="fictional-model",
+            staging_dir=tmp_path / "staging",
         )
         with pytest.raises(AgentError) as caught:
             await generator.submit(task, assets)
@@ -371,6 +587,7 @@ async def test_submit_rejects_invalid_media_asset_before_http(
             base_url="https://fictional-chiyun.test",
             api_key="fixture-key",
             model="fictional-model",
+            staging_dir=tmp_path / "staging",
         )
         with pytest.raises(AgentError) as caught:
             await generator.submit(_task(output_count=1), [first, second])
@@ -408,16 +625,49 @@ async def test_submit_parses_snake_inline_and_https_url_results(
         ]
     }
 
-    submission, _ = await _submit_payload(tmp_path, payload)
+    download_requests: list[httpx.Request] = []
+
+    async def resolver(host: str, port: int) -> list[str]:
+        assert (host, port) == ("cdn.fictional.test", 443)
+        return ["93.184.216.34"]
+
+    def download(request: httpx.Request) -> httpx.Response:
+        download_requests.append(request)
+        return httpx.Response(
+            200,
+            content=JPEG_1X1,
+            headers={"Content-Type": "image/jpeg"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(download),
+        headers={"Authorization": "Bearer must-not-reach-result-host"},
+    ) as result_client:
+        submission, _ = await _submit_payload(
+            tmp_path,
+            payload,
+            task_output_count=2,
+            result_http_client=result_client,
+            result_host_resolver=resolver,
+        )
 
     assert [item.mime_type for item in submission.result_items] == [
         "image/webp",
         "image/jpeg",
     ]
-    assert submission.result_items[0].base64_data == snake_data
-    assert submission.result_items[1].url == (
-        "https://cdn.fictional.test/result.jpg?sig=fake"
+    assert submission.result_items[0].local_path is not None
+    assert submission.result_items[0].local_path.read_bytes() == b"fictional-webp-result"
+    assert submission.result_items[1].local_path is not None
+    assert submission.result_items[1].local_path.read_bytes() == JPEG_1X1
+    assert len(download_requests) == 1
+    assert "authorization" not in download_requests[0].headers
+    staged_bytes = b"".join(
+        path.read_bytes()
+        for path in (tmp_path / "staging").rglob("*")
+        if path.is_file()
     )
+    assert b"sig=fake" not in staged_bytes
+    assert b"cdn.fictional.test" not in staged_bytes
 
 
 @pytest.mark.asyncio
@@ -531,6 +781,7 @@ async def test_submit_classifies_http_errors_without_raw_body(
             base_url="https://fictional-chiyun.test",
             api_key=secret_key,
             model="fictional-model",
+            staging_dir=tmp_path / "staging",
         )
         with pytest.raises(AgentError) as caught:
             await generator.submit(
@@ -560,6 +811,7 @@ async def test_submit_classifies_transport_timeout_as_retryable(
             base_url="https://fictional-chiyun.test",
             api_key="fixture-key",
             model="fictional-model",
+            staging_dir=tmp_path / "staging",
         )
         with pytest.raises(AgentError) as caught:
             await generator.submit(
@@ -585,6 +837,7 @@ async def test_submit_limits_response_before_json_parsing(tmp_path: Path) -> Non
             base_url="https://fictional-chiyun.test",
             api_key="fixture-key",
             model="fictional-model",
+            staging_dir=tmp_path / "staging",
             max_response_bytes=32,
         )
         with pytest.raises(AgentError) as caught:
@@ -614,6 +867,7 @@ async def test_success_log_is_metadata_only_and_poll_does_not_request_again(
             base_url="https://fictional-chiyun.test",
             api_key=key,
             model="fictional-model",
+            staging_dir=tmp_path / "staging",
         )
         submission = await generator.submit(
             _task(output_count=1),
@@ -621,7 +875,7 @@ async def test_success_log_is_metadata_only_and_poll_does_not_request_again(
         )
         polled = await generator.poll(submission)
 
-    assert polled is submission
+    assert polled == submission
     assert len(requests) == 1
     assert "result_count=1" in caplog.text
     assert "image/png" in caplog.text
@@ -630,7 +884,207 @@ async def test_success_log_is_metadata_only_and_poll_does_not_request_again(
 
 
 @pytest.mark.asyncio
-async def test_poll_rejects_nonterminal_submission_without_http() -> None:
+async def test_poll_recovers_synchronous_results_after_process_restart(
+    tmp_path: Path,
+) -> None:
+    staging_dir = tmp_path / "staging"
+    first_submission, submit_requests = await _submit_payload(
+        tmp_path,
+        _fixture_payload(),
+        task_output_count=2,
+        staging_dir=staging_dir,
+    )
+    checkpoint_submission = ProviderSubmission(
+        provider="chiyun",
+        provider_task_id=first_submission.provider_task_id,
+        status="succeeded",
+        result_items=[],
+    )
+    poll_requests: list[httpx.Request] = []
+
+    def paid_post_must_not_repeat(request: httpx.Request) -> httpx.Response:
+        poll_requests.append(request)
+        raise AssertionError("poll attempted a second paid request")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(paid_post_must_not_repeat)
+    ) as new_client:
+        restarted = ChiyunImageGenerator(
+            new_client,
+            base_url="https://fictional-chiyun.test",
+            api_key="different-runtime-key",
+            model="fictional-model",
+            staging_dir=staging_dir,
+        )
+        recovered = await restarted.poll(checkpoint_submission)
+
+    assert len(submit_requests) == 1
+    assert poll_requests == []
+    assert recovered.status == "succeeded"
+    assert len(recovered.result_items) == 2
+    assert [item.local_path.read_bytes() for item in recovered.result_items] == [
+        b"fictional-image-result",
+        b"fictional-image-result-2",
+    ]
+    assert all(item.base64_data is None for item in recovered.result_items)
+    assert all(item.url is None for item in recovered.result_items)
+
+    manifest = (
+        staging_dir / first_submission.provider_task_id / "manifest.json"
+    ).read_text(encoding="utf-8")
+    assert set(json.loads(manifest)) == {"version", "results"}
+    forbidden = (
+        "fixture-key-never-sent-externally",
+        "different-runtime-key",
+        "ZmljdGlvbmFsLWltYWdlLXJlc3VsdA==",
+        "https://",
+    )
+    all_staged = b"".join(
+        path.read_bytes() for path in staging_dir.rglob("*") if path.is_file()
+    )
+    assert all(value.encode() not in all_staged for value in forbidden)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tamper",
+    ["missing_manifest", "missing_file", "changed_file", "path_traversal"],
+)
+async def test_poll_fails_safely_for_missing_or_tampered_staging(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    staging_dir = tmp_path / "staging"
+    submission, _ = await _submit_payload(
+        tmp_path,
+        _fixture_payload(),
+        task_output_count=2,
+        staging_dir=staging_dir,
+    )
+    result_dir = staging_dir / submission.provider_task_id
+    manifest_path = result_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    first_path = result_dir / manifest["results"][0]["filename"]
+    if tamper == "missing_manifest":
+        manifest_path.unlink()
+    elif tamper == "missing_file":
+        first_path.unlink()
+    elif tamper == "changed_file":
+        first_path.write_bytes(b"tampered")
+    else:
+        manifest["results"][0]["filename"] = "../outside.png"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    requests: list[httpx.Request] = []
+    async with _recording_client(requests) as client:
+        restarted = ChiyunImageGenerator(
+            client,
+            base_url="https://fictional-chiyun.test",
+            api_key="fixture-key",
+            model="fictional-model",
+            staging_dir=staging_dir,
+        )
+        with pytest.raises(AgentError) as caught:
+            await restarted.poll(
+                ProviderSubmission(
+                    provider="chiyun",
+                    provider_task_id=submission.provider_task_id,
+                    status="succeeded",
+                    result_items=[],
+                )
+            )
+
+    assert caught.value.detail.category == ErrorCategory.PROVIDER_TERMINAL
+    assert caught.value.detail.retryable is False
+    assert requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsafe_url",
+    [
+        "https://localhost/out.png",
+        "https://127.0.0.1/out.png",
+        "https://10.1.2.3/out.png",
+        "https://169.254.169.254/latest/meta-data",
+        "https://[::1]/out.png",
+        "https://user@public.example/out.png",
+        "https://public.example:444/out.png",
+    ],
+)
+async def test_submit_rejects_unsafe_url_results_before_download(
+    tmp_path: Path,
+    unsafe_url: str,
+) -> None:
+    payload = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "fileData": {
+                                "mimeType": "image/png",
+                                "fileUri": unsafe_url,
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    result_requests: list[httpx.Request] = []
+
+    def unexpected_download(request: httpx.Request) -> httpx.Response:
+        result_requests.append(request)
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(unexpected_download)
+    ) as result_client:
+        with pytest.raises(AgentError) as caught:
+            await _submit_payload(
+                tmp_path,
+                payload,
+                result_http_client=result_client,
+            )
+
+    assert caught.value.detail.category == ErrorCategory.PROVIDER_TERMINAL
+    assert caught.value.detail.retryable is False
+    assert result_requests == []
+
+
+@pytest.mark.asyncio
+async def test_submit_rejects_url_result_without_dedicated_downloader(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "fileData": {
+                                "mimeType": "image/png",
+                                "fileUri": "https://public.example/out.png",
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+
+    with pytest.raises(AgentError) as caught:
+        await _submit_payload(tmp_path, payload)
+
+    assert caught.value.detail.category == ErrorCategory.PROVIDER_TERMINAL
+    assert "url_download_not_configured" in caught.value.detail.technical_detail
+
+
+@pytest.mark.asyncio
+async def test_poll_rejects_nonterminal_submission_without_http(
+    tmp_path: Path,
+) -> None:
     requests: list[httpx.Request] = []
     async with _recording_client(requests) as client:
         generator = ChiyunImageGenerator(
@@ -638,6 +1092,7 @@ async def test_poll_rejects_nonterminal_submission_without_http() -> None:
             base_url="https://fictional-chiyun.test",
             api_key="fixture-key",
             model="fictional-model",
+            staging_dir=tmp_path / "staging",
         )
         with pytest.raises(AgentError) as caught:
             await generator.poll(
@@ -670,6 +1125,7 @@ async def test_submit_rejects_invalid_json_without_raw_response(
             base_url="https://fictional-chiyun.test",
             api_key="fixture-key",
             model="fictional-model",
+            staging_dir=tmp_path / "staging",
         )
         with pytest.raises(AgentError) as caught:
             await generator.submit(
@@ -682,7 +1138,9 @@ async def test_submit_rejects_invalid_json_without_raw_response(
 
 
 @pytest.mark.asyncio
-async def test_probe_models_only_reads_model_list_and_parses_ids() -> None:
+async def test_probe_models_only_reads_model_list_and_parses_ids(
+    tmp_path: Path,
+) -> None:
     requests: list[httpx.Request] = []
 
     def models(request: httpx.Request) -> httpx.Response:
@@ -706,6 +1164,7 @@ async def test_probe_models_only_reads_model_list_and_parses_ids() -> None:
             base_url="https://fictional-chiyun.test",
             api_key="fixture-key",
             model="fictional-model",
+            staging_dir=tmp_path / "staging",
         )
         result = await generator.probe_models()
 
@@ -722,6 +1181,7 @@ async def test_probe_models_only_reads_model_list_and_parses_ids() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", [404, 405, 501])
 async def test_probe_models_reports_no_free_verification_when_unsupported(
+    tmp_path: Path,
     status_code: int,
 ) -> None:
     requests: list[httpx.Request] = []
@@ -738,6 +1198,7 @@ async def test_probe_models_reports_no_free_verification_when_unsupported(
             base_url="https://fictional-chiyun.test",
             api_key="fixture-key",
             model="fictional-model",
+            staging_dir=tmp_path / "staging",
         )
         result = await generator.probe_models()
 
@@ -751,7 +1212,9 @@ async def test_probe_models_reports_no_free_verification_when_unsupported(
 
 
 @pytest.mark.asyncio
-async def test_probe_models_treats_missing_models_structure_as_unsupported() -> None:
+async def test_probe_models_treats_missing_models_structure_as_unsupported(
+    tmp_path: Path,
+) -> None:
     requests: list[httpx.Request] = []
 
     def missing_structure(request: httpx.Request) -> httpx.Response:
@@ -766,6 +1229,7 @@ async def test_probe_models_treats_missing_models_structure_as_unsupported() -> 
             base_url="https://fictional-chiyun.test",
             api_key="fixture-key",
             model="fictional-model",
+            staging_dir=tmp_path / "staging",
         )
         result = await generator.probe_models()
 
@@ -778,6 +1242,7 @@ async def test_probe_models_treats_missing_models_structure_as_unsupported() -> 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", [429, 503])
 async def test_probe_models_classifies_retryable_http_errors(
+    tmp_path: Path,
     status_code: int,
 ) -> None:
     requests: list[httpx.Request] = []
@@ -794,6 +1259,7 @@ async def test_probe_models_classifies_retryable_http_errors(
             base_url="https://fictional-chiyun.test",
             api_key="fixture-key",
             model="fictional-model",
+            staging_dir=tmp_path / "staging",
         )
         with pytest.raises(AgentError) as caught:
             await generator.probe_models()
@@ -805,7 +1271,9 @@ async def test_probe_models_classifies_retryable_http_errors(
 
 
 @pytest.mark.asyncio
-async def test_probe_models_classifies_connection_error_as_retryable() -> None:
+async def test_probe_models_classifies_connection_error_as_retryable(
+    tmp_path: Path,
+) -> None:
     requests: list[httpx.Request] = []
 
     def fail(request: httpx.Request) -> httpx.Response:
@@ -820,6 +1288,7 @@ async def test_probe_models_classifies_connection_error_as_retryable() -> None:
             base_url="https://fictional-chiyun.test",
             api_key="fixture-key",
             model="fictional-model",
+            staging_dir=tmp_path / "staging",
         )
         with pytest.raises(AgentError) as caught:
             await generator.probe_models()
