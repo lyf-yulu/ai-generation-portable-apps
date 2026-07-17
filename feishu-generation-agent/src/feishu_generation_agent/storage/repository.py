@@ -7,7 +7,7 @@ from typing import Any
 
 import aiosqlite
 
-from feishu_generation_agent.domain import Artifact
+from feishu_generation_agent.domain import Artifact, VisionDescription
 
 
 _SCHEMA = """
@@ -230,6 +230,48 @@ class Repository:
                 artifact.sha256,
                 _now(),
             ),
+        )
+
+    async def get_vision_cache(
+        self,
+        cache_key: str,
+    ) -> dict[str, Any] | None:
+        cursor = await self._connection.execute(
+            """
+            SELECT description_json
+            FROM vision_cache
+            WHERE cache_key = ?
+            """,
+            (cache_key,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return None
+        description = json.loads(row[0])
+        if not isinstance(description, dict):
+            raise ValueError("vision cache entry is not a JSON object")
+        return description
+
+    async def save_vision_cache(
+        self,
+        cache_key: str,
+        description: VisionDescription,
+    ) -> None:
+        description_json = json.dumps(
+            description.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        await self._write(
+            """
+            INSERT INTO vision_cache (cache_key, description_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+              description_json = excluded.description_json,
+              updated_at = excluded.updated_at
+            """,
+            (cache_key, description_json, _now()),
         )
 
     async def _write(self, sql: str, parameters: tuple[Any, ...]) -> None:
