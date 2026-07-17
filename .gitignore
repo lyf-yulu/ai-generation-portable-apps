@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 .portable_python/
 .superpowers/
+.worktrees/
 
 # Runtime data — never track generated outputs, uploads, state, or logs
 # 无 / 后缀 = 目录/文件/symlink 都覆盖（deploy.sh 把 25GB 数据挂成 symlink 时会用到）

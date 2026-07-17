@@ -1228,7 +1228,7 @@ Expected: FAIL，提示 `ChiyunImageGenerator` 不存在。
 
 - [ ] **Step 4: 增加模型能力探针但不硬编码未验证模型**
 
-实现 `probe_models()`：先请求 `/v1beta/models`；若通道不支持列表，则对配置模型执行不含图片、明确要求只返回文本的最小非生成能力请求。`chiyun_model` 为空时配置检查失败，不能猜测模型名。
+实现 `probe_models()`：只请求 `/v1beta/models`。若通道不支持模型列表，则报告“该通道无法无费用验证模型”，不得调用 `generateContent`；模型能力只在用户明确批准的付费冒烟测试中验证。`chiyun_model` 为空时配置检查失败，不能猜测模型名。
 
 - [ ] **Step 5: 运行 Chiyun 单元测试**
 
