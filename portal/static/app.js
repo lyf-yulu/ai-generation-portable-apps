@@ -563,6 +563,33 @@ function DreaminaApp() {
         card.appendChild(previewWrap);
       }
 
+      // Download links for every result file. History cards previously offered
+      // ONLY the native <video> 3-dot menu / long-press as a download path, which
+      // hits the browser download manager and fails under self-signed HTTPS
+      // ("请检查互联网连接状况"). Since users often refresh away a finished job and
+      // can only retrieve it from history, that left them with no working way to
+      // download. These links reuse _blobDownload (fetch → blob → local save),
+      // the same self-signed-safe path the live result panel uses.
+      if (files.length) {
+        const dl = document.createElement('div');
+        dl.className = 'dm-hist-downloads';
+        for (const f of files) {
+          const url = '/dreamina/' + f.replace(/^\//, '');
+          const name = f.split('/').pop();
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = name;
+          a.className = 'dm-hist-dl-link';
+          a.textContent = files.length > 1 ? `下载 ${name}` : '下载';
+          a.addEventListener('click', (e) => {
+            e.preventDefault();
+            this._blobDownload(url, name);
+          });
+          dl.appendChild(a);
+        }
+        card.appendChild(dl);
+      }
+
       if (files.length > 1) {
         const count = document.createElement('div');
         count.className = 'dm-hist-count';

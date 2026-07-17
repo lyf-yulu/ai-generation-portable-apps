@@ -751,6 +751,25 @@ button:disabled,
 video.dm-hist-thumb { background: transparent; }
 img.dm-hist-thumb { cursor: zoom-in; }
 
+.dm-hist-downloads {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.dm-hist-dl-link {
+  display: inline-block;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--accent, #2563eb);
+  background: var(--surface, #f1f5f9);
+  border: 1px solid var(--border-strong, #cbd5e1);
+  border-radius: var(--radius-md, 6px);
+  text-decoration: none;
+  cursor: pointer;
+}
+.dm-hist-dl-link:hover { background: var(--border, #e2e8f0); }
+
 .dm-hist-log-panel {
   display: block;
   margin-top: 8px;
