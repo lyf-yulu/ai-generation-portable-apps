@@ -1323,6 +1323,8 @@ git commit -m "feat(agent): generate approved videos through Seedance"
 - [ ] **Step 1: 写失败 Graph 测试，覆盖局部执行、失败继续和重复恢复**
 
 ```python
+import json
+
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
@@ -1346,16 +1348,38 @@ async def test_existing_provider_id_is_polled_not_resubmitted(fake_services_with
     assert result["artifacts"][0]["provider_task_id"] == "ark-existing"
 
 
-async def test_preassociated_chiyun_intent_recovers_staged_local_result(fake_services_with_staged_chiyun_intent):
-    result = await fake_services_with_staged_chiyun_intent.run_from_execution_node()
-    assert fake_services_with_staged_chiyun_intent.image_generator.submit_calls == 0
-    assert fake_services_with_staged_chiyun_intent.image_generator.poll_calls == 1
-    assert result["artifacts"][0]["provider_task_id"] == fake_services_with_staged_chiyun_intent.submission_id
+async def test_submitted_chiyun_operation_recovers_staged_local_result(fake_services_with_submitted_chiyun_staging):
+    result = await fake_services_with_submitted_chiyun_staging.run_from_execution_node()
+    assert fake_services_with_submitted_chiyun_staging.image_generator.submit_calls == 0
+    assert fake_services_with_submitted_chiyun_staging.image_generator.poll_calls == 1
+    assert result["artifacts"][0]["provider_task_id"] == fake_services_with_submitted_chiyun_staging.official_id
 
 
-async def test_missing_staging_for_submitting_intent_is_uncertain_and_never_resubmitted(fake_services_with_missing_chiyun_staging):
+async def test_missing_staging_for_submitted_chiyun_is_uncertain_and_never_resubmitted(fake_services_with_missing_chiyun_staging):
     result = await fake_services_with_missing_chiyun_staging.run_from_execution_node()
     assert fake_services_with_missing_chiyun_staging.image_generator.submit_calls == 0
+    assert fake_services_with_missing_chiyun_staging.image_generator.poll_calls == 1
+    assert result["execution_records"][0]["status"] == "submission_uncertain"
+
+
+async def test_recovered_seedance_preintent_never_submits_or_polls(fake_services_with_seedance_preintent):
+    result = await fake_services_with_seedance_preintent.run_from_execution_node()
+    assert fake_services_with_seedance_preintent.video_generator.submit_calls == 0
+    assert fake_services_with_seedance_preintent.video_generator.poll_calls == 0
+    operation = await fake_services_with_seedance_preintent.repository.get_operation("run-exec", "task-video", "submit")
+    assert operation["phase"] == "submission_uncertain"
+    assert operation["official_id"] is None
+    assert result["execution_records"][0]["status"] == "submission_uncertain"
+
+
+async def test_seedance_post_outcome_error_becomes_uncertain_without_retry_or_poll(fake_services_with_seedance_post_timeout):
+    result = await fake_services_with_seedance_post_timeout.run_first_attempt()
+    assert fake_services_with_seedance_post_timeout.video_generator.submit_calls == 1
+    assert fake_services_with_seedance_post_timeout.video_generator.entered_http_send is True
+    assert fake_services_with_seedance_post_timeout.video_generator.poll_calls == 0
+    operation = await fake_services_with_seedance_post_timeout.repository.get_operation("run-exec", "task-video", "submit")
+    assert operation["phase"] == "submission_uncertain"
+    assert operation["official_id"] is None
     assert result["execution_records"][0]["status"] == "submission_uncertain"
 
 
@@ -1363,6 +1387,24 @@ async def test_tampered_staged_local_result_is_rejected_before_final_copy(fake_s
     result = await fake_services_with_tampered_staged_result.run_from_execution_node()
     assert result["execution_records"][0]["status"] == "failed"
     assert fake_services_with_tampered_staged_result.file_store.save_download_calls == 0
+
+
+async def test_raw_signed_url_exists_only_in_downloader_local_call(fake_services_with_signed_seedance_url, caplog):
+    marker = "SIGNED_TOKEN_MARKER_NEVER_PERSIST"
+    raw_url = f"https://cdn.fictional.test/video.mp4?token={marker}"
+    fake_services_with_signed_seedance_url.video_generator.result_url = raw_url
+    result = await fake_services_with_signed_seedance_url.run_from_execution_node()
+    assert fake_services_with_signed_seedance_url.result_downloader.received_urls == [raw_url]
+    assert result["artifacts"][0]["provider_url"] == "https://cdn.fictional.test/video.mp4"
+    assert marker not in json.dumps(result, ensure_ascii=False)
+    operation = await fake_services_with_signed_seedance_url.repository.get_operation("run-exec", "task-video", "submit")
+    events = await fake_services_with_signed_seedance_url.repository.list_events("run-exec")
+    assert marker not in json.dumps(operation, ensure_ascii=False)
+    assert marker not in json.dumps(events, ensure_ascii=False)
+    assert marker not in caplog.text
+    await fake_services_with_signed_seedance_url.close_storage()
+    assert marker.encode() not in fake_services_with_signed_seedance_url.business_db_path.read_bytes()
+    assert marker.encode() not in fake_services_with_signed_seedance_url.checkpoint_db_path.read_bytes()
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1377,25 +1419,31 @@ Expected: FAIL，图缺少审批后执行节点或幂等逻辑。
 
 - [ ] **Step 4: 实现串行幂等执行**
 
-对每个批准任务先查询 operation=`submit`。无记录时，必须在任何供应商网络请求前生成安全的 32 位十六进制 `submission_id`，原子保存 operation `status=submitting`、`provider_id=submission_id` 和必要的非敏感 intent 元数据，然后调用对应生成器 `submit(..., submission_id=submission_id)`。Chiyun 使用该 ID 作为 staging/provider task ID；Seedance 若返回官方 provider ID，则成功返回后用官方 ID 替换本地关联 ID，但若在官方 ID 持久化前崩溃，同样进入不确定状态，不自动重提。
+Repository 在 Task 11 增加显式且互不混用的 `phase`、`client_submission_id`、`official_id` 字段；`phase` 只能是 `intent_created`、`submitted`、`submission_uncertain` 或供应商终态。不得再把 `provider_id` 的字符串外形当作来源标记，Ark 返回的任何通过长度、控制字符和路径编码校验的 ID（包括 32 位小写十六进制）都只能作为 `official_id`。
 
-已有 operation 时绝不能把 `submitting` 当成“无记录”：对 `submitting`/已有 provider ID 构造 submission 并调用 `poll()`。Chiyun staging 已存在时由预关联 ID 恢复 staged local results；staging 缺失或无法验证时将 operation/execution record 标为 `submission_uncertain`，禁止自动再次调用 `submit()`，仅允许后续人工明确 retry。其他已提交状态继续按官方 provider ID 轮询。每次状态变更写 operation；终态失败或不确定写执行记录后继续下一项。轮询使用可注入 `async_sleep` 和配置间隔；超时只标记当前任务失败，不删除关联 ID。
+对每个批准任务先原子执行 `create_submission_intent_if_absent()`。创建者在任何供应商请求前生成 client correlation ID，写入 `phase=intent_created`、`client_submission_id=<id>`、`official_id=NULL` 和必要的非敏感 intent 元数据；方法必须返回 `created=True/False`，只有本进程本次拿到 `created=True` 才拥有唯一一次首次 `submit(..., submission_id=client_submission_id)` 调用权。并发失败者或任何进程恢复读到 `intent_created + official_id=NULL` 时，禁止 submit、禁止构造 `ProviderSubmission`、禁止 poll，立即原子改为 `submission_uncertain` 并要求人工明确 retry。
+
+Seedance 不支持 client-assigned 官方任务 ID。首次 submit 返回后，必须先把 Ark ID 原子写为 `phase=submitted, official_id=<Ark ID>`，之后才允许 poll。只要调用已进入 Seedance `submit()`，timeout、429/5xx、响应超限、非法 JSON、缺失/非法 ID、缺失/非法 status 等结果都保守视为“供应商可能已创建任务”：Graph 不得依据适配器现有 `retryable` taxonomy 自动 submit，而要写 `submission_uncertain`。明确发生在请求前的 Graph 本地审批/配置/素材校验可在创建 intent 前失败；若未来要自动重试 connection-establishment failure，必须先引入可验证的“请求尚未发送”边界和专门测试，本任务默认不作该乐观判断。
+
+Chiyun 首次 submit 使用 client ID 作为确定性 staging ID；适配器成功返回后，即使 `official_id == client_submission_id`，也必须显式写成 `phase=submitted` 才可按其 staging poll 规则恢复。恢复看到尚未转为 `submitted` 的 Chiyun intent 同样不自动 poll；已 `submitted` 但 staging 缺失/无效时转 `submission_uncertain`。只有 `phase=submitted + official_id` 才构造 `ProviderSubmission` 并 poll。每次状态变更写 operation；终态失败或不确定写执行记录后继续下一项。轮询使用可注入 `async_sleep` 和配置间隔；超时只标记当前任务失败，不删除关联 ID。
 
 该策略只保证工作流在崩溃不确定时的 at-most-once safety（不自动重复付费），不宣称供应商副作用 exactly-once。
 
 - [ ] **Step 5: 实现原子下载和 Artifact 记录**
 
-已有 operation 恢复必须先 `poll()` 取得当前 `result_items`，再按来源分支处理，不能因为记录已存在而重新 submit，也不能把 staged `local_path` 误走 URL/Base64 分支。
+只有 `phase=submitted + official_id` 的 operation 恢复才可 `poll()` 取得当前 `result_items`；`intent_created` 绝不能伪造成 `ProviderSubmission`。按来源分支处理结果，不能因为记录已存在而重新 submit，也不能把 staged `local_path` 误走 URL/Base64 分支。`ProviderSubmission` 可能含带签名 query 的原始 URL，因此它只能作为节点栈上的临时对象，禁止 `model_dump()` 后写入 Graph State、operation payload、Checkpoint 或事件。
 
 `local_path` 始终是不可信输入。只接受归属于配置 staging root、且目录结构与 provider task ID 一致的直接 staged result；从 staging root directory fd 开始，使用 `O_DIRECTORY|O_NOFOLLOW` 和相对 `dir_fd` 逐级打开目录，再以 `O_NOFOLLOW` 打开普通文件，禁止按完整路径直接读取。分块读取必须受单项上限约束，并重新核对声明 size/SHA-256、读取前后文件与目录身份；随后用 Pillow 或视频文件头重嗅探真实 MIME。任何 symlink、目录替换、路径越界、大小/hash/MIME 不符均拒绝。验证后的字节通过 `FileStore.save_download()` 原子复制到最终 outputs，不能把 staging path 直接登记为最终 Artifact；即使 Task 9 已校验过，Task 11 仍必须在复制时二次验证以封闭返回路径后的竞态。
 
-生成器返回 Base64 时先校验解码大小和文件头；返回 URL 时使用不带 Authorization/Cookie/Proxy-Authorization、禁用环境代理并将已验证公网 IP 固定到实际连接的独立下载器，限制逐跳重定向和总字节数。图片用 Pillow verify，视频至少验证 ISO BMFF `ftyp` 或 WebM EBML 头。成功后记录真实 MIME、size、sha256、provider URL 的脱敏版本和 provider task ID。
+生成器返回 Base64 时先校验解码大小和文件头。返回 URL 时，raw 完整 URL 只能保存在节点局部变量中，并原样传给不带 Authorization/Cookie/Proxy-Authorization、禁用环境代理且将已验证公网 IP 固定到实际连接的独立 `SafeResultDownloader`；限制逐跳重定向和总字节数。下载调用返回后立即丢弃 raw URL，不得写日志、事件、operation、Graph State、Checkpoint 或错误详情。图片用 Pillow verify，视频至少验证 ISO BMFF `ftyp` 或 WebM EBML 头。
+
+成功后记录真实 MIME、size、sha256 和 provider task ID。`Artifact.provider_url` 只允许保存用 `urlsplit`/`urlunsplit` 构造的脱敏 `scheme + host + path`，必须移除 userinfo、query 和 fragment；禁止用字符串替换处理。operation payload 只保存 client/official ID、phase 和非敏感摘要，不保存 `ProviderSubmission` 或 result items。测试必须用唯一 token marker 同时扫描节点返回 State、operation、events、日志、业务 SQLite 原始字节和关闭后的 Checkpoint SQLite 原始字节，全部不得出现 marker；同时断言下载器 mock 收到未删减的 raw URL，最终 Artifact 只含脱敏 URL。
 
 - [ ] **Step 6: 验证恢复不会重复付费提交**
 
 Run: `cd feishu-generation-agent && uv run pytest tests/graph/test_execution_graph.py -q`
 
-Expected: 局部批准、失败继续、已有 provider ID、网络前持久化 submission intent、staged local result 恢复、staging 路径/目录/文件篡改拒绝、`submission_uncertain` 零自动重提、已有有效最终文件、最终文件哈希不符重建、文档版本变化和超时用例全部 PASS。
+Expected: 局部批准、失败继续、`intent_created/submitted/submission_uncertain` 显式阶段、Seedance preintent 恢复零 submit/零 poll、Seedance POST 后所有不确定响应零自动重提、Chiyun 仅 submitted staging 恢复、staging 路径/目录/文件篡改拒绝、raw 签名 URL 只到下载器且在 State/operation/events/logs/业务库/Checkpoint 中 marker 全不存在、Artifact URL 脱敏、已有有效最终文件、最终文件哈希不符重建、文档版本变化和超时用例全部 PASS。
 
 - [ ] **Step 7: Commit**
 

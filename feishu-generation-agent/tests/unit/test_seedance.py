@@ -149,7 +149,7 @@ async def test_submit_preserves_explicit_reference_order_and_official_payload(
                 ]
             ),
             list(reversed(_assets(tmp_path))),
-            submission_id="a" * 32,
+            submission_id="client-correlation-only",
         )
 
     assert len(requests) == 1
@@ -190,7 +190,7 @@ async def test_submit_preserves_explicit_reference_order_and_official_payload(
     assert "submission_id" not in request.content.decode("utf-8")
     assert submission.provider == "seedance"
     assert submission.provider_task_id == "task-ark-fictional-123"
-    assert submission.provider_task_id != "a" * 32
+    assert submission.provider_task_id != "client-correlation-only"
     assert submission.status == "queued"
 
 
@@ -225,13 +225,43 @@ async def test_submit_accepts_origin_base_and_valid_first_last_frames(
         result = await generator.submit(task, list(reversed(_assets(tmp_path))))
 
     assert result.provider_task_id == "task-ark-first-last"
-    assert requests[0].url.path == "/contents/generations/tasks"
+    assert requests[0].url.path == "/api/v3/contents/generations/tasks"
     body = json.loads(requests[0].content)
     assert [item["role"] for item in body["content"][1:]] == [
         "first_frame",
         "last_frame",
     ]
     assert body["generate_audio"] is False
+
+
+@pytest.mark.asyncio
+async def test_origin_base_poll_uses_official_api_v3_path() -> None:
+    requests: list[httpx.Request] = []
+
+    def poll(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"id": "task-ark-origin", "status": "queued"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(poll)
+    ) as client:
+        generator = SeedanceVideoGenerator(
+            client,
+            base_url="https://ark.fictional.test",
+            api_key="fictional-key",
+            model="fictional-model",
+        )
+        result = await generator.poll(
+            _submission(provider_task_id="task-ark-origin")
+        )
+
+    assert result.status == "queued"
+    assert requests[0].url.path == (
+        "/api/v3/contents/generations/tasks/task-ark-origin"
+    )
 
 
 @pytest.mark.parametrize(
@@ -618,6 +648,137 @@ async def test_poll_succeeded_returns_one_temporary_untrusted_signed_url() -> No
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "result_payload",
+    [
+        {"content": {"video_url": "https://cdn.fictional.test/video.mp4"}},
+        {"content": {"videoUrl": "https://cdn.fictional.test/video.mp4"}},
+        {
+            "content": [
+                {
+                    "type": "video_url",
+                    "video_url": {
+                        "url": "https://cdn.fictional.test/video.mp4"
+                    },
+                }
+            ]
+        },
+        {
+            "content": [
+                {"videoUrl": "https://cdn.fictional.test/video.mp4"}
+            ]
+        },
+        {
+            "content": [
+                {"url": "https://cdn.fictional.test/video.mp4"}
+            ]
+        },
+        {
+            "data": {
+                "content": {
+                    "video_url": "https://cdn.fictional.test/video.mp4"
+                }
+            }
+        },
+        {"video_url": "https://cdn.fictional.test/video.mp4"},
+        {"videoUrl": "https://cdn.fictional.test/video.mp4"},
+        {"results": [{"url": "https://cdn.fictional.test/video.mp4"}]},
+        {
+            "results": [
+                {"video_url": "https://cdn.fictional.test/video.mp4"}
+            ]
+        },
+    ],
+)
+async def test_poll_accepts_each_known_single_video_result_schema(
+    result_payload: dict[str, Any],
+) -> None:
+    payload = {
+        "id": "task-ark-fictional-123",
+        "status": "succeeded",
+        **result_payload,
+    }
+    generator, client = _generator_for_handler(
+        lambda request: httpx.Response(200, json=payload)
+    )
+    async with client:
+        result = await generator.poll(_submission())
+
+    assert len(result.result_items) == 1
+    assert result.result_items[0].url == (
+        "https://cdn.fictional.test/video.mp4"
+    )
+    assert result.result_items[0].url_trust == "untrusted"
+
+
+@pytest.mark.asyncio
+async def test_poll_deduplicates_same_video_url_across_known_schema() -> None:
+    video_url = "https://cdn.fictional.test/video.mp4?signature=fixture"
+    generator, client = _generator_for_handler(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "id": "task-ark-fictional-123",
+                "status": "succeeded",
+                "results": [{"url": video_url}, {"video_url": video_url}],
+            },
+        )
+    )
+    async with client:
+        result = await generator.poll(_submission())
+
+    assert [item.url for item in result.result_items] == [video_url]
+
+
+@pytest.mark.asyncio
+async def test_poll_rejects_two_distinct_video_urls() -> None:
+    generator, client = _generator_for_handler(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "id": "task-ark-fictional-123",
+                "status": "succeeded",
+                "content": [
+                    {"url": "https://cdn.fictional.test/one.mp4"},
+                    {"video_url": "https://cdn.fictional.test/two.mp4"},
+                ],
+            },
+        )
+    )
+    async with client:
+        with pytest.raises(AgentError) as caught:
+            await generator.poll(_submission())
+
+    assert caught.value.detail.category == ErrorCategory.PROVIDER_TERMINAL
+    assert "multiple_video_urls" in caught.value.detail.technical_detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["success", "succeeded"])
+async def test_submit_immediate_success_uses_same_video_result_contract(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    video_url = "https://cdn.fictional.test/immediate.mp4?signature=fixture"
+    generator, client = _generator_for_handler(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "id": "task-ark-immediate",
+                "status": status,
+                "data": {"results": [{"video_url": video_url}]},
+            },
+        )
+    )
+    async with client:
+        result = await generator.submit(_video_task(), _assets(tmp_path))
+
+    assert result.status == "succeeded"
+    assert [item.url for item in result.result_items] == [video_url]
+    assert result.result_items[0].url_trust == "untrusted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "status",
     ["queued", "running", "pending", "submitted", "processing", "in_progress"],
 )
@@ -772,10 +933,12 @@ async def test_poll_rejects_missing_or_invalid_video_result(
     [
         (_submission(provider="other"), "provider"),
         (_submission(provider_task_id=""), "provider_task_id"),
-        (_submission(provider_task_id="a" * 32), "provider_task_id"),
+        (_submission(provider_task_id="task\nid"), "provider_task_id"),
+        (_submission(provider_task_id="task\x7fid"), "provider_task_id"),
+        (_submission(provider_task_id="x" * 513), "provider_task_id"),
     ],
 )
-async def test_poll_rejects_foreign_or_local_correlation_id_before_http(
+async def test_poll_rejects_foreign_or_unsafe_official_id_before_http(
     submission: ProviderSubmission,
     expected_cause: str,
 ) -> None:
@@ -790,6 +953,24 @@ async def test_poll_rejects_foreign_or_local_correlation_id_before_http(
     assert caught.value.detail.category == ErrorCategory.VALIDATION
     assert expected_cause in caught.value.detail.technical_detail
     assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_poll_accepts_32_lowercase_hex_as_official_ark_id() -> None:
+    official_id = "a" * 32
+    requests: list[httpx.Request] = []
+
+    def poll(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": official_id, "status": "queued"})
+
+    generator, client = _generator_for_handler(poll)
+    async with client:
+        result = await generator.poll(_submission(provider_task_id=official_id))
+
+    assert len(requests) == 1
+    assert requests[0].url.path.endswith(f"/{official_id}")
+    assert result.provider_task_id == official_id
 
 
 @pytest.mark.asyncio
@@ -816,7 +997,6 @@ async def test_poll_quotes_official_task_id_as_one_path_segment() -> None:
     [
         ({"status": "queued"}, "provider_task_id"),
         ({"id": "", "status": "queued"}, "provider_task_id"),
-        ({"id": "a" * 32, "status": "queued"}, "provider_task_id"),
         ({"id": "task-ark", "status": "mystery"}, "status"),
     ],
 )
@@ -834,6 +1014,27 @@ async def test_submit_rejects_malformed_create_response(
 
     assert caught.value.detail.category == ErrorCategory.PROVIDER_TERMINAL
     assert expected_cause in caught.value.detail.technical_detail
+
+
+@pytest.mark.asyncio
+async def test_submit_accepts_32_lowercase_hex_returned_as_official_ark_id(
+    tmp_path: Path,
+) -> None:
+    official_id = "b" * 32
+    generator, client = _generator_for_handler(
+        lambda request: httpx.Response(
+            200,
+            json={"id": official_id, "status": "queued"},
+        )
+    )
+    async with client:
+        result = await generator.submit(
+            _video_task(),
+            _assets(tmp_path),
+            submission_id="client-intent-correlation",
+        )
+
+    assert result.provider_task_id == official_id
 
 
 @pytest.mark.asyncio

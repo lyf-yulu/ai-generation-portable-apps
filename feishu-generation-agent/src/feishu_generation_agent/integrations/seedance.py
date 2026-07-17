@@ -4,9 +4,9 @@ import ipaddress
 from io import BytesIO
 import json
 import os
-import re
 import stat
 from typing import Any
+import unicodedata
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -48,7 +48,6 @@ _DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024
 _DEFAULT_MAX_INPUT_BYTES = 32 * 1024 * 1024
 _DEFAULT_MAX_TOTAL_INPUT_BYTES = 64 * 1024 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
-_LOCAL_SUBMISSION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _NONTERMINAL_STATUSES = frozenset(
     {"queued", "running", "pending", "submitted", "processing", "in_progress"}
 )
@@ -117,9 +116,8 @@ class SeedanceVideoGenerator:
                 "max_total_input_bytes", "cause=less_than_single_limit"
             )
 
-        api_path = "/api/v3" if normalized_path == "/api/v3" else ""
         self._http_client = http_client
-        self._base_url = f"https://{parsed.netloc}{api_path}"
+        self._base_url = f"https://{parsed.netloc}/api/v3"
         self._api_key = SecretStr(secret.strip())
         self._model = model.strip()
         self._max_response_bytes = max_response_bytes
@@ -173,10 +171,16 @@ class SeedanceVideoGenerator:
         status = self._status(body.get("status"), "submit")
         if status in _TERMINAL_FAILURE_STATUSES:
             raise self._terminal_status_error("submit", status)
+        result_items = (
+            [self._video_result(body, operation="submit")]
+            if status in {"success", "succeeded"}
+            else []
+        )
         return ProviderSubmission(
             provider="seedance",
             provider_task_id=provider_task_id,
             status="succeeded" if status == "success" else status,
+            result_items=result_items,
         )
 
     async def poll(
@@ -230,7 +234,7 @@ class SeedanceVideoGenerator:
                 "operation=poll; cause=invalid_status",
             )
 
-        result = self._video_result(body)
+        result = self._video_result(body, operation="poll")
         return ProviderSubmission(
             provider="seedance",
             provider_task_id=provider_task_id,
@@ -307,31 +311,112 @@ class SeedanceVideoGenerator:
             )
         return payload
 
-    def _video_result(self, body: dict[str, Any]) -> ProviderResult:
-        content = body.get("content")
-        if not isinstance(content, dict):
-            raise self._invalid_result("missing_content")
-        video_url = content.get("video_url")
-        if not isinstance(video_url, str) or not video_url:
-            raise self._invalid_result("missing_video_url")
-        mime_type = content.get("mime_type")
-        if mime_type is not None and mime_type != "video/mp4":
-            raise self._invalid_result("invalid_mime")
-        self._validate_result_url(video_url)
+    def _video_result(
+        self,
+        body: dict[str, Any],
+        *,
+        operation: str,
+    ) -> ProviderResult:
+        candidates = self._collect_video_url_candidates(
+            body,
+            operation=operation,
+        )
+        video_urls: list[str] = []
+        for candidate in candidates:
+            if not isinstance(candidate, str) or not candidate:
+                raise self._invalid_result(operation, "invalid_video_url")
+            self._validate_result_url(candidate, operation=operation)
+            if candidate not in video_urls:
+                video_urls.append(candidate)
+        if not video_urls:
+            raise self._invalid_result(operation, "missing_video_url")
+        if len(video_urls) != 1:
+            raise self._invalid_result(operation, "multiple_video_urls")
         return ProviderResult(
-            url=video_url,
+            url=video_urls[0],
             url_trust="untrusted",
             mime_type="video/mp4",
         )
 
-    def _validate_result_url(self, value: str) -> None:
+    def _collect_video_url_candidates(
+        self,
+        body: dict[str, Any],
+        *,
+        operation: str,
+        depth: int = 0,
+    ) -> list[Any]:
+        if depth > 16:
+            raise self._invalid_result(operation, "nested_data_too_deep")
+        candidates: list[Any] = []
+        content = body.get("content")
+        if isinstance(content, dict):
+            mime_type = content.get("mime_type")
+            if mime_type is not None and mime_type != "video/mp4":
+                raise self._invalid_result(operation, "invalid_mime")
+            self._append_mapping_values(
+                candidates,
+                content,
+                ("video_url", "videoUrl"),
+            )
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    self._append_mapping_values(
+                        candidates,
+                        item,
+                        ("video_url", "videoUrl", "url"),
+                        unwrap_url_object=True,
+                    )
+
+        nested = body.get("data")
+        if isinstance(nested, dict):
+            candidates.extend(
+                self._collect_video_url_candidates(
+                    nested,
+                    operation=operation,
+                    depth=depth + 1,
+                )
+            )
+        self._append_mapping_values(
+            candidates,
+            body,
+            ("video_url", "videoUrl"),
+        )
+        results = body.get("results")
+        if isinstance(results, list):
+            for item in results:
+                if isinstance(item, dict):
+                    self._append_mapping_values(
+                        candidates,
+                        item,
+                        ("url", "video_url"),
+                    )
+        return candidates
+
+    @staticmethod
+    def _append_mapping_values(
+        candidates: list[Any],
+        mapping: dict[str, Any],
+        keys: tuple[str, ...],
+        *,
+        unwrap_url_object: bool = False,
+    ) -> None:
+        for key in keys:
+            if key not in mapping:
+                continue
+            value = mapping[key]
+            if unwrap_url_object and isinstance(value, dict):
+                value = value.get("url")
+            candidates.append(value)
+
+    def _validate_result_url(self, value: str, *, operation: str) -> None:
         if value != value.strip() or len(value) > 8192:
-            raise self._invalid_result("unsafe_video_url")
+            raise self._invalid_result(operation, "unsafe_video_url")
         try:
             parsed = urlsplit(value)
             port = parsed.port
         except (TypeError, ValueError):
-            raise self._invalid_result("unsafe_video_url") from None
+            raise self._invalid_result(operation, "unsafe_video_url") from None
         hostname = (parsed.hostname or "").rstrip(".").lower()
         if (
             parsed.scheme != "https"
@@ -342,7 +427,7 @@ class SeedanceVideoGenerator:
             or parsed.fragment
             or self._is_obviously_local_host(hostname)
         ):
-            raise self._invalid_result("unsafe_video_url")
+            raise self._invalid_result(operation, "unsafe_video_url")
 
     @staticmethod
     def _is_obviously_local_host(value: str | None) -> bool:
@@ -367,8 +452,10 @@ class SeedanceVideoGenerator:
             or not value
             or value != value.strip()
             or len(value) > 512
-            or any(ord(character) < 32 for character in value)
-            or _LOCAL_SUBMISSION_ID.fullmatch(value) is not None
+            or any(
+                unicodedata.category(character) == "Cc"
+                for character in value
+            )
         ):
             raise self._provider_error(
                 "Seedance 返回的任务 ID 无效",
@@ -789,8 +876,8 @@ class SeedanceVideoGenerator:
             f"operation={operation}; status={status}",
         )
 
-    def _invalid_result(self, cause: str) -> AgentError:
+    def _invalid_result(self, operation: str, cause: str) -> AgentError:
         return self._provider_error(
             "Seedance 视频结果无效",
-            f"operation=poll; cause={cause}",
+            f"operation={operation}; cause={cause}",
         )
