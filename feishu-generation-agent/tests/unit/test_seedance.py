@@ -664,12 +664,18 @@ async def test_poll_succeeded_returns_one_temporary_untrusted_signed_url() -> No
         },
         {
             "content": [
-                {"videoUrl": "https://cdn.fictional.test/video.mp4"}
+                {
+                    "type": "thumbnail",
+                    "videoUrl": "https://cdn.fictional.test/video.mp4",
+                }
             ]
         },
         {
             "content": [
-                {"url": "https://cdn.fictional.test/video.mp4"}
+                {
+                    "type": "video_url",
+                    "url": "https://cdn.fictional.test/video.mp4",
+                }
             ]
         },
         {
@@ -711,6 +717,90 @@ async def test_poll_accepts_each_known_single_video_result_schema(
 
 
 @pytest.mark.asyncio
+async def test_poll_ignores_thumbnail_and_frame_urls_beside_real_video() -> None:
+    video_url = "https://cdn.fictional.test/video.mp4"
+    generator, client = _generator_for_handler(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "id": "task-ark-fictional-123",
+                "status": "succeeded",
+                "content": [
+                    {
+                        "type": "thumbnail",
+                        "url": "https://cdn.fictional.test/thumb.jpg",
+                    },
+                    {
+                        "type": "last_frame",
+                        "url": "https://cdn.fictional.test/last.jpg",
+                    },
+                    {"video_url": video_url},
+                ],
+            },
+        )
+    )
+    async with client:
+        result = await generator.poll(_submission())
+
+    assert [item.url for item in result.result_items] == [video_url]
+
+
+@pytest.mark.asyncio
+async def test_poll_rejects_untyped_bare_content_url_as_no_video() -> None:
+    generator, client = _generator_for_handler(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "id": "task-ark-fictional-123",
+                "status": "succeeded",
+                "content": [
+                    {"url": "https://cdn.fictional.test/ambiguous.bin"}
+                ],
+            },
+        )
+    )
+    async with client:
+        with pytest.raises(AgentError) as caught:
+            await generator.poll(_submission())
+
+    assert caught.value.detail.category == ErrorCategory.PROVIDER_TERMINAL
+    assert "missing_video_url" in caught.value.detail.technical_detail
+
+
+@pytest.mark.asyncio
+async def test_poll_ignores_multiple_non_video_content_urls() -> None:
+    generator, client = _generator_for_handler(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "id": "task-ark-fictional-123",
+                "status": "succeeded",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "url": "https://cdn.fictional.test/input.jpg",
+                    },
+                    {
+                        "type": "thumbnail",
+                        "url": "https://cdn.fictional.test/thumb.jpg",
+                    },
+                    {
+                        "type": "last_frame",
+                        "url": "https://cdn.fictional.test/last.jpg",
+                    },
+                ],
+            },
+        )
+    )
+    async with client:
+        with pytest.raises(AgentError) as caught:
+            await generator.poll(_submission())
+
+    assert caught.value.detail.category == ErrorCategory.PROVIDER_TERMINAL
+    assert "missing_video_url" in caught.value.detail.technical_detail
+
+
+@pytest.mark.asyncio
 async def test_poll_deduplicates_same_video_url_across_known_schema() -> None:
     video_url = "https://cdn.fictional.test/video.mp4?signature=fixture"
     generator, client = _generator_for_handler(
@@ -738,7 +828,7 @@ async def test_poll_rejects_two_distinct_video_urls() -> None:
                 "id": "task-ark-fictional-123",
                 "status": "succeeded",
                 "content": [
-                    {"url": "https://cdn.fictional.test/one.mp4"},
+                    {"videoUrl": "https://cdn.fictional.test/one.mp4"},
                     {"video_url": "https://cdn.fictional.test/two.mp4"},
                 ],
             },

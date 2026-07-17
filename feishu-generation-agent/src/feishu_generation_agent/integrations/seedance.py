@@ -364,9 +364,15 @@ class SeedanceVideoGenerator:
                     self._append_mapping_values(
                         candidates,
                         item,
-                        ("video_url", "videoUrl", "url"),
+                        ("video_url", "videoUrl"),
                         unwrap_url_object=True,
                     )
+                    if item.get("type") == "video_url":
+                        self._append_mapping_values(
+                            candidates,
+                            item,
+                            ("url",),
+                        )
 
         nested = body.get("data")
         if isinstance(nested, dict):
