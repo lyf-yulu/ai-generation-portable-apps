@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 from feishu_generation_agent.config import Settings
 
@@ -18,3 +19,15 @@ def test_require_reports_missing_secret_names():
     settings = Settings(deepseek_api_key=None, ark_api_key=None)
     with pytest.raises(ValueError, match="DEEPSEEK_API_KEY, ARK_API_KEY"):
         settings.require("deepseek_api_key", "ark_api_key")
+
+
+def test_require_reports_empty_secret_as_missing():
+    settings = Settings(deepseek_api_key=SecretStr(""))
+    with pytest.raises(ValueError, match="^DEEPSEEK_API_KEY$"):
+        settings.require("deepseek_api_key")
+
+
+def test_require_reports_whitespace_only_secret_as_missing():
+    settings = Settings(ark_api_key=SecretStr(" \t"))
+    with pytest.raises(ValueError, match="^ARK_API_KEY$"):
+        settings.require("ark_api_key")

@@ -46,6 +46,12 @@ class Settings(BaseSettings):
             path.mkdir(parents=True, exist_ok=True)
 
     def require(self, *field_names: str) -> None:
-        missing = [name.upper() for name in field_names if getattr(self, name) in (None, "")]
+        missing = []
+        for name in field_names:
+            value = getattr(self, name)
+            if isinstance(value, SecretStr):
+                value = value.get_secret_value()
+            if value is None or (isinstance(value, str) and not value.strip()):
+                missing.append(name.upper())
         if missing:
             raise ValueError(", ".join(missing))
