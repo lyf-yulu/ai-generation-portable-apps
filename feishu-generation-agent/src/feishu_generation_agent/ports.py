@@ -53,6 +53,8 @@ class ImageGenerator(Protocol):
         self,
         task: GenerationTask,
         assets: list[MediaAsset],
+        *,
+        submission_id: str | None = None,
     ) -> ProviderSubmission:
         raise NotImplementedError
 
@@ -65,6 +67,8 @@ class VideoGenerator(Protocol):
         self,
         task: GenerationTask,
         assets: list[MediaAsset],
+        *,
+        submission_id: str | None = None,
     ) -> ProviderSubmission:
         raise NotImplementedError
 

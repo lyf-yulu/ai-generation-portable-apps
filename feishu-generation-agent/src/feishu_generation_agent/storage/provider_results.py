@@ -6,7 +6,7 @@ import stat
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 
@@ -35,7 +35,13 @@ class StagedProviderResult:
 
 
 class ProviderResultStore:
-    def __init__(self, staging_dir: Path, *, max_item_bytes: int) -> None:
+    def __init__(
+        self,
+        staging_dir: Path,
+        *,
+        max_item_bytes: int,
+        directory_hook: Callable[[str], None] | None = None,
+    ) -> None:
         if not isinstance(staging_dir, Path):
             raise ValueError("staging_dir must be a Path")
         if (
@@ -53,83 +59,156 @@ class ProviderResultStore:
             raise ValueError("staging_dir must be a directory")
         self._root = staging_dir
         self._max_item_bytes = max_item_bytes
+        self._directory_hook = directory_hook
 
     def save(
         self,
         items: list[tuple[bytes, str]],
+        *,
+        provider_task_id: str | None = None,
     ) -> tuple[str, list[StagedProviderResult]]:
         if not items:
             raise ProviderResultStagingError("empty result set")
-        provider_task_id = uuid4().hex
-        temporary_dir = self._root / f".{provider_task_id}.part"
-        final_dir = self._root / provider_task_id
+        provider_task_id = (
+            uuid4().hex if provider_task_id is None else provider_task_id
+        )
+        if not self.is_valid_provider_task_id(provider_task_id):
+            raise ProviderResultStagingError("invalid provider task id")
+        temporary_name = f".{provider_task_id}.part"
+        temporary_created = False
+        final_created = False
+        root_descriptor = self._open_root()
         try:
-            temporary_dir.mkdir(mode=0o700)
+            root_identity = self._directory_identity(
+                os.fstat(root_descriptor)
+            )
+            self._run_directory_hook("root_opened")
+            os.mkdir(temporary_name, mode=0o700, dir_fd=root_descriptor)
+            temporary_created = True
+            temporary_descriptor = os.open(
+                temporary_name,
+                self._directory_flags(),
+                dir_fd=root_descriptor,
+            )
+            temporary_identity = self._directory_identity(
+                os.fstat(temporary_descriptor)
+            )
             manifest_items: list[dict[str, Any]] = []
-            for index, (content, mime_type) in enumerate(items):
-                if not isinstance(content, bytes) or not content:
-                    raise ProviderResultStagingError("invalid result content")
-                if len(content) > self._max_item_bytes:
-                    raise ProviderResultStagingError("result exceeds size limit")
-                extension = _MIME_EXTENSIONS.get(mime_type)
-                if extension is None:
-                    raise ProviderResultStagingError("unsupported result mime")
-                filename = f"result-{index:03d}.{extension}"
-                temporary_path = temporary_dir / f".{filename}.part"
-                final_path = temporary_dir / filename
-                digest = sha256(content).hexdigest()
-                with temporary_path.open("xb") as output:
-                    output.write(content)
-                    output.flush()
-                    os.fsync(output.fileno())
-                temporary_path.replace(final_path)
-                manifest_items.append(
-                    {
-                        "filename": filename,
-                        "mime_type": mime_type,
-                        "size": len(content),
-                        "sha256": digest,
-                    }
-                )
+            try:
+                for index, (content, mime_type) in enumerate(items):
+                    if not isinstance(content, bytes) or not content:
+                        raise ProviderResultStagingError(
+                            "invalid result content"
+                        )
+                    if len(content) > self._max_item_bytes:
+                        raise ProviderResultStagingError(
+                            "result exceeds size limit"
+                        )
+                    extension = _MIME_EXTENSIONS.get(mime_type)
+                    if extension is None:
+                        raise ProviderResultStagingError(
+                            "unsupported result mime"
+                        )
+                    filename = f"result-{index:03d}.{extension}"
+                    digest = sha256(content).hexdigest()
+                    self._write_atomic(
+                        temporary_descriptor,
+                        filename,
+                        content,
+                    )
+                    manifest_items.append(
+                        {
+                            "filename": filename,
+                            "mime_type": mime_type,
+                            "size": len(content),
+                            "sha256": digest,
+                        }
+                    )
 
-            manifest = {"version": 1, "results": manifest_items}
-            manifest_part = temporary_dir / ".manifest.json.part"
-            manifest_path = temporary_dir / "manifest.json"
-            encoded_manifest = json.dumps(
-                manifest,
-                ensure_ascii=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            with manifest_part.open("xb") as output:
-                output.write(encoded_manifest)
-                output.flush()
-                os.fsync(output.fileno())
-            manifest_part.replace(manifest_path)
-            temporary_dir.replace(final_dir)
-            return provider_task_id, self.load(provider_task_id)
+                manifest = {"version": 1, "results": manifest_items}
+                encoded_manifest = json.dumps(
+                    manifest,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                self._write_atomic(
+                    temporary_descriptor,
+                    "manifest.json",
+                    encoded_manifest,
+                )
+                self._assert_directory_entry(
+                    root_descriptor,
+                    temporary_name,
+                    temporary_identity,
+                )
+            finally:
+                os.close(temporary_descriptor)
+            self._assert_root_current(root_identity)
+            os.rename(
+                temporary_name,
+                provider_task_id,
+                src_dir_fd=root_descriptor,
+                dst_dir_fd=root_descriptor,
+            )
+            final_created = True
+            self._assert_root_current(root_identity)
         except BaseException:
-            shutil.rmtree(temporary_dir, ignore_errors=True)
+            if temporary_created:
+                self._remove_tree(root_descriptor, temporary_name)
+            if final_created:
+                self._remove_tree(root_descriptor, provider_task_id)
             raise
+        finally:
+            os.close(root_descriptor)
+        return provider_task_id, self.load(provider_task_id)
 
     def load(self, provider_task_id: str) -> list[StagedProviderResult]:
-        if (
-            not isinstance(provider_task_id, str)
-            or _PROVIDER_TASK_ID.fullmatch(provider_task_id) is None
-        ):
+        if not self.is_valid_provider_task_id(provider_task_id):
             raise ProviderResultStagingError("invalid provider task id")
-        result_dir = self._root / provider_task_id
+        root_descriptor = self._open_root()
         try:
-            directory_stat = result_dir.lstat()
-        except OSError as exc:
-            raise ProviderResultStagingError("missing result directory") from exc
-        if (
-            not stat.S_ISDIR(directory_stat.st_mode)
-            or stat.S_ISLNK(directory_stat.st_mode)
-        ):
-            raise ProviderResultStagingError("invalid result directory")
+            root_identity = self._directory_identity(os.fstat(root_descriptor))
+            self._run_directory_hook("root_opened")
+            try:
+                result_descriptor = os.open(
+                    provider_task_id,
+                    self._directory_flags(),
+                    dir_fd=root_descriptor,
+                )
+            except OSError as exc:
+                raise ProviderResultStagingError(
+                    "missing result directory"
+                ) from exc
+            try:
+                result_identity = self._directory_identity(
+                    os.fstat(result_descriptor)
+                )
+                self._run_directory_hook("result_opened")
+                staged = self._load_from_directory(
+                    result_descriptor,
+                    provider_task_id,
+                )
+                self._assert_directory_entry(
+                    root_descriptor,
+                    provider_task_id,
+                    result_identity,
+                )
+                self._assert_root_current(root_identity)
+                return staged
+            finally:
+                os.close(result_descriptor)
+        finally:
+            os.close(root_descriptor)
+
+    def _load_from_directory(
+        self,
+        result_descriptor: int,
+        provider_task_id: str,
+    ) -> list[StagedProviderResult]:
 
         manifest_bytes = self._read_regular_file(
-            result_dir / "manifest.json",
+            "manifest.json",
+            dir_fd=result_descriptor,
             max_bytes=_MAX_MANIFEST_BYTES,
         )
         try:
@@ -170,8 +249,12 @@ class ProviderResultStore:
                 or _SHA256.fullmatch(digest) is None
             ):
                 raise ProviderResultStagingError("invalid manifest item")
-            local_path = result_dir / filename
-            content = self._read_regular_file(local_path, max_bytes=size)
+            local_path = self._root / provider_task_id / filename
+            content = self._read_regular_file(
+                filename,
+                dir_fd=result_descriptor,
+                max_bytes=size,
+            )
             if len(content) != size or sha256(content).hexdigest() != digest:
                 raise ProviderResultStagingError("result integrity mismatch")
             staged.append(
@@ -185,12 +268,24 @@ class ProviderResultStore:
         return staged
 
     @staticmethod
-    def _read_regular_file(path: Path, *, max_bytes: int) -> bytes:
+    def is_valid_provider_task_id(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and _PROVIDER_TASK_ID.fullmatch(value) is not None
+        )
+
+    @staticmethod
+    def _read_regular_file(
+        filename: str,
+        *,
+        dir_fd: int,
+        max_bytes: int,
+    ) -> bytes:
         flags = os.O_RDONLY
         flags |= getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
-            descriptor = os.open(path, flags)
+            descriptor = os.open(filename, flags, dir_fd=dir_fd)
         except OSError as exc:
             raise ProviderResultStagingError("staged file unavailable") from exc
         try:
@@ -223,3 +318,103 @@ class ProviderResultStore:
             return bytes(content)
         finally:
             os.close(descriptor)
+
+    @staticmethod
+    def _directory_flags() -> int:
+        return (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+
+    def _open_root(self) -> int:
+        try:
+            descriptor = os.open(self._root, self._directory_flags())
+        except OSError as exc:
+            raise ProviderResultStagingError("staging root unavailable") from exc
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            raise ProviderResultStagingError("invalid staging root")
+        return descriptor
+
+    @staticmethod
+    def _directory_identity(value: os.stat_result) -> tuple[int, int, int]:
+        return value.st_dev, value.st_ino, value.st_mode
+
+    def _assert_root_current(
+        self,
+        expected_identity: tuple[int, int, int],
+    ) -> None:
+        try:
+            current = self._root.lstat()
+        except OSError as exc:
+            raise ProviderResultStagingError("staging root changed") from exc
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or self._directory_identity(current) != expected_identity
+        ):
+            raise ProviderResultStagingError("staging root changed")
+
+    @staticmethod
+    def _assert_directory_entry(
+        parent_descriptor: int,
+        name: str,
+        expected_identity: tuple[int, int, int],
+    ) -> None:
+        try:
+            current = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ProviderResultStagingError("result directory changed") from exc
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or ProviderResultStore._directory_identity(current)
+            != expected_identity
+        ):
+            raise ProviderResultStagingError("result directory changed")
+
+    @staticmethod
+    def _write_atomic(
+        directory_descriptor: int,
+        filename: str,
+        content: bytes,
+    ) -> None:
+        temporary_name = f".{filename}.part"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(
+            temporary_name,
+            flags,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        try:
+            view = memoryview(content)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.rename(
+            temporary_name,
+            filename,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+
+    def _run_directory_hook(self, event: str) -> None:
+        if self._directory_hook is not None:
+            self._directory_hook(event)
+
+    @staticmethod
+    def _remove_tree(root_descriptor: int, name: str) -> None:
+        try:
+            shutil.rmtree(name, dir_fd=root_descriptor)
+        except (FileNotFoundError, NotADirectoryError):
+            pass

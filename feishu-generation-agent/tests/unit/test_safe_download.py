@@ -1,4 +1,5 @@
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager
 
 import httpx
 import pytest
@@ -10,6 +11,140 @@ from feishu_generation_agent.integrations.safe_download import SafeResultDownloa
 async def _public_resolver(host: str, port: int) -> Sequence[str]:
     del host, port
     return ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"]
+
+
+@asynccontextmanager
+async def _downloader(
+    respond: Callable[[httpx.Request], httpx.Response],
+    *,
+    resolver: Callable[[str, int], Awaitable[Sequence[str]]],
+    max_bytes: int = 1024,
+) -> AsyncIterator[SafeResultDownloader]:
+    downloader = SafeResultDownloader(
+        transport=httpx.MockTransport(respond),
+        resolver=resolver,
+        max_bytes=max_bytes,
+    )
+    try:
+        yield downloader
+    finally:
+        await downloader.aclose()
+
+
+@pytest.mark.asyncio
+async def test_downloader_pins_validated_ip_and_preserves_host_and_sni() -> None:
+    requests: list[httpx.Request] = []
+    resolver_calls = 0
+
+    async def rebinding_resolver(host: str, port: int) -> Sequence[str]:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        assert (host, port) == ("public.example", 443)
+        if resolver_calls > 1:
+            return ["127.0.0.1"]
+        return ["93.184.216.34"]
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            content=b"fictional-pinned-image",
+            headers={"Content-Type": "image/png"},
+        )
+
+    async with _downloader(respond, resolver=rebinding_resolver) as downloader:
+        content = await downloader.download(
+            "https://public.example/result.png?signature=fake",
+            expected_mime_type="image/png",
+        )
+
+    assert content == b"fictional-pinned-image"
+    assert resolver_calls == 1
+    assert len(requests) == 1
+    assert requests[0].url.host == "93.184.216.34"
+    assert requests[0].headers["host"] == "public.example"
+    assert requests[0].extensions["sni_hostname"] == "public.example"
+
+
+@pytest.mark.asyncio
+async def test_downloader_brackets_pinned_ipv6_url() -> None:
+    requests: list[httpx.Request] = []
+
+    async def ipv6_resolver(host: str, port: int) -> Sequence[str]:
+        assert (host, port) == ("ipv6.example", 443)
+        return ["2606:2800:220:1:248:1893:25c8:1946"]
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            content=b"fictional-ipv6-image",
+            headers={"Content-Type": "image/png"},
+        )
+
+    async with _downloader(respond, resolver=ipv6_resolver) as downloader:
+        await downloader.download(
+            "https://ipv6.example/result.png",
+            expected_mime_type="image/png",
+        )
+
+    assert str(requests[0].url).startswith(
+        "https://[2606:2800:220:1:248:1893:25c8:1946]/"
+    )
+    assert requests[0].headers["host"] == "ipv6.example"
+    assert requests[0].extensions["sni_hostname"] == "ipv6.example"
+
+
+@pytest.mark.asyncio
+async def test_downloader_brackets_original_ipv6_host_header() -> None:
+    requests: list[httpx.Request] = []
+    expanded = "2606:2800:0220:0001:0248:1893:25c8:1946"
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            content=b"fictional-literal-ipv6-image",
+            headers={"Content-Type": "image/png"},
+        )
+
+    async with _downloader(respond, resolver=_public_resolver) as downloader:
+        await downloader.download(
+            f"https://[{expanded}]/result.png",
+            expected_mime_type="image/png",
+        )
+
+    assert requests[0].headers["host"] == f"[{expanded}]"
+    assert requests[0].extensions["sni_hostname"] == expanded
+
+
+@pytest.mark.asyncio
+async def test_downloader_owns_client_with_environment_proxies_disabled() -> None:
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            content=b"fictional-no-proxy-image",
+            headers={"Content-Type": "image/png"},
+        )
+
+    downloader = SafeResultDownloader(
+        transport=httpx.MockTransport(respond),
+        resolver=_public_resolver,
+        max_bytes=1024,
+    )
+    try:
+        await downloader.download(
+            "https://public.example/result.png",
+            expected_mime_type="image/png",
+        )
+        assert downloader._http_client.trust_env is False
+    finally:
+        await downloader.aclose()
+
+    assert len(requests) == 1
 
 
 @pytest.mark.asyncio
@@ -43,14 +178,7 @@ async def test_downloader_rejects_local_private_and_malformed_urls_without_http(
         requests.append(request)
         return httpx.Response(500)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(unexpected)
-    ) as client:
-        downloader = SafeResultDownloader(
-            client,
-            resolver=_public_resolver,
-            max_bytes=1024,
-        )
+    async with _downloader(unexpected, resolver=_public_resolver) as downloader:
         with pytest.raises(AgentError) as caught:
             await downloader.download(url, expected_mime_type="image/png")
 
@@ -71,14 +199,7 @@ async def test_downloader_rejects_any_private_dns_answer_without_http() -> None:
         requests.append(request)
         return httpx.Response(500)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(unexpected)
-    ) as client:
-        downloader = SafeResultDownloader(
-            client,
-            resolver=mixed_resolver,
-            max_bytes=1024,
-        )
+    async with _downloader(unexpected, resolver=mixed_resolver) as downloader:
         with pytest.raises(AgentError) as caught:
             await downloader.download(
                 "https://mixed.example/result.png",
@@ -100,7 +221,7 @@ async def test_downloader_revalidates_redirects_and_never_sends_credentials() ->
 
     def respond(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        if request.url.host == "public.example":
+        if request.headers["host"] == "public.example":
             return httpx.Response(
                 302,
                 headers={"Location": "https://cdn.example/final.png"},
@@ -111,18 +232,11 @@ async def test_downloader_revalidates_redirects_and_never_sends_credentials() ->
             headers={"Content-Type": "image/png"},
         )
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(respond),
-        headers={
-            "Authorization": "Bearer must-never-leak",
-            "Cookie": "session=must-never-leak",
-        },
-    ) as client:
-        downloader = SafeResultDownloader(
-            client,
-            resolver=resolver,
-            max_bytes=1024,
+    async with _downloader(respond, resolver=resolver) as downloader:
+        downloader._http_client.headers["Authorization"] = (
+            "Bearer must-never-leak"
         )
+        downloader._http_client.headers["Cookie"] = "session=must-never-leak"
         content = await downloader.download(
             "https://public.example/start.png?signature=fictional",
             expected_mime_type="image/png",
@@ -143,14 +257,7 @@ async def test_downloader_rejects_private_redirect_before_second_request() -> No
         requests.append(request)
         return httpx.Response(302, headers={"Location": "https://127.0.0.1/out"})
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(respond)
-    ) as client:
-        downloader = SafeResultDownloader(
-            client,
-            resolver=_public_resolver,
-            max_bytes=1024,
-        )
+    async with _downloader(respond, resolver=_public_resolver) as downloader:
         with pytest.raises(AgentError) as caught:
             await downloader.download(
                 "https://public.example/start",
@@ -170,14 +277,11 @@ async def test_downloader_streams_with_a_hard_size_limit() -> None:
             headers={"Content-Type": "image/png"},
         )
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(oversized)
-    ) as client:
-        downloader = SafeResultDownloader(
-            client,
-            resolver=_public_resolver,
-            max_bytes=8,
-        )
+    async with _downloader(
+        oversized,
+        resolver=_public_resolver,
+        max_bytes=8,
+    ) as downloader:
         with pytest.raises(AgentError) as caught:
             await downloader.download(
                 "https://public.example/large.png",

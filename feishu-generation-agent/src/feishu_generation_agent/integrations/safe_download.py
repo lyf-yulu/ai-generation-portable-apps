@@ -2,7 +2,8 @@ import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 import ipaddress
 import socket
-from urllib.parse import urljoin, urlsplit
+from typing import Protocol, runtime_checkable
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
@@ -17,11 +18,22 @@ HostResolver = Callable[[str, int], Awaitable[Sequence[str]]]
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 
+@runtime_checkable
+class ResultDownloader(Protocol):
+    async def download(
+        self,
+        url: str,
+        *,
+        expected_mime_type: str,
+    ) -> bytes:
+        raise NotImplementedError
+
+
 class SafeResultDownloader:
     def __init__(
         self,
-        http_client: httpx.AsyncClient,
         *,
+        transport: httpx.AsyncBaseTransport | None = None,
         resolver: HostResolver | None = None,
         max_bytes: int,
         max_redirects: int = 3,
@@ -34,20 +46,45 @@ class SafeResultDownloader:
             or max_redirects < 0
         ):
             raise ValueError("max_redirects must be non-negative")
-        self._http_client = http_client
+        self._http_client = httpx.AsyncClient(
+            transport=transport,
+            trust_env=False,
+            follow_redirects=False,
+        )
         self._resolver = resolver or self._resolve_host
         self._max_bytes = max_bytes
         self._max_redirects = max_redirects
 
+    async def aclose(self) -> None:
+        await self._http_client.aclose()
+
     async def download(self, url: str, *, expected_mime_type: str) -> bytes:
         current_url = url
         for redirect_count in range(self._max_redirects + 1):
-            await self._validate_public_url(current_url)
+            hostname, address = await self._validated_target(current_url)
+            parsed = urlsplit(current_url)
+            pinned_host = (
+                f"[{address.compressed}]"
+                if isinstance(address, ipaddress.IPv6Address)
+                else address.compressed
+            )
+            pinned_url = urlunsplit(
+                ("https", pinned_host, parsed.path, parsed.query, "")
+            )
+            host_header = (
+                f"[{hostname}]"
+                if ":" in hostname
+                else hostname
+            )
             request = self._http_client.build_request(
                 "GET",
-                current_url,
-                headers={"Accept": expected_mime_type},
+                pinned_url,
+                headers={
+                    "Accept": expected_mime_type,
+                    "Host": host_header,
+                },
             )
+            request.extensions["sni_hostname"] = hostname
             for header_name in (
                 "authorization",
                 "cookie",
@@ -108,7 +145,10 @@ class SafeResultDownloader:
                 await response.aclose()
         raise self._provider_error("redirect_limit")
 
-    async def _validate_public_url(self, url: str) -> None:
+    async def _validated_target(
+        self,
+        url: str,
+    ) -> tuple[str, ipaddress.IPv4Address | ipaddress.IPv6Address]:
         if not isinstance(url, str):
             raise self._provider_error("unsafe_url")
         try:
@@ -142,7 +182,7 @@ class SafeResultDownloader:
         if literal is not None:
             if not self._is_public_address(literal):
                 raise self._provider_error("unsafe_address")
-            return
+            return normalized_host, literal
 
         try:
             addresses = await self._resolver(normalized_host, 443)
@@ -157,6 +197,7 @@ class SafeResultDownloader:
             ) from None
         if not addresses:
             raise self._provider_error("missing_dns_address")
+        validated: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
         for value in addresses:
             try:
                 address = ipaddress.ip_address(value)
@@ -164,6 +205,8 @@ class SafeResultDownloader:
                 raise self._provider_error("invalid_dns_address") from None
             if not self._is_public_address(address):
                 raise self._provider_error("unsafe_address")
+            validated.append(address)
+        return normalized_host, validated[0]
 
     @staticmethod
     async def _resolve_host(host: str, port: int) -> Sequence[str]:

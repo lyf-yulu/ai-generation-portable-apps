@@ -1,3 +1,4 @@
+from inspect import signature
 from pathlib import Path
 
 import pytest
@@ -215,3 +216,10 @@ def test_all_six_adapter_protocols_are_public():
         "VideoGenerator",
         "DeliveryWriter",
     }
+
+
+def test_paid_generator_protocols_accept_preassociated_submission_id() -> None:
+    for protocol in (ImageGenerator, VideoGenerator):
+        parameter = signature(protocol.submit).parameters["submission_id"]
+        assert parameter.kind.name == "KEYWORD_ONLY"
+        assert parameter.default is None

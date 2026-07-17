@@ -16,6 +16,7 @@ from feishu_generation_agent.domain.errors import AgentError, ErrorCategory
 from feishu_generation_agent.domain.artifact import ProviderSubmission
 from feishu_generation_agent.domain.plan import GenerationTask
 from feishu_generation_agent.integrations.chiyun import ChiyunImageGenerator
+from feishu_generation_agent.integrations.safe_download import SafeResultDownloader
 
 
 PNG_1X1 = base64.b64decode(
@@ -30,6 +31,27 @@ def _jpeg_fixture() -> bytes:
 
 
 JPEG_1X1 = _jpeg_fixture()
+
+
+class _InlineFixtureDownloader:
+    async def download(self, url: str, *, expected_mime_type: str) -> bytes:
+        raise AssertionError(
+            f"unexpected URL result {url} ({expected_mime_type})"
+        )
+
+
+class _SyncDownloader:
+    def download(self, url: str, *, expected_mime_type: str) -> bytes:
+        del url, expected_mime_type
+        return b"not-awaitable"
+
+
+INLINE_FIXTURE_DOWNLOADER = _InlineFixtureDownloader()
+
+
+async def _public_result_resolver(host: str, port: int) -> list[str]:
+    del host, port
+    return ["93.184.216.34"]
 
 
 def _task(*, output_count: int = 2) -> GenerationTask:
@@ -94,10 +116,15 @@ async def _submit_payload(
     *,
     status_code: int = 200,
     task_output_count: int = 1,
+    submission_id: str | None = None,
     **generator_options: Any,
 ):
     requests: list[httpx.Request] = []
     generator_options.setdefault("staging_dir", tmp_path / "staging")
+    generator_options.setdefault(
+        "result_downloader",
+        INLINE_FIXTURE_DOWNLOADER,
+    )
 
     def respond(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -113,9 +140,15 @@ async def _submit_payload(
             model="fictional-model",
             **generator_options,
         )
+        submit_options = (
+            {"submission_id": submission_id}
+            if submission_id is not None
+            else {}
+        )
         submission = await generator.submit(
             _task(output_count=task_output_count),
             [_asset(tmp_path, "asset-blue"), _asset(tmp_path, "asset-green")],
+            **submit_options,
         )
     return submission, requests
 
@@ -139,6 +172,7 @@ async def test_submit_uses_generate_content_original_mime_and_explicit_order(
             api_key="fixture-key-never-sent-externally",
             model="verified/model preview",
             staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
         )
         assets = [
             _asset(tmp_path, "asset-blue"),
@@ -275,6 +309,7 @@ def test_constructor_rejects_unsafe_or_empty_configuration(
         "api_key": "fixture-key-never-sent-externally",
         "model": "fictional-model",
         "staging_dir": tmp_path / "staging",
+        "result_downloader": INLINE_FIXTURE_DOWNLOADER,
     }
     values.update(updates)
 
@@ -298,10 +333,36 @@ def test_constructor_keeps_api_key_secret_and_out_of_repr(
         api_key=SecretStr(api_key),
         model="fictional-model",
         staging_dir=tmp_path / "staging",
+        result_downloader=INLINE_FIXTURE_DOWNLOADER,
     )
 
     assert api_key not in repr(generator)
     assert api_key not in repr(vars(generator))
+
+
+@pytest.mark.parametrize(
+    "invalid_downloader",
+    [None, object(), _SyncDownloader()],
+)
+def test_constructor_requires_result_downloader_before_any_post(
+    tmp_path: Path,
+    invalid_downloader: object,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    with pytest.raises(AgentError) as caught:
+        ChiyunImageGenerator(
+            _recording_client(requests),
+            base_url="https://fictional-chiyun.test",
+            api_key="fixture-key",
+            model="fictional-model",
+            staging_dir=tmp_path / "staging",
+            result_downloader=invalid_downloader,
+        )
+
+    assert caught.value.detail.category == ErrorCategory.CONFIGURATION
+    assert "result_downloader" in caught.value.detail.technical_detail
+    assert requests == []
 
 
 @pytest.mark.parametrize(
@@ -338,6 +399,7 @@ def test_constructor_maps_none_and_malformed_configuration_to_agent_error(
         "api_key": key,
         "model": "fictional-model",
         "staging_dir": tmp_path / "staging",
+        "result_downloader": INLINE_FIXTURE_DOWNLOADER,
     }
     values.update(updates)
 
@@ -364,6 +426,7 @@ async def test_submit_rejects_single_input_over_limit_before_http(
             api_key="fixture-key",
             model="fictional-model",
             staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
             max_input_bytes=64,
             max_total_input_bytes=128,
         )
@@ -395,6 +458,7 @@ async def test_submit_rejects_total_inputs_before_read_bytes_or_http(
             api_key="fixture-key",
             model="fictional-model",
             staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
             max_input_bytes=100,
             max_total_input_bytes=100,
         )
@@ -430,6 +494,7 @@ async def test_submit_rejects_forged_or_replaced_input_file(
             api_key="fixture-key",
             model="fictional-model",
             staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
             max_input_bytes=1024,
             max_total_input_bytes=2048,
         )
@@ -461,6 +526,7 @@ async def test_submit_rejects_non_image_task_before_http(tmp_path: Path) -> None
             api_key="fixture-key",
             model="fictional-model",
             staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
         )
         with pytest.raises(AgentError) as caught:
             await generator.submit(
@@ -545,6 +611,7 @@ async def test_submit_rejects_reference_identity_and_order_mismatch(
             api_key="fixture-key",
             model="fictional-model",
             staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
         )
         with pytest.raises(AgentError) as caught:
             await generator.submit(task, assets)
@@ -588,6 +655,7 @@ async def test_submit_rejects_invalid_media_asset_before_http(
             api_key="fixture-key",
             model="fictional-model",
             staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
         )
         with pytest.raises(AgentError) as caught:
             await generator.submit(_task(output_count=1), [first, second])
@@ -639,17 +707,23 @@ async def test_submit_parses_snake_inline_and_https_url_results(
             headers={"Content-Type": "image/jpeg"},
         )
 
-    async with httpx.AsyncClient(
+    result_downloader = SafeResultDownloader(
         transport=httpx.MockTransport(download),
-        headers={"Authorization": "Bearer must-not-reach-result-host"},
-    ) as result_client:
+        resolver=resolver,
+        max_bytes=1024 * 1024,
+    )
+    result_downloader._http_client.headers["Authorization"] = (
+        "Bearer must-not-reach-result-host"
+    )
+    try:
         submission, _ = await _submit_payload(
             tmp_path,
             payload,
             task_output_count=2,
-            result_http_client=result_client,
-            result_host_resolver=resolver,
+            result_downloader=result_downloader,
         )
+    finally:
+        await result_downloader.aclose()
 
     assert [item.mime_type for item in submission.result_items] == [
         "image/webp",
@@ -782,6 +856,7 @@ async def test_submit_classifies_http_errors_without_raw_body(
             api_key=secret_key,
             model="fictional-model",
             staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
         )
         with pytest.raises(AgentError) as caught:
             await generator.submit(
@@ -812,6 +887,7 @@ async def test_submit_classifies_transport_timeout_as_retryable(
             api_key="fixture-key",
             model="fictional-model",
             staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
         )
         with pytest.raises(AgentError) as caught:
             await generator.submit(
@@ -838,6 +914,7 @@ async def test_submit_limits_response_before_json_parsing(tmp_path: Path) -> Non
             api_key="fixture-key",
             model="fictional-model",
             staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
             max_response_bytes=32,
         )
         with pytest.raises(AgentError) as caught:
@@ -868,6 +945,7 @@ async def test_success_log_is_metadata_only_and_poll_does_not_request_again(
             api_key=key,
             model="fictional-model",
             staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
         )
         submission = await generator.submit(
             _task(output_count=1),
@@ -915,6 +993,7 @@ async def test_poll_recovers_synchronous_results_after_process_restart(
             api_key="different-runtime-key",
             model="fictional-model",
             staging_dir=staging_dir,
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
         )
         recovered = await restarted.poll(checkpoint_submission)
 
@@ -943,6 +1022,105 @@ async def test_poll_recovers_synchronous_results_after_process_restart(
         path.read_bytes() for path in staging_dir.rglob("*") if path.is_file()
     )
     assert all(value.encode() not in all_staged for value in forbidden)
+
+
+@pytest.mark.asyncio
+async def test_persisted_submission_id_recovers_when_return_value_was_not_saved(
+    tmp_path: Path,
+) -> None:
+    submission_id = "a" * 32
+    staging_dir = tmp_path / "staging"
+    returned, submit_requests = await _submit_payload(
+        tmp_path,
+        _fixture_payload(),
+        task_output_count=2,
+        submission_id=submission_id,
+        staging_dir=staging_dir,
+    )
+    assert returned.provider_task_id == submission_id
+
+    poll_requests: list[httpx.Request] = []
+    async with _recording_client(poll_requests) as client:
+        restarted = ChiyunImageGenerator(
+            client,
+            base_url="https://fictional-chiyun.test",
+            api_key="different-runtime-key",
+            model="fictional-model",
+            staging_dir=staging_dir,
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
+        )
+        recovered = await restarted.poll(
+            ProviderSubmission(
+                provider="chiyun",
+                provider_task_id=submission_id,
+                status="submitted",
+                result_items=[],
+            )
+        )
+
+    assert len(submit_requests) == 1
+    assert poll_requests == []
+    assert recovered.provider_task_id == submission_id
+    assert len(recovered.result_items) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "submission_id",
+    ["../outside", "A" * 32, "a" * 31, "a" * 33],
+)
+async def test_submit_rejects_unsafe_submission_id_before_paid_post(
+    tmp_path: Path,
+    submission_id: str,
+) -> None:
+    requests: list[httpx.Request] = []
+    async with _recording_client(requests) as client:
+        generator = ChiyunImageGenerator(
+            client,
+            base_url="https://fictional-chiyun.test",
+            api_key="fixture-key",
+            model="fictional-model",
+            staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
+        )
+        with pytest.raises(AgentError) as caught:
+            await generator.submit(
+                _task(output_count=1),
+                [_asset(tmp_path, "asset-blue"), _asset(tmp_path, "asset-green")],
+                submission_id=submission_id,
+            )
+
+    assert caught.value.detail.category == ErrorCategory.VALIDATION
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_poll_missing_preassociated_staging_fails_without_post(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+    async with _recording_client(requests) as client:
+        generator = ChiyunImageGenerator(
+            client,
+            base_url="https://fictional-chiyun.test",
+            api_key="fixture-key",
+            model="fictional-model",
+            staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
+        )
+        with pytest.raises(AgentError) as caught:
+            await generator.poll(
+                ProviderSubmission(
+                    provider="chiyun",
+                    provider_task_id="b" * 32,
+                    status="submitted",
+                    result_items=[],
+                )
+            )
+
+    assert caught.value.detail.category == ErrorCategory.PROVIDER_TERMINAL
+    assert "staging_invalid" in caught.value.detail.technical_detail
+    assert requests == []
 
 
 @pytest.mark.asyncio
@@ -983,6 +1161,7 @@ async def test_poll_fails_safely_for_missing_or_tampered_staging(
             api_key="fixture-key",
             model="fictional-model",
             staging_dir=staging_dir,
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
         )
         with pytest.raises(AgentError) as caught:
             await restarted.poll(
@@ -1038,47 +1217,24 @@ async def test_submit_rejects_unsafe_url_results_before_download(
         result_requests.append(request)
         return httpx.Response(500)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(unexpected_download)
-    ) as result_client:
+    result_downloader = SafeResultDownloader(
+        transport=httpx.MockTransport(unexpected_download),
+        resolver=_public_result_resolver,
+        max_bytes=1024,
+    )
+    try:
         with pytest.raises(AgentError) as caught:
             await _submit_payload(
                 tmp_path,
                 payload,
-                result_http_client=result_client,
+                result_downloader=result_downloader,
             )
+    finally:
+        await result_downloader.aclose()
 
     assert caught.value.detail.category == ErrorCategory.PROVIDER_TERMINAL
     assert caught.value.detail.retryable is False
     assert result_requests == []
-
-
-@pytest.mark.asyncio
-async def test_submit_rejects_url_result_without_dedicated_downloader(
-    tmp_path: Path,
-) -> None:
-    payload = {
-        "candidates": [
-            {
-                "content": {
-                    "parts": [
-                        {
-                            "fileData": {
-                                "mimeType": "image/png",
-                                "fileUri": "https://public.example/out.png",
-                            }
-                        }
-                    ]
-                }
-            }
-        ]
-    }
-
-    with pytest.raises(AgentError) as caught:
-        await _submit_payload(tmp_path, payload)
-
-    assert caught.value.detail.category == ErrorCategory.PROVIDER_TERMINAL
-    assert "url_download_not_configured" in caught.value.detail.technical_detail
 
 
 @pytest.mark.asyncio
@@ -1093,13 +1249,14 @@ async def test_poll_rejects_nonterminal_submission_without_http(
             api_key="fixture-key",
             model="fictional-model",
             staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
         )
         with pytest.raises(AgentError) as caught:
             await generator.poll(
                 ProviderSubmission(
                     provider="chiyun",
                     provider_task_id="fictional-pending-id",
-                    status="submitted",
+                    status="pending",
                 )
             )
 
@@ -1126,6 +1283,7 @@ async def test_submit_rejects_invalid_json_without_raw_response(
             api_key="fixture-key",
             model="fictional-model",
             staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
         )
         with pytest.raises(AgentError) as caught:
             await generator.submit(
@@ -1165,6 +1323,7 @@ async def test_probe_models_only_reads_model_list_and_parses_ids(
             api_key="fixture-key",
             model="fictional-model",
             staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
         )
         result = await generator.probe_models()
 
@@ -1199,6 +1358,7 @@ async def test_probe_models_reports_no_free_verification_when_unsupported(
             api_key="fixture-key",
             model="fictional-model",
             staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
         )
         result = await generator.probe_models()
 
@@ -1230,6 +1390,7 @@ async def test_probe_models_treats_missing_models_structure_as_unsupported(
             api_key="fixture-key",
             model="fictional-model",
             staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
         )
         result = await generator.probe_models()
 
@@ -1260,6 +1421,7 @@ async def test_probe_models_classifies_retryable_http_errors(
             api_key="fixture-key",
             model="fictional-model",
             staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
         )
         with pytest.raises(AgentError) as caught:
             await generator.probe_models()
@@ -1289,6 +1451,7 @@ async def test_probe_models_classifies_connection_error_as_retryable(
             api_key="fixture-key",
             model="fictional-model",
             staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
         )
         with pytest.raises(AgentError) as caught:
             await generator.probe_models()

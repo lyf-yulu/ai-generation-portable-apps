@@ -2,6 +2,7 @@ import base64
 import binascii
 from dataclasses import dataclass
 from hashlib import sha256
+import inspect
 import json
 import logging
 import os
@@ -25,8 +26,7 @@ from feishu_generation_agent.domain.errors import (
 )
 from feishu_generation_agent.domain.plan import GenerationTask
 from feishu_generation_agent.integrations.safe_download import (
-    HostResolver,
-    SafeResultDownloader,
+    ResultDownloader,
 )
 from feishu_generation_agent.storage.provider_results import (
     ProviderResultStagingError,
@@ -69,8 +69,7 @@ class ChiyunImageGenerator:
         api_key: str | SecretStr | None,
         model: str | None,
         staging_dir: Path,
-        result_http_client: httpx.AsyncClient | None = None,
-        result_host_resolver: HostResolver | None = None,
+        result_downloader: ResultDownloader | None,
         max_response_bytes: int = _DEFAULT_MAX_RESPONSE_BYTES,
         max_result_bytes: int = _DEFAULT_MAX_RESULT_BYTES,
         max_input_bytes: int = _DEFAULT_MAX_INPUT_BYTES,
@@ -120,6 +119,14 @@ class ChiyunImageGenerator:
             )
         if not isinstance(staging_dir, Path):
             raise self._configuration_error("staging_dir", "cause=not_path")
+        if (
+            not isinstance(result_downloader, ResultDownloader)
+            or not inspect.iscoroutinefunction(result_downloader.download)
+        ):
+            raise self._configuration_error(
+                "result_downloader",
+                "cause=missing_or_invalid",
+            )
         try:
             result_store = ProviderResultStore(
                 staging_dir,
@@ -139,21 +146,24 @@ class ChiyunImageGenerator:
         self._max_total_input_bytes = max_total_input_bytes
         self._timeout = httpx.Timeout(120, connect=10)
         self._result_store = result_store
-        self._result_downloader = (
-            SafeResultDownloader(
-                result_http_client,
-                resolver=result_host_resolver,
-                max_bytes=max_result_bytes,
-            )
-            if result_http_client is not None
-            else None
-        )
+        self._result_downloader = result_downloader
 
     async def submit(
         self,
         task: GenerationTask,
         assets: list[MediaAsset],
+        *,
+        submission_id: str | None = None,
     ) -> ProviderSubmission:
+        if (
+            submission_id is not None
+            and not ProviderResultStore.is_valid_provider_task_id(submission_id)
+        ):
+            raise self._validation_error(
+                task.task_id,
+                "提交关联 ID 无效",
+                "cause=invalid_submission_id",
+            )
         asset_contents = self._validate_assets(task, assets)
         parts: list[dict[str, Any]] = [{"text": self._prompt(task)}]
         for asset, content in zip(assets, asset_contents, strict=True):
@@ -205,14 +215,6 @@ class ChiyunImageGenerator:
             else:
                 if result.url is None:
                     raise AssertionError("pending result has no source")
-                if self._result_downloader is None:
-                    raise self._provider_error(
-                        "Chiyun 返回了未配置下载器的图片地址",
-                        (
-                            "operation=generate; "
-                            "cause=url_download_not_configured"
-                        ),
-                    )
                 content = await self._result_downloader.download(
                     result.url,
                     expected_mime_type=result.mime_type,
@@ -220,7 +222,8 @@ class ChiyunImageGenerator:
             materialized.append((content, result.mime_type))
         try:
             provider_task_id, staged_results = self._result_store.save(
-                materialized
+                materialized,
+                provider_task_id=submission_id,
             )
         except (OSError, ProviderResultStagingError):
             raise self._provider_error(
@@ -244,7 +247,10 @@ class ChiyunImageGenerator:
         self,
         submission: ProviderSubmission,
     ) -> ProviderSubmission:
-        if submission.provider != "chiyun" or submission.status != "succeeded":
+        if submission.provider != "chiyun" or submission.status not in {
+            "submitted",
+            "succeeded",
+        }:
             raise self._error(
                 ErrorCategory.VALIDATION,
                 "Chiyun 同步任务只能轮询已成功的提交",
@@ -768,6 +774,7 @@ class ChiyunImageGenerator:
             "base_url": "Chiyun 服务地址配置无效",
             "api_key": "Chiyun API Key 未配置",
             "model": "Chiyun 模型未配置",
+            "result_downloader": "Chiyun 结果下载器配置无效",
         }
         return cls._error(
             ErrorCategory.CONFIGURATION,

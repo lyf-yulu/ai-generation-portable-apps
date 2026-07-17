@@ -1317,7 +1317,7 @@ git commit -m "feat(agent): generate approved videos through Seedance"
 - Create: `feishu-generation-agent/tests/graph/test_execution_graph.py`
 
 **Interfaces:**
-- Consumes: 批准任务、`ImageGenerator`、`VideoGenerator`、`Repository` 幂等操作、`FileStore.save_download()`。
+- Consumes: 批准任务、支持 `submit(..., submission_id=...)` 的 `ImageGenerator` / `VideoGenerator`、`Repository` 提交意图与幂等操作、`ProviderSubmission.result_items`（含不可信 staged `local_path`）、`FileStore.save_download()`。
 - Produces: `revalidate_approval`, `check_source_revision`, `execute_selected_tasks`, `verify_and_download_artifacts` 节点。
 
 - [ ] **Step 1: 写失败 Graph 测试，覆盖局部执行、失败继续和重复恢复**
@@ -1344,6 +1344,25 @@ async def test_existing_provider_id_is_polled_not_resubmitted(fake_services_with
     assert fake_services_with_existing_operation.video_generator.submit_calls == 0
     assert fake_services_with_existing_operation.video_generator.poll_calls >= 1
     assert result["artifacts"][0]["provider_task_id"] == "ark-existing"
+
+
+async def test_preassociated_chiyun_intent_recovers_staged_local_result(fake_services_with_staged_chiyun_intent):
+    result = await fake_services_with_staged_chiyun_intent.run_from_execution_node()
+    assert fake_services_with_staged_chiyun_intent.image_generator.submit_calls == 0
+    assert fake_services_with_staged_chiyun_intent.image_generator.poll_calls == 1
+    assert result["artifacts"][0]["provider_task_id"] == fake_services_with_staged_chiyun_intent.submission_id
+
+
+async def test_missing_staging_for_submitting_intent_is_uncertain_and_never_resubmitted(fake_services_with_missing_chiyun_staging):
+    result = await fake_services_with_missing_chiyun_staging.run_from_execution_node()
+    assert fake_services_with_missing_chiyun_staging.image_generator.submit_calls == 0
+    assert result["execution_records"][0]["status"] == "submission_uncertain"
+
+
+async def test_tampered_staged_local_result_is_rejected_before_final_copy(fake_services_with_tampered_staged_result):
+    result = await fake_services_with_tampered_staged_result.run_from_execution_node()
+    assert result["execution_records"][0]["status"] == "failed"
+    assert fake_services_with_tampered_staged_result.file_store.save_download_calls == 0
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1358,17 +1377,25 @@ Expected: FAIL，图缺少审批后执行节点或幂等逻辑。
 
 - [ ] **Step 4: 实现串行幂等执行**
 
-对每个批准任务：查询 operation=`submit`；无记录时调用对应生成器 `submit()` 并立即保存 provider ID；有记录时构造 submission 直接 poll；每次状态变更写 operation；终态失败写执行记录后继续下一项。轮询使用可注入 `async_sleep` 和配置间隔；超时只标记当前任务失败，不删除 provider ID。
+对每个批准任务先查询 operation=`submit`。无记录时，必须在任何供应商网络请求前生成安全的 32 位十六进制 `submission_id`，原子保存 operation `status=submitting`、`provider_id=submission_id` 和必要的非敏感 intent 元数据，然后调用对应生成器 `submit(..., submission_id=submission_id)`。Chiyun 使用该 ID 作为 staging/provider task ID；Seedance 若返回官方 provider ID，则成功返回后用官方 ID 替换本地关联 ID，但若在官方 ID 持久化前崩溃，同样进入不确定状态，不自动重提。
+
+已有 operation 时绝不能把 `submitting` 当成“无记录”：对 `submitting`/已有 provider ID 构造 submission 并调用 `poll()`。Chiyun staging 已存在时由预关联 ID 恢复 staged local results；staging 缺失或无法验证时将 operation/execution record 标为 `submission_uncertain`，禁止自动再次调用 `submit()`，仅允许后续人工明确 retry。其他已提交状态继续按官方 provider ID 轮询。每次状态变更写 operation；终态失败或不确定写执行记录后继续下一项。轮询使用可注入 `async_sleep` 和配置间隔；超时只标记当前任务失败，不删除关联 ID。
+
+该策略只保证工作流在崩溃不确定时的 at-most-once safety（不自动重复付费），不宣称供应商副作用 exactly-once。
 
 - [ ] **Step 5: 实现原子下载和 Artifact 记录**
 
-生成器返回 Base64 时先校验解码大小和文件头；返回 URL 时使用不带 Authorization 的独立 GET 下载，限制重定向次数和总字节数。图片用 Pillow verify，视频至少验证 ISO BMFF `ftyp` 或 WebM EBML 头。成功后记录真实 MIME、size、sha256、provider URL 的脱敏版本和 provider task ID。
+已有 operation 恢复必须先 `poll()` 取得当前 `result_items`，再按来源分支处理，不能因为记录已存在而重新 submit，也不能把 staged `local_path` 误走 URL/Base64 分支。
+
+`local_path` 始终是不可信输入。只接受归属于配置 staging root、且目录结构与 provider task ID 一致的直接 staged result；从 staging root directory fd 开始，使用 `O_DIRECTORY|O_NOFOLLOW` 和相对 `dir_fd` 逐级打开目录，再以 `O_NOFOLLOW` 打开普通文件，禁止按完整路径直接读取。分块读取必须受单项上限约束，并重新核对声明 size/SHA-256、读取前后文件与目录身份；随后用 Pillow 或视频文件头重嗅探真实 MIME。任何 symlink、目录替换、路径越界、大小/hash/MIME 不符均拒绝。验证后的字节通过 `FileStore.save_download()` 原子复制到最终 outputs，不能把 staging path 直接登记为最终 Artifact；即使 Task 9 已校验过，Task 11 仍必须在复制时二次验证以封闭返回路径后的竞态。
+
+生成器返回 Base64 时先校验解码大小和文件头；返回 URL 时使用不带 Authorization/Cookie/Proxy-Authorization、禁用环境代理并将已验证公网 IP 固定到实际连接的独立下载器，限制逐跳重定向和总字节数。图片用 Pillow verify，视频至少验证 ISO BMFF `ftyp` 或 WebM EBML 头。成功后记录真实 MIME、size、sha256、provider URL 的脱敏版本和 provider task ID。
 
 - [ ] **Step 6: 验证恢复不会重复付费提交**
 
 Run: `cd feishu-generation-agent && uv run pytest tests/graph/test_execution_graph.py -q`
 
-Expected: 局部批准、失败继续、已有 provider ID、已有有效文件、文件哈希不符重下、文档版本变化和超时用例全部 PASS。
+Expected: 局部批准、失败继续、已有 provider ID、网络前持久化 submission intent、staged local result 恢复、staging 路径/目录/文件篡改拒绝、`submission_uncertain` 零自动重提、已有有效最终文件、最终文件哈希不符重建、文档版本变化和超时用例全部 PASS。
 
 - [ ] **Step 7: Commit**
 

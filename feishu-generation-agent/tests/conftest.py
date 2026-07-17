@@ -108,7 +108,10 @@ class FakePaidGenerator:
         self,
         task: GenerationTask,
         assets: list[MediaAsset],
+        *,
+        submission_id: str | None = None,
     ) -> ProviderSubmission:
+        del submission_id
         self.submit_calls += 1
         return ProviderSubmission(
             provider=self.provider,
