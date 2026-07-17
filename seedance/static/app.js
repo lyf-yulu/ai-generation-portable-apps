@@ -39,6 +39,34 @@ async function api(url, method, body) {
   } catch (e) { return null; }
 }
 
+// Status-aware single poll for pollJob's retry logic. Unlike api() — which
+// collapses HTTP 404 / 5xx / network-error / bad-JSON all into a single null
+// (or, worse, returns a truthy {error:...} body that pollJob mistook for a
+// real job and looped on forever showing "unknown") — this distinguishes:
+//   {kind:'ok', job}  HTTP 200 + a job object carrying a status field
+//   {kind:'gone'}     HTTP 404 — job no longer exists (sub-app restarted and
+//                     cleared its in-memory JOBS). Poll stops cleanly.
+//   {kind:'error'}    network error / timeout / 5xx / non-JSON — transient,
+//                     caller retries with backoff.
+async function pollJobOnce(url) {
+  try {
+    const wsId = getActiveWorkspaceId();
+    const sep = url.includes('?') ? '&' : '?';
+    const urlWithWs = url + sep + 'ws=' + encodeURIComponent(wsId);
+    const headers = { 'X-Workspace-Id': wsId };
+    const keyId = localStorage.getItem('portal_key_id_seedance');
+    if (keyId) headers['X-Key-Id'] = keyId;
+    const res = await fetch(urlWithWs, { method: 'GET', headers });
+    if (res.status === 404) return { kind: 'gone' };
+    if (!res.ok) return { kind: 'error' };
+    const job = await res.json();
+    if (!job || typeof job.status === 'undefined') return { kind: 'error' };
+    return { kind: 'ok', job };
+  } catch (e) {
+    return { kind: 'error' };
+  }
+}
+
 function escHtml(s) {
   return s ? String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') : '';
 }
@@ -46,9 +74,39 @@ function escHtml(s) {
 // ============================================================
 // FILE DROP / PREVIEW HELPERS
 // ============================================================
+function clearDropMedia(drop, input, name) {
+  input.value = '';
+  drop.classList.remove('hasPreview');
+  drop.querySelector('.preview')?.remove();
+  const span = drop.querySelector('span');
+  if (span) span.textContent = '未上传';
+  const app = window._app_sd;
+  if (app && app.savedMedia) delete app.savedMedia[name];
+  if (window._currentSavedMedia) delete window._currentSavedMedia[name];
+  if (app && typeof app.saveWorkspaceDraft === 'function') app.saveWorkspaceDraft();
+}
+
+function ensureRemoveBtn(drop, input, name) {
+  // Static drops (first_frame/last_frame in index.html) lack the remove button
+  // that makeDrop() injects for dynamically-built ref slots. Add one here so
+  // every wired drop gets a working 移除 button on the single wiring path.
+  if (drop.querySelector('.removeMediaBtn')) return;
+  const rmBtn = document.createElement('button');
+  rmBtn.className = 'removeMediaBtn';
+  rmBtn.type = 'button';
+  rmBtn.textContent = '移除';
+  rmBtn.addEventListener('click', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    clearDropMedia(drop, input, name);
+  });
+  drop.appendChild(rmBtn);
+}
+
 function wireFileDrop(drop, input, name) {
   if (input.dataset.wired) return;
   input.dataset.wired = '1';
+  ensureRemoveBtn(drop, input, name);
   input.addEventListener('change', async () => {
     const f = input.files?.[0];
     if (!f) {
@@ -142,22 +200,7 @@ function makeDrop(container, name, label, accept, formId) {
   if (formId) input.setAttribute('form', formId);
   const span = document.createElement('span');
   span.textContent = '未上传';
-  const rmBtn = document.createElement('button');
-  rmBtn.className = 'removeMediaBtn';
-  rmBtn.type = 'button';
-  rmBtn.textContent = '移除';
-  rmBtn.addEventListener('click', e => {
-    e.preventDefault();
-    e.stopPropagation();
-    input.value = '';
-    el.classList.remove('hasPreview');
-    el.querySelector('.preview')?.remove();
-    span.textContent = '未上传';
-    const app = window._app_sd;
-    if (app && app.savedMedia) delete app.savedMedia[name];
-    if (window._currentSavedMedia) delete window._currentSavedMedia[name];
-  });
-  el.append(input, span, rmBtn);
+  el.append(input, span);
   wireFileDrop(el, input, name);
   container.appendChild(el);
 }
@@ -733,9 +776,36 @@ function SeedanceApp() {
       const setSubmitting = (v) => { if (isActive()) this.submitting = v; else cache().submitting = v; };
       const setLatestJob = (job) => { cache()._latestJob = job; };
 
+      // Transient-failure tolerance. A single failed poll (proxy timeout, wifi
+      // blip, sub-app 5xx) used to `break` and permanently abandon the watcher,
+      // leaving a finished result invisible until manual resubmit. Now we retry
+      // with backoff and only give up after MAX_FAILS consecutive failures
+      // (~2min at the 10s backoff cap). A 404 ('gone' — sub-app restarted and
+      // cleared JOBS) exits cleanly instead of looping forever on "unknown".
+      const MAX_FAILS = 15;
+      let consecutiveFails = 0;
+
       while (true) {
-        const job = await api(APP_PATH + '/api/jobs/' + jobId);
-        if (!job) break;
+        const r = await pollJobOnce(APP_PATH + '/api/jobs/' + jobId);
+        if (r.kind === 'gone') {
+          // Job no longer exists server-side (restart). Refresh the jobs list so
+          // any completed result recorded in activity can still surface there.
+          setStatus('任务已失效(服务可能重启过),请查看活动记录或重新提交');
+          break;
+        }
+        if (r.kind === 'error') {
+          consecutiveFails++;
+          if (consecutiveFails >= MAX_FAILS) {
+            setStatus('网络不稳定,已停止刷新 · 稍后可重新提交');
+            break;
+          }
+          // Exponential backoff capped at 10s, starting from the 2.5s cadence.
+          const wait = Math.min(10000, 2500 * Math.pow(1.5, consecutiveFails - 1));
+          await new Promise(res => setTimeout(res, wait));
+          continue;
+        }
+        consecutiveFails = 0;
+        const job = r.job;
         setStatus((job.status || 'unknown') + ' ' + (job.done || 0) + '/' + (job.total || 0));
         setEvents((job.events || []).map(e => '[' + (e.time || '') + '] ' + (e.message || '')).join('\n'));
         setLatestJob(job);

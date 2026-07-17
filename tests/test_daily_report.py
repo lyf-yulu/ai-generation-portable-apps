@@ -30,6 +30,12 @@ class UsageJsonlTests(unittest.TestCase):
             }[fmt]):
                 tracker.record("seedance", "10.0.0.1", "POST", "/api/jobs", "alice")
 
+            # usage.json is now written by a debounced background flusher (the
+            # hot path no longer writes synchronously under the lock). flush()
+            # stops the flusher and forces a final write — a reliable barrier so
+            # we can assert on-disk state deterministically.
+            tracker.flush()
+
             jsonl = base / "logs" / "usage-2026-06-30.jsonl"
             self.assertTrue(jsonl.exists())
             lines = jsonl.read_text("utf-8").splitlines()
@@ -46,6 +52,10 @@ class UsageJsonlTests(unittest.TestCase):
             tracker = module.UsageTracker()
             with mock.patch.object(module, "_append_usage_jsonl", side_effect=OSError("disk full")):
                 tracker.record("seedance", "10.0.0.1", "POST", "/api/jobs", "alice")
+            # Debounced persistence: flush() stops the flusher and forces the
+            # pending write — a reliable barrier — before we assert the jsonl
+            # failure did not compromise the primary usage.json save.
+            tracker.flush()
             self.assertTrue((base / "usage.json").exists())
             data = json.loads((base / "usage.json").read_text("utf-8"))
             self.assertEqual(len(data["records"]), 1)

@@ -41,6 +41,32 @@ async function api(url, method, body) {
   } catch (e) { return null; }
 }
 
+// Status-aware single poll for pollJob's retry logic. Unlike api() — which
+// collapses HTTP 404 / 5xx / network-error / bad-JSON all into null (or a
+// truthy {error:...} body that pollJob looped on forever showing "unknown") —
+// this distinguishes:
+//   {kind:'ok', job}  HTTP 200 + a job object carrying a status field
+//   {kind:'gone'}     HTTP 404 — job gone (sub-app restarted, JOBS cleared)
+//   {kind:'error'}    network error / timeout / 5xx / non-JSON — transient
+async function pollJobOnce(url) {
+  try {
+    const wsId = getActiveWorkspaceId();
+    const sep = url.includes('?') ? '&' : '?';
+    const urlWithWs = url + sep + 'ws=' + encodeURIComponent(wsId);
+    const headers = { 'X-Workspace-Id': wsId };
+    const keyId = localStorage.getItem('portal_key_id_nano_banana');
+    if (keyId) headers['X-Key-Id'] = keyId;
+    const res = await fetch(urlWithWs, { method: 'GET', headers });
+    if (res.status === 404) return { kind: 'gone' };
+    if (!res.ok) return { kind: 'error' };
+    const job = await res.json();
+    if (!job || typeof job.status === 'undefined') return { kind: 'error' };
+    return { kind: 'ok', job };
+  } catch (e) {
+    return { kind: 'error' };
+  }
+}
+
 function escHtml(s) { return s ? String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') : ''; }
 
 // ============================================================
@@ -541,9 +567,33 @@ function NanoBananaApp() {
       var setSubmitting = function (v) { if (isActive()) self.submitting = v; else cache().submitting = v; };
       var setLatestJob = function (job) { cache()._latestJob = job; };
 
+      // Transient-failure tolerance. A single failed poll (proxy timeout, wifi
+      // blip, sub-app 5xx) used to `break` and permanently abandon the watcher,
+      // leaving a finished result invisible until manual resubmit. Now retry
+      // with backoff, give up only after MAX_FAILS consecutive failures. A 404
+      // ('gone' — sub-app restarted, JOBS cleared) exits cleanly instead of
+      // looping forever on "unknown".
+      var MAX_FAILS = 15;
+      var consecutiveFails = 0;
+
       while (true) {
-        var job = await api(APP_PATH + '/api/jobs/' + jobId);
-        if (!job) break;
+        var r = await pollJobOnce(APP_PATH + '/api/jobs/' + jobId);
+        if (r.kind === 'gone') {
+          setStatus('任务已失效(服务可能重启过),请查看活动记录或重新提交');
+          break;
+        }
+        if (r.kind === 'error') {
+          consecutiveFails++;
+          if (consecutiveFails >= MAX_FAILS) {
+            setStatus('网络不稳定,已停止刷新 · 稍后可重新提交');
+            break;
+          }
+          var wait = Math.min(10000, 2500 * Math.pow(1.5, consecutiveFails - 1));
+          await new Promise(function (res) { setTimeout(res, wait); });
+          continue;
+        }
+        consecutiveFails = 0;
+        var job = r.job;
         setStatus((job.status || '') + ' ' + (job.done || 0) + '/' + (job.total || 0));
         setEvents((job.events || []).map(function (e) { return '[' + (e.time || '') + '] ' + (e.message || ''); }).join('\n'));
         setLatestJob(job);

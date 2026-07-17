@@ -733,6 +733,24 @@ class UsageTracker:
         self._lock = threading.Lock()
         self._data = self._load()
         self._pending_jobs: list[dict] = []
+        # Debounced persistence: hot paths (record/register_job/inc_daily_jobs/
+        # finalize_job/_add_user_stat) used to json.dumps + double-write the whole
+        # usage.json to disk *while holding self._lock*, on EVERY proxied request
+        # (including every static JS/CSS/image of a sub-app). Under load all proxy
+        # threads serialized on that lock + disk I/O, and usage.json grows
+        # unboundedly (daily/by_user never pruned) so each write got slower. That
+        # was the portal-side stall that dragged all four sub-apps down together.
+        #
+        # Now _save() just marks dirty + wakes a background flusher. The flusher
+        # snapshots under the lock (cheap) and does the json.dumps + disk write
+        # OUTSIDE the lock, at most once per _FLUSH_INTERVAL. shutdown() forces a
+        # final synchronous flush so nothing is lost on restart.
+        self._dirty = False
+        self._flush_wake = threading.Event()
+        self._stop_flush = threading.Event()
+        self._FLUSH_INTERVAL = 2.0
+        self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
+        self._flush_thread.start()
         threading.Thread(target=self._job_poll_loop, daemon=True).start()
         threading.Thread(target=self._auto_backup_loop, daemon=True).start()
 
@@ -780,10 +798,21 @@ class UsageTracker:
         return d
 
     def _save(self):
+        """Mark usage data dirty and wake the background flusher.
+
+        MUST be called while holding self._lock (every caller already does).
+        This is now O(1) — no json.dumps, no disk I/O on the request thread —
+        so hot paths no longer serialize the whole file under the lock. The
+        actual write happens in _flush_loop, at most once per _FLUSH_INTERVAL.
+        """
+        self._dirty = True
+        self._flush_wake.set()
+
+    def _write_to_disk(self, payload: str):
         """Atomic double-write: tmp → primary (rename), then copy primary → .bak.
+        Runs OUTSIDE self._lock — payload is a pre-serialized snapshot string.
         Long-term retention: do NOT prune any date keys here."""
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(self._data, ensure_ascii=False, indent=2)
         tmp_path = USAGE_PATH.with_suffix(USAGE_PATH.suffix + ".tmp")
         bak_path = USAGE_PATH.with_suffix(USAGE_PATH.suffix + ".bak")
         try:
@@ -795,6 +824,53 @@ class UsageTracker:
         # Refresh .bak (best-effort; failure here doesn't compromise primary)
         try:
             shutil.copyfile(USAGE_PATH, bak_path)
+        except Exception:
+            pass
+
+    def _flush_now(self) -> bool:
+        """Serialize a snapshot under the lock, then write it to disk outside
+        the lock. Returns True if a write was performed. Only json.dumps holds
+        the lock (unavoidable — must snapshot a consistent view); the two disk
+        writes happen lock-free so other threads keep moving."""
+        with self._lock:
+            if not self._dirty:
+                return False
+            payload = json.dumps(self._data, ensure_ascii=False, indent=2)
+            self._dirty = False
+        self._write_to_disk(payload)
+        return True
+
+    def _flush_loop(self):
+        """Debounced writer: wake on _flush_wake or every _FLUSH_INTERVAL,
+        coalescing bursts of _save() calls into a single disk write. On
+        _stop_flush (shutdown), do a final flush and exit."""
+        while not self._stop_flush.is_set():
+            self._flush_wake.wait(timeout=self._FLUSH_INTERVAL)
+            self._flush_wake.clear()
+            try:
+                self._flush_now()
+            except Exception as exc:
+                print(f"  [usage] flush loop error: {exc}", flush=True)
+        # Final drain on shutdown so nothing dirty is lost across restart.
+        try:
+            self._flush_now()
+        except Exception:
+            pass
+
+    def flush(self):
+        """Stop the background flusher and force a final synchronous write.
+
+        Reliable barrier: signals the loop to stop, joins it (so it cannot race
+        us by grabbing the dirty flag and writing after we return), then does one
+        last _flush_now(). Used on shutdown and by tests that assert on-disk
+        state right after record()."""
+        self._stop_flush.set()
+        self._flush_wake.set()
+        t = getattr(self, "_flush_thread", None)
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=5)
+        try:
+            self._flush_now()
         except Exception:
             pass
 
@@ -2135,6 +2211,12 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        # Force a final synchronous flush of usage data before we tear down —
+        # the debounced flusher may have pending dirty state not yet written.
+        try:
+            tracker.flush()
+        except Exception:
+            pass
         manager.shutdown()
         if redirect_server:
             redirect_server.shutdown()
