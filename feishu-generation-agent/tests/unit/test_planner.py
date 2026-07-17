@@ -174,6 +174,158 @@ def storyboard_document(tmp_path: Path) -> NormalizedDocument:
     )
 
 
+def _with_storyboard_header(
+    document: NormalizedDocument,
+) -> NormalizedDocument:
+    shifted_blocks = [
+        block.model_copy(update={"table_row": block.table_row + 1})
+        if block.block_type == "table_cell"
+        and block.parent_id == "table-1"
+        and block.table_row is not None
+        else block
+        for block in document.blocks
+    ]
+    header_blocks = [
+        DocumentBlock(
+            block_id="header-cell",
+            parent_id="table-1",
+            block_type="table_cell",
+            order=2,
+            path=["page-1", "table-1", "header-cell"],
+            table_row=0,
+            table_column=0,
+        ),
+        DocumentBlock(
+            block_id="header-title",
+            parent_id="header-cell",
+            block_type="text",
+            order=3,
+            path=["page-1", "table-1", "header-cell", "header-title"],
+            text="画面描述",
+        ),
+    ]
+    return document.model_copy(
+        update={
+            "blocks": [*shifted_blocks, *header_blocks],
+            "text_view": (
+                "[block:header-title] 画面描述\n" + document.text_view
+            ),
+        }
+    )
+
+
+def _numbered_storyboard_document(
+    document: NormalizedDocument,
+    *,
+    header: str,
+    numbers: list[str],
+) -> NormalizedDocument:
+    blocks = [
+        block
+        for block in document.blocks
+        if block.block_id in {"page-1", "table-1", "image-1"}
+    ]
+    text_lines = [f"[block:number-header] {header}"]
+    blocks.extend(
+        [
+            DocumentBlock(
+                block_id="number-header-cell",
+                parent_id="table-1",
+                block_type="table_cell",
+                order=2,
+                path=["page-1", "table-1", "number-header-cell"],
+                table_row=0,
+                table_column=0,
+            ),
+            DocumentBlock(
+                block_id="number-header",
+                parent_id="number-header-cell",
+                block_type="text",
+                order=3,
+                path=[
+                    "page-1",
+                    "table-1",
+                    "number-header-cell",
+                    "number-header",
+                ],
+                text=header,
+            ),
+            DocumentBlock(
+                block_id="description-header-cell",
+                parent_id="table-1",
+                block_type="table_cell",
+                order=4,
+                path=["page-1", "table-1", "description-header-cell"],
+                table_row=0,
+                table_column=1,
+            ),
+            DocumentBlock(
+                block_id="description-header",
+                parent_id="description-header-cell",
+                block_type="text",
+                order=5,
+                path=[
+                    "page-1",
+                    "table-1",
+                    "description-header-cell",
+                    "description-header",
+                ],
+                text="画面描述",
+            ),
+        ]
+    )
+    for row, number in enumerate(numbers, start=1):
+        number_cell = f"number-cell-{row}"
+        number_id = f"shot-number-{row}"
+        description_cell = f"description-cell-{row}"
+        shot_id = f"shot-{row}"
+        order = 6 + (row - 1) * 4
+        blocks.extend(
+            [
+                DocumentBlock(
+                    block_id=number_cell,
+                    parent_id="table-1",
+                    block_type="table_cell",
+                    order=order,
+                    path=["page-1", "table-1", number_cell],
+                    table_row=row,
+                    table_column=0,
+                ),
+                DocumentBlock(
+                    block_id=number_id,
+                    parent_id=number_cell,
+                    block_type="text",
+                    order=order + 1,
+                    path=["page-1", "table-1", number_cell, number_id],
+                    text=number,
+                ),
+                DocumentBlock(
+                    block_id=description_cell,
+                    parent_id="table-1",
+                    block_type="table_cell",
+                    order=order + 2,
+                    path=["page-1", "table-1", description_cell],
+                    table_row=row,
+                    table_column=1,
+                ),
+                DocumentBlock(
+                    block_id=shot_id,
+                    parent_id=description_cell,
+                    block_type="text",
+                    order=order + 3,
+                    path=["page-1", "table-1", description_cell, shot_id],
+                    text=f"纸船经过虚构场景 {row}。",
+                ),
+            ]
+        )
+        text_lines.extend(
+            [f"[block:{number_id}] {number}", f"[block:{shot_id}] 场景 {row}"]
+        )
+    return document.model_copy(
+        update={"blocks": blocks, "text_view": "\n".join(text_lines)}
+    )
+
+
 @pytest.fixture
 def mixed_document(tmp_path: Path) -> NormalizedDocument:
     first = _asset(tmp_path, "asset-1", "image-1")
@@ -882,6 +1034,132 @@ def test_validator_does_not_treat_ordinary_table_as_storyboard(
     issues = validate_plan(
         json.loads(_plan_json(task)), ordinary_document, 4
     )
+
+    assert not any("storyboard" in issue for issue in issues)
+
+
+def test_validator_recognizes_explicit_storyboard_rows_after_header(
+    storyboard_document: NormalizedDocument,
+):
+    document = _with_storyboard_header(storyboard_document)
+    incomplete = validate_plan(
+        json.loads(
+            _plan_json(_video_task(source_block_ids=["shot-1"]))
+        ),
+        document,
+        4,
+    )
+    split = validate_plan(
+        json.loads(
+            _plan_json(
+                _video_task("task-1", source_block_ids=["shot-1"]),
+                _video_task(
+                    "task-2",
+                    source_block_ids=["shot-2", "shot-3", "shot-4"],
+                ),
+            )
+        ),
+        document,
+        4,
+    )
+    complete = validate_plan(
+        json.loads(
+            _plan_json(
+                _video_task(
+                    source_block_ids=[
+                        "shot-1",
+                        "shot-2",
+                        "shot-3",
+                        "shot-4",
+                    ]
+                )
+            )
+        ),
+        document,
+        4,
+    )
+
+    assert "missing source_block_ids" in " ".join(incomplete)
+    assert "header-title" not in " ".join(incomplete)
+    assert "exactly one image_to_video" in " ".join(split)
+    assert complete == []
+
+
+@pytest.mark.parametrize(
+    ("header", "numbers"),
+    [
+        ("镜头", ["1", "2"]),
+        ("镜号", ["1、", "2、"]),
+        ("镜头号", ["1.", "2."]),
+    ],
+)
+def test_validator_recognizes_numbered_storyboard_under_header(
+    storyboard_document: NormalizedDocument,
+    header: str,
+    numbers: list[str],
+):
+    document = _numbered_storyboard_document(
+        storyboard_document,
+        header=header,
+        numbers=numbers,
+    )
+    first_row_sources = ["shot-number-1", "shot-1"]
+    all_row_sources = [
+        "shot-number-1",
+        "shot-1",
+        "shot-number-2",
+        "shot-2",
+    ]
+
+    incomplete = validate_plan(
+        json.loads(
+            _plan_json(_video_task(source_block_ids=first_row_sources))
+        ),
+        document,
+        4,
+    )
+    complete = validate_plan(
+        json.loads(
+            _plan_json(_video_task(source_block_ids=all_row_sources))
+        ),
+        document,
+        4,
+    )
+
+    joined = " ".join(incomplete)
+    assert "storyboard table table-1" in joined
+    assert "shot-number-2" in joined and "shot-2" in joined
+    assert "number-header" not in joined
+    assert "description-header" not in joined
+    assert complete == []
+
+
+@pytest.mark.parametrize(
+    ("header", "numbers"),
+    [
+        ("镜头", ["1"]),
+        ("镜头", ["1", "3"]),
+        ("参数", ["1", "2"]),
+    ],
+)
+def test_validator_ignores_incidental_header_or_scattered_numbers(
+    storyboard_document: NormalizedDocument,
+    header: str,
+    numbers: list[str],
+):
+    document = _numbered_storyboard_document(
+        storyboard_document,
+        header=header,
+        numbers=numbers,
+    )
+    task = _image_task()
+    task["source_block_ids"] = [
+        block.block_id
+        for block in document.blocks
+        if block.block_id.startswith(("shot-number-", "shot-"))
+    ]
+
+    issues = validate_plan(json.loads(_plan_json(task)), document, 4)
 
     assert not any("storyboard" in issue for issue in issues)
 

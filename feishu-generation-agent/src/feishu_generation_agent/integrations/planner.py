@@ -21,6 +21,8 @@ _ALLOWED_TASK_TYPES = {"image_to_image", "image_to_video"}
 _STORYBOARD_ROW_MARKER = re.compile(
     r"^\s*镜头\s*(?:\d+|[一二三四五六七八九十百]+)\s*[：:]?"
 )
+_STORYBOARD_HEADER = re.compile(r"^\s*(?:镜头|镜号|镜头号)\s*[：:]?\s*$")
+_STORYBOARD_ROW_NUMBER = re.compile(r"^\s*([0-9]{1,3})\s*[、.．]?\s*$")
 _PLAN_SYSTEM_PROMPT = """你是 AI 图片与视频生成需求规划器。
 只根据给定文档、稳定引用和视觉描述输出 TaskPlan JSON，不得虚构素材或需求。
 不要输出思维过程、推理原文、Markdown 或 JSON 之外的说明。
@@ -44,9 +46,10 @@ def _storyboard_requirements(
 ) -> dict[str, list[str]]:
     """Return content block IDs for explicitly marked storyboard tables.
 
-    A table is treated as a storyboard only when it has at least two non-empty
-    rows and every non-empty row contains text beginning with an explicit
-    ``镜头 N`` marker. This deliberately excludes ordinary parameter tables.
+    A table is treated as a storyboard when at least two rows begin with an
+    explicit ``镜头 N`` marker, or when a ``镜头``/``镜号`` header is followed
+    by at least two rows numbered consecutively from 1 in the primary column.
+    Only detected shot rows contribute required block IDs; headers are excluded.
     """
     requirements: dict[str, list[str]] = {}
     tables = sorted(
@@ -59,30 +62,32 @@ def _storyboard_requirements(
     )
     for table in tables:
         cells = {
-            block.block_id: block.table_row
+            block.block_id: block
             for block in document.blocks
             if block.block_type == "table_cell"
             and block.parent_id == table.block_id
             and isinstance(block.table_row, int)
         }
         row_content: dict[int, list[Any]] = {}
+        cell_content: dict[str, list[Any]] = {}
         for block in document.blocks:
             if block.block_type in {"table", "table_cell"}:
                 continue
-            row = next(
+            cell_id = next(
                 (
-                    cells[path_part]
+                    path_part
                     for path_part in block.path
                     if path_part in cells
                 ),
                 None,
             )
-            if row is not None:
-                row_content.setdefault(row, []).append(block)
+            if cell_id is not None:
+                row = cells[cell_id].table_row
+                if row is not None:
+                    row_content.setdefault(row, []).append(block)
+                    cell_content.setdefault(cell_id, []).append(block)
 
-        if len(row_content) < 2:
-            continue
-        marker_rows = {
+        shot_rows = {
             row
             for row, blocks in row_content.items()
             if any(
@@ -91,13 +96,69 @@ def _storyboard_requirements(
                 for block in blocks
             )
         }
-        if marker_rows != set(row_content):
+        if len(shot_rows) < 2:
+            shot_rows = set()
+            header_rows = sorted(
+                row
+                for row, blocks in row_content.items()
+                if any(
+                    block.block_type == "text"
+                    and bool(_STORYBOARD_HEADER.fullmatch(block.text))
+                    for block in blocks
+                )
+            )
+            for header_row in header_rows:
+                numbered_rows: list[tuple[int, int]] = []
+                for row in sorted(row_content):
+                    if row <= header_row:
+                        continue
+                    row_cells = sorted(
+                        (
+                            cell
+                            for cell in cells.values()
+                            if cell.table_row == row
+                            and cell.block_id in cell_content
+                        ),
+                        key=lambda cell: (
+                            cell.table_column
+                            if cell.table_column is not None
+                            else 10**9,
+                            cell.order,
+                            cell.block_id,
+                        ),
+                    )
+                    if not row_cells:
+                        continue
+                    primary_blocks = cell_content[row_cells[0].block_id]
+                    number_match = next(
+                        (
+                            _STORYBOARD_ROW_NUMBER.fullmatch(block.text)
+                            for block in primary_blocks
+                            if block.block_type == "text"
+                            and _STORYBOARD_ROW_NUMBER.fullmatch(block.text)
+                        ),
+                        None,
+                    )
+                    if number_match is not None:
+                        numbered_rows.append(
+                            (row, int(number_match.group(1)))
+                        )
+                numbers = [number for _, number in numbered_rows]
+                if (
+                    len(numbered_rows) >= 2
+                    and numbers == list(range(1, len(numbered_rows) + 1))
+                ):
+                    shot_rows = {row for row, _ in numbered_rows}
+                    break
+
+        if len(shot_rows) < 2:
             continue
 
         content_blocks = sorted(
             (
                 block
-                for blocks in row_content.values()
+                for row, blocks in row_content.items()
+                if row in shot_rows
                 for block in blocks
             ),
             key=lambda block: (block.order, block.block_id),
