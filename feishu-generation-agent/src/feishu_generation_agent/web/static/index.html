@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>飞书生成任务审批工作区</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">LOCAL GENERATION AGENT</p>
+        <h1>飞书生成任务审批工作区</h1>
+      </div>
+      <form id="run-form" class="source-form">
+        <label for="source-url">飞书需求文档</label>
+        <div class="source-row">
+          <input id="source-url" name="source_url" type="url"
+            placeholder="https://company.feishu.cn/docx/..." required>
+          <button type="submit" class="primary">读取并规划</button>
+        </div>
+      </form>
+    </header>
+
+    <p id="error-message" class="error-message" role="alert" hidden></p>
+
+    <main class="workspace">
+      <aside class="trace-panel panel" aria-label="LangGraph 执行信息">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">WORKFLOW</p>
+            <h2>节点轨迹</h2>
+          </div>
+          <span id="status-badge" class="status-badge">尚未创建</span>
+        </div>
+        <dl class="run-meta">
+          <div><dt>当前节点</dt><dd id="current-node">—</dd></div>
+          <div><dt>当前状态</dt><dd id="run-status">—</dd></div>
+          <div><dt>thread ID</dt><dd id="thread-id">—</dd></div>
+          <div><dt>累计耗时</dt><dd id="run-duration">—</dd></div>
+        </dl>
+        <ol id="event-list" class="event-list"></ol>
+      </aside>
+
+      <section class="review-panel panel" aria-label="任务审批工作区">
+        <div class="panel-heading review-heading">
+          <div>
+            <p class="eyebrow">REVIEW</p>
+            <h2 id="document-title">等待提交飞书文档</h2>
+          </div>
+          <a id="source-link" href="#" target="_blank" rel="noreferrer">查看源文档</a>
+        </div>
+        <p class="document-meta">文档版本 <span id="document-revision">—</span></p>
+        <p id="document-summary" class="document-summary"></p>
+        <p class="document-meta">可编辑提示词、负面约束、生成参数与参考图片。</p>
+        <div id="validation-issues" class="validation-issues" hidden></div>
+        <div id="task-list" class="task-list"></div>
+
+        <div class="feedback-box">
+          <label for="reject-feedback">退回意见</label>
+          <textarea id="reject-feedback" rows="3"
+            placeholder="说明需要重新规划的内容"></textarea>
+        </div>
+      </section>
+    </main>
+
+    <footer class="action-bar">
+      <span id="polling-note">每 1 秒自动刷新运行状态</span>
+      <div class="action-buttons">
+        <button id="reject-button" type="button" class="secondary">退回重新规划</button>
+        <button id="cancel-button" type="button" class="danger">全部取消</button>
+        <button id="approve-button" type="button" class="primary">批准所选任务</button>
+      </div>
+    </footer>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

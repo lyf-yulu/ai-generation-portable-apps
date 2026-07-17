@@ -21,6 +21,7 @@ class AgentState(TypedDict, total=False):
     source_revision: int
     vision_descriptions: list[dict[str, Any]]
     vision_issues: list[str]
+    draft_revision: int
     draft_plan: dict[str, Any]
     task_plan: dict[str, Any]
     audit_report: dict[str, Any]

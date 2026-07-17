@@ -109,6 +109,38 @@ class Repository:
             (run_id, thread_id, source_url, status, timestamp, timestamp),
         )
 
+    async def get_run(self, run_id: str) -> dict[str, Any] | None:
+        cursor = await self._connection.execute(
+            """
+            SELECT run_id, thread_id, source_url, status, created_at, updated_at
+            FROM runs
+            WHERE run_id = ?
+            """,
+            (run_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return dict(row) if row is not None else None
+
+    async def update_run_status(self, run_id: str, status: str) -> bool:
+        async with self._write_lock:
+            try:
+                cursor = await self._connection.execute(
+                    """
+                    UPDATE runs
+                    SET status = ?, updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (status, _now(), run_id),
+                )
+                await self._connection.commit()
+            except BaseException:
+                await self._connection.rollback()
+                raise
+        changed = cursor.rowcount > 0
+        await cursor.close()
+        return changed
+
     async def append_event(
         self,
         run_id: str,

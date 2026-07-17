@@ -1,0 +1,386 @@
+(() => {
+  "use strict";
+
+  const state = { runId: null, view: null, busy: false };
+  const byId = (id) => document.getElementById(id);
+  const runForm = byId("run-form");
+  const errorMessage = byId("error-message");
+  const taskList = byId("task-list");
+  const actionButtons = [
+    byId("reject-button"),
+    byId("cancel-button"),
+    byId("approve-button"),
+  ];
+
+  function element(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = String(text);
+    return node;
+  }
+
+  function detailText(detail) {
+    if (typeof detail === "string") return detail;
+    if (Array.isArray(detail)) {
+      return detail.map((item) => item.msg || JSON.stringify(item)).join("；");
+    }
+    if (detail && typeof detail === "object") return JSON.stringify(detail);
+    return "请求失败";
+  }
+
+  function showError(error) {
+    errorMessage.textContent = error instanceof Error ? error.message : String(error);
+    errorMessage.hidden = false;
+  }
+
+  function clearError() {
+    errorMessage.textContent = "";
+    errorMessage.hidden = true;
+  }
+
+  async function api(url, options = {}) {
+    const response = await fetch(url, options);
+    const contentType = response.headers.get("content-type") || "";
+    const payload = contentType.includes("application/json")
+      ? await response.json()
+      : await response.text();
+    if (!response.ok) {
+      const detail = payload && typeof payload === "object" ? payload.detail : payload;
+      throw new Error(detailText(detail));
+    }
+    return payload;
+  }
+
+  function setBusy(value) {
+    state.busy = value;
+    document.querySelectorAll("button").forEach((button) => {
+      button.disabled = value;
+    });
+    updateActionAvailability();
+  }
+
+  function updateActionAvailability() {
+    const canReview = state.view && state.view.status === "waiting_approval";
+    actionButtons.forEach((button) => {
+      button.disabled = state.busy || !canReview;
+    });
+  }
+
+  function formatDuration(value) {
+    if (typeof value !== "number") return "—";
+    if (value < 1000) return `${value} ms`;
+    return `${(value / 1000).toFixed(1)} s`;
+  }
+
+  function renderEvents(events) {
+    const list = byId("event-list");
+    const nodes = (events || []).map((event) => {
+      const item = element("li", "event-item");
+      const meta = element("div", "event-meta");
+      meta.append(
+        element("strong", "", `${event.node || "workflow"} · ${event.status || ""}`),
+        element("span", "", formatDuration(event.duration_ms)),
+      );
+      item.append(meta, element("p", "event-summary", event.summary || ""));
+      return item;
+    });
+    list.replaceChildren(...nodes);
+  }
+
+  function descriptionFor(assetId) {
+    const descriptions = state.view?.approval?.vision_descriptions || [];
+    return descriptions.find((item) => item.asset_id === assetId) || null;
+  }
+
+  function assetFor(assetId) {
+    const assets = state.view?.approval?.media_assets || [];
+    return assets.find((item) => item.asset_id === assetId) || null;
+  }
+
+  function field(labelText, control, wide = false) {
+    const wrapper = element("div", wide ? "field field-wide" : "field");
+    wrapper.append(element("label", "", labelText), control);
+    return wrapper;
+  }
+
+  function textArea(value, onInput, rows = 3) {
+    const control = document.createElement("textarea");
+    control.rows = rows;
+    control.value = value || "";
+    control.addEventListener("input", () => onInput(control.value));
+    return control;
+  }
+
+  function textInput(value, onInput, type = "text") {
+    const control = document.createElement("input");
+    control.type = type;
+    control.value = value ?? "";
+    control.addEventListener("input", () => onInput(control.value));
+    return control;
+  }
+
+  async function patchReferences(task) {
+    const rows = [...document.querySelectorAll(`[data-reference-task="${CSS.escape(task.task_id)}"]`)];
+    const references = rows.map((row) => ({
+      asset_id: row.dataset.assetId,
+      role: row.querySelector("select").value,
+      order: Number(row.querySelector("input[type=number]").value),
+    }));
+    await mutate(`/api/runs/${state.runId}/tasks/${encodeURIComponent(task.task_id)}/references`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ references }),
+    });
+  }
+
+  async function uploadReference(task, fileInput, role, order, replacesAssetId = null) {
+    const file = fileInput.files[0];
+    if (!file) throw new Error("请选择图片文件");
+    const body = new FormData();
+    body.append("file", file);
+    body.append("task_id", task.task_id);
+    body.append("role", role);
+    body.append("order", String(order));
+    if (replacesAssetId) body.append("replaces_asset_id", replacesAssetId);
+    await mutate(`/api/runs/${state.runId}/references`, { method: "POST", body });
+  }
+
+  async function unlinkReference(task, assetId) {
+    await mutate(
+      `/api/runs/${state.runId}/tasks/${encodeURIComponent(task.task_id)}/references/${encodeURIComponent(assetId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  async function mutate(url, options) {
+    if (state.busy) return;
+    setBusy(true);
+    clearError();
+    try {
+      await api(url, options);
+      await poll(true);
+    } catch (error) {
+      showError(error);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function referenceRow(task, reference) {
+    const asset = assetFor(reference.asset_id);
+    const description = descriptionFor(reference.asset_id);
+    const row = element("div", "reference-row");
+    row.dataset.referenceTask = task.task_id;
+    row.dataset.assetId = reference.asset_id;
+
+    const image = document.createElement("img");
+    image.alt = `参考图片 ${reference.order}`;
+    if (asset?.preview_url) image.src = asset.preview_url;
+
+    const descriptionText = description
+      ? [description.subjects?.join("、"), description.scene, description.probable_role]
+          .filter(Boolean)
+          .join(" · ")
+      : "本地新增图片，尚无视觉描述";
+    const descriptionNode = element("div", "reference-description", descriptionText);
+
+    const role = document.createElement("select");
+    ["reference_image", "first_frame", "last_frame"].forEach((value) => {
+      const option = element("option", "", value);
+      option.value = value;
+      option.selected = value === reference.role;
+      role.append(option);
+    });
+    role.setAttribute("aria-label", "图片用途");
+
+    const order = document.createElement("input");
+    order.type = "number";
+    order.min = "1";
+    order.value = reference.order;
+    order.setAttribute("aria-label", "图片顺序");
+
+    const actions = element("div", "reference-actions");
+    const replaceInput = document.createElement("input");
+    replaceInput.type = "file";
+    replaceInput.accept = "image/*";
+    replaceInput.hidden = true;
+    const replace = element("button", "quiet-button", "替换");
+    replace.type = "button";
+    replace.addEventListener("click", () => replaceInput.click());
+    replaceInput.addEventListener("change", () => {
+      uploadReference(task, replaceInput, role.value, Number(order.value), reference.asset_id);
+    });
+    const remove = element("button", "quiet-button", "删除");
+    remove.type = "button";
+    remove.addEventListener("click", () => unlinkReference(task, reference.asset_id));
+    actions.append(replaceInput, replace, remove);
+    row.append(image, descriptionNode, role, order, actions);
+    return row;
+  }
+
+  function referenceSection(task) {
+    const section = element("section", "reference-section");
+    const heading = element("div", "panel-heading");
+    heading.append(element("h3", "", "参考图片"));
+    const save = element("button", "quiet-button", "保存用途与顺序");
+    save.type = "button";
+    save.addEventListener("click", () => patchReferences(task));
+    heading.append(save);
+    const list = element("div", "reference-list");
+    [...task.reference_images]
+      .sort((a, b) => a.order - b.order)
+      .forEach((reference) => list.append(referenceRow(task, reference)));
+
+    const upload = element("div", "upload-row");
+    const fileInput = document.createElement("input");
+    fileInput.type = "file";
+    fileInput.accept = "image/*";
+    const role = document.createElement("select");
+    ["reference_image", "first_frame", "last_frame"].forEach((value) => {
+      const option = element("option", "", value);
+      option.value = value;
+      role.append(option);
+    });
+    const order = document.createElement("input");
+    order.type = "number";
+    order.min = "1";
+    order.value = String(task.reference_images.length + 1);
+    const add = element("button", "secondary", "增添图片");
+    add.type = "button";
+    add.addEventListener("click", () => {
+      uploadReference(task, fileInput, role.value, Number(order.value));
+    });
+    upload.append(fileInput, role, order, add);
+    section.append(heading, list, upload);
+    return section;
+  }
+
+  function renderTask(task) {
+    const card = element("article", "task-card");
+    const titleRow = element("div", "task-title-row");
+    const selected = document.createElement("input");
+    selected.type = "checkbox";
+    selected.checked = true;
+    selected.dataset.taskId = task.task_id;
+    selected.setAttribute("aria-label", `选择任务 ${task.title}`);
+    const title = element("div", "");
+    title.append(
+      element("h3", "", task.title),
+      element("span", "task-type", `${task.task_type} · 置信度 ${task.confidence ?? "—"}`),
+    );
+    titleRow.append(selected, title);
+
+    const grid = element("div", "task-grid");
+    grid.append(
+      field("提示词", textArea(task.prompt, (value) => { task.prompt = value; }, 5), true),
+      field(
+        "负面约束",
+        textArea((task.negative_constraints || []).join("\n"), (value) => {
+          task.negative_constraints = value.split("\n").map((item) => item.trim()).filter(Boolean);
+        }),
+        true,
+      ),
+      field("画面比例", textInput(task.aspect_ratio, (value) => { task.aspect_ratio = value; })),
+    );
+    if (task.task_type === "image_to_image") {
+      grid.append(field("图片尺寸", textInput(task.image_size, (value) => { task.image_size = value; })));
+    } else {
+      grid.append(
+        field("视频时长", textInput(task.duration, (value) => { task.duration = Number(value); }, "number")),
+        field("分辨率", textInput(task.resolution, (value) => { task.resolution = value; })),
+      );
+      const audio = document.createElement("select");
+      [["true", "开启"], ["false", "关闭"]].forEach(([value, label]) => {
+        const option = element("option", "", label);
+        option.value = value;
+        option.selected = String(Boolean(task.generate_audio)) === value;
+        audio.append(option);
+      });
+      audio.addEventListener("change", () => { task.generate_audio = audio.value === "true"; });
+      grid.append(field("声音", audio));
+    }
+
+    const notes = element("div", "task-notes");
+    (task.assumptions || []).forEach((text) => notes.append(element("span", "note", `假设：${text}`)));
+    (task.warnings || []).forEach((text) => notes.append(element("span", "note", `警告：${text}`)));
+    (task.blocking_issues || []).forEach((text) => notes.append(element("span", "note blocking", `阻塞：${text}`)));
+    card.append(titleRow, grid, notes, referenceSection(task));
+    return card;
+  }
+
+  function render(view) {
+    state.view = view;
+    byId("status-badge").textContent = view.status;
+    byId("run-status").textContent = view.status;
+    byId("thread-id").textContent = view.thread_id;
+    const latestEvent = (view.events || []).at(-1);
+    byId("current-node").textContent = latestEvent?.node || "—";
+    const durations = (view.events || []).map((item) => item.duration_ms).filter((item) => typeof item === "number");
+    byId("run-duration").textContent = formatDuration(durations.reduce((sum, value) => sum + value, 0));
+    byId("document-title").textContent = view.approval.document_title || "未命名文档";
+    byId("source-link").href = view.source_url;
+    byId("document-revision").textContent = view.approval.revision ?? "—";
+    byId("document-summary").textContent = view.approval.document_summary || "";
+    renderEvents(view.events);
+
+    const issues = view.approval.validation_issues || [];
+    const issueBox = byId("validation-issues");
+    issueBox.textContent = issues.join("；");
+    issueBox.hidden = issues.length === 0;
+    taskList.replaceChildren(...(view.approval.tasks || []).map(renderTask));
+    updateActionAvailability();
+  }
+
+  async function poll(force = false) {
+    if (!state.runId || (state.busy && !force)) return;
+    if (!force && document.activeElement?.closest(".task-card")) return;
+    try {
+      const view = await api(`/api/runs/${state.runId}`);
+      render(view);
+    } catch (error) {
+      showError(error);
+    }
+  }
+
+  async function submitDecision(action) {
+    if (!state.runId || state.busy) return;
+    const body = { action };
+    if (action === "reject") body.feedback = byId("reject-feedback").value;
+    if (action === "approve") {
+      body.selected_task_ids = [...document.querySelectorAll("input[data-task-id]:checked")]
+        .map((input) => input.dataset.taskId);
+      body.tasks = state.view.approval.tasks;
+    }
+    await mutate(`/api/runs/${state.runId}/decision`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  runForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (state.busy) return;
+    setBusy(true);
+    clearError();
+    try {
+      const created = await api("/api/runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source_url: byId("source-url").value }),
+      });
+      state.runId = created.run_id;
+      await poll(true);
+    } catch (error) {
+      showError(error);
+    } finally {
+      setBusy(false);
+    }
+  });
+
+  byId("reject-button").addEventListener("click", () => submitDecision("reject"));
+  byId("cancel-button").addEventListener("click", () => submitDecision("cancel"));
+  byId("approve-button").addEventListener("click", () => submitDecision("approve"));
+  setInterval(() => poll(false), 1000);
+  updateActionAvailability();
+})();
