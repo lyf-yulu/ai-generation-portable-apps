@@ -54,6 +54,12 @@
         <p id="document-summary" class="document-summary"></p>
         <p class="document-meta">可编辑提示词、负面约束、生成参数与参考图片。</p>
         <div id="validation-issues" class="validation-issues" hidden></div>
+        <div id="review-conflict" class="review-conflict" role="alert" hidden>
+          <span id="review-conflict-text"></span>
+          <button id="discard-review-draft" type="button" class="quiet-button">
+            放弃本地修改并刷新
+          </button>
+        </div>
         <div id="task-list" class="task-list"></div>
 
         <div class="feedback-box">
@@ -73,6 +79,7 @@
       </div>
     </footer>
 
+    <script src="/static/review-state.js" defer></script>
     <script src="/static/app.js" defer></script>
   </body>
 </html>

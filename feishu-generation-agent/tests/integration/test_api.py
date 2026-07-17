@@ -2,6 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -925,6 +926,7 @@ async def test_static_review_workspace_is_served_and_uses_safe_dom_updates():
         ) as client:
             page = await client.get("/")
             script = await client.get("/static/app.js")
+            review_state = await client.get("/static/review-state.js")
             styles = await client.get("/static/styles.css")
             options = await client.options(
                 "/api/runs",
@@ -933,6 +935,7 @@ async def test_static_review_workspace_is_served_and_uses_safe_dom_updates():
 
     assert page.status_code == 200
     assert script.status_code == 200
+    assert review_state.status_code == 200
     assert styles.status_code == 200
     for text in (
         "节点轨迹",
@@ -953,10 +956,28 @@ async def test_static_review_workspace_is_served_and_uses_safe_dom_updates():
     assert "response.ok" in script.text
     assert "detail" in script.text
     assert ".disabled" in script.text
-    for unsafe in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"):
-        assert unsafe not in script.text
+    assert "review-state.js" in page.text
+    for source in (script.text, review_state.text):
+        for unsafe in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"):
+            assert unsafe not in source
     assert "grid-template-columns" in styles.text
     assert "access-control-allow-origin" not in options.headers
+
+
+def test_review_draft_state_machine_in_node():
+    project_root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [
+            "node",
+            "--test",
+            str(project_root / "tests" / "frontend" / "review_state.test.cjs"),
+        ],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 async def test_validation_error_does_not_echo_unknown_secret_field(tmp_path: Path):

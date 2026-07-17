@@ -1,16 +1,25 @@
 (() => {
   "use strict";
 
-  const state = { runId: null, view: null, busy: false };
+  const ReviewState = globalThis.ReviewState;
+  if (!ReviewState) throw new Error("审批草稿状态模块加载失败");
+
+  const state = {
+    runId: null,
+    view: null,
+    busy: false,
+    review: ReviewState.createReviewState(),
+  };
   const byId = (id) => document.getElementById(id);
   const runForm = byId("run-form");
   const errorMessage = byId("error-message");
   const taskList = byId("task-list");
-  const actionButtons = [
-    byId("reject-button"),
-    byId("cancel-button"),
-    byId("approve-button"),
-  ];
+  const rejectButton = byId("reject-button");
+  const cancelButton = byId("cancel-button");
+  const approveButton = byId("approve-button");
+  const conflictBox = byId("review-conflict");
+  const conflictText = byId("review-conflict-text");
+  const discardButton = byId("discard-review-draft");
 
   function element(tag, className, text) {
     const node = document.createElement(tag);
@@ -53,17 +62,25 @@
 
   function setBusy(value) {
     state.busy = value;
-    document.querySelectorAll("button").forEach((button) => {
-      button.disabled = value;
+    runForm.querySelectorAll("input, button").forEach((control) => {
+      control.disabled = value;
     });
     updateActionAvailability();
   }
 
   function updateActionAvailability() {
     const canReview = state.view && state.view.status === "waiting_approval";
-    actionButtons.forEach((button) => {
-      button.disabled = state.busy || !canReview;
+    const conflict = ReviewState.conflictMessage(state.review);
+    rejectButton.disabled = state.busy || !canReview;
+    cancelButton.disabled = state.busy || !canReview;
+    approveButton.disabled = state.busy || !ReviewState.canApprove(state.review);
+    byId("reject-feedback").disabled = state.busy || !canReview;
+    taskList.querySelectorAll("input, textarea, select, button").forEach((control) => {
+      control.disabled = state.busy || !canReview || Boolean(conflict);
     });
+    conflictText.textContent = conflict;
+    conflictBox.hidden = !conflict;
+    discardButton.disabled = state.busy || !conflict;
   }
 
   function formatDuration(value) {
@@ -119,46 +136,80 @@
     return control;
   }
 
+  function updateTask(taskId, patch) {
+    try {
+      state.review = ReviewState.patchTask(state.review, taskId, patch);
+      state.view = ReviewState.draftView(state.review);
+      updateActionAvailability();
+    } catch (error) {
+      showError(error);
+    }
+  }
+
+  function currentTask(taskId) {
+    return state.view?.approval?.tasks.find((task) => task.task_id === taskId) || null;
+  }
+
+  function updateReference(taskId, assetId, patch) {
+    const task = currentTask(taskId);
+    if (!task) return;
+    const references = task.reference_images.map((reference) => (
+      reference.asset_id === assetId ? { ...reference, ...patch } : reference
+    ));
+    updateTask(taskId, { reference_images: references });
+  }
+
+  function requireCleanDraftForReferenceMutation() {
+    if (!ReviewState.hasDirty(state.review)) return true;
+    showError(new Error("请先提交或放弃本地任务编辑，再增添、替换或删除参考图片"));
+    return false;
+  }
+
   async function patchReferences(task) {
-    const rows = [...document.querySelectorAll(`[data-reference-task="${CSS.escape(task.task_id)}"]`)];
-    const references = rows.map((row) => ({
-      asset_id: row.dataset.assetId,
-      role: row.querySelector("select").value,
-      order: Number(row.querySelector("input[type=number]").value),
-    }));
+    if (!ReviewState.canSaveReferences(state.review, task.task_id)) {
+      showError(new Error("请先处理其他本地任务编辑，再保存参考图片用途与顺序"));
+      return;
+    }
+    const references = currentTask(task.task_id)?.reference_images || [];
     await mutate(`/api/runs/${state.runId}/tasks/${encodeURIComponent(task.task_id)}/references`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ references }),
-    });
+    }, true);
   }
 
   async function uploadReference(task, fileInput, role, order, replacesAssetId = null) {
+    if (!requireCleanDraftForReferenceMutation()) return;
     const file = fileInput.files[0];
-    if (!file) throw new Error("请选择图片文件");
+    if (!file) {
+      showError(new Error("请选择图片文件"));
+      return;
+    }
     const body = new FormData();
     body.append("file", file);
     body.append("task_id", task.task_id);
     body.append("role", role);
     body.append("order", String(order));
     if (replacesAssetId) body.append("replaces_asset_id", replacesAssetId);
-    await mutate(`/api/runs/${state.runId}/references`, { method: "POST", body });
+    await mutate(`/api/runs/${state.runId}/references`, { method: "POST", body }, true);
   }
 
   async function unlinkReference(task, assetId) {
+    if (!requireCleanDraftForReferenceMutation()) return;
     await mutate(
       `/api/runs/${state.runId}/tasks/${encodeURIComponent(task.task_id)}/references/${encodeURIComponent(assetId)}`,
       { method: "DELETE" },
+      true,
     );
   }
 
-  async function mutate(url, options) {
+  async function mutate(url, options, resetDraft = false) {
     if (state.busy) return;
     setBusy(true);
     clearError();
     try {
       await api(url, options);
-      await poll(true);
+      await poll(true, resetDraft);
     } catch (error) {
       showError(error);
     } finally {
@@ -192,12 +243,18 @@
       role.append(option);
     });
     role.setAttribute("aria-label", "图片用途");
+    role.addEventListener("change", () => {
+      updateReference(task.task_id, reference.asset_id, { role: role.value });
+    });
 
     const order = document.createElement("input");
     order.type = "number";
     order.min = "1";
     order.value = reference.order;
     order.setAttribute("aria-label", "图片顺序");
+    order.addEventListener("input", () => {
+      updateReference(task.task_id, reference.asset_id, { order: Number(order.value) });
+    });
 
     const actions = element("div", "reference-actions");
     const replaceInput = document.createElement("input");
@@ -260,9 +317,18 @@
     const titleRow = element("div", "task-title-row");
     const selected = document.createElement("input");
     selected.type = "checkbox";
-    selected.checked = true;
+    selected.checked = ReviewState.selectedTaskIds(state.review).includes(task.task_id);
     selected.dataset.taskId = task.task_id;
     selected.setAttribute("aria-label", `选择任务 ${task.title}`);
+    selected.addEventListener("change", () => {
+      try {
+        state.review = ReviewState.setTaskSelected(state.review, task.task_id, selected.checked);
+        state.view = ReviewState.draftView(state.review);
+        updateActionAvailability();
+      } catch (error) {
+        showError(error);
+      }
+    });
     const title = element("div", "");
     title.append(
       element("h3", "", task.title),
@@ -272,22 +338,37 @@
 
     const grid = element("div", "task-grid");
     grid.append(
-      field("提示词", textArea(task.prompt, (value) => { task.prompt = value; }, 5), true),
+      field("提示词", textArea(task.prompt, (value) => {
+        updateTask(task.task_id, { prompt: value });
+      }, 5), true),
       field(
         "负面约束",
         textArea((task.negative_constraints || []).join("\n"), (value) => {
-          task.negative_constraints = value.split("\n").map((item) => item.trim()).filter(Boolean);
+          updateTask(task.task_id, {
+            negative_constraints: value.split("\n").map((item) => item.trim()).filter(Boolean),
+          });
         }),
         true,
       ),
-      field("画面比例", textInput(task.aspect_ratio, (value) => { task.aspect_ratio = value; })),
+      field("画面比例", textInput(task.aspect_ratio, (value) => {
+        updateTask(task.task_id, { aspect_ratio: value });
+      })),
+      field("生成数量", textInput(task.output_count, (value) => {
+        updateTask(task.task_id, { output_count: Number(value) });
+      }, "number")),
     );
     if (task.task_type === "image_to_image") {
-      grid.append(field("图片尺寸", textInput(task.image_size, (value) => { task.image_size = value; })));
+      grid.append(field("图片尺寸", textInput(task.image_size, (value) => {
+        updateTask(task.task_id, { image_size: value });
+      })));
     } else {
       grid.append(
-        field("视频时长", textInput(task.duration, (value) => { task.duration = Number(value); }, "number")),
-        field("分辨率", textInput(task.resolution, (value) => { task.resolution = value; })),
+        field("视频时长", textInput(task.duration, (value) => {
+          updateTask(task.task_id, { duration: Number(value) });
+        }, "number")),
+        field("分辨率", textInput(task.resolution, (value) => {
+          updateTask(task.task_id, { resolution: value });
+        })),
       );
       const audio = document.createElement("select");
       [["true", "开启"], ["false", "关闭"]].forEach(([value, label]) => {
@@ -296,7 +377,9 @@
         option.selected = String(Boolean(task.generate_audio)) === value;
         audio.append(option);
       });
-      audio.addEventListener("change", () => { task.generate_audio = audio.value === "true"; });
+      audio.addEventListener("change", () => {
+        updateTask(task.task_id, { generate_audio: audio.value === "true" });
+      });
       grid.append(field("声音", audio));
     }
 
@@ -331,12 +414,15 @@
     updateActionAvailability();
   }
 
-  async function poll(force = false) {
+  async function poll(force = false, resetDraft = false) {
     if (!state.runId || (state.busy && !force)) return;
     if (!force && document.activeElement?.closest(".task-card")) return;
     try {
-      const view = await api(`/api/runs/${state.runId}`);
-      render(view);
+      const serverView = await api(`/api/runs/${state.runId}`);
+      state.review = resetDraft
+        ? ReviewState.mergeServerView(ReviewState.createReviewState(), serverView)
+        : ReviewState.mergeServerView(state.review, serverView);
+      render(ReviewState.draftView(state.review));
     } catch (error) {
       showError(error);
     }
@@ -344,18 +430,36 @@
 
   async function submitDecision(action) {
     if (!state.runId || state.busy) return;
-    const body = { action };
+    let body = { action };
     if (action === "reject") body.feedback = byId("reject-feedback").value;
-    if (action === "approve") {
-      body.selected_task_ids = [...document.querySelectorAll("input[data-task-id]:checked")]
-        .map((input) => input.dataset.taskId);
-      body.tasks = state.view.approval.tasks;
+    try {
+      if (action === "approve") {
+        const submission = ReviewState.beginApprovalSubmit(state.review);
+        state.review = submission.state;
+        body = submission.payload;
+      }
+      setBusy(true);
+      clearError();
+      await api(`/api/runs/${state.runId}/decision`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (action === "approve") {
+        state.review = ReviewState.completeApprovalSubmit(state.review);
+      } else {
+        state.review = ReviewState.createReviewState();
+      }
+      await poll(true);
+    } catch (error) {
+      if (action === "approve" && ReviewState.isSubmitting(state.review)) {
+        state.review = ReviewState.failApprovalSubmit(state.review);
+        state.view = ReviewState.draftView(state.review);
+      }
+      showError(error);
+    } finally {
+      setBusy(false);
     }
-    await mutate(`/api/runs/${state.runId}/decision`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
   }
 
   runForm.addEventListener("submit", async (event) => {
@@ -370,6 +474,7 @@
         body: JSON.stringify({ source_url: byId("source-url").value }),
       });
       state.runId = created.run_id;
+      state.review = ReviewState.createReviewState();
       await poll(true);
     } catch (error) {
       showError(error);
@@ -381,6 +486,11 @@
   byId("reject-button").addEventListener("click", () => submitDecision("reject"));
   byId("cancel-button").addEventListener("click", () => submitDecision("cancel"));
   byId("approve-button").addEventListener("click", () => submitDecision("approve"));
+  discardButton.addEventListener("click", () => {
+    state.review = ReviewState.discardLocalChanges(state.review);
+    clearError();
+    render(ReviewState.draftView(state.review));
+  });
   setInterval(() => poll(false), 1000);
   updateActionAvailability();
 })();
