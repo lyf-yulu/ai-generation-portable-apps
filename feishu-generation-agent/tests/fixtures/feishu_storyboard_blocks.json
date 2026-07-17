@@ -1,0 +1,103 @@
+{
+  "media_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "items": [
+    {
+      "block_id": "story-page",
+      "block_type": 1,
+      "children": ["story-intro", "story-table"],
+      "page": {
+        "elements": [
+          {"text_run": {"content": "虚构纸船分镜"}}
+        ]
+      }
+    },
+    {
+      "block_id": "story-intro",
+      "parent_id": "story-page",
+      "block_type": 2,
+      "text": {
+        "elements": [
+          {"text_run": {"content": "以下内容和素材均为测试虚构。"}}
+        ]
+      }
+    },
+    {
+      "block_id": "story-table",
+      "parent_id": "story-page",
+      "block_type": 31,
+      "children": ["cell-11", "cell-10", "cell-01", "cell-00"],
+      "table": {
+        "cells": ["cell-00", "cell-01", "cell-10", "cell-11"],
+        "property": {"row_size": 2, "column_size": 2}
+      }
+    },
+    {
+      "block_id": "cell-00",
+      "parent_id": "story-table",
+      "block_type": 32,
+      "children": ["shot-1"],
+      "table_cell": {}
+    },
+    {
+      "block_id": "shot-1",
+      "parent_id": "cell-00",
+      "block_type": 2,
+      "text": {
+        "elements": [
+          {"text_run": {"content": "镜头一：蓝色纸船入水。"}}
+        ]
+      }
+    },
+    {
+      "block_id": "cell-01",
+      "parent_id": "story-table",
+      "block_type": 32,
+      "children": ["image-block-1"],
+      "table_cell": {}
+    },
+    {
+      "block_id": "image-block-1",
+      "parent_id": "cell-01",
+      "block_type": 27,
+      "image": {
+        "token": "fiction-shared-image-token",
+        "width": 1,
+        "height": 1
+      }
+    },
+    {
+      "block_id": "cell-10",
+      "parent_id": "story-table",
+      "block_type": 32,
+      "children": ["shot-2"],
+      "table_cell": {}
+    },
+    {
+      "block_id": "shot-2",
+      "parent_id": "cell-10",
+      "block_type": 2,
+      "text": {
+        "elements": [
+          {"text_run": {"content": "镜头二：纸船经过虚构的小桥。"}}
+        ]
+      }
+    },
+    {
+      "block_id": "cell-11",
+      "parent_id": "story-table",
+      "block_type": 32,
+      "children": ["image-block-2"],
+      "table_cell": {}
+    },
+    {
+      "block_id": "image-block-2",
+      "parent_id": "cell-11",
+      "block_type": 27,
+      "image": {
+        "token": "fiction-shared-image-token",
+        "width": 1,
+        "height": 1
+      }
+    }
+  ]
+}

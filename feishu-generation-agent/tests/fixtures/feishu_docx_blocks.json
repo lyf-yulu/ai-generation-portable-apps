@@ -1,0 +1,35 @@
+{
+  "media_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "items": [
+    {
+      "block_id": "fiction-page",
+      "block_type": 1,
+      "children": ["fiction-paragraph", "fiction-image"],
+      "page": {
+        "elements": [
+          {"text_run": {"content": "虚构产品需求"}}
+        ]
+      }
+    },
+    {
+      "block_id": "fiction-paragraph",
+      "parent_id": "fiction-page",
+      "block_type": 2,
+      "text": {
+        "elements": [
+          {"text_run": {"content": "制作一张虚构的蓝色纸船插画。"}}
+        ]
+      }
+    },
+    {
+      "block_id": "fiction-image",
+      "parent_id": "fiction-page",
+      "block_type": 27,
+      "image": {
+        "token": "fiction-file-token",
+        "width": 1,
+        "height": 1
+      }
+    }
+  ]
+}
