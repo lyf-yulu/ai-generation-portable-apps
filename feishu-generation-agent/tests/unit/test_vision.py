@@ -190,6 +190,73 @@ async def test_concurrent_same_key_uses_single_model_call(
     assert results == [results[0]] * 5
 
 
+async def test_concurrent_same_key_rebinds_each_callers_asset_identity(
+    repository: Repository,
+    webp_asset: MediaAsset,
+):
+    first_asset = webp_asset.model_copy(
+        update={"asset_id": "asset-a", "source_block_id": "block-a"}
+    )
+    second_asset = webp_asset.model_copy(
+        update={"asset_id": "asset-b", "source_block_id": "block-b"}
+    )
+    model = FakeVisionModel(description_payload("model-placeholder"))
+    model.release = asyncio.Event()
+    analyzer = ClaudeVisionAnalyzer(model, repository, prompt_version="vision-v1")
+
+    pending = [
+        asyncio.create_task(analyzer.analyze(first_asset)),
+        asyncio.create_task(analyzer.analyze(second_asset)),
+    ]
+    await model.started.wait()
+    await asyncio.sleep(0)
+    model.release.set()
+    results = await asyncio.gather(*pending)
+
+    assert model.calls == 1
+    assert [result.asset_id for result in results] == ["asset-a", "asset-b"]
+    cached = await repository.get_vision_cache(
+        "abc123:claude-fictional-vision:vision-v1"
+    )
+    assert cached is not None
+    assert cached["asset_id"] == ""
+
+
+async def test_concurrent_shared_failure_rebinds_safe_error_to_each_asset(
+    repository: Repository,
+    webp_asset: MediaAsset,
+):
+    first_asset = webp_asset.model_copy(update={"asset_id": "asset-a"})
+    second_asset = webp_asset.model_copy(update={"asset_id": "asset-b"})
+    model = FakeVisionModel(
+        ModelRefusalError("fictional-secret-in-shared-refusal")
+    )
+    model.release = asyncio.Event()
+    analyzer = ClaudeVisionAnalyzer(model, repository, prompt_version="vision-v1")
+
+    pending = [
+        asyncio.create_task(analyzer.analyze(first_asset)),
+        asyncio.create_task(analyzer.analyze(second_asset)),
+    ]
+    await model.started.wait()
+    await asyncio.sleep(0)
+    model.release.set()
+    results = await asyncio.gather(*pending, return_exceptions=True)
+
+    assert model.calls == 1
+    assert results[0] is not results[1]
+    for asset, result in zip((first_asset, second_asset), results, strict=True):
+        assert isinstance(result, AgentError)
+        detail = result.detail
+        serialized = json.dumps(detail.model_dump(mode="json"))
+        assert detail.category == ErrorCategory.PROVIDER_TERMINAL
+        assert detail.retryable is False
+        assert asset.asset_id in f"{detail.message} {detail.technical_detail}"
+        assert "fictional-secret" not in serialized
+        assert result.__cause__ is None
+        assert result.__context__ is None
+
+
 @pytest.mark.parametrize(
     "failure",
     [
@@ -197,6 +264,8 @@ async def test_concurrent_same_key_uses_single_model_call(
             "fictional-secret-in-connection-error",
             request=httpx.Request("POST", "https://claude.invalid"),
         ),
+        ConnectionError("fictional-secret-in-builtin-connection-error"),
+        TimeoutError("fictional-secret-in-builtin-timeout-error"),
         RateLimitFailure("fictional-secret-in-rate-limit-error"),
     ],
 )
@@ -221,6 +290,32 @@ async def test_connection_and_rate_limit_errors_are_retryable_and_safe(
     assert webp_asset.local_path.exists()
 
 
+async def test_cache_connection_error_is_retryable_and_safe(
+    repository: Repository,
+    webp_asset: MediaAsset,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    async def fail_cache_read(cache_key: str) -> dict[str, Any] | None:
+        del cache_key
+        raise ConnectionError("fictional-secret-in-cache-error")
+
+    monkeypatch.setattr(repository, "get_vision_cache", fail_cache_read)
+    model = FakeVisionModel()
+    analyzer = ClaudeVisionAnalyzer(model, repository, prompt_version="vision-v1")
+
+    with pytest.raises(AgentError) as raised:
+        await analyzer.analyze(webp_asset)
+
+    detail = raised.value.detail
+    assert detail.category == ErrorCategory.TRANSIENT
+    assert detail.retryable is True
+    assert webp_asset.asset_id in f"{detail.message} {detail.technical_detail}"
+    assert "fictional-secret" not in json.dumps(detail.model_dump(mode="json"))
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert model.calls == 0
+
+
 async def test_missing_structured_fields_are_non_retryable_validation_errors(
     repository: Repository,
     webp_asset: MediaAsset,
@@ -238,6 +333,27 @@ async def test_missing_structured_fields_are_non_retryable_validation_errors(
     assert detail.retryable is False
     assert webp_asset.asset_id in f"{detail.message} {detail.technical_detail}"
     assert webp_asset.local_path.exists()
+
+
+async def test_none_structured_result_is_non_retryable_provider_refusal(
+    repository: Repository,
+    webp_asset: MediaAsset,
+):
+    model = FakeVisionModel()
+    model.result = None
+    analyzer = ClaudeVisionAnalyzer(model, repository, prompt_version="vision-v1")
+
+    with pytest.raises(AgentError) as raised:
+        await analyzer.analyze(webp_asset)
+
+    detail = raised.value.detail
+    assert detail.category == ErrorCategory.PROVIDER_TERMINAL
+    assert detail.retryable is False
+    assert "拒绝" in detail.message
+    assert webp_asset.asset_id in f"{detail.message} {detail.technical_detail}"
+    assert await repository.get_vision_cache(
+        "abc123:claude-fictional-vision:vision-v1"
+    ) is None
 
 
 async def test_model_refusal_is_non_retryable_and_keeps_original_image(
@@ -261,3 +377,67 @@ async def test_model_refusal_is_non_retryable_and_keeps_original_image(
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
     assert webp_asset.local_path.exists()
+
+
+async def test_download_error_blocks_before_cache_file_and_model(
+    repository: Repository,
+    webp_asset: MediaAsset,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sentinel = tmp_path / "existing-sentinel.webp"
+    sentinel.write_bytes(b"must-not-be-read")
+    failed_asset = webp_asset.model_copy(
+        update={
+            "asset_id": "asset-download-failed",
+            "local_path": sentinel,
+            "download_error": "fictional-secret-upstream-download-error",
+        }
+    )
+    cache_reads = 0
+
+    async def unexpected_cache_read(cache_key: str) -> dict[str, Any] | None:
+        nonlocal cache_reads
+        del cache_key
+        cache_reads += 1
+        return description_payload("cached-asset")
+
+    monkeypatch.setattr(repository, "get_vision_cache", unexpected_cache_read)
+    model = FakeVisionModel()
+    analyzer = ClaudeVisionAnalyzer(model, repository, prompt_version="vision-v1")
+
+    with pytest.raises(AgentError) as raised:
+        await analyzer.analyze(failed_asset)
+
+    detail = raised.value.detail
+    serialized = json.dumps(detail.model_dump(mode="json"))
+    assert detail.category == ErrorCategory.DOCUMENT
+    assert detail.retryable is False
+    assert failed_asset.asset_id in f"{detail.message} {detail.technical_detail}"
+    assert "fictional-secret" not in serialized
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert cache_reads == 0
+    assert model.calls == 0
+    assert sentinel.exists()
+
+
+async def test_missing_local_file_is_non_retryable_document_error(
+    repository: Repository,
+    webp_asset: MediaAsset,
+    tmp_path: Path,
+):
+    missing_asset = webp_asset.model_copy(
+        update={"local_path": tmp_path / "does-not-exist.webp"}
+    )
+    model = FakeVisionModel()
+    analyzer = ClaudeVisionAnalyzer(model, repository, prompt_version="vision-v1")
+
+    with pytest.raises(AgentError) as raised:
+        await analyzer.analyze(missing_asset)
+
+    detail = raised.value.detail
+    assert detail.category == ErrorCategory.DOCUMENT
+    assert detail.retryable is False
+    assert missing_asset.asset_id in f"{detail.message} {detail.technical_detail}"
+    assert model.calls == 0

@@ -30,6 +30,12 @@ class _ModelRefusal(RuntimeError):
     pass
 
 
+class _AssetReadFailure(RuntimeError):
+    def __init__(self, cause_name: str) -> None:
+        super().__init__()
+        self.cause_name = cause_name
+
+
 class ClaudeVisionAnalyzer:
     def __init__(
         self,
@@ -47,6 +53,9 @@ class ClaudeVisionAnalyzer:
         self._inflight_lock = asyncio.Lock()
 
     async def analyze(self, asset: MediaAsset) -> VisionDescription:
+        if asset.download_error is not None:
+            raise self._download_error(asset)
+
         cache_key = (
             f"{asset.sha256}:{self.model_name}:{self.prompt_version}"
         )
@@ -60,7 +69,7 @@ class ClaudeVisionAnalyzer:
                         update={"asset_id": asset.asset_id}
                     )
                 return description
-        except (ValidationError, ValueError) as exc:
+        except Exception as exc:
             cache_error = self._error_for(asset, exc)
         if cache_error is not None:
             raise cache_error
@@ -73,65 +82,71 @@ class ClaudeVisionAnalyzer:
                 )
                 self._inflight[cache_key] = pending
 
+        shared_description: VisionDescription | None = None
+        shared_error: AgentError | None = None
         try:
-            return await asyncio.shield(pending)
+            shared_description = await asyncio.shield(pending)
+        except Exception as exc:
+            shared_error = self._error_for(asset, exc)
         finally:
             if pending.done():
                 async with self._inflight_lock:
                     if self._inflight.get(cache_key) is pending:
                         self._inflight.pop(cache_key, None)
+        if shared_error is not None:
+            raise shared_error
+        if shared_description is None:
+            raise self._error_for(asset, _ModelRefusal())
+        return shared_description.model_copy(update={"asset_id": asset.asset_id})
 
     async def _analyze_and_cache(
         self,
         asset: MediaAsset,
         cache_key: str,
     ) -> VisionDescription:
-        safe_error: AgentError | None = None
+        read_error: _AssetReadFailure | None = None
         try:
-            image_data = base64.b64encode(
-                asset.local_path.read_bytes()
-            ).decode("ascii")
-            messages = [
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": asset.mime_type,
-                                "data": image_data,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                "请分析这张参考图，并将 asset_id 精确设为 "
-                                f"{asset.asset_id}。"
-                            ),
-                        },
-                    ],
-                },
-            ]
-            structured_model = self._model.with_structured_output(
-                VisionDescription
-            )
-            result = await structured_model.ainvoke(messages)
-            if isinstance(result, dict) and result.get("refusal"):
-                raise _ModelRefusal
-            description = VisionDescription.model_validate(result)
-            if description.asset_id != asset.asset_id:
-                description = description.model_copy(
-                    update={"asset_id": asset.asset_id}
-                )
-            await self._repository.save_vision_cache(cache_key, description)
-            return description
+            image_bytes = asset.local_path.read_bytes()
         except OSError as exc:
-            safe_error = self._asset_read_error(asset, exc)
-        except Exception as exc:
-            safe_error = self._error_for(asset, exc)
-        raise safe_error
+            read_error = _AssetReadFailure(type(exc).__name__)
+        if read_error is not None:
+            raise read_error
+
+        image_data = base64.b64encode(image_bytes).decode("ascii")
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": asset.mime_type,
+                            "data": image_data,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "请分析这张参考图；asset_id 仅为结构占位字段，"
+                            "请设为空字符串。"
+                        ),
+                    },
+                ],
+            },
+        ]
+        structured_model = self._model.with_structured_output(
+            VisionDescription
+        )
+        result = await structured_model.ainvoke(messages)
+        if result is None or (isinstance(result, dict) and result.get("refusal")):
+            raise _ModelRefusal
+        description = VisionDescription.model_validate(result).model_copy(
+            update={"asset_id": ""}
+        )
+        await self._repository.save_vision_cache(cache_key, description)
+        return description
 
     @staticmethod
     def _resolve_model_name(model: Any) -> str:
@@ -143,6 +158,9 @@ class ClaudeVisionAnalyzer:
 
     @classmethod
     def _error_for(cls, asset: MediaAsset, exc: Exception) -> AgentError:
+        if isinstance(exc, _AssetReadFailure):
+            return cls._asset_read_error(asset, exc.cause_name)
+
         status_code = cls._status_code(exc)
         exception_name = type(exc).__name__
         lowered_name = exception_name.lower()
@@ -210,13 +228,26 @@ class ClaudeVisionAnalyzer:
         )
 
     @staticmethod
-    def _asset_read_error(asset: MediaAsset, exc: OSError) -> AgentError:
+    def _asset_read_error(asset: MediaAsset, cause_name: str) -> AgentError:
         return AgentError(
             ErrorDetail(
                 category=ErrorCategory.DOCUMENT,
                 message=f"无法读取图片素材（asset_id={asset.asset_id}）",
                 technical_detail=(
-                    f"asset_id={asset.asset_id}; cause={type(exc).__name__}"
+                    f"asset_id={asset.asset_id}; cause={cause_name}"
+                ),
+                retryable=False,
+            )
+        )
+
+    @staticmethod
+    def _download_error(asset: MediaAsset) -> AgentError:
+        return AgentError(
+            ErrorDetail(
+                category=ErrorCategory.DOCUMENT,
+                message=f"图片素材下载失败（asset_id={asset.asset_id}）",
+                technical_detail=(
+                    f"asset_id={asset.asset_id}; cause=download_error"
                 ),
                 retryable=False,
             )
