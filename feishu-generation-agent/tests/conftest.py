@@ -1,10 +1,15 @@
+import base64
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from feishu_generation_agent.config import Settings
-from feishu_generation_agent.domain.artifact import DeliveryRecord, ProviderSubmission
+from feishu_generation_agent.domain.artifact import (
+    DeliveryRecord,
+    ProviderResult,
+    ProviderSubmission,
+)
 from feishu_generation_agent.domain.document import (
     DocumentBlock,
     MediaAsset,
@@ -111,12 +116,28 @@ class FakePaidGenerator:
         *,
         submission_id: str | None = None,
     ) -> ProviderSubmission:
-        del submission_id
         self.submit_calls += 1
+        assert isinstance(submission_id, str) and len(submission_id) == 32
+        is_image = self.provider == "chiyun"
+        content = (
+            base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            )
+            if is_image
+            else b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2"
+        )
         return ProviderSubmission(
             provider=self.provider,
-            provider_task_id="must-not-run-in-task-7",
-            status="submitted",
+            provider_task_id=(
+                submission_id if is_image else "fictional-seedance-official"
+            ),
+            status="succeeded",
+            result_items=[
+                ProviderResult(
+                    base64_data=base64.b64encode(content).decode("ascii"),
+                    mime_type="image/png" if is_image else "video/mp4",
+                )
+            ],
         )
 
     async def poll(self, submission: ProviderSubmission) -> ProviderSubmission:
@@ -226,14 +247,16 @@ async def fake_services(tmp_path: Path):
         chiyun_api_key="fictional-chiyun-key-must-not-persist",
         ark_api_key="fictional-ark-key-must-not-persist",
         max_output_count=4,
+        provider_poll_interval_seconds=0,
+        provider_poll_max_attempts=4,
     )
     repository = await Repository.open(settings.business_db_path)
     services = GraphServices(
         document_source=FakeGraphDocumentSource(document),
         vision_analyzer=FakeGraphVisionAnalyzer(),
         planner=FakeGraphPlanner(task),
-        image_generator=FakePaidGenerator("fake-image"),
-        video_generator=FakePaidGenerator("fake-video"),
+        image_generator=FakePaidGenerator("chiyun"),
+        video_generator=FakePaidGenerator("seedance"),
         delivery_writer=FakeGraphDeliveryWriter(),
         repository=repository,
         file_store=FileStore(

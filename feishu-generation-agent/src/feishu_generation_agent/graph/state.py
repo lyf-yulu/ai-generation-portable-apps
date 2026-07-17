@@ -28,7 +28,7 @@ class AgentState(TypedDict, total=False):
     validation_issues: list[str]
     planner_feedback: str | None
     approval_decision: dict[str, Any] | None
-    approval_revision: int
+    approval_revision: int | None
     approved_tasks: list[dict[str, Any]]
     execution_records: list[dict[str, Any]]
     artifacts: list[dict[str, Any]]

@@ -200,6 +200,66 @@ class ProviderResultStore:
         finally:
             os.close(root_descriptor)
 
+    def read_verified(
+        self,
+        provider_task_id: str,
+        *,
+        local_path: Path,
+        mime_type: str,
+        size: int,
+        digest: str,
+    ) -> bytes:
+        matches = [
+            item
+            for item in self.load(provider_task_id)
+            if item.local_path == local_path
+            and item.mime_type == mime_type
+            and item.size == size
+            and item.sha256 == digest
+        ]
+        if len(matches) != 1:
+            raise ProviderResultStagingError(
+                "staged result does not match provider result"
+            )
+        filename = matches[0].local_path.name
+        root_descriptor = self._open_root()
+        try:
+            root_identity = self._directory_identity(os.fstat(root_descriptor))
+            try:
+                result_descriptor = os.open(
+                    provider_task_id,
+                    self._directory_flags(),
+                    dir_fd=root_descriptor,
+                )
+            except OSError as exc:
+                raise ProviderResultStagingError(
+                    "missing result directory"
+                ) from exc
+            try:
+                result_identity = self._directory_identity(
+                    os.fstat(result_descriptor)
+                )
+                content = self._read_regular_file(
+                    filename,
+                    dir_fd=result_descriptor,
+                    max_bytes=size,
+                )
+                if len(content) != size or sha256(content).hexdigest() != digest:
+                    raise ProviderResultStagingError(
+                        "result integrity mismatch"
+                    )
+                self._assert_directory_entry(
+                    root_descriptor,
+                    provider_task_id,
+                    result_identity,
+                )
+                self._assert_root_current(root_identity)
+                return content
+            finally:
+                os.close(result_descriptor)
+        finally:
+            os.close(root_descriptor)
+
     def _load_from_directory(
         self,
         result_descriptor: int,

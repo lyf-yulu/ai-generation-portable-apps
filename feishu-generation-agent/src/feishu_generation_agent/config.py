@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     langsmith_project: str = "feishu-generation-agent-local"
     max_output_count: int = 4
     max_download_bytes: int = 500 * 1024 * 1024
+    provider_poll_interval_seconds: float = Field(default=1.0, ge=0.0)
+    provider_poll_max_attempts: int = Field(default=120, ge=1, le=10_000)
 
     def ensure_paths(self) -> None:
         for path in (

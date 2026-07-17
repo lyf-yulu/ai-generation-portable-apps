@@ -271,7 +271,7 @@ async def test_cancel_ends_without_generation(fake_services: GraphServices):
     assert await fake_services.repository.count_operations() == 0
 
 
-async def test_approve_revalidates_but_does_not_generate(
+async def test_approve_revalidates_then_executes_generation(
     fake_services: GraphServices,
 ):
     graph = build_graph(fake_services, InMemorySaver())
@@ -293,15 +293,18 @@ async def test_approve_revalidates_but_does_not_generate(
         config=config,
     )
 
-    assert result["status"] == "approved"
+    assert result["status"] == "succeeded"
     assert result["approval_decision"]["action"] == "approve"
     assert result["approval_revision"] == 7
     assert [task["task_id"] for task in result["approved_tasks"]] == [
         "task-video"
     ]
     json.dumps(result, ensure_ascii=False)
-    _assert_no_paid_side_effects(fake_services)
-    assert await fake_services.repository.count_operations() == 0
+    assert fake_services.image_generator.submit_calls == 0
+    assert fake_services.video_generator.submit_calls == 1
+    assert fake_services.video_generator.poll_calls == 0
+    assert fake_services.delivery_writer.deliver_calls == 0
+    assert await fake_services.repository.count_operations() == 1
     events = await fake_services.repository.list_events("run-approve")
     assert ("human_approval", "started") in [
         (event["node"], event["status"]) for event in events
@@ -311,7 +314,7 @@ async def test_approve_revalidates_but_does_not_generate(
     ]
 
 
-async def test_approve_fails_safely_if_source_revision_changed(
+async def test_approve_replans_if_source_revision_changed(
     fake_services: GraphServices,
 ):
     graph = build_graph(fake_services, InMemorySaver())
@@ -325,28 +328,26 @@ async def test_approve_fails_safely_if_source_revision_changed(
         fake_services.document_source.document.model_copy(update={"revision": 8})
     )
 
-    with pytest.raises(AgentError) as raised:
-        await graph.ainvoke(
-            Command(
-                resume={
-                    "action": "approve",
-                    "selected_task_ids": ["task-video"],
-                    "tasks": plan["tasks"],
-                }
-            ),
-            config=config,
-        )
+    result = await graph.ainvoke(
+        Command(
+            resume={
+                "action": "approve",
+                "selected_task_ids": ["task-video"],
+                "tasks": plan["tasks"],
+            }
+        ),
+        config=config,
+    )
 
-    assert raised.value.detail.category == ErrorCategory.VALIDATION
-    assert raised.value.__cause__ is None
-    assert raised.value.__context__ is None
+    assert _interrupt_payload(result)["document_revision"] == 8
+    assert result["approval_decision"] is None
+    assert result["approved_tasks"] == []
     _assert_no_paid_side_effects(fake_services)
     assert await fake_services.repository.count_operations() == 0
     events = await fake_services.repository.list_events("run-stale")
-    assert (events[-1]["node"], events[-1]["status"]) == (
-        "revalidate_approval",
-        "failed",
-    )
+    assert ("check_source_revision", "source_changed") in [
+        (event["node"], event["status"]) for event in events
+    ]
 
 
 @pytest.mark.parametrize(
@@ -529,7 +530,7 @@ async def test_sqlite_checkpoint_resumes_after_saver_lifecycle(
             config=config,
         )
 
-    assert result["status"] == "approved"
+    assert result["status"] == "succeeded"
     assert result["approval_decision"]["action"] == "approve"
     assert resume_source.ingest_calls == 0
     assert resume_source.revision_calls == 1
@@ -549,5 +550,8 @@ async def test_sqlite_checkpoint_resumes_after_saver_lifecycle(
             "started",
             "completed",
         ]
-    _assert_no_paid_side_effects(resume_services)
-    assert await resume_services.repository.count_operations() == 0
+    assert resume_services.image_generator.submit_calls == 0
+    assert resume_services.video_generator.submit_calls == 1
+    assert resume_services.video_generator.poll_calls == 0
+    assert resume_services.delivery_writer.deliver_calls == 0
+    assert await resume_services.repository.count_operations() == 1

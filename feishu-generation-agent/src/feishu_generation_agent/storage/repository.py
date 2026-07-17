@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,9 @@ CREATE TABLE IF NOT EXISTS operations (
   operation TEXT NOT NULL,
   provider_id TEXT,
   status TEXT NOT NULL,
+  phase TEXT NOT NULL DEFAULT 'failed',
+  client_submission_id TEXT,
+  official_id TEXT,
   payload_json TEXT NOT NULL DEFAULT '{}',
   updated_at TEXT NOT NULL,
   PRIMARY KEY (run_id, task_id, operation)
@@ -54,6 +58,20 @@ CREATE TABLE IF NOT EXISTS vision_cache (
 
 _BEARER_TOKEN = re.compile(r"(?i)(\bBearer\s+)[^\s,;]+")
 _QUERY_TOKEN = re.compile(r"(?i)([?&]token=)[^&#\s]*")
+_CLIENT_SUBMISSION_ID = re.compile(r"[0-9a-f]{32}\Z")
+_SAFE_PROVIDER = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
+_OPERATION_PHASES = frozenset(
+    {
+        "intent_created",
+        "submitted",
+        "submission_uncertain",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "expired",
+        "timed_out",
+    }
+)
 
 
 def _now() -> str:
@@ -78,6 +96,7 @@ class Repository:
         connection.row_factory = aiosqlite.Row
         try:
             await connection.executescript(_SCHEMA)
+            await cls._migrate_operations(connection)
             await connection.commit()
         except BaseException:
             await connection.close()
@@ -182,15 +201,19 @@ class Repository:
         payload_json = json.dumps(
             payload or {}, ensure_ascii=False, separators=(",", ":")
         )
+        phase = self._legacy_phase(status)
         await self._write(
             """
             INSERT INTO operations (
               run_id, task_id, operation, provider_id, status,
+              phase, client_submission_id, official_id,
               payload_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
             ON CONFLICT(run_id, task_id, operation) DO UPDATE SET
               provider_id = excluded.provider_id,
               status = excluded.status,
+              phase = excluded.phase,
+              official_id = excluded.official_id,
               payload_json = excluded.payload_json,
               updated_at = excluded.updated_at
             """,
@@ -200,10 +223,130 @@ class Repository:
                 operation,
                 provider_id,
                 status,
+                phase,
+                provider_id,
                 payload_json,
                 _now(),
             ),
         )
+
+    async def create_submission_intent_if_absent(
+        self,
+        run_id: str,
+        task_id: str,
+        provider: str,
+        client_submission_id: str,
+    ) -> tuple[bool, dict[str, Any]]:
+        self._validate_identity_segment(run_id, "run_id")
+        self._validate_identity_segment(task_id, "task_id")
+        if not isinstance(provider, str) or _SAFE_PROVIDER.fullmatch(provider) is None:
+            raise ValueError("invalid provider")
+        self._validate_client_submission_id(client_submission_id)
+        payload_json = json.dumps(
+            {"provider": provider},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        timestamp = _now()
+        async with self._write_lock:
+            try:
+                await self._connection.execute("BEGIN IMMEDIATE")
+                cursor = await self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO operations (
+                      run_id, task_id, operation, provider_id, status,
+                      phase, client_submission_id, official_id,
+                      payload_json, updated_at
+                    ) VALUES (?, ?, 'submit', NULL, 'intent_created',
+                              'intent_created', ?, NULL, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        task_id,
+                        client_submission_id,
+                        payload_json,
+                        timestamp,
+                    ),
+                )
+                created = cursor.rowcount == 1
+                await cursor.close()
+                select_cursor = await self._connection.execute(
+                    """
+                    SELECT run_id, task_id, operation, provider_id, status,
+                           phase, client_submission_id, official_id,
+                           payload_json, updated_at
+                    FROM operations
+                    WHERE run_id = ? AND task_id = ? AND operation = 'submit'
+                    """,
+                    (run_id, task_id),
+                )
+                row = await select_cursor.fetchone()
+                await select_cursor.close()
+                if row is None:
+                    raise RuntimeError("submission intent was not persisted")
+                await self._connection.commit()
+            except BaseException:
+                await self._connection.rollback()
+                raise
+        return created, self._operation_from_row(row)
+
+    async def compare_and_set_operation(
+        self,
+        run_id: str,
+        task_id: str,
+        operation: str,
+        *,
+        expected_phase: str,
+        expected_client_submission_id: str,
+        expected_official_id: str | None,
+        phase: str,
+        official_id: str | None,
+    ) -> bool:
+        self._validate_identity_segment(run_id, "run_id")
+        self._validate_identity_segment(task_id, "task_id")
+        self._validate_identity_segment(operation, "operation")
+        self._validate_phase(expected_phase)
+        self._validate_phase(phase)
+        self._validate_client_submission_id(expected_client_submission_id)
+        if expected_official_id is not None:
+            self._validate_official_id(expected_official_id)
+        if phase == "submitted" and official_id is None:
+            raise ValueError("submitted operation requires official_id")
+        if official_id is not None:
+            self._validate_official_id(official_id)
+        async with self._write_lock:
+            try:
+                cursor = await self._connection.execute(
+                    """
+                    UPDATE operations
+                    SET provider_id = ?, status = ?, phase = ?,
+                        official_id = ?, updated_at = ?
+                    WHERE run_id = ? AND task_id = ? AND operation = ?
+                      AND phase = ?
+                      AND client_submission_id = ?
+                      AND official_id IS ?
+                    """,
+                    (
+                        official_id,
+                        phase,
+                        phase,
+                        official_id,
+                        _now(),
+                        run_id,
+                        task_id,
+                        operation,
+                        expected_phase,
+                        expected_client_submission_id,
+                        expected_official_id,
+                    ),
+                )
+                changed = cursor.rowcount == 1
+                await self._connection.commit()
+            except BaseException:
+                await self._connection.rollback()
+                raise
+        await cursor.close()
+        return changed
 
     async def get_operation(
         self,
@@ -214,6 +357,7 @@ class Repository:
         cursor = await self._connection.execute(
             """
             SELECT run_id, task_id, operation, provider_id, status,
+                   phase, client_submission_id, official_id,
                    payload_json, updated_at
             FROM operations
             WHERE run_id = ? AND task_id = ? AND operation = ?
@@ -224,9 +368,38 @@ class Repository:
         await cursor.close()
         if row is None:
             return None
-        result = dict(row)
-        result["payload"] = json.loads(result.pop("payload_json"))
-        return result
+        return self._operation_from_row(row)
+
+    async def list_operations(
+        self,
+        run_id: str,
+        *,
+        task_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if task_id is None:
+            sql = """
+                SELECT run_id, task_id, operation, provider_id, status,
+                       phase, client_submission_id, official_id,
+                       payload_json, updated_at
+                FROM operations
+                WHERE run_id = ?
+                ORDER BY task_id, operation
+            """
+            parameters = (run_id,)
+        else:
+            sql = """
+                SELECT run_id, task_id, operation, provider_id, status,
+                       phase, client_submission_id, official_id,
+                       payload_json, updated_at
+                FROM operations
+                WHERE run_id = ? AND task_id = ?
+                ORDER BY operation
+            """
+            parameters = (run_id, task_id)
+        cursor = await self._connection.execute(sql, parameters)
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [self._operation_from_row(row) for row in rows]
 
     async def count_operations(self) -> int:
         cursor = await self._connection.execute(
@@ -263,6 +436,46 @@ class Repository:
                 _now(),
             ),
         )
+
+    async def get_artifact(self, artifact_id: str) -> Artifact | None:
+        cursor = await self._connection.execute(
+            """
+            SELECT artifact_json
+            FROM artifacts
+            WHERE artifact_id = ?
+            """,
+            (artifact_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return Artifact.model_validate_json(row[0]) if row is not None else None
+
+    async def list_artifacts(
+        self,
+        run_id: str,
+        *,
+        task_id: str | None = None,
+    ) -> list[Artifact]:
+        if task_id is None:
+            sql = """
+                SELECT artifact_json
+                FROM artifacts
+                WHERE run_id = ?
+                ORDER BY artifact_id
+            """
+            parameters = (run_id,)
+        else:
+            sql = """
+                SELECT artifact_json
+                FROM artifacts
+                WHERE run_id = ? AND task_id = ?
+                ORDER BY artifact_id
+            """
+            parameters = (run_id, task_id)
+        cursor = await self._connection.execute(sql, parameters)
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [Artifact.model_validate_json(row[0]) for row in rows]
 
     async def get_vision_cache(
         self,
@@ -314,3 +527,115 @@ class Repository:
             except BaseException:
                 await self._connection.rollback()
                 raise
+
+    @staticmethod
+    async def _migrate_operations(connection: aiosqlite.Connection) -> None:
+        cursor = await connection.execute("PRAGMA table_info(operations)")
+        rows = await cursor.fetchall()
+        await cursor.close()
+        columns = {str(row[1]) for row in rows}
+        additions = {
+            "phase": "TEXT",
+            "client_submission_id": "TEXT",
+            "official_id": "TEXT",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                await connection.execute(
+                    f"ALTER TABLE operations ADD COLUMN {name} {declaration}"
+                )
+        await connection.execute(
+            """
+            UPDATE operations
+            SET phase = CASE status
+              WHEN 'intent_created' THEN 'intent_created'
+              WHEN 'submitted' THEN 'submitted'
+              WHEN 'submission_uncertain' THEN 'submission_uncertain'
+              WHEN 'succeeded' THEN 'succeeded'
+              WHEN 'completed' THEN 'succeeded'
+              WHEN 'cancelled' THEN 'cancelled'
+              WHEN 'expired' THEN 'expired'
+              WHEN 'timed_out' THEN 'timed_out'
+              ELSE 'failed'
+            END
+            WHERE phase IS NULL OR phase = ''
+            """
+        )
+        cursor = await connection.execute(
+            """
+            SELECT rowid, run_id, task_id, operation
+            FROM operations
+            WHERE phase = 'submitted'
+              AND (client_submission_id IS NULL OR client_submission_id = '')
+            """
+        )
+        legacy_submitted = await cursor.fetchall()
+        await cursor.close()
+        for row in legacy_submitted:
+            client_submission_id = sha256(
+                (
+                    f"legacy\0{row[1]}\0{row[2]}\0{row[3]}"
+                ).encode("utf-8")
+            ).hexdigest()[:32]
+            await connection.execute(
+                """
+                UPDATE operations
+                SET client_submission_id = ?
+                WHERE rowid = ? AND phase = 'submitted'
+                  AND (client_submission_id IS NULL OR client_submission_id = '')
+                """,
+                (client_submission_id, row[0]),
+            )
+        await connection.execute(
+            """
+            UPDATE operations
+            SET official_id = provider_id
+            WHERE official_id IS NULL AND provider_id IS NOT NULL
+            """
+        )
+
+    @staticmethod
+    def _operation_from_row(row: aiosqlite.Row) -> dict[str, Any]:
+        result = dict(row)
+        payload = json.loads(result.pop("payload_json"))
+        if not isinstance(payload, dict):
+            raise ValueError("operation payload must be a JSON object")
+        result["payload"] = payload
+        return result
+
+    @staticmethod
+    def _legacy_phase(status: str) -> str:
+        return {
+            "completed": "succeeded",
+        }.get(status, status if status in _OPERATION_PHASES else "failed")
+
+    @staticmethod
+    def _validate_identity_segment(value: str, field_name: str) -> None:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 255
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
+            raise ValueError(f"invalid {field_name}")
+
+    @staticmethod
+    def _validate_client_submission_id(value: str) -> None:
+        if not isinstance(value, str) or _CLIENT_SUBMISSION_ID.fullmatch(value) is None:
+            raise ValueError("invalid client_submission_id")
+
+    @staticmethod
+    def _validate_official_id(value: str) -> None:
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or len(value) > 512
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
+            raise ValueError("invalid official_id")
+
+    @staticmethod
+    def _validate_phase(value: str) -> None:
+        if value not in _OPERATION_PHASES:
+            raise ValueError("invalid operation phase")
