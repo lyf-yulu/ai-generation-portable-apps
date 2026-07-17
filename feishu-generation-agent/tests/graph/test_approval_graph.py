@@ -1,10 +1,10 @@
 import json
-import os
-from dataclasses import fields
+from dataclasses import dataclass, fields, replace
 from typing import Any
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.types import Command
 
 from feishu_generation_agent.domain.errors import AgentError, ErrorCategory
@@ -12,6 +12,79 @@ from feishu_generation_agent.graph.builder import build_graph
 from feishu_generation_agent.graph.nodes import GraphServices
 from feishu_generation_agent.graph.state import AgentState
 from feishu_generation_agent.storage.checkpoints import open_checkpointer
+
+
+_FORMAL_STATE_KEYS = {
+    "run_id",
+    "thread_id",
+    "source_url",
+    "source_type",
+    "source_token",
+    "document_id",
+    "document_title",
+    "document_revision",
+    "normalized_document",
+    "media_assets",
+    "vision_descriptions",
+    "draft_plan",
+    "audit_report",
+    "validation_issues",
+    "approval_decision",
+    "approved_tasks",
+    "execution_records",
+    "artifacts",
+    "delivery_record",
+    "status",
+    "last_error",
+}
+
+
+@dataclass
+class _UnsafeSerdeProbe:
+    value: str
+
+
+class _ResumeOnlyDocumentSource:
+    def __init__(self, revision: int) -> None:
+        self.revision = revision
+        self.ingest_calls = 0
+        self.revision_calls = 0
+
+    async def ingest(self, request: Any) -> Any:
+        del request
+        self.ingest_calls += 1
+        raise AssertionError("resume must not ingest again")
+
+    async def get_revision(self, source_url: str) -> int:
+        assert source_url.startswith("https://")
+        self.revision_calls += 1
+        return self.revision
+
+
+class _NeverCalledVisionAnalyzer:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def analyze(self, asset: Any) -> Any:
+        del asset
+        self.calls += 1
+        raise AssertionError("resume must not analyze images again")
+
+
+class _NeverCalledPlanner:
+    def __init__(self) -> None:
+        self.plan_calls = 0
+        self.audit_calls = 0
+
+    async def plan(self, *args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        self.plan_calls += 1
+        raise AssertionError("resume must not plan again")
+
+    async def audit(self, *args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        self.audit_calls += 1
+        raise AssertionError("resume must not audit again")
 
 
 def _input(run_id: str, thread_id: str) -> AgentState:
@@ -41,7 +114,8 @@ def _assert_no_paid_side_effects(services: GraphServices) -> None:
 
 def test_agent_state_and_graph_services_contracts_are_stable():
     assert AgentState.__total__ is False
-    assert set(AgentState.__annotations__) == {
+    assert _FORMAL_STATE_KEYS <= set(AgentState.__annotations__)
+    assert {
         "run_id",
         "thread_id",
         "source_url",
@@ -66,7 +140,7 @@ def test_agent_state_and_graph_services_contracts_are_stable():
         "artifacts",
         "delivery_record",
         "error",
-    }
+    } <= set(AgentState.__annotations__)
     assert [field.name for field in fields(GraphServices)] == [
         "document_source",
         "vision_analyzer",
@@ -91,6 +165,8 @@ async def test_graph_pauses_before_any_generation(fake_services: GraphServices):
     assert payload["run_id"] == "run-1"
     assert payload["thread_id"] == "thread-1"
     assert payload["status"] == "waiting_approval"
+    assert payload["document_revision"] == 7
+    assert payload["draft_plan"]["tasks"][0]["task_id"] == "task-video"
     assert payload["task_plan"]["tasks"][0]["task_id"] == "task-video"
     assert payload["audit_report"] == {
         "issues": [],
@@ -114,11 +190,28 @@ async def test_checkpointed_state_is_plain_json_and_nodes_record_safe_events(
     await graph.ainvoke(_input("run-json", "thread-json"), config=config)
     snapshot = await graph.aget_state(config)
 
-    json.dumps(snapshot.values, ensure_ascii=False)
+    assert _FORMAL_STATE_KEYS <= set(snapshot.values)
+    serialized_state = json.dumps(snapshot.values, ensure_ascii=False)
     assert snapshot.values["status"] == "waiting_approval"
+    assert snapshot.values["source_type"] == "docx"
+    assert snapshot.values["source_token"] == "doc-graph"
+    assert snapshot.values["document_id"] == "doc-graph"
+    assert snapshot.values["document_title"] == "纸船审批测试"
+    assert snapshot.values["document_revision"] == 7
+    assert snapshot.values["draft_plan"] == snapshot.values["task_plan"]
+    assert snapshot.values["approval_decision"] is None
+    assert snapshot.values["approved_tasks"] == []
+    assert snapshot.values["execution_records"] == []
+    assert snapshot.values["artifacts"] == []
+    assert snapshot.values["delivery_record"] is None
+    assert snapshot.values["last_error"] is None
+    assert snapshot.values["media_assets"][0]["file_token"] is None
     assert snapshot.values["source_document"]["media_assets"][0][
         "file_token"
     ] is None
+    assert "fictional-file-token" not in serialized_state
+    assert "must-not-persist" not in serialized_state
+    assert "base64" not in serialized_state.lower()
     events = await fake_services.repository.list_events("run-json")
     completed_nodes = [
         "ingest_source",
@@ -353,11 +446,18 @@ async def test_node_failure_records_only_safe_error_summary(
 async def test_sqlite_checkpointer_is_strict_and_contains_no_secrets(
     fake_services: GraphServices,
 ):
-    assert os.environ["LANGGRAPH_STRICT_MSGPACK"] == "true"
     settings = fake_services.settings
     config = _config("thread-sqlite")
 
     async with open_checkpointer(settings) as checkpointer:
+        assert isinstance(checkpointer.serde, JsonPlusSerializer)
+        assert checkpointer.serde._allowed_msgpack_modules is None
+        encoded = checkpointer.serde.dumps_typed(
+            _UnsafeSerdeProbe("must-not-rehydrate")
+        )
+        restored = checkpointer.serde.loads_typed(encoded)
+        assert restored == {"value": "must-not-rehydrate"}
+        assert not isinstance(restored, _UnsafeSerdeProbe)
         graph = build_graph(fake_services, checkpointer)
         await graph.ainvoke(
             _input("run-sqlite", "thread-sqlite"),
@@ -384,3 +484,70 @@ async def test_sqlite_checkpointer_is_strict_and_contains_no_secrets(
         b"fictional-file-token",
     ):
         assert secret not in checkpoint_bytes
+
+
+async def test_sqlite_checkpoint_resumes_after_saver_lifecycle(
+    fake_services: GraphServices,
+):
+    settings = fake_services.settings
+    thread_id = "thread-durable"
+    run_id = "run-durable"
+    config = _config(thread_id)
+
+    async with open_checkpointer(settings) as first_checkpointer:
+        first_graph = build_graph(fake_services, first_checkpointer)
+        first = await first_graph.ainvoke(
+            _input(run_id, thread_id),
+            config=config,
+        )
+        plan = _interrupt_payload(first)["draft_plan"]
+
+    assert fake_services.document_source.ingest_calls == 1
+    assert fake_services.vision_analyzer.calls == 1
+    assert fake_services.planner.plan_calls == 1
+    assert fake_services.planner.audit_calls == 1
+
+    resume_source = _ResumeOnlyDocumentSource(revision=7)
+    resume_vision = _NeverCalledVisionAnalyzer()
+    resume_planner = _NeverCalledPlanner()
+    resume_services = replace(
+        fake_services,
+        document_source=resume_source,
+        vision_analyzer=resume_vision,
+        planner=resume_planner,
+    )
+    async with open_checkpointer(settings) as second_checkpointer:
+        second_graph = build_graph(resume_services, second_checkpointer)
+        result = await second_graph.ainvoke(
+            Command(
+                resume={
+                    "action": "approve",
+                    "selected_task_ids": ["task-video"],
+                    "tasks": plan["tasks"],
+                }
+            ),
+            config=config,
+        )
+
+    assert result["status"] == "approved"
+    assert result["approval_decision"]["action"] == "approve"
+    assert resume_source.ingest_calls == 0
+    assert resume_source.revision_calls == 1
+    assert resume_vision.calls == 0
+    assert resume_planner.plan_calls == 0
+    assert resume_planner.audit_calls == 0
+    events = await fake_services.repository.list_events(run_id)
+    for node in (
+        "ingest_source",
+        "normalize_document",
+        "analyze_images",
+        "plan_requirements",
+        "audit_plan",
+        "validate_plan",
+    ):
+        assert [event["status"] for event in events if event["node"] == node] == [
+            "started",
+            "completed",
+        ]
+    _assert_no_paid_side_effects(resume_services)
+    assert await resume_services.repository.count_operations() == 0

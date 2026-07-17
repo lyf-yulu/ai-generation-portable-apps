@@ -165,6 +165,16 @@ def _json_model(model: Any) -> dict[str, Any]:
     return payload
 
 
+def _draft_plan(state: AgentState) -> Any:
+    plan = state.get("draft_plan")
+    return plan if plan is not None else state.get("task_plan")
+
+
+def _document_revision(state: AgentState) -> Any:
+    revision = state.get("document_revision")
+    return revision if revision is not None else state.get("source_revision")
+
+
 async def ingest_source(
     state: AgentState,
     config: RunnableConfig,
@@ -185,10 +195,23 @@ async def ingest_source(
         document = _document_for_checkpoint(
             await services.document_source.ingest(request)
         )
+        document_json = _json_model(document)
         return {
             "status": "running",
             "requirement_request": _json_model(request),
-            "source_document": _json_model(document),
+            "source_document": document_json,
+            "source_type": document.source_type.value,
+            "source_token": document.source_token,
+            "document_id": document.document_id,
+            "document_title": document.title,
+            "document_revision": document.revision,
+            "media_assets": document_json["media_assets"],
+            "approval_decision": None,
+            "approved_tasks": [],
+            "execution_records": [],
+            "artifacts": [],
+            "delivery_record": None,
+            "last_error": None,
         }
 
     return await _run_node(state, "ingest_source", services, operation)
@@ -203,8 +226,15 @@ async def normalize_document(
     async def operation() -> AgentState:
         _ensure_thread_id(state, config)
         document = NormalizedDocument.model_validate(state.get("source_document"))
+        document_json = _json_model(document)
         return {
-            "normalized_document": _json_model(document),
+            "normalized_document": document_json,
+            "source_type": document.source_type.value,
+            "source_token": document.source_token,
+            "document_id": document.document_id,
+            "document_title": document.title,
+            "document_revision": document.revision,
+            "media_assets": document_json["media_assets"],
             "source_revision": document.revision,
         }
 
@@ -256,7 +286,8 @@ async def plan_requirements(
             descriptions,
             state.get("planner_feedback"),
         )
-        return {"task_plan": _json_model(plan)}
+        plan_json = _json_model(plan)
+        return {"draft_plan": plan_json, "task_plan": plan_json}
 
     return await _run_node(state, "plan_requirements", services, operation)
 
@@ -272,7 +303,7 @@ async def audit_plan(
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
-        plan = TaskPlan.model_validate(state.get("task_plan"))
+        plan = TaskPlan.model_validate(_draft_plan(state))
         report = await services.planner.audit(document, plan)
         return {"audit_report": _json_model(report)}
 
@@ -287,7 +318,7 @@ async def validate_planned_tasks(
 ) -> AgentState:
     async def operation() -> AgentState:
         _ensure_thread_id(state, config)
-        plan = TaskPlan.model_validate(state.get("task_plan"))
+        plan = TaskPlan.model_validate(_draft_plan(state))
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
@@ -308,13 +339,17 @@ async def validate_planned_tasks(
 
 
 def _approval_payload(state: AgentState) -> dict[str, Any]:
+    plan = _draft_plan(state)
+    revision = _document_revision(state)
     payload = {
         "action": "review_plan",
         "run_id": state.get("run_id"),
         "thread_id": state.get("thread_id"),
         "status": "waiting_approval",
-        "source_revision": state.get("source_revision"),
-        "task_plan": state.get("task_plan"),
+        "document_revision": revision,
+        "source_revision": revision,
+        "draft_plan": plan,
+        "task_plan": plan,
         "audit_report": state.get("audit_report"),
         "validation_issues": state.get("validation_issues", []),
     }
@@ -392,7 +427,7 @@ async def human_approval(
                 goto=END,
             )
 
-        original = TaskPlan.model_validate(state.get("task_plan"))
+        original = TaskPlan.model_validate(_draft_plan(state))
         candidate = (
             TaskPlan(
                 tasks=decision.tasks,
@@ -416,7 +451,7 @@ async def human_approval(
         return Command(
             update={
                 "approval_decision": decision_json,
-                "approval_revision": state.get("source_revision"),
+                "approval_revision": _document_revision(state),
                 "approved_tasks": [
                     _json_model(task) for task in approved.tasks
                 ],
@@ -445,7 +480,7 @@ async def revalidate_approval(
         selected_plan = TaskPlan(
             tasks=state.get("approved_tasks", []),
             document_summary=TaskPlan.model_validate(
-                state.get("task_plan")
+                _draft_plan(state)
             ).document_summary,
         )
         document = NormalizedDocument.model_validate(
