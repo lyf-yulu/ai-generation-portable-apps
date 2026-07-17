@@ -222,6 +222,9 @@ class FeishuDocumentSource:
         ordered: list[
             tuple[dict[str, Any], list[str], int | None, int | None]
         ] = []
+        children_by_id = FeishuDocumentSource._validate_block_references(
+            blocks_by_id, source_ids
+        )
         visited: set[str] = set()
         active: set[str] = set()
 
@@ -242,9 +245,7 @@ class FeishuDocumentSource:
             raw = blocks_by_id[block_id]
             path = [*parent_path, block_id]
             ordered.append((raw, path, row, column))
-            for child_id, child_row, child_column in (
-                FeishuDocumentSource._children(raw)
-            ):
+            for child_id, child_row, child_column in children_by_id[block_id]:
                 visit(child_id, path, child_row, child_column)
             active.remove(block_id)
             visited.add(block_id)
@@ -261,19 +262,89 @@ class FeishuDocumentSource:
         return ordered
 
     @staticmethod
+    def _validate_block_references(
+        blocks_by_id: dict[str, dict[str, Any]],
+        source_ids: list[str],
+    ) -> dict[str, list[tuple[str, int | None, int | None]]]:
+        children_by_id: dict[
+            str, list[tuple[str, int | None, int | None]]
+        ] = {}
+        referenced_parent: dict[str, str] = {}
+
+        for parent_id in source_ids:
+            children = FeishuDocumentSource._children(blocks_by_id[parent_id])
+            children_by_id[parent_id] = children
+            for child_id, _row, _column in children:
+                if child_id not in blocks_by_id:
+                    raise FeishuDocumentSource._document_error(
+                        "飞书文档引用了不存在的 Block",
+                        f"parent {parent_id} references missing child {child_id}",
+                    )
+                if child_id in referenced_parent:
+                    raise FeishuDocumentSource._document_error(
+                        "飞书文档 Block 被多个父节点引用",
+                        f"child {child_id} referenced by "
+                        f"{referenced_parent[child_id]} and {parent_id}",
+                    )
+                referenced_parent[child_id] = parent_id
+
+        for block_id in source_ids:
+            raw_parent = blocks_by_id[block_id].get("parent_id")
+            if raw_parent is not None and (
+                not isinstance(raw_parent, str) or not raw_parent
+            ):
+                raise FeishuDocumentSource._document_error(
+                    "飞书文档包含无效父 Block ID",
+                    f"block {block_id} has invalid parent_id",
+                )
+            declared_parent = raw_parent if isinstance(raw_parent, str) else None
+            if declared_parent is not None and declared_parent not in blocks_by_id:
+                raise FeishuDocumentSource._document_error(
+                    "飞书文档引用了不存在的父 Block",
+                    f"block {block_id} declares missing parent {declared_parent}",
+                )
+            actual_parent = referenced_parent.get(block_id)
+            if declared_parent != actual_parent:
+                raise FeishuDocumentSource._document_error(
+                    "飞书文档 Block 父节点声明与引用不一致",
+                    f"block {block_id}: declared parent={declared_parent!r}, "
+                    f"referenced parent={actual_parent!r}",
+                )
+
+        return children_by_id
+
+    @staticmethod
     def _children(raw: dict[str, Any]) -> list[tuple[str, int | None, int | None]]:
         children = raw.get("children", [])
-        child_ids = [item for item in children if isinstance(item, str)]
+        if not isinstance(children, list) or not all(
+            isinstance(item, str) and item for item in children
+        ):
+            raise FeishuDocumentSource._document_error(
+                "飞书 Block 子节点列表无效",
+                f"block {raw.get('block_id')}: children is not a list of IDs",
+            )
+        child_ids = list(children)
+        if len(child_ids) != len(set(child_ids)):
+            raise FeishuDocumentSource._document_error(
+                "飞书 Block 包含重复子节点",
+                f"block {raw.get('block_id')}: duplicate child ID",
+            )
         if raw.get("block_type") != 31:
             return [(child_id, None, None) for child_id in child_ids]
 
         table = raw.get("table")
         if not isinstance(table, Mapping):
-            return [(child_id, None, None) for child_id in child_ids]
+            raise FeishuDocumentSource._document_error(
+                "飞书表格内容无效",
+                f"table block {raw.get('block_id')}: missing table object",
+            )
         cells = table.get("cells", [])
         property_value = table.get("property", {})
         if not isinstance(cells, list) or not isinstance(property_value, Mapping):
-            return [(child_id, None, None) for child_id in child_ids]
+            raise FeishuDocumentSource._document_error(
+                "飞书表格行列信息无效",
+                f"table block {raw.get('block_id')}: invalid cells or dimensions",
+            )
         columns = property_value.get("column_size")
         rows = property_value.get("row_size")
         if (
@@ -284,23 +355,26 @@ class FeishuDocumentSource:
             or isinstance(rows, bool)
             or rows <= 0
             or len(cells) != rows * columns
-            or not all(isinstance(cell, str) for cell in cells)
+            or not all(isinstance(cell, str) and cell for cell in cells)
         ):
             raise FeishuDocumentSource._document_error(
                 "飞书表格行列信息无效",
                 f"table block {raw.get('block_id')}: invalid cells or dimensions",
             )
-        result = [
+        if len(cells) != len(set(cells)):
+            raise FeishuDocumentSource._document_error(
+                "飞书表格包含重复单元格",
+                f"table block {raw.get('block_id')}: duplicate cell ID",
+            )
+        if child_ids and child_ids != cells:
+            raise FeishuDocumentSource._document_error(
+                "飞书表格 children 与 cells 不一致",
+                f"table block {raw.get('block_id')}: children do not match cells",
+            )
+        return [
             (cell_id, index // columns, index % columns)
             for index, cell_id in enumerate(cells)
         ]
-        cell_ids = set(cells)
-        result.extend(
-            (child_id, None, None)
-            for child_id in child_ids
-            if child_id not in cell_ids
-        )
-        return result
 
     @staticmethod
     def _extract_text(raw: dict[str, Any], block_type: str) -> str:

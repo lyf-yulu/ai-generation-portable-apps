@@ -82,11 +82,7 @@ class FeishuClient:
                 json_body=json_body,
             )
             payload = self._optional_response_json(response)
-            code = self._api_code(payload)
-            authentication_failed = (
-                response.status_code == 401 or code == _TOKEN_INVALID_CODE
-            )
-            if authentication_failed and attempt == 0:
+            if self._authentication_failed(response, payload) and attempt == 0:
                 token = await self._refresh_after_auth_failure(token)
                 continue
             if not payload and response.status_code < 400:
@@ -148,11 +144,11 @@ class FeishuClient:
         token = await self.tenant_token()
         for attempt in range(2):
             response = await self._send("GET", path, token)
-            if response.status_code == 401 and attempt == 0:
+            payload = self._optional_response_json(response)
+            if self._authentication_failed(response, payload) and attempt == 0:
                 token = await self._refresh_after_auth_failure(token)
                 continue
-            if response.status_code >= 400:
-                payload = self._optional_response_json(response)
+            if response.status_code >= 400 or self._api_code(payload) != 0:
                 self._raise_for_api_error(response, payload, "GET", path)
             return (
                 response.content,
@@ -322,6 +318,13 @@ class FeishuClient:
     def _api_code(payload: dict) -> int:
         code = payload.get("code", 0)
         return code if isinstance(code, int) else -1
+
+    @staticmethod
+    def _authentication_failed(response: httpx.Response, payload: dict) -> bool:
+        return (
+            response.status_code == 401
+            or FeishuClient._api_code(payload) == _TOKEN_INVALID_CODE
+        )
 
     @staticmethod
     def _technical_detail(

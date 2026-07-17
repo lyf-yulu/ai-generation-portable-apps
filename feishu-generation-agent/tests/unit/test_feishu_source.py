@@ -370,6 +370,109 @@ async def test_download_media_returns_response_content_type():
     assert mime_type == "image/png; charset=binary"
 
 
+async def test_download_media_refreshes_token_for_json_api_error_then_succeeds():
+    png = base64.b64decode(_fixture("feishu_docx_blocks.json")["media_base64"])
+    token_requests = 0
+    media_requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_requests, media_requests
+        if request.url.path.endswith("tenant_access_token/internal"):
+            token_requests += 1
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "tenant_access_token": f"fiction-token-{token_requests}",
+                    "expire": 7200,
+                },
+            )
+        media_requests += 1
+        if media_requests == 1:
+            return httpx.Response(200, json={"code": 99991663, "msg": "expired"})
+        assert request.headers["Authorization"] == "Bearer fiction-token-2"
+        return httpx.Response(200, content=png, headers={"Content-Type": "image/png"})
+
+    async with httpx.AsyncClient(
+        base_url="https://open.feishu.cn",
+        transport=httpx.MockTransport(handler),
+    ) as http_client:
+        client = FeishuClient(
+            Settings(lark_app_id="fiction-app", lark_app_secret="fiction-secret"),
+            http_client=http_client,
+        )
+        content, mime_type = await client.download_media("fiction-file-token")
+
+    assert content == png
+    assert mime_type == "image/png"
+    assert token_requests == 2
+    assert media_requests == 2
+
+
+async def test_download_media_refreshes_only_once_for_repeated_token_error():
+    token_requests = 0
+    media_requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_requests, media_requests
+        if request.url.path.endswith("tenant_access_token/internal"):
+            token_requests += 1
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "tenant_access_token": f"fiction-token-{token_requests}",
+                    "expire": 7200,
+                },
+            )
+        media_requests += 1
+        return httpx.Response(200, json={"code": 99991663, "msg": "expired"})
+
+    async with httpx.AsyncClient(
+        base_url="https://open.feishu.cn",
+        transport=httpx.MockTransport(handler),
+    ) as http_client:
+        client = FeishuClient(
+            Settings(lark_app_id="fiction-app", lark_app_secret="fiction-secret"),
+            http_client=http_client,
+        )
+        with pytest.raises(AgentError) as raised:
+            await client.download_media("fiction-file-token")
+
+    assert raised.value.detail.category == ErrorCategory.PERMISSION
+    assert raised.value.detail.retryable is False
+    assert token_requests == 2
+    assert media_requests == 2
+
+
+async def test_download_media_rejects_parseable_nonzero_code_as_document_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return httpx.Response(
+                200,
+                json={"code": 0, "tenant_access_token": "token", "expire": 7200},
+            )
+        return httpx.Response(
+            200,
+            content=b'{"code":1770001,"msg":"invalid media"}',
+            headers={"Content-Type": "image/png"},
+        )
+
+    async with httpx.AsyncClient(
+        base_url="https://open.feishu.cn",
+        transport=httpx.MockTransport(handler),
+    ) as http_client:
+        client = FeishuClient(
+            Settings(lark_app_id="fiction-app", lark_app_secret="fiction-secret"),
+            http_client=http_client,
+        )
+        with pytest.raises(AgentError) as raised:
+            await client.download_media("fiction-file-token")
+
+    assert raised.value.detail.category == ErrorCategory.DOCUMENT
+    assert raised.value.detail.retryable is False
+
+
 async def test_ingest_docx_preserves_hierarchy_and_stable_references(
     file_store: FileStore,
 ):
@@ -473,6 +576,126 @@ async def test_ingest_table_uses_row_major_dfs_and_caches_shared_image(
     )
     assert client.download_calls == ["fiction-shared-image-token"]
     assert document.media_assets[0].local_path == document.media_assets[1].local_path
+
+
+@pytest.mark.parametrize(
+    "blocks",
+    [
+        [
+            {"block_id": "root", "block_type": 1, "children": ["missing"]},
+        ],
+        [
+            {
+                "block_id": "root",
+                "block_type": 1,
+                "children": ["child", "child"],
+            },
+            {"block_id": "child", "parent_id": "root", "block_type": 2},
+        ],
+        [
+            {
+                "block_id": "root",
+                "block_type": 1,
+                "children": ["parent-a", "parent-b"],
+            },
+            {
+                "block_id": "parent-a",
+                "parent_id": "root",
+                "block_type": 2,
+                "children": ["child"],
+            },
+            {
+                "block_id": "parent-b",
+                "parent_id": "root",
+                "block_type": 2,
+                "children": ["child"],
+            },
+            {"block_id": "child", "parent_id": "parent-a", "block_type": 2},
+        ],
+        [
+            {
+                "block_id": "root",
+                "block_type": 1,
+                "children": ["parent-a", "parent-b"],
+            },
+            {
+                "block_id": "parent-a",
+                "parent_id": "root",
+                "block_type": 2,
+                "children": ["child"],
+            },
+            {"block_id": "parent-b", "parent_id": "root", "block_type": 2},
+            {"block_id": "child", "parent_id": "parent-b", "block_type": 2},
+        ],
+        [
+            {"block_id": "orphan", "parent_id": "missing", "block_type": 2},
+        ],
+    ],
+    ids=[
+        "missing-child",
+        "duplicate-child",
+        "multi-parent-child",
+        "declared-parent-mismatch",
+        "missing-declared-parent",
+    ],
+)
+async def test_ingest_rejects_inconsistent_block_references(
+    blocks: list[dict[str, Any]],
+    file_store: FileStore,
+):
+    source = FeishuDocumentSource(FakeFeishuClient(blocks, b""), file_store)
+
+    with pytest.raises(AgentError) as raised:
+        await source.ingest(
+            RequirementRequest(source_url="https://fiction.feishu.cn/docx/doccn123")
+        )
+
+    assert raised.value.detail.category == ErrorCategory.DOCUMENT
+    assert raised.value.detail.retryable is False
+
+
+@pytest.mark.parametrize(
+    ("children", "cells", "cell_ids"),
+    [
+        ([], ["cell", "cell"], ["cell"]),
+        (
+            ["cell-b", "cell-a"],
+            ["cell-a", "cell-b"],
+            ["cell-a", "cell-b"],
+        ),
+    ],
+    ids=["duplicate-table-cell", "table-children-mismatch"],
+)
+async def test_ingest_rejects_inconsistent_table_references(
+    children: list[str],
+    cells: list[str],
+    cell_ids: list[str],
+    file_store: FileStore,
+):
+    blocks: list[dict[str, Any]] = [
+        {
+            "block_id": "table",
+            "block_type": 31,
+            "children": children,
+            "table": {
+                "cells": cells,
+                "property": {"row_size": 1, "column_size": 2},
+            },
+        },
+        *[
+            {"block_id": cell_id, "parent_id": "table", "block_type": 32}
+            for cell_id in cell_ids
+        ],
+    ]
+    source = FeishuDocumentSource(FakeFeishuClient(blocks, b""), file_store)
+
+    with pytest.raises(AgentError) as raised:
+        await source.ingest(
+            RequirementRequest(source_url="https://fiction.feishu.cn/docx/doccn123")
+        )
+
+    assert raised.value.detail.category == ErrorCategory.DOCUMENT
+    assert raised.value.detail.retryable is False
 
 
 async def test_image_download_failure_is_blocking_and_never_silently_skipped(

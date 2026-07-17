@@ -25,7 +25,7 @@
       "block_id": "story-table",
       "parent_id": "story-page",
       "block_type": 31,
-      "children": ["cell-11", "cell-10", "cell-01", "cell-00"],
+      "children": ["cell-00", "cell-01", "cell-10", "cell-11"],
       "table": {
         "cells": ["cell-00", "cell-01", "cell-10", "cell-11"],
         "property": {"row_size": 2, "column_size": 2}
