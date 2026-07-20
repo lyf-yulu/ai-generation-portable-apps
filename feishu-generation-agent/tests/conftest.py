@@ -151,10 +151,12 @@ class FakeGraphDeliveryWriter:
 
     async def deliver(
         self,
+        run_id: str,
         document: NormalizedDocument,
         plan: TaskPlan,
         artifacts: list[Any],
     ) -> DeliveryRecord:
+        assert run_id
         self.deliver_calls += 1
         return DeliveryRecord(
             document_id=document.document_id,

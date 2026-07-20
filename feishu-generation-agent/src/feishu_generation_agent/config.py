@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     lark_app_id: str | None = None
     lark_app_secret: SecretStr | None = None
     lark_output_owner_open_id: str | None = None
+    lark_output_folder_token: str | None = None
     deepseek_api_key: SecretStr | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: Literal["deepseek-v4-pro"] = "deepseek-v4-pro"

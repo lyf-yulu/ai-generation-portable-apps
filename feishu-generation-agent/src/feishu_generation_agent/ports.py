@@ -79,6 +79,7 @@ class VideoGenerator(Protocol):
 class DeliveryWriter(Protocol):
     async def deliver(
         self,
+        run_id: str,
         document: NormalizedDocument,
         plan: TaskPlan,
         artifacts: list[Artifact],
