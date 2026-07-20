@@ -18,6 +18,11 @@ dependencies = [
   "uvicorn[standard]>=0.34,<1",
 ]
 
+[project.scripts]
+feishu-generation-agent = "feishu_generation_agent.main:main"
+agent-config-probe = "feishu_generation_agent.cli.config_probe:main"
+agent-smoke = "feishu_generation_agent.cli.smoke:main"
+
 [build-system]
 requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"

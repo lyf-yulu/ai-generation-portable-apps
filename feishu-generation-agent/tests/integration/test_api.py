@@ -21,6 +21,7 @@ from feishu_generation_agent.graph.runtime import GraphRuntime
 from feishu_generation_agent.storage.files import FileStore
 from feishu_generation_agent.storage.repository import Repository
 from feishu_generation_agent.web.app import create_app
+from feishu_generation_agent.cli import smoke
 
 
 def _task(task_id: str = "task-1") -> dict[str, Any]:
@@ -979,6 +980,82 @@ async def test_static_review_workspace_is_served_and_uses_safe_dom_updates():
             assert unsafe not in source
     assert "grid-template-columns" in styles.text
     assert "access-control-allow-origin" not in options.headers
+
+
+async def test_health_reports_capabilities_without_secrets(tmp_path: Path):
+    settings = Settings(
+        _env_file=None,
+        data_dir=tmp_path / "data",
+        outputs_dir=tmp_path / "outputs",
+        business_db_path=tmp_path / "business.sqlite3",
+        checkpoint_db_path=tmp_path / "checkpoints.sqlite3",
+    )
+    app = create_app(settings=settings)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            response = await client.get("/api/health")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ready"] is False
+    assert body["capabilities"]["feishu_read"]["configured"] is False
+    assert "secret" not in response.text.lower()
+    assert "api_key" not in response.text.lower()
+
+
+def test_smoke_requires_both_paid_confirmations(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    constructed = 0
+
+    def forbidden_factory(*args, **kwargs):
+        del args, kwargs
+        nonlocal constructed
+        constructed += 1
+        raise AssertionError("paid services must not be constructed")
+
+    monkeypatch.setattr(smoke, "build_paid_smoke_runner", forbidden_factory)
+    monkeypatch.delenv("ALLOW_PAID_SMOKE", raising=False)
+
+    first = smoke.main(["https://acme.feishu.cn/docx/doccn123"])
+    second = smoke.main(
+        ["--confirm-paid-smoke", "https://acme.feishu.cn/docx/doccn123"]
+    )
+
+    assert first != 0
+    assert second != 0
+    assert "--confirm-paid-smoke" in capsys.readouterr().err
+    assert constructed == 0
+
+
+def test_smoke_constructs_runner_only_after_both_confirmations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class Runner:
+        async def run(self) -> None:
+            calls.append("run")
+
+    def factory(settings: Settings, source_url: str):
+        assert isinstance(settings, Settings)
+        calls.append(source_url)
+        return Runner()
+
+    monkeypatch.setattr(smoke, "build_paid_smoke_runner", factory)
+    monkeypatch.setenv("ALLOW_PAID_SMOKE", "YES")
+
+    result = smoke.main(
+        ["--confirm-paid-smoke", "https://acme.feishu.cn/docx/doccn123"]
+    )
+
+    assert result == 0
+    assert calls == ["https://acme.feishu.cn/docx/doccn123", "run"]
 
 
 def test_review_draft_state_machine_in_node():

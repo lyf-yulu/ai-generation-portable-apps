@@ -18,6 +18,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 
 from feishu_generation_agent.graph.builder import build_graph
+from feishu_generation_agent.bootstrap import open_services, runtime_is_configured
+from feishu_generation_agent.config import Settings
 from feishu_generation_agent.graph.nodes import GraphServices
 from feishu_generation_agent.graph.runtime import (
     GraphRuntime,
@@ -37,9 +39,10 @@ def create_app(
     *,
     runtime: GraphRuntime | None = None,
     services: GraphServices | None = None,
+    settings: Settings | None = None,
 ) -> FastAPI:
-    if runtime is not None and services is not None:
-        raise ValueError("runtime and services cannot both be provided")
+    if sum(value is not None for value in (runtime, services, settings)) > 1:
+        raise ValueError("runtime, services and settings are mutually exclusive")
     static_dir = Path(__file__).with_name("static")
 
     @asynccontextmanager
@@ -74,35 +77,113 @@ def create_app(
                     os.environ[name] = value
 
     @asynccontextmanager
+    async def activated_services(
+        active_services: GraphServices,
+    ) -> AsyncIterator[GraphRuntime]:
+        async with open_checkpointer(active_services.settings) as checkpointer:
+            active = GraphRuntime(
+                graph=build_graph(active_services, checkpointer),
+                repository=active_services.repository,
+                file_store=active_services.file_store,
+                settings=active_services.settings,
+                delivery_writer=active_services.delivery_writer,
+            )
+            try:
+                await active.resume_pending_runs()
+                yield active
+            finally:
+                await active.close()
+
+    @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if services is not None:
             async with tracing_environment(services.settings):
-                async with open_checkpointer(services.settings) as checkpointer:
-                    active = GraphRuntime(
-                        graph=build_graph(services, checkpointer),
-                        repository=services.repository,
-                        file_store=services.file_store,
-                        settings=services.settings,
-                        delivery_writer=services.delivery_writer,
-                    )
+                async with activated_services(services) as active:
                     app.state.runtime = active
                     try:
-                        await active.resume_pending_runs()
                         yield
                     finally:
-                        await active.close()
                         app.state.runtime = None
             return
 
-        app.state.runtime = runtime
-        try:
-            yield
-        finally:
-            if runtime is not None:
+        if runtime is not None:
+            app.state.runtime = runtime
+            try:
+                yield
+            finally:
                 await runtime.close()
+                app.state.runtime = None
+            return
+
+        local_settings = settings or Settings()
+        if runtime_is_configured(local_settings):
+            async with tracing_environment(local_settings):
+                async with open_services(local_settings) as built_services:
+                    async with activated_services(built_services) as active:
+                        app.state.runtime = active
+                        try:
+                            yield
+                        finally:
+                            app.state.runtime = None
+            return
+
+        async with tracing_environment(local_settings):
             app.state.runtime = None
+            try:
+                yield
+            finally:
+                app.state.runtime = None
 
     app = FastAPI(title="本地飞书生成任务 Agent", lifespan=lifespan)
+
+    @app.get("/api/health")
+    async def health() -> dict:
+        active_settings = (
+            services.settings
+            if services is not None
+            else runtime.settings
+            if runtime is not None
+            else settings or Settings()
+        )
+
+        def configured(*names: str) -> bool:
+            for name in names:
+                value = getattr(active_settings, name)
+                if hasattr(value, "get_secret_value"):
+                    value = value.get_secret_value()
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    return False
+            return True
+
+        checks = {
+            "local_storage": True,
+            "feishu_read": configured("lark_app_id", "lark_app_secret"),
+            "feishu_write": configured(
+                "lark_app_id",
+                "lark_app_secret",
+                "lark_output_owner_open_id",
+                "lark_output_folder_token",
+            ),
+            "planning": configured("deepseek_api_key", "deepseek_model"),
+            "vision": configured("claude_api_key", "claude_model"),
+            "image_generation": configured(
+                "chiyun_api_key", "chiyun_model"
+            ),
+            "video_generation": configured("ark_api_key", "seedance_model"),
+        }
+        capabilities = {
+            name: {
+                "configured": value,
+                "reachable": None,
+                "permission_ok": None,
+                "message": "已配置" if value else "缺少配置",
+            }
+            for name, value in checks.items()
+        }
+        return {
+            "ready": all(checks.values()),
+            "capabilities": capabilities,
+        }
 
     @app.exception_handler(RequestValidationError)
     async def safe_validation_error(
