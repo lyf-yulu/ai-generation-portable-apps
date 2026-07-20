@@ -2,6 +2,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import Any, TypeVar
 from uuid import uuid4
@@ -651,6 +652,50 @@ def _provider_for_task(task: GenerationTask) -> str:
     return "chiyun" if task.task_type is TaskType.IMAGE_TO_IMAGE else "seedance"
 
 
+def _task_fingerprint(task: GenerationTask) -> str:
+    canonical = json.dumps(
+        task.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _intent_is_stale(
+    operation: dict[str, Any], lease_seconds: float
+) -> bool:
+    try:
+        updated_at = datetime.fromisoformat(operation["updated_at"])
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=UTC)
+    except (KeyError, TypeError, ValueError):
+        return True
+    return (datetime.now(UTC) - updated_at).total_seconds() >= (
+        lease_seconds
+    )
+
+
+async def _keep_submission_intent_alive(
+    services: GraphServices,
+    run_id: str,
+    task: GenerationTask,
+    provider: str,
+    client_id: str,
+    task_fingerprint: str,
+) -> None:
+    interval = max(
+        0.01, min(5.0, services.settings.submission_intent_lease_seconds / 3)
+    )
+    while True:
+        await async_sleep(interval)
+        renewed = await services.repository.renew_submission_intent_lease(
+            run_id, task.task_id, client_id, provider, task_fingerprint
+        )
+        if not renewed:
+            return
+
+
 def _generator_for_task(task: GenerationTask, services: GraphServices):
     if task.task_type is TaskType.IMAGE_TO_IMAGE:
         return services.image_generator
@@ -671,10 +716,12 @@ async def _transition_operation(
     return await services.repository.compare_and_set_operation(
         run_id,
         task_id,
-        "submit",
+        operation["operation"],
         expected_phase=operation["phase"],
         expected_client_submission_id=client_id,
         expected_official_id=operation.get("official_id"),
+        expected_provider=operation["provider"],
+        expected_task_fingerprint=operation["task_fingerprint"],
         phase=phase,
         official_id=official_id,
     )
@@ -689,17 +736,21 @@ async def _existing_valid_artifacts(
         run_id, task_id=task.task_id
     )
     if len(artifacts) != task.output_count:
+        if artifacts:
+            await services.repository.delete_task_artifacts(run_id, task.task_id)
         return None
     expected_ids = {
         sha256(f"{run_id}\0{task.task_id}\0{index}".encode()).hexdigest()[:32]
         for index in range(task.output_count)
     }
     if {artifact.artifact_id for artifact in artifacts} != expected_ids:
+        await services.repository.delete_task_artifacts(run_id, task.task_id)
         return None
     if not all(
         services.file_store.verify_artifact(run_id, artifact)
         for artifact in artifacts
     ):
+        await services.repository.delete_task_artifacts(run_id, task.task_id)
         return None
     return artifacts
 
@@ -765,9 +816,156 @@ async def _materialize_submission(
             status="ready",
         )
         artifacts.append(artifact)
-    for artifact in artifacts:
-        await services.repository.save_artifact(run_id, artifact)
+    await services.repository.replace_task_artifacts(
+        run_id, task.task_id, artifacts
+    )
     return artifacts
+
+
+async def _repair_succeeded_submission(
+    services: GraphServices,
+    run_id: str,
+    task: GenerationTask,
+    provider: str,
+    generator: Any,
+    submit_operation: dict[str, Any],
+) -> tuple[ExecutionRecord, list[Artifact]]:
+    official_id = submit_operation.get("official_id")
+    if not isinstance(official_id, str):
+        return ExecutionRecord(
+            task_id=task.task_id, provider=provider, status="submission_uncertain"
+        ), []
+    created, repair = await services.repository.create_artifact_repair_intent_if_absent(
+        run_id, task.task_id, provider, official_id, uuid4().hex,
+        submit_operation["task_fingerprint"],
+    )
+    if not created:
+        existing = await _existing_valid_artifacts(services, run_id, task)
+        if repair["phase"] == "succeeded" and existing is not None:
+            return ExecutionRecord(
+                task_id=task.task_id, provider=provider,
+                provider_task_id=official_id, status="succeeded"
+            ), existing
+        if repair["phase"] != "intent_created":
+            return ExecutionRecord(
+                task_id=task.task_id, provider=provider,
+                provider_task_id=official_id,
+                status=repair["phase"],
+            ), []
+    try:
+        submission = await _poll_submission(
+            generator,
+            ProviderSubmission(provider=provider, provider_task_id=official_id,
+                               status="submitted"),
+            services,
+        )
+        if submission is None:
+            target = "timed_out"
+            artifacts: list[Artifact] = []
+        elif submission.status.lower() not in _SUCCESS_PROVIDER_STATUSES:
+            target = "failed"
+            artifacts = []
+        else:
+            artifacts = await _materialize_submission(
+                services, run_id, task, submission
+            )
+            target = "succeeded"
+        changed = await _transition_operation(
+            services, run_id, task.task_id, repair, target, official_id
+        )
+        latest = await services.repository.get_operation(
+            run_id, task.task_id, repair["operation"]
+        )
+        authoritative = target if changed else (
+            latest["phase"] if latest is not None else "failed"
+        )
+        if authoritative == "succeeded":
+            valid = await _existing_valid_artifacts(services, run_id, task)
+            if valid is not None:
+                artifacts = valid
+            else:
+                authoritative = "failed"
+                artifacts = []
+        elif artifacts:
+            await services.repository.delete_task_artifacts(
+                run_id, task.task_id
+            )
+            artifacts = []
+        return ExecutionRecord(
+            task_id=task.task_id, provider=provider,
+            provider_task_id=official_id, status=authoritative,
+        ), artifacts
+    except Exception as exc:
+        latest = await services.repository.get_operation(
+            run_id, task.task_id, repair["operation"]
+        )
+        if latest is not None and latest["phase"] == "intent_created":
+            await _transition_operation(
+                services, run_id, task.task_id, latest, "failed", official_id
+            )
+            latest = await services.repository.get_operation(
+                run_id, task.task_id, repair["operation"]
+            )
+        if latest is not None and latest["phase"] == "succeeded":
+            valid = await _existing_valid_artifacts(services, run_id, task)
+            if valid is not None:
+                return ExecutionRecord(
+                    task_id=task.task_id, provider=provider,
+                    provider_task_id=official_id, status="succeeded",
+                ), valid
+        return ExecutionRecord(
+            task_id=task.task_id, provider=provider,
+            provider_task_id=official_id,
+            status=latest["phase"] if latest is not None else "failed",
+            error=_execution_error(exc),
+        ), []
+
+
+async def _finish_submit_phase(
+    services: GraphServices,
+    run_id: str,
+    task: GenerationTask,
+    provider: str,
+    operation: dict[str, Any],
+    target: str,
+    official_id: str,
+    artifacts: list[Artifact] | None = None,
+    error: dict[str, object] | None = None,
+) -> tuple[ExecutionRecord, list[Artifact]]:
+    changed = await _transition_operation(
+        services, run_id, task.task_id, operation, target, official_id
+    )
+    latest = await services.repository.get_operation(
+        run_id, task.task_id, "submit"
+    )
+    if latest is None or (
+        latest.get("provider") != provider
+        or latest.get("task_fingerprint") != _task_fingerprint(task)
+        or latest.get("official_id") != official_id
+    ):
+        return ExecutionRecord(
+            task_id=task.task_id, provider=provider,
+            provider_task_id=official_id, status="submission_uncertain",
+        ), []
+    authoritative = target if changed else latest["phase"]
+    if authoritative == "succeeded":
+        valid = await _existing_valid_artifacts(services, run_id, task)
+        if valid is None:
+            return ExecutionRecord(
+                task_id=task.task_id, provider=provider,
+                provider_task_id=official_id, status="failed",
+            ), []
+        return ExecutionRecord(
+            task_id=task.task_id, provider=provider,
+            provider_task_id=official_id, status="succeeded",
+        ), valid
+    if artifacts:
+        await services.repository.delete_task_artifacts(run_id, task.task_id)
+    return ExecutionRecord(
+        task_id=task.task_id, provider=provider,
+        provider_task_id=official_id, status=authoritative,
+        error=error,
+    ), []
 
 
 async def _execute_one_task(
@@ -777,6 +975,7 @@ async def _execute_one_task(
     assets: list[MediaAsset],
 ) -> tuple[ExecutionRecord, list[Artifact]]:
     provider = _provider_for_task(task)
+    task_fingerprint = _task_fingerprint(task)
     generator = _generator_for_task(task, services)
     existing_artifacts = await _existing_valid_artifacts(
         services, run_id, task
@@ -784,29 +983,43 @@ async def _execute_one_task(
     operation = await services.repository.get_operation(
         run_id, task.task_id, "submit"
     )
+    if operation is not None and (
+        operation.get("provider") != provider
+        or operation.get("task_fingerprint") != task_fingerprint
+    ):
+        return (
+            ExecutionRecord(
+                task_id=task.task_id,
+                provider=provider,
+                provider_task_id=operation.get("official_id"),
+                status="submission_uncertain",
+                error={"message": "已保存任务身份与当前审批任务不一致"},
+            ),
+            [],
+        )
+    if existing_artifacts is not None:
+        if operation is None:
+            await services.repository.delete_task_artifacts(run_id, task.task_id)
+            existing_artifacts = None
+        elif operation["phase"] not in {"submitted", "succeeded"}:
+            await services.repository.delete_task_artifacts(run_id, task.task_id)
+            return ExecutionRecord(
+                task_id=task.task_id, provider=provider,
+                provider_task_id=operation.get("official_id"),
+                status=operation["phase"],
+            ), []
     if existing_artifacts is not None:
         official_id = operation.get("official_id") if operation else None
         if operation is not None and operation["phase"] != "succeeded":
-            if (
-                not isinstance(official_id, str)
-                or not await _transition_operation(
-                    services,
-                    run_id,
-                    task.task_id,
-                    operation,
-                    "succeeded",
-                    official_id,
-                )
-            ):
-                return (
-                    ExecutionRecord(
-                        task_id=task.task_id,
-                        provider=provider,
-                        provider_task_id=official_id,
-                        status="submission_uncertain",
-                    ),
-                    existing_artifacts,
-                )
+            if not isinstance(official_id, str):
+                return ExecutionRecord(
+                    task_id=task.task_id, provider=provider,
+                    status="submission_uncertain",
+                ), []
+            return await _finish_submit_phase(
+                services, run_id, task, provider, operation, "succeeded",
+                official_id, existing_artifacts,
+            )
         return (
             ExecutionRecord(
                 task_id=task.task_id,
@@ -822,26 +1035,34 @@ async def _execute_one_task(
     if operation is None:
         created, operation = (
             await services.repository.create_submission_intent_if_absent(
-                run_id, task.task_id, provider, uuid4().hex
+                run_id, task.task_id, provider, uuid4().hex, task_fingerprint
             )
         )
         owns_submit = created
 
     phase = operation["phase"]
     if phase == "intent_created" and not owns_submit:
-        await _transition_operation(
-            services,
-            run_id,
-            task.task_id,
-            operation,
-            "submission_uncertain",
-            None,
-        )
+        if _intent_is_stale(
+            operation, services.settings.submission_intent_lease_seconds
+        ):
+            client_id = operation.get("client_submission_id")
+            if isinstance(client_id, str):
+                cutoff = datetime.now(UTC) - timedelta(
+                    seconds=services.settings.submission_intent_lease_seconds
+                )
+                await services.repository.expire_submission_intent_lease(
+                    run_id, task.task_id, client_id, provider,
+                    task_fingerprint, cutoff.isoformat(),
+                )
+            latest = await services.repository.get_operation(
+                run_id, task.task_id, "submit"
+            )
+            phase = (latest or {}).get("phase", "submission_uncertain")
         return (
             ExecutionRecord(
                 task_id=task.task_id,
                 provider=provider,
-                status="submission_uncertain",
+                status=phase,
             ),
             [],
         )
@@ -857,40 +1078,20 @@ async def _execute_one_task(
         )
 
     if phase == "succeeded":
-        if not isinstance(operation.get("official_id"), str):
-            return (
-                ExecutionRecord(
-                    task_id=task.task_id,
-                    provider=provider,
-                    status="submission_uncertain",
-                ),
-                [],
-            )
-        if not await _transition_operation(
-            services,
-            run_id,
-            task.task_id,
-            operation,
-            "submitted",
-            operation["official_id"],
-        ):
-            return (
-                ExecutionRecord(
-                    task_id=task.task_id,
-                    provider=provider,
-                    provider_task_id=operation["official_id"],
-                    status="submission_uncertain",
-                ),
-                [],
-            )
-        operation = await services.repository.get_operation(
-            run_id, task.task_id, "submit"
+        return await _repair_succeeded_submission(
+            services, run_id, task, provider, generator, operation
         )
-        if operation is None:
-            raise _provider_terminal_error("提交状态无法安全恢复")
 
     if owns_submit:
         client_id = operation["client_submission_id"]
+        await services.repository.renew_submission_intent_lease(
+            run_id, task.task_id, client_id, provider, task_fingerprint
+        )
+        heartbeat = asyncio.create_task(
+            _keep_submission_intent_alive(
+                services, run_id, task, provider, client_id, task_fingerprint
+            )
+        )
         try:
             immediate = await generator.submit(
                 task, assets, submission_id=client_id
@@ -914,16 +1115,11 @@ async def _execute_one_task(
                 )
                 if (
                     latest is None
-                    or latest["phase"] != "submission_uncertain"
-                    or latest["client_submission_id"] != client_id
-                    or not await _transition_operation(
-                        services,
-                        run_id,
-                        task.task_id,
-                        latest,
-                        "submitted",
-                        official_id,
-                    )
+                    or latest["phase"] != "submitted"
+                    or latest.get("client_submission_id") != client_id
+                    or latest.get("official_id") != official_id
+                    or latest.get("provider") != provider
+                    or latest.get("task_fingerprint") != task_fingerprint
                 ):
                     raise _provider_terminal_error("提交状态无法安全落库")
             operation = await services.repository.get_operation(
@@ -944,15 +1140,26 @@ async def _execute_one_task(
                     "submission_uncertain",
                     None,
                 )
+                latest = await services.repository.get_operation(
+                    run_id, task.task_id, "submit"
+                )
+            if latest is not None and latest["phase"] == "succeeded":
+                return await _repair_succeeded_submission(
+                    services, run_id, task, provider, generator, latest
+                )
             return (
                 ExecutionRecord(
                     task_id=task.task_id,
                     provider=provider,
-                    status="submission_uncertain",
+                    provider_task_id=(latest or {}).get("official_id"),
+                    status=(latest or {}).get("phase", "submission_uncertain"),
                     error=_execution_error(exc),
                 ),
                 [],
             )
+        finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
 
     official_id = operation.get("official_id")
     if not isinstance(official_id, str) or not official_id:
@@ -977,45 +1184,19 @@ async def _execute_one_task(
                 services,
             )
         if submission is None:
-            await _transition_operation(
-                services,
-                run_id,
-                task.task_id,
-                operation,
-                "timed_out",
-                official_id,
-            )
-            return (
-                ExecutionRecord(
-                    task_id=task.task_id,
-                    provider=provider,
-                    provider_task_id=official_id,
-                    status="timed_out",
-                ),
-                [],
+            return await _finish_submit_phase(
+                services, run_id, task, provider, operation,
+                "timed_out", official_id,
             )
         status = submission.status.lower()
         if status not in _SUCCESS_PROVIDER_STATUSES:
             phase = status if status in {"cancelled", "expired"} else "failed"
-            await _transition_operation(
-                services,
-                run_id,
-                task.task_id,
-                operation,
-                phase,
+            return await _finish_submit_phase(
+                services, run_id, task, provider, operation, phase,
                 official_id,
-            )
-            return (
-                ExecutionRecord(
-                    task_id=task.task_id,
-                    provider=provider,
-                    provider_task_id=official_id,
-                    status=phase,
-                    error=_execution_error(
-                        _provider_terminal_error("供应商生成任务失败")
-                    ),
+                error=_execution_error(
+                    _provider_terminal_error("供应商生成任务失败")
                 ),
-                [],
             )
         artifacts = await _materialize_submission(
             services, run_id, task, submission
@@ -1023,33 +1204,14 @@ async def _execute_one_task(
         latest = await services.repository.get_operation(
             run_id, task.task_id, "submit"
         )
-        if latest is not None and latest["phase"] != "succeeded":
-            transitioned = await _transition_operation(
-                services,
-                run_id,
-                task.task_id,
-                latest,
-                "succeeded",
-                official_id,
-            )
-            if not transitioned:
-                return (
-                    ExecutionRecord(
-                        task_id=task.task_id,
-                        provider=provider,
-                        provider_task_id=official_id,
-                        status="submission_uncertain",
-                    ),
-                    artifacts,
-                )
-        return (
-            ExecutionRecord(
-                task_id=task.task_id,
-                provider=provider,
-                provider_task_id=official_id,
-                status="succeeded",
-            ),
-            artifacts,
+        if latest is None:
+            return ExecutionRecord(
+                task_id=task.task_id, provider=provider,
+                provider_task_id=official_id, status="submission_uncertain",
+            ), []
+        return await _finish_submit_phase(
+            services, run_id, task, provider, latest, "succeeded",
+            official_id, artifacts,
         )
     except Exception as exc:
         latest = await services.repository.get_operation(
@@ -1069,20 +1231,20 @@ async def _execute_one_task(
             "submission_uncertain" if chiyun_staging_invalid else "failed"
         )
         if latest is not None and latest["phase"] == "submitted":
-            await _transition_operation(
-                services,
-                run_id,
-                task.task_id,
-                latest,
-                failure_phase,
-                official_id,
+            return await _finish_submit_phase(
+                services, run_id, task, provider, latest, failure_phase,
+                official_id, error=_execution_error(exc),
+            )
+        if latest is not None and latest["phase"] == "succeeded":
+            return await _repair_succeeded_submission(
+                services, run_id, task, provider, generator, latest
             )
         return (
             ExecutionRecord(
                 task_id=task.task_id,
                 provider=provider,
                 provider_task_id=official_id,
-                status=failure_phase,
+                status=(latest or {}).get("phase", failure_phase),
                 error=_execution_error(exc),
             ),
             [],
@@ -1152,19 +1314,47 @@ async def verify_and_download_artifacts(
         artifacts = [
             Artifact.model_validate(item) for item in state.get("artifacts", [])
         ]
-        repository_artifacts = await services.repository.list_artifacts(run_id)
-        if {
-            artifact.artifact_id for artifact in artifacts
-        } != {artifact.artifact_id for artifact in repository_artifacts}:
+        records = [
+            ExecutionRecord.model_validate(item)
+            for item in state.get("execution_records", [])
+        ]
+        tasks = {
+            task.task_id: task
+            for task in TaskPlan(
+                tasks=state.get("approved_tasks", []), document_summary=""
+            ).tasks
+        }
+        successful = {record.task_id: record for record in records
+                      if record.status == "succeeded"}
+        if any(artifact.task_id not in successful for artifact in artifacts):
             raise _provider_terminal_error("生成产物记录不一致")
-        if not all(
-            services.file_store.verify_artifact(run_id, artifact)
-            for artifact in artifacts
-        ):
-            raise _provider_terminal_error("生成产物校验失败")
+        verified: list[Artifact] = []
+        for task_id, record in successful.items():
+            task = tasks.get(task_id)
+            if task is None:
+                raise _provider_terminal_error("生成产物记录不一致")
+            state_items = sorted(
+                (item for item in artifacts if item.task_id == task_id),
+                key=lambda item: item.artifact_id,
+            )
+            repository_items = sorted(
+                await services.repository.list_artifacts(run_id, task_id=task_id),
+                key=lambda item: item.artifact_id,
+            )
+            if (
+                len(state_items) != task.output_count
+                or [item.model_dump(mode="json") for item in state_items]
+                != [item.model_dump(mode="json") for item in repository_items]
+                or any(item.provider_task_id != record.provider_task_id
+                       for item in state_items)
+                or not all(services.file_store.verify_artifact(run_id, item)
+                           for item in state_items)
+            ):
+                raise _provider_terminal_error("生成产物记录或文件校验失败")
+            verified.extend(state_items)
         status = state.get("status")
         return {
-            "artifacts": [_json_model(artifact) for artifact in artifacts],
+            "artifacts": [_json_model(artifact) for artifact in verified],
             "status": "succeeded"
             if status == "verification_pending"
             else "completed_with_errors",

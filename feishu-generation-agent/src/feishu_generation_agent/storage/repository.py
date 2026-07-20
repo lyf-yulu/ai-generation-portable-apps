@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS operations (
   run_id TEXT NOT NULL,
   task_id TEXT NOT NULL,
   operation TEXT NOT NULL,
+  provider TEXT,
+  task_fingerprint TEXT,
   provider_id TEXT,
   status TEXT NOT NULL,
   phase TEXT NOT NULL DEFAULT 'failed',
@@ -60,6 +62,7 @@ _BEARER_TOKEN = re.compile(r"(?i)(\bBearer\s+)[^\s,;]+")
 _QUERY_TOKEN = re.compile(r"(?i)([?&]token=)[^&#\s]*")
 _CLIENT_SUBMISSION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _SAFE_PROVIDER = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
+_TASK_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
 _OPERATION_PHASES = frozenset(
     {
         "intent_created",
@@ -72,6 +75,27 @@ _OPERATION_PHASES = frozenset(
         "timed_out",
     }
 )
+_OPERATION_TRANSITIONS = {
+    "submit": frozenset(
+        {
+            ("intent_created", "submitted"),
+            ("intent_created", "submission_uncertain"),
+            ("submitted", "succeeded"),
+            ("submitted", "submission_uncertain"),
+            ("submitted", "failed"),
+            ("submitted", "cancelled"),
+            ("submitted", "expired"),
+            ("submitted", "timed_out"),
+        }
+    ),
+    "artifact_repair": frozenset(
+        {
+            ("intent_created", "succeeded"),
+            ("intent_created", "failed"),
+            ("intent_created", "timed_out"),
+        }
+    ),
+}
 
 
 def _now() -> str:
@@ -198,6 +222,8 @@ class Repository:
         status: str,
         payload: dict[str, Any] | None = None,
     ) -> None:
+        if operation == "submit" or operation.startswith("artifact_repair_"):
+            raise ValueError("reserved operations require immutable intent and CAS")
         payload_json = json.dumps(
             payload or {}, ensure_ascii=False, separators=(",", ":")
         )
@@ -236,12 +262,17 @@ class Repository:
         task_id: str,
         provider: str,
         client_submission_id: str,
+        task_fingerprint: str,
     ) -> tuple[bool, dict[str, Any]]:
         self._validate_identity_segment(run_id, "run_id")
         self._validate_identity_segment(task_id, "task_id")
-        if not isinstance(provider, str) or _SAFE_PROVIDER.fullmatch(provider) is None:
+        if (
+            not isinstance(provider, str)
+            or _SAFE_PROVIDER.fullmatch(provider) is None
+        ):
             raise ValueError("invalid provider")
         self._validate_client_submission_id(client_submission_id)
+        self._validate_task_fingerprint(task_fingerprint)
         payload_json = json.dumps(
             {"provider": provider},
             ensure_ascii=True,
@@ -254,15 +285,18 @@ class Repository:
                 cursor = await self._connection.execute(
                     """
                     INSERT OR IGNORE INTO operations (
-                      run_id, task_id, operation, provider_id, status,
+                      run_id, task_id, operation, provider, task_fingerprint,
+                      provider_id, status,
                       phase, client_submission_id, official_id,
                       payload_json, updated_at
-                    ) VALUES (?, ?, 'submit', NULL, 'intent_created',
+                    ) VALUES (?, ?, 'submit', ?, ?, NULL, 'intent_created',
                               'intent_created', ?, NULL, ?, ?)
                     """,
                     (
                         run_id,
                         task_id,
+                        provider,
+                        task_fingerprint,
                         client_submission_id,
                         payload_json,
                         timestamp,
@@ -272,7 +306,8 @@ class Repository:
                 await cursor.close()
                 select_cursor = await self._connection.execute(
                     """
-                    SELECT run_id, task_id, operation, provider_id, status,
+                    SELECT run_id, task_id, operation, provider,
+                           task_fingerprint, provider_id, status,
                            phase, client_submission_id, official_id,
                            payload_json, updated_at
                     FROM operations
@@ -299,6 +334,8 @@ class Repository:
         expected_phase: str,
         expected_client_submission_id: str,
         expected_official_id: str | None,
+        expected_provider: str,
+        expected_task_fingerprint: str,
         phase: str,
         official_id: str | None,
     ) -> bool:
@@ -307,7 +344,14 @@ class Repository:
         self._validate_identity_segment(operation, "operation")
         self._validate_phase(expected_phase)
         self._validate_phase(phase)
+        self._validate_transition(operation, expected_phase, phase)
         self._validate_client_submission_id(expected_client_submission_id)
+        if (
+            not isinstance(expected_provider, str)
+            or _SAFE_PROVIDER.fullmatch(expected_provider) is None
+        ):
+            raise ValueError("invalid provider")
+        self._validate_task_fingerprint(expected_task_fingerprint)
         if expected_official_id is not None:
             self._validate_official_id(expected_official_id)
         if phase == "submitted" and official_id is None:
@@ -325,6 +369,8 @@ class Repository:
                       AND phase = ?
                       AND client_submission_id = ?
                       AND official_id IS ?
+                      AND provider = ?
+                      AND task_fingerprint = ?
                     """,
                     (
                         official_id,
@@ -338,6 +384,8 @@ class Repository:
                         expected_phase,
                         expected_client_submission_id,
                         expected_official_id,
+                        expected_provider,
+                        expected_task_fingerprint,
                     ),
                 )
                 changed = cursor.rowcount == 1
@@ -348,6 +396,147 @@ class Repository:
         await cursor.close()
         return changed
 
+    async def renew_submission_intent_lease(
+        self,
+        run_id: str,
+        task_id: str,
+        client_submission_id: str,
+        provider: str,
+        task_fingerprint: str,
+    ) -> bool:
+        self._validate_client_submission_id(client_submission_id)
+        self._validate_task_fingerprint(task_fingerprint)
+        async with self._write_lock:
+            try:
+                cursor = await self._connection.execute(
+                    """
+                    UPDATE operations SET updated_at = ?
+                    WHERE run_id = ? AND task_id = ? AND operation = 'submit'
+                      AND phase = 'intent_created'
+                      AND client_submission_id = ?
+                      AND provider = ? AND task_fingerprint = ?
+                    """,
+                    (_now(), run_id, task_id, client_submission_id,
+                     provider, task_fingerprint),
+                )
+                changed = cursor.rowcount == 1
+                await self._connection.commit()
+            except BaseException:
+                await self._connection.rollback()
+                raise
+        await cursor.close()
+        return changed
+
+    async def expire_submission_intent_lease(
+        self,
+        run_id: str,
+        task_id: str,
+        client_submission_id: str,
+        provider: str,
+        task_fingerprint: str,
+        cutoff: str,
+    ) -> bool:
+        async with self._write_lock:
+            try:
+                cursor = await self._connection.execute(
+                    """
+                    UPDATE operations
+                    SET status = 'submission_uncertain',
+                        phase = 'submission_uncertain', updated_at = ?
+                    WHERE run_id = ? AND task_id = ? AND operation = 'submit'
+                      AND phase = 'intent_created'
+                      AND client_submission_id = ?
+                      AND provider = ? AND task_fingerprint = ?
+                      AND updated_at <= ?
+                    """,
+                    (_now(), run_id, task_id, client_submission_id,
+                     provider, task_fingerprint, cutoff),
+                )
+                changed = cursor.rowcount == 1
+                await self._connection.commit()
+            except BaseException:
+                await self._connection.rollback()
+                raise
+        await cursor.close()
+        return changed
+
+    async def create_artifact_repair_intent_if_absent(
+        self,
+        run_id: str,
+        task_id: str,
+        provider: str,
+        official_id: str,
+        client_submission_id: str,
+        task_fingerprint: str,
+    ) -> tuple[bool, dict[str, Any]]:
+        self._validate_identity_segment(run_id, "run_id")
+        self._validate_identity_segment(task_id, "task_id")
+        if not isinstance(provider, str) or _SAFE_PROVIDER.fullmatch(provider) is None:
+            raise ValueError("invalid provider")
+        self._validate_official_id(official_id)
+        self._validate_client_submission_id(client_submission_id)
+        self._validate_task_fingerprint(task_fingerprint)
+        timestamp = _now()
+        async with self._write_lock:
+            try:
+                await self._connection.execute("BEGIN IMMEDIATE")
+                select_cursor = await self._connection.execute(
+                    """
+                    SELECT run_id, task_id, operation, provider, task_fingerprint,
+                           provider_id, status, phase, client_submission_id,
+                           official_id, payload_json, updated_at
+                    FROM operations
+                    WHERE run_id = ? AND task_id = ?
+                      AND operation LIKE 'artifact_repair_%'
+                    ORDER BY operation DESC
+                    LIMIT 1
+                    """,
+                    (run_id, task_id),
+                )
+                previous = await select_cursor.fetchone()
+                await select_cursor.close()
+                if previous is not None and previous["phase"] == "intent_created":
+                    await self._connection.commit()
+                    return False, self._operation_from_row(previous)
+                sequence = (
+                    int(str(previous["operation"]).rsplit("_", 1)[1]) + 1
+                    if previous is not None else 1
+                )
+                operation = f"artifact_repair_{sequence:04d}"
+                cursor = await self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO operations (
+                      run_id, task_id, operation, provider, task_fingerprint,
+                      provider_id, status, phase, client_submission_id,
+                      official_id, payload_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?,
+                              'intent_created', 'intent_created', ?, ?, '{}', ?)
+                    """,
+                    (run_id, task_id, operation, provider, task_fingerprint,
+                     official_id, client_submission_id, official_id, timestamp),
+                )
+                created = cursor.rowcount == 1
+                await cursor.close()
+                cursor = await self._connection.execute(
+                    """
+                    SELECT run_id, task_id, operation, provider, task_fingerprint,
+                           provider_id, status, phase, client_submission_id,
+                           official_id, payload_json, updated_at
+                    FROM operations
+                    WHERE run_id = ? AND task_id = ? AND operation = ?
+                    """,
+                    (run_id, task_id, operation),
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+                if row is None:
+                    raise RuntimeError("artifact repair intent was not persisted")
+                await self._connection.commit()
+            except BaseException:
+                await self._connection.rollback()
+                raise
+        return created, self._operation_from_row(row)
+
     async def get_operation(
         self,
         run_id: str,
@@ -356,7 +545,8 @@ class Repository:
     ) -> dict[str, Any] | None:
         cursor = await self._connection.execute(
             """
-            SELECT run_id, task_id, operation, provider_id, status,
+            SELECT run_id, task_id, operation, provider, task_fingerprint,
+                   provider_id, status,
                    phase, client_submission_id, official_id,
                    payload_json, updated_at
             FROM operations
@@ -378,7 +568,8 @@ class Repository:
     ) -> list[dict[str, Any]]:
         if task_id is None:
             sql = """
-                SELECT run_id, task_id, operation, provider_id, status,
+                SELECT run_id, task_id, operation, provider, task_fingerprint,
+                       provider_id, status,
                        phase, client_submission_id, official_id,
                        payload_json, updated_at
                 FROM operations
@@ -388,7 +579,8 @@ class Repository:
             parameters = (run_id,)
         else:
             sql = """
-                SELECT run_id, task_id, operation, provider_id, status,
+                SELECT run_id, task_id, operation, provider, task_fingerprint,
+                       provider_id, status,
                        phase, client_submission_id, official_id,
                        payload_json, updated_at
                 FROM operations
@@ -435,6 +627,41 @@ class Repository:
                 artifact.sha256,
                 _now(),
             ),
+        )
+
+    async def replace_task_artifacts(
+        self, run_id: str, task_id: str, artifacts: list[Artifact]
+    ) -> None:
+        if any(artifact.task_id != task_id for artifact in artifacts):
+            raise ValueError("artifact task identity mismatch")
+        timestamp = _now()
+        async with self._write_lock:
+            try:
+                await self._connection.execute("BEGIN IMMEDIATE")
+                await self._connection.execute(
+                    "DELETE FROM artifacts WHERE run_id = ? AND task_id = ?",
+                    (run_id, task_id),
+                )
+                for artifact in artifacts:
+                    await self._connection.execute(
+                        """
+                        INSERT INTO artifacts (
+                          artifact_id, run_id, task_id, artifact_json, sha256,
+                          updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (artifact.artifact_id, run_id, task_id,
+                         artifact.model_dump_json(), artifact.sha256, timestamp),
+                    )
+                await self._connection.commit()
+            except BaseException:
+                await self._connection.rollback()
+                raise
+
+    async def delete_task_artifacts(self, run_id: str, task_id: str) -> None:
+        await self._write(
+            "DELETE FROM artifacts WHERE run_id = ? AND task_id = ?",
+            (run_id, task_id),
         )
 
     async def get_artifact(self, artifact_id: str) -> Artifact | None:
@@ -538,6 +765,8 @@ class Repository:
             "phase": "TEXT",
             "client_submission_id": "TEXT",
             "official_id": "TEXT",
+            "provider": "TEXT",
+            "task_fingerprint": "TEXT",
         }
         for name, declaration in additions.items():
             if name not in columns:
@@ -561,6 +790,22 @@ class Repository:
             WHERE phase IS NULL OR phase = ''
             """
         )
+        cursor = await connection.execute(
+            "SELECT rowid, payload_json FROM operations WHERE provider IS NULL"
+        )
+        legacy_providers = await cursor.fetchall()
+        await cursor.close()
+        for row in legacy_providers:
+            try:
+                payload = json.loads(row[1])
+                provider = payload.get("provider") if isinstance(payload, dict) else None
+            except (TypeError, ValueError):
+                provider = None
+            if isinstance(provider, str) and _SAFE_PROVIDER.fullmatch(provider):
+                await connection.execute(
+                    "UPDATE operations SET provider = ? WHERE rowid = ?",
+                    (provider, row[0]),
+                )
         cursor = await connection.execute(
             """
             SELECT rowid, run_id, task_id, operation
@@ -639,3 +884,19 @@ class Repository:
     def _validate_phase(value: str) -> None:
         if value not in _OPERATION_PHASES:
             raise ValueError("invalid operation phase")
+
+    @staticmethod
+    def _validate_task_fingerprint(value: str) -> None:
+        if not isinstance(value, str) or _TASK_FINGERPRINT.fullmatch(value) is None:
+            raise ValueError("invalid task_fingerprint")
+
+    @staticmethod
+    def _validate_transition(operation: str, expected: str, target: str) -> None:
+        operation_kind = (
+            "artifact_repair"
+            if operation.startswith("artifact_repair_")
+            else operation
+        )
+        allowed = _OPERATION_TRANSITIONS.get(operation_kind)
+        if allowed is None or (expected, target) not in allowed:
+            raise ValueError("invalid operation phase transition")

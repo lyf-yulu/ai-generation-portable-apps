@@ -142,13 +142,13 @@ async def test_repository_rolls_back_when_write_is_cancelled():
 async def test_operation_is_unique_by_run_task_and_name(tmp_path: Path):
     repo = await Repository.open(tmp_path / "agent.sqlite3")
     await repo.save_operation(
-        "run-1", "task-1", "submit", "provider-123", "submitted"
+        "run-1", "task-1", "publish", "provider-123", "submitted"
     )
     await repo.save_operation(
-        "run-1", "task-1", "submit", "provider-123", "submitted"
+        "run-1", "task-1", "publish", "provider-123", "submitted"
     )
 
-    operation = await repo.get_operation("run-1", "task-1", "submit")
+    operation = await repo.get_operation("run-1", "task-1", "publish")
 
     assert operation is not None
     assert operation["provider_id"] == "provider-123"
@@ -161,7 +161,7 @@ async def test_operation_upsert_replaces_mutable_fields(tmp_path: Path):
     await repo.save_operation(
         "run-1",
         "task-1",
-        "submit",
+        "publish",
         "provider-old",
         "submitted",
         {"attempt": 1},
@@ -169,13 +169,13 @@ async def test_operation_upsert_replaces_mutable_fields(tmp_path: Path):
     await repo.save_operation(
         "run-1",
         "task-1",
-        "submit",
+        "publish",
         "provider-new",
         "completed",
         {"attempt": 2},
     )
 
-    operation = await repo.get_operation("run-1", "task-1", "submit")
+    operation = await repo.get_operation("run-1", "task-1", "publish")
 
     assert operation is not None
     assert operation["provider_id"] == "provider-new"
@@ -329,13 +329,14 @@ async def test_submission_intent_is_atomically_created_once_under_concurrency(
 ) -> None:
     repo = await Repository.open(tmp_path / "agent.sqlite3")
     client_id = "a" * 32
+    fingerprint = "0" * 64
 
     first, second = await asyncio.gather(
         repo.create_submission_intent_if_absent(
-            "run-1", "task-1", "seedance", client_id
+            "run-1", "task-1", "seedance", client_id, fingerprint
         ),
         repo.create_submission_intent_if_absent(
-            "run-1", "task-1", "seedance", client_id
+            "run-1", "task-1", "seedance", client_id, fingerprint
         ),
     )
 
@@ -350,14 +351,102 @@ async def test_submission_intent_is_atomically_created_once_under_concurrency(
     await repo.close()
 
 
+async def test_submission_identity_is_immutable_and_checked_by_cas(
+    tmp_path: Path,
+) -> None:
+    repo = await Repository.open(tmp_path / "agent.sqlite3")
+    client_id = "e" * 32
+    fingerprint = "f" * 64
+    created, operation = await repo.create_submission_intent_if_absent(
+        "run-identity", "task-identity", "seedance", client_id, fingerprint
+    )
+
+    assert created is True
+    assert operation["provider"] == "seedance"
+    assert operation["task_fingerprint"] == fingerprint
+    assert not await repo.compare_and_set_operation(
+        "run-identity",
+        "task-identity",
+        "submit",
+        expected_phase="intent_created",
+        expected_client_submission_id=client_id,
+        expected_official_id=None,
+        expected_provider="chiyun",
+        expected_task_fingerprint=fingerprint,
+        phase="submitted",
+        official_id="official-id",
+    )
+    current = await repo.get_operation("run-identity", "task-identity", "submit")
+    assert current is not None
+    assert current["phase"] == "intent_created"
+    await repo.close()
+
+
+async def test_submit_operation_rejects_terminal_phase_regression(
+    tmp_path: Path,
+) -> None:
+    repo = await Repository.open(tmp_path / "agent.sqlite3")
+    client_id = "a" * 32
+    fingerprint = "b" * 64
+    await repo.create_submission_intent_if_absent(
+        "run-monotonic", "task-monotonic", "seedance", client_id, fingerprint
+    )
+    assert await repo.compare_and_set_operation(
+        "run-monotonic", "task-monotonic", "submit",
+        expected_phase="intent_created", expected_client_submission_id=client_id,
+        expected_official_id=None, expected_provider="seedance",
+        expected_task_fingerprint=fingerprint, phase="submitted",
+        official_id="official-id",
+    )
+    assert await repo.compare_and_set_operation(
+        "run-monotonic", "task-monotonic", "submit",
+        expected_phase="submitted", expected_client_submission_id=client_id,
+        expected_official_id="official-id", expected_provider="seedance",
+        expected_task_fingerprint=fingerprint, phase="succeeded",
+        official_id="official-id",
+    )
+    with pytest.raises(ValueError, match="transition"):
+        await repo.compare_and_set_operation(
+            "run-monotonic", "task-monotonic", "submit",
+            expected_phase="succeeded", expected_client_submission_id=client_id,
+            expected_official_id="official-id", expected_provider="seedance",
+            expected_task_fingerprint=fingerprint, phase="submitted",
+            official_id="official-id",
+        )
+    await repo.close()
+
+
+async def test_submission_intent_is_atomic_across_two_repository_connections(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "agent.sqlite3"
+    first_repo = await Repository.open(path)
+    second_repo = await Repository.open(path)
+    fingerprint = "c" * 64
+    first, second = await asyncio.gather(
+        first_repo.create_submission_intent_if_absent(
+            "run-two", "task-two", "seedance", "1" * 32, fingerprint
+        ),
+        second_repo.create_submission_intent_if_absent(
+            "run-two", "task-two", "seedance", "2" * 32, fingerprint
+        ),
+    )
+    assert sorted([first[0], second[0]]) == [False, True]
+    assert first[1]["client_submission_id"] == second[1]["client_submission_id"]
+    assert first[1]["provider"] == second[1]["provider"] == "seedance"
+    await first_repo.close()
+    await second_repo.close()
+
+
 async def test_operation_transition_is_compare_and_set_on_all_identity_fields(
     tmp_path: Path,
 ) -> None:
     repo = await Repository.open(tmp_path / "agent.sqlite3")
     client_id = "b" * 32
     official_id = "ark/task ?fictional"
+    fingerprint = "0" * 64
     created, _ = await repo.create_submission_intent_if_absent(
-        "run-1", "task-1", "seedance", client_id
+        "run-1", "task-1", "seedance", client_id, fingerprint
     )
     assert created is True
 
@@ -368,6 +457,8 @@ async def test_operation_transition_is_compare_and_set_on_all_identity_fields(
         expected_phase="intent_created",
         expected_client_submission_id="c" * 32,
         expected_official_id=None,
+        expected_provider="seedance",
+        expected_task_fingerprint=fingerprint,
         phase="submitted",
         official_id=official_id,
     )
@@ -378,6 +469,8 @@ async def test_operation_transition_is_compare_and_set_on_all_identity_fields(
         expected_phase="intent_created",
         expected_client_submission_id=client_id,
         expected_official_id=None,
+        expected_provider="seedance",
+        expected_task_fingerprint=fingerprint,
         phase="submitted",
         official_id=official_id,
     )
@@ -388,6 +481,8 @@ async def test_operation_transition_is_compare_and_set_on_all_identity_fields(
         expected_phase="intent_created",
         expected_client_submission_id=client_id,
         expected_official_id=None,
+        expected_provider="seedance",
+        expected_task_fingerprint=fingerprint,
         phase="submitted",
         official_id=official_id,
     )
@@ -398,6 +493,8 @@ async def test_operation_transition_is_compare_and_set_on_all_identity_fields(
         expected_phase="submitted",
         expected_client_submission_id=client_id,
         expected_official_id=official_id,
+        expected_provider="seedance",
+        expected_task_fingerprint=fingerprint,
         phase="timed_out",
         official_id=official_id,
     )
@@ -434,7 +531,7 @@ async def test_submission_intent_rejects_unsafe_provider_or_client_id(
 
     with pytest.raises(ValueError):
         await repo.create_submission_intent_if_absent(
-            "run-1", "task-1", provider, client_id
+            "run-1", "task-1", provider, client_id, "0" * 64
         )
 
     assert await repo.count_operations() == 0
@@ -446,8 +543,9 @@ async def test_operation_transition_rejects_unknown_phase_and_unsafe_official_id
 ) -> None:
     repo = await Repository.open(tmp_path / "agent.sqlite3")
     client_id = "d" * 32
+    fingerprint = "0" * 64
     await repo.create_submission_intent_if_absent(
-        "run-1", "task-1", "seedance", client_id
+        "run-1", "task-1", "seedance", client_id, fingerprint
     )
 
     for phase, official_id in [
@@ -464,6 +562,8 @@ async def test_operation_transition_rejects_unknown_phase_and_unsafe_official_id
                 expected_phase="intent_created",
                 expected_client_submission_id=client_id,
                 expected_official_id=None,
+                expected_provider="seedance",
+                expected_task_fingerprint=fingerprint,
                 phase=phase,
                 official_id=official_id,
             )
@@ -604,6 +704,50 @@ def test_download_accepts_chunks_and_reuses_content_path(tmp_path: Path):
     assert first.local_path == second.local_path
     assert first.size == len(PNG_1X1)
     assert not list((tmp_path / "outputs").rglob("*.part"))
+
+
+def test_output_root_symlink_replacement_cannot_escape_fixed_root(
+    tmp_path: Path,
+) -> None:
+    outputs = tmp_path / "outputs"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    store = FileStore(tmp_path / "data", outputs, max_bytes=1024)
+    held = tmp_path / "held-outputs"
+    outputs.rename(held)
+    outputs.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(OSError, match="storage directory changed"):
+        store.save_download(
+            "run-1", "task-1", "result.png", PNG_1X1, "image/png"
+        )
+
+    assert not list(outside.rglob("*"))
+
+
+def test_output_task_directory_replacement_is_detected_before_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outputs = tmp_path / "outputs"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    store = FileStore(tmp_path / "data", outputs, max_bytes=1024)
+    original = store._verify_directory_chain
+
+    def replace_then_verify(root, descriptors):
+        task_dir = outputs / "runs" / "run-1" / "tasks" / "task-1"
+        displaced = task_dir.with_name("task-1-displaced")
+        task_dir.rename(displaced)
+        task_dir.symlink_to(outside, target_is_directory=True)
+        original(root, descriptors)
+
+    monkeypatch.setattr(store, "_verify_directory_chain", replace_then_verify)
+    with pytest.raises(OSError, match="storage directory changed"):
+        store.save_download(
+            "run-1", "task-1", "result.png", PNG_1X1, "image/png"
+        )
+    assert not list(outside.rglob("*"))
 
 
 def test_chunked_image_download_does_not_read_entire_part_file(

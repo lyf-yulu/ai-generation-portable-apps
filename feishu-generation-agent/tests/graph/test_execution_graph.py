@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import aiosqlite
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
@@ -24,18 +25,27 @@ from feishu_generation_agent.domain.errors import (
 from feishu_generation_agent.graph.builder import build_graph
 from feishu_generation_agent.graph.nodes import (
     GraphServices,
+    _task_fingerprint,
     execute_selected_tasks,
     revalidate_approval,
+    verify_and_download_artifacts,
 )
 from feishu_generation_agent.storage.checkpoints import open_checkpointer
 from feishu_generation_agent.storage.files import FileStore
 from feishu_generation_agent.storage.provider_results import ProviderResultStore
+from feishu_generation_agent.storage.repository import Repository
 
 
 MP4_FIXTURE = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2"
 PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
+
+
+def _plan_fingerprint(plan: dict[str, Any], task_id: str) -> str:
+    parsed = TaskPlan.model_validate(plan)
+    task = next(task for task in parsed.tasks if task.task_id == task_id)
+    return _task_fingerprint(task)
 
 
 class _ScriptedGenerator:
@@ -434,14 +444,15 @@ async def test_preexisting_intent_is_uncertain_without_provider_calls(
 ) -> None:
     run_id = "run-preexisting-intent"
     client_id = "1" * 32
-    await fake_services.repository.create_submission_intent_if_absent(
-        run_id, "task-video", "seedance", client_id
-    )
     graph = build_graph(fake_services, InMemorySaver())
     thread_id = "thread-preexisting-intent"
     config = _config(thread_id)
     first = await graph.ainvoke(_input(run_id, thread_id), config=config)
     plan = _interrupt_payload(first)["draft_plan"]
+    fingerprint = _plan_fingerprint(plan, "task-video")
+    await fake_services.repository.create_submission_intent_if_absent(
+        run_id, "task-video", "seedance", client_id, fingerprint
+    )
 
     result = await graph.ainvoke(
         Command(
@@ -455,14 +466,74 @@ async def test_preexisting_intent_is_uncertain_without_provider_calls(
     )
 
     assert result["status"] == "completed_with_errors"
-    assert result["execution_records"][0]["status"] == "submission_uncertain"
+    assert result["execution_records"][0]["status"] == "intent_created"
     _assert_zero_generation(fake_services)
     operation = await fake_services.repository.get_operation(
         run_id, "task-video", "submit"
     )
     assert operation is not None
-    assert operation["phase"] == "submission_uncertain"
+    assert operation["phase"] == "intent_created"
     assert operation["official_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_changed_task_with_same_id_never_reuses_submission(
+    fake_services: GraphServices,
+) -> None:
+    run_id = "run-changed-task"
+    state, config = await _waiting_state(
+        fake_services, run_id, "thread-changed-task"
+    )
+    approved = TaskPlan.model_validate(state["draft_plan"]).tasks[0]
+    old = approved.model_copy(update={"prompt": approved.prompt + " old"})
+    await fake_services.repository.create_submission_intent_if_absent(
+        run_id, approved.task_id, "seedance", "9" * 32,
+        _task_fingerprint(old),
+    )
+    state["approved_tasks"] = [approved.model_dump(mode="json")]
+
+    result = await execute_selected_tasks(state, config, services=fake_services)
+
+    assert result["execution_records"][0]["status"] == "submission_uncertain"
+    _assert_zero_generation(fake_services)
+
+
+@pytest.mark.asyncio
+async def test_stale_submission_intent_becomes_uncertain_without_retry(
+    fake_services: GraphServices,
+) -> None:
+    run_id = "run-stale-intent"
+    state, config = await _waiting_state(
+        fake_services, run_id, "thread-stale-intent"
+    )
+    task = TaskPlan.model_validate(state["draft_plan"]).tasks[0]
+    await fake_services.repository.create_submission_intent_if_absent(
+        run_id, task.task_id, "seedance", "6" * 32,
+        _task_fingerprint(task),
+    )
+    async with aiosqlite.connect(
+        fake_services.settings.business_db_path
+    ) as connection:
+        await connection.execute(
+            """
+            UPDATE operations SET updated_at = '2000-01-01T00:00:00+00:00'
+            WHERE run_id = ? AND task_id = ? AND operation = 'submit'
+            """,
+            (run_id, task.task_id),
+        )
+        await connection.commit()
+    state["approved_tasks"] = state["draft_plan"]["tasks"]
+
+    result = await execute_selected_tasks(
+        state, config, services=fake_services
+    )
+
+    assert result["execution_records"][0]["status"] == "submission_uncertain"
+    operation = await fake_services.repository.get_operation(
+        run_id, task.task_id, "submit"
+    )
+    assert operation is not None and operation["phase"] == "submission_uncertain"
+    _assert_zero_generation(fake_services)
 
 
 @pytest.mark.asyncio
@@ -513,20 +584,6 @@ async def test_submitted_recovery_retries_poll_only_and_materializes(
     run_id = "run-submitted-recovery"
     client_id = "2" * 32
     official_id = "seedance-recovery-official"
-    created, _ = await fake_services.repository.create_submission_intent_if_absent(
-        run_id, "task-video", "seedance", client_id
-    )
-    assert created
-    assert await fake_services.repository.compare_and_set_operation(
-        run_id,
-        "task-video",
-        "submit",
-        expected_phase="intent_created",
-        expected_client_submission_id=client_id,
-        expected_official_id=None,
-        phase="submitted",
-        official_id=official_id,
-    )
     video = _ScriptedGenerator(
         "seedance",
         polls=[
@@ -543,7 +600,23 @@ async def test_submitted_recovery_retries_poll_only_and_materializes(
     config = _config(thread_id)
     first = await graph.ainvoke(_input(run_id, thread_id), config=config)
     plan = _interrupt_payload(first)["draft_plan"]
-
+    fingerprint = _plan_fingerprint(plan, "task-video")
+    created, _ = await fake_services.repository.create_submission_intent_if_absent(
+        run_id, "task-video", "seedance", client_id, fingerprint
+    )
+    assert created
+    assert await fake_services.repository.compare_and_set_operation(
+        run_id,
+        "task-video",
+        "submit",
+        expected_phase="intent_created",
+        expected_client_submission_id=client_id,
+        expected_official_id=None,
+        expected_provider="seedance",
+        expected_task_fingerprint=fingerprint,
+        phase="submitted",
+        official_id=official_id,
+    )
     result = await graph.ainvoke(
         Command(
             resume={
@@ -572,8 +645,13 @@ async def test_submitted_poll_rejects_changed_provider_identity(
     run_id = "run-poll-identity"
     client_id = "6" * 32
     official_id = "seedance-expected-official"
+    state, config = await _waiting_state(
+        fake_services, run_id, "thread-poll-identity"
+    )
+    state["approved_tasks"] = state["draft_plan"]["tasks"]
+    fingerprint = _plan_fingerprint(state["draft_plan"], "task-video")
     await fake_services.repository.create_submission_intent_if_absent(
-        run_id, "task-video", "seedance", client_id
+        run_id, "task-video", "seedance", client_id, fingerprint
     )
     assert await fake_services.repository.compare_and_set_operation(
         run_id,
@@ -582,6 +660,8 @@ async def test_submitted_poll_rejects_changed_provider_identity(
         expected_phase="intent_created",
         expected_client_submission_id=client_id,
         expected_official_id=None,
+        expected_provider="seedance",
+        expected_task_fingerprint=fingerprint,
         phase="submitted",
         official_id=official_id,
     )
@@ -597,11 +677,6 @@ async def test_submitted_poll_rejects_changed_provider_identity(
         ],
     )
     services = replace(fake_services, video_generator=video)
-    state, config = await _waiting_state(
-        services, run_id, "thread-poll-identity"
-    )
-    state["approved_tasks"] = state["draft_plan"]["tasks"]
-
     result = await execute_selected_tasks(state, config, services=services)
 
     assert video.submit_calls == 0
@@ -622,7 +697,13 @@ async def test_concurrent_execution_has_one_submit_and_intent_loser_is_uncertain
         ),
         block_submit=blocker,
     )
-    services = replace(fake_services, video_generator=video)
+    services = replace(
+        fake_services,
+        video_generator=video,
+        settings=fake_services.settings.model_copy(
+            update={"submission_intent_lease_seconds": 0.03}
+        ),
+    )
     graph = build_graph(services, InMemorySaver())
     thread_id = "thread-concurrent-state"
     config = _config(thread_id)
@@ -639,13 +720,14 @@ async def test_concurrent_execution_has_one_submit_and_intent_loser_is_uncertain
         execute_selected_tasks(state, config, services=services)
     )
     await video.first_submit.wait()
+    await asyncio.sleep(0.06)
     loser = await execute_selected_tasks(state, config, services=services)
     blocker.set()
     winner_result = await winner
 
     assert video.submit_calls == 1
     assert video.poll_calls == 0
-    assert loser["execution_records"][0]["status"] == "submission_uncertain"
+    assert loser["execution_records"][0]["status"] == "intent_created"
     assert winner_result["execution_records"][0]["status"] == "succeeded"
 
 
@@ -747,8 +829,9 @@ async def test_submitted_poll_timeout_retains_official_id_and_never_submits(
     state["approved_tasks"] = state["draft_plan"]["tasks"]
     client_id = "3" * 32
     official_id = "seedance-timeout-official"
+    fingerprint = _plan_fingerprint(state["draft_plan"], "task-video")
     await fake_services.repository.create_submission_intent_if_absent(
-        run_id, "task-video", "seedance", client_id
+        run_id, "task-video", "seedance", client_id, fingerprint
     )
     assert await fake_services.repository.compare_and_set_operation(
         run_id,
@@ -757,6 +840,8 @@ async def test_submitted_poll_timeout_retains_official_id_and_never_submits(
         expected_phase="intent_created",
         expected_client_submission_id=client_id,
         expected_official_id=None,
+        expected_provider="seedance",
+        expected_task_fingerprint=fingerprint,
         phase="submitted",
         official_id=official_id,
     )
@@ -808,6 +893,21 @@ async def test_valid_artifact_skips_provider_but_corrupt_artifact_polls_only(
 
     artifact = (await fake_services.repository.list_artifacts(run_id))[0]
     artifact.local_path.write_bytes(b"corrupt")
+    submit_before_repair = await fake_services.repository.get_operation(
+        run_id, "task-video", "submit"
+    )
+    assert submit_before_repair is not None
+    repair_created, _ = (
+        await fake_services.repository.create_artifact_repair_intent_if_absent(
+            run_id,
+            "task-video",
+            "seedance",
+            "seedance-artifact-recovery",
+            "8" * 32,
+            submit_before_repair["task_fingerprint"],
+        )
+    )
+    assert repair_created is True
     recovery = _ScriptedGenerator(
         "seedance",
         polls=[
@@ -830,6 +930,181 @@ async def test_valid_artifact_skips_provider_but_corrupt_artifact_polls_only(
     assert recovered["execution_records"][0]["status"] == "succeeded"
     saved = (await fake_services.repository.list_artifacts(run_id))[0]
     assert fake_services.file_store.verify_artifact(run_id, saved)
+    submit = await fake_services.repository.get_operation(
+        run_id, "task-video", "submit"
+    )
+    repair = next(
+        operation
+        for operation in await fake_services.repository.list_operations(
+            run_id, task_id="task-video"
+        )
+        if operation["operation"].startswith("artifact_repair_")
+    )
+    assert submit is not None and submit["phase"] == "succeeded"
+    assert repair is not None and repair["phase"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_failed_artifact_repair_does_not_break_final_verification(
+    fake_services: GraphServices,
+) -> None:
+    run_id = "run-artifact-repair-failed"
+    initial = _ScriptedGenerator(
+        "seedance",
+        submit_result=_submission(
+            "seedance", "repair-failed-official", "succeeded",
+            result=_video_result(),
+        ),
+    )
+    services = replace(fake_services, video_generator=initial)
+    state, config = await _waiting_state(
+        services, run_id, "thread-artifact-repair-failed"
+    )
+    state["approved_tasks"] = state["draft_plan"]["tasks"]
+    first = await execute_selected_tasks(state, config, services=services)
+    artifact = (await services.repository.list_artifacts(run_id))[0]
+    artifact.local_path.write_bytes(b"corrupt")
+    failed_poll = _ScriptedGenerator(
+        "seedance",
+        polls=[_submission("seedance", "repair-failed-official", "failed")],
+    )
+    failed_services = replace(services, video_generator=failed_poll)
+    failed = await execute_selected_tasks(state, config, services=failed_services)
+    merged = {**state, **failed}
+
+    verified = await verify_and_download_artifacts(
+        merged, config, services=failed_services
+    )
+
+    assert verified["status"] == "completed_with_errors"
+    assert verified["artifacts"] == []
+    assert await services.repository.list_artifacts(run_id) == []
+
+
+@pytest.mark.asyncio
+async def test_two_database_connections_reconcile_poll_race_to_one_phase(
+    fake_services: GraphServices,
+) -> None:
+    run_id = "run-two-connection-poll-race"
+    state, config = await _waiting_state(
+        fake_services, run_id, "thread-two-connection-poll-race"
+    )
+    state["approved_tasks"] = state["draft_plan"]["tasks"]
+    task = TaskPlan.model_validate(state["draft_plan"]).tasks[0]
+    first_repo = await Repository.open(fake_services.settings.business_db_path)
+    second_repo = await Repository.open(fake_services.settings.business_db_path)
+    client_id = "7" * 32
+    official_id = "two-connection-official"
+    fingerprint = _task_fingerprint(task)
+    await first_repo.create_submission_intent_if_absent(
+        run_id, task.task_id, "seedance", client_id, fingerprint
+    )
+    assert await first_repo.compare_and_set_operation(
+        run_id, task.task_id, "submit",
+        expected_phase="intent_created",
+        expected_client_submission_id=client_id,
+        expected_official_id=None,
+        expected_provider="seedance",
+        expected_task_fingerprint=fingerprint,
+        phase="submitted",
+        official_id=official_id,
+    )
+    gate = asyncio.Event()
+    count = 0
+    lock = asyncio.Lock()
+
+    class RacingGenerator:
+        def __init__(self, succeeds: bool) -> None:
+            self.succeeds = succeeds
+
+        async def poll(self, submission):
+            nonlocal count
+            async with lock:
+                count += 1
+                if count >= 2:
+                    gate.set()
+            await gate.wait()
+            if self.succeeds:
+                return _submission(
+                    "seedance", official_id, "succeeded", result=_video_result()
+                )
+            return _submission("seedance", official_id, "running")
+
+    first_services = replace(
+        fake_services, repository=first_repo,
+        video_generator=RacingGenerator(True),
+    )
+    second_services = replace(
+        fake_services, repository=second_repo,
+        video_generator=RacingGenerator(False),
+    )
+    first, second = await asyncio.gather(
+        execute_selected_tasks(state, config, services=first_services),
+        execute_selected_tasks(state, config, services=second_services),
+    )
+    current = await first_repo.get_operation(run_id, task.task_id, "submit")
+    assert current is not None
+    assert first["execution_records"][0]["status"] == current["phase"]
+    assert second["execution_records"][0]["status"] == current["phase"]
+    await first_repo.close()
+    await second_repo.close()
+
+
+@pytest.mark.asyncio
+async def test_final_verification_rejects_same_id_with_changed_metadata(
+    fake_services: GraphServices,
+) -> None:
+    state, config = await _waiting_state(
+        fake_services, "run-artifact-metadata", "thread-artifact-metadata"
+    )
+    state["approved_tasks"] = state["draft_plan"]["tasks"]
+    executed = await execute_selected_tasks(
+        state, config, services=fake_services
+    )
+    tampered = dict(executed["artifacts"][0])
+    tampered["provider_url"] = "https://cdn.fictional.test/other.mp4"
+    merged = {**state, **executed, "artifacts": [tampered]}
+
+    with pytest.raises(AgentError) as caught:
+        await verify_and_download_artifacts(
+            merged, config, services=fake_services
+        )
+
+    assert caught.value.detail.category == ErrorCategory.PROVIDER_TERMINAL
+
+
+@pytest.mark.asyncio
+async def test_loser_verification_never_deletes_concurrent_winner_artifact(
+    fake_services: GraphServices,
+) -> None:
+    run_id = "run-loser-verification"
+    state, config = await _waiting_state(
+        fake_services, run_id, "thread-loser-verification"
+    )
+    state["approved_tasks"] = state["draft_plan"]["tasks"]
+    winner = await execute_selected_tasks(state, config, services=fake_services)
+    assert winner["execution_records"][0]["status"] == "succeeded"
+    loser_state = {
+        **state,
+        "execution_records": [
+            {
+                "task_id": "task-video",
+                "provider": "seedance",
+                "status": "intent_created",
+            }
+        ],
+        "artifacts": [],
+        "status": "completed_with_errors",
+    }
+
+    verified = await verify_and_download_artifacts(
+        loser_state, config, services=fake_services
+    )
+
+    assert verified["status"] == "completed_with_errors"
+    persisted = await fake_services.repository.list_artifacts(run_id)
+    assert len(persisted) == 1
+    assert fake_services.file_store.verify_artifact(run_id, persisted[0])
 
 
 class _RecordingDownloader:
@@ -847,7 +1122,7 @@ async def test_signed_result_url_marker_reaches_only_downloader(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     marker = "SIGNED_MARKER_MUST_NEVER_PERSIST"
-    raw_url = f"https://cdn.fictional.test/result.mp4?token={marker}"
+    raw_url = f"https://cdn.fictional.test/result.mp4?signature={marker}"
     downloader = _RecordingDownloader()
     file_store = FileStore(
         fake_services.settings.data_dir,
@@ -903,8 +1178,16 @@ async def test_signed_result_url_marker_reaches_only_downloader(
     )
     assert marker not in json.dumps(operation, ensure_ascii=False)
     assert marker not in caplog.text
-    database_bytes = services.settings.business_db_path.read_bytes()
-    assert marker.encode() not in database_bytes
+    await services.repository.close()
+    business_bytes = b"".join(
+        path.read_bytes()
+        for path in services.settings.business_db_path.parent.glob(
+            f"{services.settings.business_db_path.name}*"
+        )
+        if path.is_file()
+    )
+    assert business_bytes
+    assert marker.encode() not in business_bytes
     checkpoint_bytes = b"".join(
         path.read_bytes()
         for path in services.settings.checkpoint_db_path.parent.glob(
@@ -940,8 +1223,9 @@ async def test_cold_checkpoint_resume_of_submitted_operation_is_poll_only(
         plan = _interrupt_payload(first)["draft_plan"]
 
     client_id = "4" * 32
+    fingerprint = _plan_fingerprint(plan, "task-video")
     await services.repository.create_submission_intent_if_absent(
-        run_id, "task-video", "seedance", client_id
+        run_id, "task-video", "seedance", client_id, fingerprint
     )
     assert await services.repository.compare_and_set_operation(
         run_id,
@@ -950,6 +1234,8 @@ async def test_cold_checkpoint_resume_of_submitted_operation_is_poll_only(
         expected_phase="intent_created",
         expected_client_submission_id=client_id,
         expected_official_id=None,
+        expected_provider="seedance",
+        expected_task_fingerprint=fingerprint,
         phase="submitted",
         official_id=official_id,
     )
@@ -1084,7 +1370,14 @@ async def test_chiyun_submitted_staging_tamper_fails_without_resubmit(
     else:
         result_item.local_path.write_bytes(b"changed")
     await fake_services.repository.create_submission_intent_if_absent(
-        run_id, "task-image", "chiyun", client_id
+        run_id,
+        "task-image",
+        "chiyun",
+        client_id,
+        _task_fingerprint(TaskPlan.model_validate(state["draft_plan"]).tasks[0]),
+    )
+    fingerprint = _task_fingerprint(
+        TaskPlan.model_validate(state["draft_plan"]).tasks[0]
     )
     assert await fake_services.repository.compare_and_set_operation(
         run_id,
@@ -1093,6 +1386,8 @@ async def test_chiyun_submitted_staging_tamper_fails_without_resubmit(
         expected_phase="intent_created",
         expected_client_submission_id=client_id,
         expected_official_id=None,
+        expected_provider="chiyun",
+        expected_task_fingerprint=fingerprint,
         phase="submitted",
         official_id=official_id,
     )

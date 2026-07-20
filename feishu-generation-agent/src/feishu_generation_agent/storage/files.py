@@ -81,6 +81,18 @@ class FileStore:
         self._max_bytes = max_bytes
         self._result_downloader = result_downloader
         self._provider_result_store = provider_result_store
+        self._data_root_fd = self._open_root(data_dir)
+        self._outputs_root_fd = self._open_root(outputs_dir)
+
+    def close(self) -> None:
+        for attribute in ("_data_root_fd", "_outputs_root_fd"):
+            descriptor = getattr(self, attribute, -1)
+            if descriptor >= 0:
+                os.close(descriptor)
+                setattr(self, attribute, -1)
+
+    def __del__(self) -> None:
+        self.close()
 
     def save_input(
         self,
@@ -89,8 +101,14 @@ class FileStore:
         content: bytes,
     ) -> StoredFile:
         self._validate_segment(run_id)
-        directory = self._data_dir / "runs" / run_id / "inputs"
-        return self._save_atomic(directory, filename, content, None)
+        return self._save_atomic(
+            self._data_dir,
+            self._data_root_fd,
+            ("runs", run_id, "inputs"),
+            filename,
+            content,
+            None,
+        )
 
     def save_download(
         self,
@@ -102,11 +120,10 @@ class FileStore:
     ) -> StoredFile:
         self._validate_segment(run_id)
         self._validate_segment(task_id)
-        directory = (
-            self._outputs_dir / "runs" / run_id / "tasks" / task_id
-        )
         return self._save_atomic(
-            directory,
+            self._outputs_dir,
+            self._outputs_root_fd,
+            ("runs", run_id, "tasks", task_id),
             filename,
             content,
             declared_content_type,
@@ -220,7 +237,7 @@ class FileStore:
         directory_flags = os.O_RDONLY | os.O_DIRECTORY
         nofollow = getattr(os, "O_NOFOLLOW", 0)
         descriptors: list[tuple[int, int | None, str | None]] = []
-        root_fd = os.open(self._outputs_dir, directory_flags | nofollow)
+        root_fd = os.dup(self._outputs_root_fd)
         descriptors.append((root_fd, None, None))
         current_fd = root_fd
         try:
@@ -383,18 +400,30 @@ class FileStore:
 
     def _save_atomic(
         self,
-        directory: Path,
+        root: Path,
+        root_fd: int,
+        directory_segments: tuple[str, ...],
         display_name: str,
         content: bytes | Iterable[bytes],
         declared_content_type: str | None,
     ) -> StoredFile:
-        directory.mkdir(parents=True, exist_ok=True)
-        part_path = directory / f".{uuid4().hex}.part"
+        directory = root.joinpath(*directory_segments)
+        descriptors = self._open_or_create_directories(root_fd, directory_segments)
+        directory_fd = descriptors[-1][0]
+        part_name = f".{uuid4().hex}.part"
+        part_fd: int | None = None
         try:
             size = 0
             digest = sha256()
             header = bytearray()
-            with part_path.open("xb") as output:
+            part_fd = os.open(
+                part_name,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            with os.fdopen(part_fd, "wb", closefd=False) as output:
                 for chunk in self._chunks(content):
                     size += len(chunk)
                     if size > self._max_bytes:
@@ -406,10 +435,12 @@ class FileStore:
                     if len(header) < 128:
                         header.extend(chunk[: 128 - len(header)])
                     output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
 
-            verified = self._validate_path(
-                part_path,
-                part_path.stat().st_size,
+            verified = self._validate_descriptor(
+                part_fd,
+                size,
                 digest.hexdigest(),
                 bytes(header),
                 declared_content_type,
@@ -417,10 +448,18 @@ class FileStore:
             final_path = directory / (
                 f"{verified.sha256}.{verified.extension}"
             )
-            if self._existing_file_matches(final_path, verified):
-                part_path.unlink()
+            final_name = final_path.name
+            if self._existing_file_matches_at(directory_fd, final_name, verified):
+                os.unlink(part_name, dir_fd=directory_fd)
             else:
-                part_path.replace(final_path)
+                os.rename(
+                    part_name,
+                    final_name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                )
+                os.fsync(directory_fd)
+            self._verify_directory_chain(root, descriptors)
             return StoredFile(
                 display_name=display_name,
                 local_path=final_path,
@@ -431,19 +470,29 @@ class FileStore:
                 height=verified.height,
             )
         except BaseException:
-            part_path.unlink(missing_ok=True)
+            try:
+                os.unlink(part_name, dir_fd=directory_fd)
+            except OSError:
+                pass
             raise
+        finally:
+            if part_fd is not None:
+                os.close(part_fd)
+            for descriptor, _, _ in reversed(descriptors):
+                os.close(descriptor)
 
-    def _existing_file_matches(
+    def _existing_file_matches_at(
         self,
-        path: Path,
+        directory_fd: int,
+        filename: str,
         expected: _VerifiedMedia,
     ) -> bool:
         descriptor: int | None = None
         try:
             descriptor = os.open(
-                path,
+                filename,
                 os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
             )
             before = os.fstat(descriptor)
             if not stat.S_ISREG(before.st_mode) or before.st_size != expected.size:
@@ -460,7 +509,9 @@ class FileStore:
                 size += len(chunk)
                 digest.update(chunk)
             after = os.fstat(descriptor)
-            current = path.lstat()
+            current = os.stat(
+                filename, dir_fd=directory_fd, follow_symlinks=False
+            )
             return (
                 size == expected.size
                 and digest.hexdigest() == expected.sha256
@@ -475,9 +526,9 @@ class FileStore:
             if descriptor is not None:
                 os.close(descriptor)
 
-    def _validate_path(
+    def _validate_descriptor(
         self,
-        path: Path,
+        descriptor: int,
         size: int,
         digest: str,
         header: bytes,
@@ -488,10 +539,12 @@ class FileStore:
         width: int | None = None
         height: int | None = None
         try:
-            with Image.open(path) as image:
-                image_format = image.format
-                width, height = image.size
-                image.verify()
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            with os.fdopen(os.dup(descriptor), "rb") as source:
+                with Image.open(source) as image:
+                    image_format = image.format
+                    width, height = image.size
+                    image.verify()
             if image_format not in _IMAGE_FORMATS:
                 raise ValueError("unsupported or invalid media content")
             mime_type, extension = _IMAGE_FORMATS[image_format]
@@ -510,6 +563,58 @@ class FileStore:
             width=width,
             height=height,
         )
+
+    @staticmethod
+    def _open_root(root: Path) -> int:
+        root.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(
+            root,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        current = root.lstat()
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            os.close(descriptor)
+            raise OSError("storage root changed during initialization")
+        return descriptor
+
+    def _open_or_create_directories(
+        self, root_fd: int, segments: tuple[str, ...]
+    ) -> list[tuple[int, int | None, str | None]]:
+        descriptors: list[tuple[int, int | None, str | None]] = []
+        current_fd = os.dup(root_fd)
+        descriptors.append((current_fd, None, None))
+        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            for segment in segments:
+                self._validate_segment(segment)
+                try:
+                    os.mkdir(segment, 0o700, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
+                child_fd = os.open(segment, flags, dir_fd=current_fd)
+                descriptors.append((child_fd, current_fd, segment))
+                current_fd = child_fd
+            return descriptors
+        except BaseException:
+            for descriptor, _, _ in reversed(descriptors):
+                os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _verify_directory_chain(
+        root: Path,
+        descriptors: list[tuple[int, int | None, str | None]],
+    ) -> None:
+        for descriptor, parent_fd, segment in reversed(descriptors):
+            opened = os.fstat(descriptor)
+            current = (
+                root.lstat()
+                if parent_fd is None
+                else os.stat(segment, dir_fd=parent_fd, follow_symlinks=False)
+            )
+            if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+                raise OSError("storage directory changed during write")
 
     @staticmethod
     def _validate_content_type(
