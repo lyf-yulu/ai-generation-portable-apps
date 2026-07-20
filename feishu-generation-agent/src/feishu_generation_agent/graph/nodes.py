@@ -77,6 +77,7 @@ _NODE_SUMMARIES = {
     "check_source_revision": "Source revision check",
     "execute_selected_tasks": "Approved task execution",
     "verify_and_download_artifacts": "Artifact verification",
+    "deliver_to_feishu": "Feishu delivery",
 }
 
 _PENDING_PROVIDER_STATUSES = frozenset(
@@ -1363,3 +1364,55 @@ async def verify_and_download_artifacts(
     return await _run_node(
         state, "verify_and_download_artifacts", services, operation
     )
+
+
+async def deliver_to_feishu(
+    state: AgentState,
+    config: RunnableConfig,
+    *,
+    services: GraphServices,
+) -> AgentState:
+    _ensure_thread_id(state, config)
+    run_id = state.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise _validation_error()
+    summary = _NODE_SUMMARIES["deliver_to_feishu"]
+    await services.repository.append_event(
+        run_id, "deliver_to_feishu", "started", f"{summary} started"
+    )
+    try:
+        document = NormalizedDocument.model_validate(
+            state.get("normalized_document")
+        )
+        draft = TaskPlan.model_validate(_draft_plan(state))
+        plan = TaskPlan(
+            tasks=state.get("approved_tasks", []),
+            document_summary=draft.document_summary,
+        )
+        artifacts = [
+            Artifact.model_validate(item) for item in state.get("artifacts", [])
+        ]
+        record = await services.delivery_writer.deliver(
+            run_id, document, plan, artifacts
+        )
+    except Exception as exc:
+        failure = _safe_error(exc)
+        await services.repository.append_event(
+            run_id,
+            "deliver_to_feishu",
+            "failed",
+            f"{summary} failed ({failure.detail.category.value})",
+        )
+        return {
+            "status": "delivery_failed",
+            "delivery_record": None,
+            "last_error": _json_model(failure.detail),
+        }
+    await services.repository.append_event(
+        run_id, "deliver_to_feishu", "completed", f"{summary} completed"
+    )
+    return {
+        "delivery_record": _json_model(record),
+        "status": "succeeded" if artifacts else "completed_with_errors",
+        "last_error": None,
+    }

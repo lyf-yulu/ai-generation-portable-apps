@@ -1,6 +1,7 @@
 import base64
 import binascii
 import os
+import shutil
 import stat
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -227,6 +228,25 @@ class FileStore:
             )
         except (OSError, ValueError, TypeError):
             return False
+
+    def delete_run(self, run_id: str) -> None:
+        self._validate_segment(run_id)
+        for root in (self._data_dir, self._outputs_dir):
+            runs_root = root / "runs"
+            target = runs_root / run_id
+            try:
+                metadata = target.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(metadata.st_mode):
+                target.unlink()
+                continue
+            if not stat.S_ISDIR(metadata.st_mode):
+                target.unlink()
+                continue
+            if target.parent.resolve() != runs_root.resolve():
+                raise ValueError("run directory is outside the configured root")
+            shutil.rmtree(target)
 
     def _read_scoped_output(
         self,

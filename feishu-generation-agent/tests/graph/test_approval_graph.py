@@ -87,6 +87,16 @@ class _NeverCalledPlanner:
         raise AssertionError("resume must not audit again")
 
 
+class _FailingDeliveryWriter:
+    def __init__(self) -> None:
+        self.deliver_calls = 0
+
+    async def deliver(self, run_id, document, plan, artifacts):
+        del run_id, document, plan, artifacts
+        self.deliver_calls += 1
+        raise RuntimeError("fictional delivery outage")
+
+
 def _input(run_id: str, thread_id: str) -> AgentState:
     return {
         "run_id": run_id,
@@ -303,7 +313,8 @@ async def test_approve_revalidates_then_executes_generation(
     assert fake_services.image_generator.submit_calls == 0
     assert fake_services.video_generator.submit_calls == 1
     assert fake_services.video_generator.poll_calls == 0
-    assert fake_services.delivery_writer.deliver_calls == 0
+    assert fake_services.delivery_writer.deliver_calls == 1
+    assert result["delivery_record"]["status"] == "succeeded"
     assert await fake_services.repository.count_operations() == 1
     events = await fake_services.repository.list_events("run-approve")
     assert ("human_approval", "started") in [
@@ -312,6 +323,36 @@ async def test_approve_revalidates_then_executes_generation(
     assert ("revalidate_approval", "completed") in [
         (event["node"], event["status"]) for event in events
     ]
+
+
+async def test_delivery_failure_is_terminal_without_discarding_artifacts(
+    fake_services: GraphServices,
+):
+    delivery = _FailingDeliveryWriter()
+    services = replace(fake_services, delivery_writer=delivery)
+    graph = build_graph(services, InMemorySaver())
+    config = _config("thread-delivery-failure")
+    first = await graph.ainvoke(
+        _input("run-delivery-failure", "thread-delivery-failure"),
+        config=config,
+    )
+    plan = _interrupt_payload(first)["task_plan"]
+
+    result = await graph.ainvoke(
+        Command(
+            resume={
+                "action": "approve",
+                "selected_task_ids": ["task-video"],
+                "tasks": plan["tasks"],
+            }
+        ),
+        config=config,
+    )
+
+    assert delivery.deliver_calls == 1
+    assert result["status"] == "delivery_failed"
+    assert len(result["artifacts"]) == 1
+    assert result["delivery_record"] is None
 
 
 async def test_approve_replans_if_source_revision_changed(
@@ -553,5 +594,5 @@ async def test_sqlite_checkpoint_resumes_after_saver_lifecycle(
     assert resume_services.image_generator.submit_calls == 0
     assert resume_services.video_generator.submit_calls == 1
     assert resume_services.video_generator.poll_calls == 0
-    assert resume_services.delivery_writer.deliver_calls == 0
+    assert resume_services.delivery_writer.deliver_calls == 1
     assert await resume_services.repository.count_operations() == 1

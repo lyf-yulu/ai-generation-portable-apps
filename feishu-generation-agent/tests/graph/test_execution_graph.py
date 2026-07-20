@@ -467,6 +467,8 @@ async def test_preexisting_intent_is_uncertain_without_provider_calls(
 
     assert result["status"] == "completed_with_errors"
     assert result["execution_records"][0]["status"] == "intent_created"
+    assert fake_services.delivery_writer.deliver_calls == 1
+    assert result["delivery_record"]["status"] == "succeeded"
     _assert_zero_generation(fake_services)
     operation = await fake_services.repository.get_operation(
         run_id, "task-video", "submit"

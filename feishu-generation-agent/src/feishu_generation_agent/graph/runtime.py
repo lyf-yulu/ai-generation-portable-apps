@@ -13,6 +13,7 @@ from feishu_generation_agent.domain.document import (
     RequirementRequest,
 )
 from feishu_generation_agent.domain.errors import AgentError
+from feishu_generation_agent.ports import DeliveryWriter
 from feishu_generation_agent.domain.plan import (
     ApprovalDecision,
     GenerationTask,
@@ -37,6 +38,19 @@ class RunValidationError(ValueError):
 
 
 class GraphRuntime:
+    _RECOVERABLE_STATUSES = frozenset(
+        {"created", "running", "resuming", "waiting_provider", "delivering"}
+    )
+    _TERMINAL_STATUSES = frozenset(
+        {
+            "succeeded",
+            "completed_with_errors",
+            "delivery_failed",
+            "failed",
+            "cancelled",
+        }
+    )
+
     def __init__(
         self,
         *,
@@ -44,14 +58,21 @@ class GraphRuntime:
         repository: Repository,
         file_store: FileStore,
         settings: Settings,
+        delivery_writer: DeliveryWriter | None = None,
     ) -> None:
         self.graph = graph
         self.repository = repository
         self.file_store = file_store
         self.settings = settings
+        self.delivery_writer = delivery_writer
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._run_locks: dict[str, asyncio.Lock] = {}
         self._closed = False
+
+    def _start_background(self, coroutine: Any, *, name: str) -> None:
+        task = asyncio.create_task(coroutine, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def start_run(self, request: RequirementRequest) -> str:
         if self._closed:
@@ -71,6 +92,165 @@ class GraphRuntime:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return run_id
+
+    async def resume_pending_runs(self) -> None:
+        if self._closed:
+            raise RunConflict("运行时正在关闭")
+        runs = await self.repository.list_runs(
+            statuses=self._RECOVERABLE_STATUSES
+        )
+        for run in runs:
+            run_id = run["run_id"]
+            lock = self._run_locks.setdefault(run_id, asyncio.Lock())
+            if lock.locked() or any(
+                task.get_name() == f"recovery-run-{run_id}"
+                for task in self._background_tasks
+                if not task.done()
+            ):
+                continue
+            self._start_background(
+                self._recover_run(run_id), name=f"recovery-run-{run_id}"
+            )
+
+    async def _recover_run(self, run_id: str) -> None:
+        lock = self._run_locks.setdefault(run_id, asyncio.Lock())
+        async with lock:
+            run = await self.repository.get_run(run_id)
+            if run is None or run["status"] not in self._RECOVERABLE_STATUSES:
+                return
+            try:
+                if run["status"] == "delivering":
+                    await self._retry_delivery_locked(
+                        run_id, run["thread_id"]
+                    )
+                    return
+                snapshot = await self.graph.aget_state(
+                    self._config(run["thread_id"])
+                )
+                state = dict(snapshot.values or {})
+                await self.repository.update_run_status(run_id, "running")
+                if state:
+                    result = await self.graph.ainvoke(
+                        None, config=self._config(run["thread_id"])
+                    )
+                else:
+                    result = await self.graph.ainvoke(
+                        {
+                            "run_id": run_id,
+                            "thread_id": run["thread_id"],
+                            "source_url": run["source_url"],
+                            "trigger_type": "local_link",
+                            "reply_context": {},
+                            "status": "created",
+                        },
+                        config=self._config(run["thread_id"]),
+                    )
+                final_status = (
+                    "waiting_approval"
+                    if self._has_interrupt(result)
+                    else self._safe_status(result.get("status"), "failed")
+                )
+                await self.repository.update_run_status(run_id, final_status)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await self.repository.append_event(
+                    run_id,
+                    "runtime",
+                    "failed",
+                    "Workflow recovery failed",
+                )
+                await self.repository.update_run_status(run_id, "failed")
+
+    async def wait_for_terminal(
+        self, run_id: str, *, timeout: float = 30.0
+    ) -> dict[str, Any]:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            run = await self.repository.get_run(run_id)
+            if run is None:
+                raise RunNotFound("运行不存在")
+            if run["status"] in self._TERMINAL_STATUSES:
+                return await self.get_run_view(run_id)
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError(f"run {run_id} did not reach a terminal status")
+            await asyncio.sleep(0.01)
+
+    async def retry_delivery(self, run_id: str) -> None:
+        if self.delivery_writer is None:
+            raise RunConflict("交付重试未配置")
+        lock = self._run_locks.setdefault(run_id, asyncio.Lock())
+        if lock.locked():
+            raise RunConflict("运行正在处理中，请稍后重试")
+        run = await self.repository.get_run(run_id)
+        if run is None:
+            raise RunNotFound("运行不存在")
+        if run["status"] != "delivery_failed":
+            raise RunConflict("只有交付失败的运行可以重试交付")
+        await self.repository.update_run_status(run_id, "delivering")
+        self._start_background(
+            self._retry_delivery_worker(run_id, run["thread_id"]),
+            name=f"delivery-retry-{run_id}",
+        )
+
+    async def _retry_delivery_worker(self, run_id: str, thread_id: str) -> None:
+        lock = self._run_locks.setdefault(run_id, asyncio.Lock())
+        async with lock:
+            await self._retry_delivery_locked(run_id, thread_id)
+
+    async def _retry_delivery_locked(
+        self, run_id: str, thread_id: str
+    ) -> None:
+        try:
+            if self.delivery_writer is None:
+                raise RunConflict("交付重试未配置")
+            record = await self.delivery_writer.retry_delivery(run_id)
+            artifacts = await self.repository.list_artifacts(run_id)
+            final_status = "succeeded" if artifacts else "completed_with_errors"
+            await self.graph.aupdate_state(
+                self._config(thread_id),
+                {
+                    "delivery_record": record.model_dump(mode="json"),
+                    "status": final_status,
+                    "last_error": None,
+                },
+                as_node="deliver_to_feishu",
+            )
+            await self.repository.append_event(
+                run_id,
+                "deliver_to_feishu",
+                "completed",
+                "Feishu delivery retry completed",
+            )
+            await self.repository.update_run_status(run_id, final_status)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self.repository.append_event(
+                run_id,
+                "deliver_to_feishu",
+                "failed",
+                "Feishu delivery retry failed",
+            )
+            await self.repository.update_run_status(run_id, "delivery_failed")
+
+    async def delete_run(self, run_id: str) -> None:
+        lock = self._run_locks.setdefault(run_id, asyncio.Lock())
+        if lock.locked():
+            raise RunConflict("运行正在处理中，不能删除")
+        async with lock:
+            run = await self.repository.get_run(run_id)
+            if run is None:
+                raise RunNotFound("运行不存在")
+            allowed = self._TERMINAL_STATUSES | {"waiting_approval"}
+            if run["status"] not in allowed:
+                raise RunConflict("只有等待审批或已结束的运行可以删除")
+            checkpointer = getattr(self.graph, "checkpointer", None)
+            if checkpointer is not None:
+                await checkpointer.adelete_thread(run["thread_id"])
+            self.file_store.delete_run(run_id)
+            await self.repository.delete_run(run_id)
+        self._run_locks.pop(run_id, None)
 
     async def _run_to_approval(
         self,
@@ -116,8 +296,17 @@ class GraphRuntime:
         snapshot = await self.graph.aget_state(self._config(run["thread_id"]))
         state = dict(snapshot.values or {})
         events = await self.repository.list_events(run_id)
+        operations = await self.repository.list_operations(run_id)
+        artifacts = await self.repository.list_artifacts(run_id)
         repository_status = self._safe_status(run.get("status"), "created")
-        if repository_status in {"created", "running", "resuming", "failed"}:
+        if repository_status in {
+            "created",
+            "running",
+            "resuming",
+            "waiting_provider",
+            "delivering",
+            "failed",
+        }:
             status = repository_status
         else:
             status = self._safe_status(state.get("status"), repository_status)
@@ -141,6 +330,35 @@ class GraphRuntime:
             "updated_at": run["updated_at"],
             "events": self._event_view(events),
             "interrupt": self._interrupt_view(snapshot, state),
+            "nodes": self._node_view(events),
+            "operations": [
+                {
+                    "task_id": operation.get("task_id"),
+                    "operation": operation.get("operation"),
+                    "provider": operation.get("provider"),
+                    "phase": operation.get("phase"),
+                    "provider_task_id": operation.get("official_id"),
+                    "updated_at": operation.get("updated_at"),
+                }
+                for operation in operations
+            ],
+            "artifacts": [
+                {
+                    "artifact_id": artifact.artifact_id,
+                    "task_id": artifact.task_id,
+                    "kind": artifact.kind,
+                    "mime_type": artifact.mime_type,
+                    "size": artifact.size,
+                    "status": artifact.status,
+                    "provider_task_id": artifact.provider_task_id,
+                    "delivered": artifact.feishu_file_token is not None,
+                }
+                for artifact in artifacts
+            ],
+            "delivery": state.get("delivery_record"),
+            "privacy": {
+                "langsmith_tracing": self.settings.langsmith_tracing,
+            },
             "approval": {
                 "document_id": state.get("document_id"),
                 "document_title": state.get("document_title"),
@@ -656,6 +874,39 @@ class GraphRuntime:
                 }
             )
         return result
+
+    @staticmethod
+    def _node_view(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        grouped: dict[str, dict[str, Any]] = {}
+        for event in GraphRuntime._event_view(events):
+            node = event.get("node")
+            if not isinstance(node, str):
+                continue
+            item = grouped.setdefault(
+                node,
+                {
+                    "node": node,
+                    "status": "pending",
+                    "started_at": None,
+                    "finished_at": None,
+                    "duration_ms": None,
+                    "retry_count": -1,
+                    "summary": "",
+                },
+            )
+            status = event.get("status")
+            if status == "started":
+                item["retry_count"] += 1
+                item["started_at"] = event.get("created_at")
+                item["finished_at"] = None
+            elif status in {"completed", "failed"}:
+                item["finished_at"] = event.get("created_at")
+                item["duration_ms"] = event.get("duration_ms")
+            item["status"] = status
+            item["summary"] = event.get("summary", "")
+        for item in grouped.values():
+            item["retry_count"] = max(0, item["retry_count"])
+        return list(grouped.values())
 
     @staticmethod
     def _interrupt_view(snapshot: Any, state: dict[str, Any]) -> dict[str, str] | None:

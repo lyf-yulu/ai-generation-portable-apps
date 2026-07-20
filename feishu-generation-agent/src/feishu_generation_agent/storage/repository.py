@@ -165,6 +165,54 @@ class Repository:
         await cursor.close()
         return dict(row) if row is not None else None
 
+    async def list_runs(
+        self, *, statuses: set[str] | frozenset[str] | None = None
+    ) -> list[dict[str, Any]]:
+        if statuses is not None:
+            values = sorted(statuses)
+            if not values:
+                return []
+            placeholders = ",".join("?" for _ in values)
+            cursor = await self._connection.execute(
+                f"""
+                SELECT run_id, thread_id, source_url, status, created_at, updated_at
+                FROM runs
+                WHERE status IN ({placeholders})
+                ORDER BY created_at ASC
+                """,
+                tuple(values),
+            )
+        else:
+            cursor = await self._connection.execute(
+                """
+                SELECT run_id, thread_id, source_url, status, created_at, updated_at
+                FROM runs
+                ORDER BY created_at ASC
+                """
+            )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [dict(row) for row in rows]
+
+    async def delete_run(self, run_id: str) -> bool:
+        async with self._write_lock:
+            try:
+                await self._connection.execute("BEGIN IMMEDIATE")
+                for table in ("events", "operations", "artifacts"):
+                    await self._connection.execute(
+                        f"DELETE FROM {table} WHERE run_id = ?", (run_id,)
+                    )
+                cursor = await self._connection.execute(
+                    "DELETE FROM runs WHERE run_id = ?", (run_id,)
+                )
+                changed = cursor.rowcount > 0
+                await cursor.close()
+                await self._connection.commit()
+            except BaseException:
+                await self._connection.rollback()
+                raise
+        return changed
+
     async def update_run_status(self, run_id: str, status: str) -> bool:
         async with self._write_lock:
             try:

@@ -17,6 +17,8 @@
   const rejectButton = byId("reject-button");
   const cancelButton = byId("cancel-button");
   const approveButton = byId("approve-button");
+  const retryDeliveryButton = byId("retry-delivery-button");
+  const deleteRunButton = byId("delete-run-button");
   const conflictBox = byId("review-conflict");
   const conflictText = byId("review-conflict-text");
   const discardButton = byId("discard-review-draft");
@@ -74,6 +76,12 @@
     rejectButton.disabled = state.busy || !canReview;
     cancelButton.disabled = state.busy || !canReview;
     approveButton.disabled = state.busy || !ReviewState.canApprove(state.review);
+    retryDeliveryButton.disabled = state.busy || state.view?.status !== "delivery_failed";
+    const deletable = [
+      "waiting_approval", "succeeded", "completed_with_errors",
+      "delivery_failed", "failed", "cancelled",
+    ].includes(state.view?.status);
+    deleteRunButton.disabled = state.busy || !deletable;
     byId("reject-feedback").disabled = state.busy || !canReview;
     taskList.querySelectorAll("input, textarea, select, button").forEach((control) => {
       control.disabled = state.busy || !canReview || Boolean(conflict);
@@ -404,6 +412,7 @@
     byId("source-link").href = view.source_url;
     byId("document-revision").textContent = view.approval.revision ?? "—";
     byId("document-summary").textContent = view.approval.document_summary || "";
+    byId("langsmith-warning").hidden = !view.privacy?.langsmith_tracing;
     renderEvents(view.events);
 
     const issues = view.approval.validation_issues || [];
@@ -486,6 +495,26 @@
   byId("reject-button").addEventListener("click", () => submitDecision("reject"));
   byId("cancel-button").addEventListener("click", () => submitDecision("cancel"));
   byId("approve-button").addEventListener("click", () => submitDecision("approve"));
+  retryDeliveryButton.addEventListener("click", async () => {
+    if (!state.runId || state.busy) return;
+    await mutate(`/api/runs/${state.runId}/retry-delivery`, { method: "POST" });
+  });
+  deleteRunButton.addEventListener("click", async () => {
+    if (!state.runId || state.busy) return;
+    if (!globalThis.confirm("删除此运行的本地记录、输入和产物？飞书交付文档不会删除。")) return;
+    setBusy(true);
+    clearError();
+    try {
+      await api(`/api/runs/${state.runId}`, { method: "DELETE" });
+      state.runId = null;
+      state.view = null;
+      state.review = ReviewState.createReviewState();
+      globalThis.location.reload();
+    } catch (error) {
+      showError(error);
+      setBusy(false);
+    }
+  });
   discardButton.addEventListener("click", () => {
     state.review = ReviewState.discardLocalChanges(state.review);
     clearError();

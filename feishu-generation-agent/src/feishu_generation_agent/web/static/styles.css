@@ -133,6 +133,7 @@ button {
 .event-item::before { content: ""; position: absolute; left: -.35rem; top: .95rem; width: .55rem; height: .55rem; border-radius: 50%; background: var(--brand); }
 .event-meta { display: flex; justify-content: space-between; gap: .5rem; color: var(--muted); font-size: .72rem; }
 .event-summary { margin: .25rem 0 0; font-size: .78rem; }
+.privacy-warning { margin-top: 1rem; padding: .7rem; border-left: 3px solid var(--warning); color: #68420d; background: #fff8e9; font-size: .78rem; }
 
 .document-meta, .document-summary { color: var(--muted); font-size: .86rem; }
 .validation-issues { margin-bottom: 1rem; padding: .75rem; border-left: 3px solid var(--warning); color: #68420d; background: #fff8e9; }

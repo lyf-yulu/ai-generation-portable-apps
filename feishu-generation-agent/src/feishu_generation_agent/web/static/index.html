@@ -40,6 +40,9 @@
           <div><dt>累计耗时</dt><dd id="run-duration">—</dd></div>
         </dl>
         <ol id="event-list" class="event-list"></ol>
+        <p id="langsmith-warning" class="privacy-warning" hidden>
+          LangSmith 追踪已开启：工作流输入和输出会发送到外部追踪服务。
+        </p>
       </aside>
 
       <section class="review-panel panel" aria-label="任务审批工作区">
@@ -73,6 +76,8 @@
     <footer class="action-bar">
       <span id="polling-note">每 1 秒自动刷新运行状态</span>
       <div class="action-buttons">
+        <button id="retry-delivery-button" type="button" class="secondary">仅重试交付</button>
+        <button id="delete-run-button" type="button" class="quiet-button">删除本地运行</button>
         <button id="reject-button" type="button" class="secondary">退回重新规划</button>
         <button id="cancel-button" type="button" class="danger">全部取消</button>
         <button id="approve-button" type="button" class="primary">批准所选任务</button>

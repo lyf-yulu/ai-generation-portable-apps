@@ -290,6 +290,23 @@ async def test_create_run_and_read_waiting_approval(tmp_path: Path):
         }
 
 
+async def test_delete_waiting_run_removes_api_view(tmp_path: Path):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime, graph, repository
+        created = await client.post(
+            "/api/runs",
+            json={"source_url": "https://acme.feishu.cn/docx/delete-me"},
+        )
+        run_id = created.json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+
+        removed = await client.delete(f"/api/runs/{run_id}")
+
+        assert removed.status_code == 200
+        assert removed.json()["status"] == "deleted"
+        assert (await client.get(f"/api/runs/{run_id}")).status_code == 404
+
+
 async def test_approval_rejects_unknown_task_id(tmp_path: Path):
     async with _environment(tmp_path) as (client, runtime, graph, repository):
         del runtime, graph, repository

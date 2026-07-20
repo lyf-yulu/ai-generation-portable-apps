@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import os
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -42,21 +43,55 @@ def create_app(
     static_dir = Path(__file__).with_name("static")
 
     @asynccontextmanager
+    async def tracing_environment(settings):
+        names = (
+            "LANGSMITH_TRACING",
+            "LANGCHAIN_TRACING_V2",
+            "LANGSMITH_API_KEY",
+            "LANGSMITH_PROJECT",
+        )
+        previous = {name: os.environ.get(name) for name in names}
+        if settings.langsmith_tracing:
+            settings.require("langsmith_api_key")
+            os.environ["LANGSMITH_TRACING"] = "true"
+            os.environ["LANGCHAIN_TRACING_V2"] = "true"
+            os.environ["LANGSMITH_API_KEY"] = (
+                settings.langsmith_api_key.get_secret_value()
+            )
+            os.environ["LANGSMITH_PROJECT"] = settings.langsmith_project
+        else:
+            os.environ["LANGSMITH_TRACING"] = "false"
+            os.environ["LANGCHAIN_TRACING_V2"] = "false"
+            os.environ.pop("LANGSMITH_API_KEY", None)
+            os.environ.pop("LANGSMITH_PROJECT", None)
+        try:
+            yield
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+    @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if services is not None:
-            async with open_checkpointer(services.settings) as checkpointer:
-                active = GraphRuntime(
-                    graph=build_graph(services, checkpointer),
-                    repository=services.repository,
-                    file_store=services.file_store,
-                    settings=services.settings,
-                )
-                app.state.runtime = active
-                try:
-                    yield
-                finally:
-                    await active.close()
-                    app.state.runtime = None
+            async with tracing_environment(services.settings):
+                async with open_checkpointer(services.settings) as checkpointer:
+                    active = GraphRuntime(
+                        graph=build_graph(services, checkpointer),
+                        repository=services.repository,
+                        file_store=services.file_store,
+                        settings=services.settings,
+                        delivery_writer=services.delivery_writer,
+                    )
+                    app.state.runtime = active
+                    try:
+                        await active.resume_pending_runs()
+                        yield
+                    finally:
+                        await active.close()
+                        app.state.runtime = None
             return
 
         app.state.runtime = runtime
@@ -127,6 +162,29 @@ def create_app(
         except RunValidationError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from None
         return {"run_id": run_id, "status": "accepted"}
+
+    @app.post(
+        "/api/runs/{run_id}/retry-delivery",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def retry_delivery(
+        run_id: str, request: Request
+    ) -> dict[str, str]:
+        active = get_runtime(request)
+        try:
+            await active.retry_delivery(run_id)
+        except (RunNotFound, RunConflict, RunValidationError) as exc:
+            raise_runtime_error(exc)
+        return {"run_id": run_id, "status": "accepted"}
+
+    @app.delete("/api/runs/{run_id}")
+    async def delete_run(run_id: str, request: Request) -> dict[str, str]:
+        active = get_runtime(request)
+        try:
+            await active.delete_run(run_id)
+        except (RunNotFound, RunConflict, RunValidationError) as exc:
+            raise_runtime_error(exc)
+        return {"run_id": run_id, "status": "deleted"}
 
     def raise_runtime_error(exc: Exception) -> None:
         if isinstance(exc, RunNotFound):

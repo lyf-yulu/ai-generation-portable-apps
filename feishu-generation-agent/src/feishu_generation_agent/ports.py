@@ -85,3 +85,6 @@ class DeliveryWriter(Protocol):
         artifacts: list[Artifact],
     ) -> DeliveryRecord:
         raise NotImplementedError
+
+    async def retry_delivery(self, run_id: str) -> DeliveryRecord:
+        raise NotImplementedError

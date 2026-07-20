@@ -8,6 +8,7 @@ from .nodes import (
     analyze_images,
     audit_plan,
     check_source_revision,
+    deliver_to_feishu,
     execute_selected_tasks,
     human_approval,
     ingest_source,
@@ -60,6 +61,10 @@ def build_graph(services: GraphServices, checkpointer: Any):
         "verify_and_download_artifacts",
         partial(verify_and_download_artifacts, services=services),
     )
+    builder.add_node(
+        "deliver_to_feishu",
+        partial(deliver_to_feishu, services=services),
+    )
 
     chain = [
         "ingest_source",
@@ -77,5 +82,6 @@ def build_graph(services: GraphServices, checkpointer: Any):
     builder.add_edge(
         "execute_selected_tasks", "verify_and_download_artifacts"
     )
-    builder.add_edge("verify_and_download_artifacts", END)
+    builder.add_edge("verify_and_download_artifacts", "deliver_to_feishu")
+    builder.add_edge("deliver_to_feishu", END)
     return builder.compile(checkpointer=checkpointer)
