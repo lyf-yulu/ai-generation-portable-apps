@@ -217,6 +217,47 @@ class FeishuClient:
             },
         )
 
+    async def create_bitable_field(
+        self, app_token: str, table_id: str, field_name: str, field_type: int
+    ) -> str:
+        payload = await self.request_json(
+            "POST",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
+            json_body={"field_name": field_name, "type": field_type},
+        )
+        field_id = payload.get("data", {}).get("field", {}).get("field_id")
+        if not isinstance(field_id, str) or not field_id:
+            raise self._document_error(
+                "飞书创建结果表字段响应无效",
+                "POST bitable fields: missing field_id",
+            )
+        return field_id
+
+    async def create_bitable_record(
+        self, app_token: str, table_id: str, fields: dict[str, object]
+    ) -> str:
+        payload = await self.request_json(
+            "POST",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records",
+            json_body={"fields": fields},
+        )
+        record_id = payload.get("data", {}).get("record", {}).get("record_id")
+        if not isinstance(record_id, str) or not record_id:
+            raise self._document_error(
+                "飞书创建结果表记录响应无效",
+                "POST bitable records: missing record_id",
+            )
+        return record_id
+
+    async def update_bitable_record(
+        self, app_token: str, table_id: str, record_id: str, fields: dict[str, object]
+    ) -> None:
+        await self.request_json(
+            "PUT",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}",
+            json_body={"fields": fields},
+        )
+
     async def append_document_blocks(
         self, document_id: str, blocks: list[dict]
     ) -> None:

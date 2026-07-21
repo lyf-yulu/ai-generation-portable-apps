@@ -257,6 +257,29 @@ async def test_creates_result_bitable_in_explicit_folder_and_grants_editor() -> 
     ]
 
 
+async def test_creates_result_fields_and_record() -> None:
+    requests: list[tuple[str, str, dict]] = []
+
+    class FakeClient:
+        async def request_json(self, method: str, path: str, *, params=None, json_body=None):
+            requests.append((method, path, json_body or {}))
+            if path.endswith("/fields"):
+                return {"code": 0, "data": {"field": {"field_id": "fld-result"}}}
+            return {"code": 0, "data": {"record": {"record_id": "rec-result"}}}
+
+    client = FeishuClient.__new__(FeishuClient)
+    client.request_json = FakeClient().request_json
+    field_id = await client.create_bitable_field("app", "tbl", "结果", 17)
+    record_id = await client.create_bitable_record("app", "tbl", {"需求名称": "需求 A"})
+
+    assert field_id == "fld-result"
+    assert record_id == "rec-result"
+    assert requests == [
+        ("POST", "/open-apis/bitable/v1/apps/app/tables/tbl/fields", {"field_name": "结果", "type": 17}),
+        ("POST", "/open-apis/bitable/v1/apps/app/tables/tbl/records", {"fields": {"需求名称": "需求 A"}}),
+    ]
+
+
 async def test_feishu_upload_accepts_bitable_parent_target() -> None:
     upload_body = b""
     upload_path = ""
