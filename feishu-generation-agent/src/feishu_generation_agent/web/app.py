@@ -24,6 +24,7 @@ from feishu_generation_agent.bootstrap import (
     runtime_is_configured,
 )
 from feishu_generation_agent.config import Settings
+from feishu_generation_agent.domain.errors import AgentError, ErrorCategory
 from feishu_generation_agent.graph.nodes import GraphServices
 from feishu_generation_agent.graph.runtime import (
     GraphRuntime,
@@ -291,6 +292,14 @@ def create_app(
         return active
 
     def raise_bitable_error(exc: Exception) -> None:
+        if (
+            isinstance(exc, AgentError)
+            and exc.detail.category is ErrorCategory.TRANSIENT
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="飞书服务暂时不可用，请稍后重试",
+            ) from None
         if isinstance(exc, BitableSchemaError):
             raise HTTPException(
                 status_code=422,

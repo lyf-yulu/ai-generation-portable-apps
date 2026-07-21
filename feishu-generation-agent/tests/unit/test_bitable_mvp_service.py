@@ -74,6 +74,18 @@ class _FakeBitable:
         return list(self.tasks)
 
 
+class _FailOnceBitable(_FakeBitable):
+    def __init__(self, tasks: list[BitableTaskSummary]) -> None:
+        super().__init__(tasks)
+        self.list_attempts = 0
+
+    async def list_tasks(self, location, schema):
+        self.list_attempts += 1
+        if self.list_attempts == 1:
+            raise RuntimeError("temporary read failure")
+        return await super().list_tasks(location, schema)
+
+
 class _FakeRuntime:
     def __init__(self, order: list[str] | None = None) -> None:
         self.order = order if order is not None else []
@@ -163,6 +175,25 @@ async def test_scan_excludes_results_and_active_claims_but_ignores_executor(
 
         assert [task.record_id for task in scanned] == ["rec-open"]
         assert scanned[0].executor_open_ids == ["ou_someone_else"]
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_scan_retries_one_transient_read_failure(tmp_path: Path) -> None:
+    bitable = _FailOnceBitable([_task()])
+    store = await BitableTaskStore.open(tmp_path / "bitable.sqlite3")
+    service = BitableMvpService(
+        bitable=bitable,
+        store=store,
+        runtime=_FakeRuntime(),
+        location=_location(),
+    )
+    try:
+        scanned = await service.scan()
+
+        assert [task.record_id for task in scanned] == ["rec-1"]
+        assert bitable.list_attempts == 2
     finally:
         await service.close()
 

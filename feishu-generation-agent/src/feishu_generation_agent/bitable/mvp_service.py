@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 from typing import Any, Protocol
 from uuid import uuid4
 
@@ -24,6 +25,7 @@ from feishu_generation_agent.storage.bitable_tasks import BitableTaskStore
 
 
 _CLAIMANT = "local-mvp"
+_LOGGER = logging.getLogger(__name__)
 _RELEASED_STATUSES = {
     "succeeded": TableTaskStatus.COMPLETED,
     "completed_with_errors": TableTaskStatus.COMPLETED,
@@ -94,6 +96,20 @@ class BitableMvpService:
         return self._location
 
     async def scan(self) -> list[BitableTaskSummary]:
+        for attempt in range(2):
+            try:
+                return await self._scan_once()
+            except Exception as exc:
+                if attempt == 1:
+                    raise
+                _LOGGER.warning(
+                    "Bitable scan read failed; retrying error_type=%s",
+                    type(exc).__name__,
+                )
+                await asyncio.sleep(0)
+        raise AssertionError("scan retry loop exhausted")
+
+    async def _scan_once(self) -> list[BitableTaskSummary]:
         location, schema = await self._prepared()
         tasks = await self._bitable.list_tasks(location, schema)
         active = {

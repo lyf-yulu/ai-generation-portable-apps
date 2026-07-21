@@ -13,6 +13,11 @@ from feishu_generation_agent.cli.smoke import (
 import feishu_generation_agent.web.app as web_app_module
 from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain import BitableTaskSummary
+from feishu_generation_agent.domain.errors import (
+    AgentError,
+    ErrorCategory,
+    ErrorDetail,
+)
 from feishu_generation_agent.graph.runtime import RunConflict, RunNotFound
 from feishu_generation_agent.graph.runtime import GraphRuntime
 from feishu_generation_agent.integrations.bitable_delivery import (
@@ -259,6 +264,28 @@ async def test_scan_maps_schema_and_read_errors_without_raw_details(
     assert "secret field detail" not in schema.text
     assert read.status_code == 502
     assert "fictional-credential" not in read.text
+
+
+async def test_scan_reports_transient_feishu_failure_as_retryable(
+    tmp_path: Path,
+) -> None:
+    service = _BitableService()
+    service.scan_error = AgentError(
+        ErrorDetail(
+            category=ErrorCategory.TRANSIENT,
+            message="飞书服务暂时不可用，请稍后重试",
+            technical_detail="GET /records: HTTP 502, secret upstream detail",
+            retryable=True,
+        )
+    )
+    app, _, client = await _client(tmp_path, service)
+
+    async with app.router.lifespan_context(app), client:
+        response = await client.get("/api/bitable/tasks")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "飞书服务暂时不可用，请稍后重试"
+    assert "secret upstream detail" not in response.text
 
 
 async def test_bitable_endpoints_report_readiness_when_not_configured(
