@@ -45,8 +45,9 @@ CAPABILITY_FIELDS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Compatibility for the existing configuration probe; runtime checks use
-# CAPABILITY_FIELDS so Bitable mode does not depend on legacy delivery fields.
+# Compatibility for the existing configuration probe. Bitable capability can be
+# recognized independently, but runtime activation remains legacy-delivery-only
+# until Task 12 provides Bitable delivery and service assembly.
 REQUIRED_RUNTIME_FIELDS = (
     *CAPABILITY_FIELDS["core"],
     *CAPABILITY_FIELDS["generation"],
