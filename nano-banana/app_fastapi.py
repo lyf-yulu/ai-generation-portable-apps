@@ -136,6 +136,21 @@ def _ws_id(request: Request) -> str:
     return "localhost"
 
 
+def _job_created_response(job_id: str) -> JSONResponse:
+    """Return the standard job-creation body AND surface job_id on the
+    X-Job-Id response header. Portal's _proxy only registers usage stats
+    (image counts here) when this header is present — the stdlib
+    json_response sets it, but returning a bare dict from FastAPI does not,
+    which silently dropped all nano-banana usage tracking after the FastAPI
+    engine cutover. See legacy json_response for the header contract."""
+    body = legacy.job_id_response(job_id)
+    headers = {"Access-Control-Expose-Headers": "X-Job-Id"}
+    jid = body.get("job_id") or body.get("id")
+    if jid:
+        headers["X-Job-Id"] = str(jid)
+    return JSONResponse(content=body, headers=headers)
+
+
 def _is_local_req(request: Request) -> bool:
     ip = (request.headers.get("X-Forwarded-For") or (request.client.host if request.client else "") or "").strip()
     return ip in ("127.0.0.1", "::1", "localhost")
@@ -558,7 +573,7 @@ async def api_jobs_json(request: Request):
         ws = _ws_id(request)
         username = legacy._decode_username(_HandlerShim(request))
         job_id = legacy.create_job(values, files, "api", "json", request_data, ws, username=username)
-        return legacy.job_id_response(job_id)
+        return _job_created_response(job_id)
     except Exception as exc:
         return JSONResponse(status_code=400, content=legacy.api_error("invalid_request", str(exc)))
 
@@ -579,7 +594,7 @@ async def api_jobs_create(request: Request):
     job_id = legacy.create_job(
         submit_values, submit_files, "page", "multipart", request_data, ws, username=username,
     )
-    return legacy.job_id_response(job_id)
+    return _job_created_response(job_id)
 
 
 # ------------------------- multipart helper -------------------------
