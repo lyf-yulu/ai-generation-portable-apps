@@ -1,4 +1,5 @@
 import base64
+import json
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,16 @@ from feishu_generation_agent.domain.plan import (
 from feishu_generation_agent.graph.nodes import GraphServices
 from feishu_generation_agent.storage.files import FileStore
 from feishu_generation_agent.storage.repository import Repository
+
+
+@pytest.fixture
+def fixture_json():
+    fixtures_dir = Path(__file__).parent / "fixtures"
+
+    def load(name: str) -> dict:
+        return json.loads((fixtures_dir / name).read_text(encoding="utf-8"))
+
+    return load
 
 
 class FakeGraphDocumentSource:

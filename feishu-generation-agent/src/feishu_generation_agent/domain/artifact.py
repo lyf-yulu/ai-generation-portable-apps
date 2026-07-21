@@ -74,7 +74,20 @@ class Artifact(BaseModel):
 
 
 class DeliveryRecord(BaseModel):
-    document_id: str
-    document_url: str
     status: str
+    target_type: Literal["docx", "bitable_record"] = "docx"
+    document_id: str | None = None
+    document_url: str | None = None
+    app_token: str | None = None
+    table_id: str | None = None
+    record_id: str | None = None
     uploaded_artifact_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_delivery_target(self) -> "DeliveryRecord":
+        if self.target_type == "docx":
+            if not self.document_id or not self.document_url:
+                raise ValueError("docx delivery requires document identity")
+        elif not self.app_token or not self.table_id or not self.record_id:
+            raise ValueError("bitable delivery requires app/table/record identity")
+        return self

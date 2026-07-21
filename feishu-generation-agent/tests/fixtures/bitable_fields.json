@@ -1,0 +1,8 @@
+{
+  "items": [
+    {"field_id": "fld_title", "field_name": "文本", "type": 1},
+    {"field_id": "fld_source", "field_name": "需求来源", "type": 15},
+    {"field_id": "fld_executor", "field_name": "执行人", "type": 11},
+    {"field_id": "fld_result", "field_name": "结果", "type": 17}
+  ]
+}

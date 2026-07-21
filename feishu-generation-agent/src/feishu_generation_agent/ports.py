@@ -77,6 +77,8 @@ class VideoGenerator(Protocol):
 
 
 class DeliveryWriter(Protocol):
+    """Persist verified artifacts to the delivery target selected for a run."""
+
     async def deliver(
         self,
         run_id: str,

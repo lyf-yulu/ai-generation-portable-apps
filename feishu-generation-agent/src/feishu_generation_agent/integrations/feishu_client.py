@@ -185,15 +185,21 @@ class FeishuClient:
         )
 
     async def upload_file_all(
-        self, filename: str, content: bytes, mime_type: str
+        self,
+        filename: str,
+        content: bytes,
+        mime_type: str,
+        *,
+        parent_type: str = "explorer",
+        parent_node: str | None = None,
     ) -> str:
-        folder = self._require_output_folder()
+        target = self._upload_parent(parent_type, parent_node)
         payload = await self._request_multipart(
             "/open-apis/drive/v1/files/upload_all",
             data={
                 "file_name": filename,
-                "parent_type": "explorer",
-                "parent_node": folder,
+                "parent_type": parent_type,
+                "parent_node": target,
                 "size": str(len(content)),
             },
             filename=filename,
@@ -202,15 +208,22 @@ class FeishuClient:
         )
         return self._file_token(payload, "upload_all")
 
-    async def prepare_file_upload(self, filename: str, size: int) -> tuple[str, int]:
-        folder = self._require_output_folder()
+    async def prepare_file_upload(
+        self,
+        filename: str,
+        size: int,
+        *,
+        parent_type: str = "explorer",
+        parent_node: str | None = None,
+    ) -> tuple[str, int]:
+        target = self._upload_parent(parent_type, parent_node)
         payload = await self.request_json(
             "POST",
             "/open-apis/drive/v1/files/upload_prepare",
             json_body={
                 "file_name": filename,
-                "parent_type": "explorer",
-                "parent_node": folder,
+                "parent_type": parent_type,
+                "parent_node": target,
                 "size": size,
             },
         )
@@ -294,6 +307,17 @@ class FeishuClient:
                 "LARK_OUTPUT_FOLDER_TOKEN is missing",
             )
         return self._output_folder_token
+
+    def _upload_parent(self, parent_type: str, parent_node: str | None) -> str:
+        if not isinstance(parent_type, str) or not parent_type:
+            raise ValueError("upload parent_type is required")
+        if parent_node is not None:
+            if not isinstance(parent_node, str) or not parent_node:
+                raise ValueError("upload parent_node is invalid")
+            return parent_node
+        if parent_type != "explorer":
+            raise ValueError("non-explorer upload requires parent_node")
+        return self._require_output_folder()
 
     def _file_token(self, payload: dict, operation: str) -> str:
         token = payload.get("data", {}).get("file_token")
