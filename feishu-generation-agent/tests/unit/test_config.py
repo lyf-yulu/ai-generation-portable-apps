@@ -4,7 +4,10 @@ import pytest
 from pydantic import SecretStr
 
 from feishu_generation_agent.config import Settings
-from feishu_generation_agent.bootstrap import capability_is_configured
+from feishu_generation_agent.bootstrap import (
+    capability_is_configured,
+    runtime_is_configured,
+)
 
 
 def test_settings_are_local_and_create_runtime_paths(tmp_path: Path):
@@ -55,6 +58,23 @@ def test_table_mode_does_not_require_legacy_delivery_fields(tmp_path):
     assert capability_is_configured(settings, "bitable")
     assert capability_is_configured(settings, "generation")
     assert not capability_is_configured(settings, "legacy_delivery")
+    assert not runtime_is_configured(settings)
+
+
+def test_legacy_delivery_mode_is_runtime_configured():
+    settings = Settings(
+        lark_app_id="cli_test",
+        lark_app_secret="secret",
+        lark_output_owner_open_id="ou_owner",
+        lark_output_folder_token="fld_token",
+        deepseek_api_key="deepseek",
+        claude_api_key="claude",
+        claude_model="claude-model",
+        chiyun_api_key="chiyun",
+        chiyun_model="chiyun-model",
+        ark_api_key="ark",
+    )
+    assert runtime_is_configured(settings)
 
 
 def test_local_claim_requires_operator_open_id():

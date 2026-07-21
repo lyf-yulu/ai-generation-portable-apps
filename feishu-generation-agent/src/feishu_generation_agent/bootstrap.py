@@ -66,10 +66,7 @@ def runtime_is_configured(settings: Settings) -> bool:
     return (
         capability_is_configured(settings, "core")
         and capability_is_configured(settings, "generation")
-        and (
-            capability_is_configured(settings, "bitable")
-            or capability_is_configured(settings, "legacy_delivery")
-        )
+        and capability_is_configured(settings, "legacy_delivery")
     )
 
 
@@ -77,10 +74,7 @@ def runtime_is_configured(settings: Settings) -> bool:
 async def open_services(settings: Settings) -> AsyncIterator[GraphServices]:
     settings.require(*CAPABILITY_FIELDS["core"])
     settings.require(*CAPABILITY_FIELDS["generation"])
-    if capability_is_configured(settings, "bitable"):
-        settings.require(*CAPABILITY_FIELDS["bitable"])
-    else:
-        settings.require(*CAPABILITY_FIELDS["legacy_delivery"])
+    settings.require(*CAPABILITY_FIELDS["legacy_delivery"])
     settings.ensure_paths()
     repository = await Repository.open(settings.business_db_path)
     provider_http = httpx.AsyncClient(trust_env=False)
