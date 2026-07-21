@@ -58,7 +58,7 @@ def test_table_mode_does_not_require_legacy_delivery_fields(tmp_path):
     assert capability_is_configured(settings, "bitable")
     assert capability_is_configured(settings, "generation")
     assert not capability_is_configured(settings, "legacy_delivery")
-    assert not runtime_is_configured(settings)
+    assert runtime_is_configured(settings)
 
 
 def test_legacy_delivery_mode_is_runtime_configured():

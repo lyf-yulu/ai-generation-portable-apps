@@ -95,6 +95,33 @@ button {
   background: #fff0ee;
 }
 
+.mode-message {
+  margin: .55rem 0 0;
+  color: var(--muted);
+  font-size: .8rem;
+}
+
+.bitable-panel {
+  min-height: 0;
+  margin: 1rem clamp(1.25rem, 4vw, 4rem) 0;
+  padding: 1.1rem 1.25rem;
+}
+.bitable-task-list { display: grid; gap: .65rem; margin-top: .9rem; }
+.bitable-task {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.3fr) minmax(220px, 1fr) auto;
+  gap: .85rem;
+  align-items: center;
+  padding: .8rem;
+  border: 1px solid var(--line);
+  border-radius: .65rem;
+  background: #fcfdfb;
+}
+.bitable-task h3 { margin-bottom: .25rem; }
+.bitable-task-meta { margin: 0; color: var(--muted); font-size: .76rem; }
+.bitable-task a { color: var(--brand); font-size: .8rem; overflow-wrap: anywhere; }
+.bitable-empty { margin: 0; color: var(--muted); font-size: .82rem; }
+
 .workspace {
   display: grid;
   grid-template-columns: minmax(270px, .72fr) minmax(560px, 1.6fr);
@@ -183,6 +210,7 @@ button {
   .reference-row { grid-template-columns: 72px 1fr; }
   .reference-row img { width: 72px; }
   .upload-row { grid-template-columns: 1fr 1fr; }
+  .bitable-task { grid-template-columns: 1fr; }
   .action-bar { align-items: stretch; flex-direction: column; }
   .action-buttons { display: grid; grid-template-columns: 1fr; }
 }

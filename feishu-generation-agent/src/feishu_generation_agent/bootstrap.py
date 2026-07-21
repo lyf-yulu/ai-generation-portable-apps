@@ -1,14 +1,20 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
 import httpx
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 
 from feishu_generation_agent.config import Settings
+from feishu_generation_agent.bitable.mvp_service import BitableMvpService
+from feishu_generation_agent.domain import BitableLocation
 from feishu_generation_agent.graph.nodes import GraphServices
 from feishu_generation_agent.integrations.chiyun import ChiyunImageGenerator
 from feishu_generation_agent.integrations.feishu_client import FeishuClient
+from feishu_generation_agent.integrations.feishu_bitable import FeishuBitableClient
+from feishu_generation_agent.integrations.bitable_delivery import BitableResultWriter
+from feishu_generation_agent.integrations.bitable_url import parse_bitable_url
 from feishu_generation_agent.integrations.feishu_delivery import (
     FeishuDeliveryWriter,
 )
@@ -16,12 +22,14 @@ from feishu_generation_agent.integrations.feishu_source import (
     FeishuDocumentSource,
 )
 from feishu_generation_agent.integrations.planner import DeepSeekPlanner
+from feishu_generation_agent.integrations.routing_delivery import RoutingDeliveryWriter
 from feishu_generation_agent.integrations.safe_download import (
     SafeResultDownloader,
 )
 from feishu_generation_agent.integrations.seedance import SeedanceVideoGenerator
 from feishu_generation_agent.integrations.vision import ClaudeVisionAnalyzer
 from feishu_generation_agent.storage.files import FileStore
+from feishu_generation_agent.storage.bitable_tasks import BitableTaskStore
 from feishu_generation_agent.storage.provider_results import ProviderResultStore
 from feishu_generation_agent.storage.repository import Repository
 
@@ -45,9 +53,7 @@ CAPABILITY_FIELDS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Compatibility for the existing configuration probe. Bitable capability can be
-# recognized independently, but runtime activation remains legacy-delivery-only
-# until Task 12 provides Bitable delivery and service assembly.
+# Compatibility for callers that still inspect the legacy document mode fields.
 REQUIRED_RUNTIME_FIELDS = (
     *CAPABILITY_FIELDS["core"],
     *CAPABILITY_FIELDS["generation"],
@@ -67,21 +73,82 @@ def runtime_is_configured(settings: Settings) -> bool:
     return (
         capability_is_configured(settings, "core")
         and capability_is_configured(settings, "generation")
-        and capability_is_configured(settings, "legacy_delivery")
+        and (
+            capability_is_configured(settings, "bitable")
+            or capability_is_configured(settings, "legacy_delivery")
+        )
     )
+
+
+@dataclass(slots=True)
+class BitableServiceFactory:
+    bitable: FeishuBitableClient
+    store: BitableTaskStore
+    location: BitableLocation
+    _claimed: bool = False
+
+    def create(self, runtime) -> BitableMvpService:
+        if self._claimed:
+            raise RuntimeError("多维表格服务已创建")
+        self._claimed = True
+        return BitableMvpService(
+            bitable=self.bitable,
+            store=self.store,
+            runtime=runtime,
+            location=self.location,
+        )
+
+    async def close_unclaimed(self) -> None:
+        if not self._claimed:
+            await self.store.close()
+
+
+@dataclass(frozen=True, slots=True)
+class ApplicationServices:
+    graph: GraphServices
+    bitable_factory: BitableServiceFactory | None
+    legacy_delivery_configured: bool
 
 
 @asynccontextmanager
 async def open_services(settings: Settings) -> AsyncIterator[GraphServices]:
+    async with _open_application_services(
+        settings, enable_bitable=True
+    ) as application:
+        yield application.graph
+
+
+@asynccontextmanager
+async def open_application_services(
+    settings: Settings,
+) -> AsyncIterator[ApplicationServices]:
+    async with _open_application_services(
+        settings, enable_bitable=True
+    ) as application:
+        yield application
+
+
+@asynccontextmanager
+async def _open_application_services(
+    settings: Settings,
+    *,
+    enable_bitable: bool,
+) -> AsyncIterator[ApplicationServices]:
     settings.require(*CAPABILITY_FIELDS["core"])
     settings.require(*CAPABILITY_FIELDS["generation"])
-    settings.require(*CAPABILITY_FIELDS["legacy_delivery"])
+    bitable_configured = enable_bitable and capability_is_configured(
+        settings, "bitable"
+    )
+    legacy_configured = capability_is_configured(settings, "legacy_delivery")
+    if not bitable_configured and not legacy_configured:
+        settings.require(*CAPABILITY_FIELDS["legacy_delivery"])
     settings.ensure_paths()
     repository = await Repository.open(settings.business_db_path)
     provider_http = httpx.AsyncClient(trust_env=False)
     downloader = SafeResultDownloader(max_bytes=settings.max_download_bytes)
     feishu = FeishuClient(settings)
     file_store: FileStore | None = None
+    bitable_factory: BitableServiceFactory | None = None
     try:
         provider_results = ProviderResultStore(
             settings.data_dir / "provider-results",
@@ -113,6 +180,42 @@ async def open_services(settings: Settings) -> AsyncIterator[GraphServices]:
         if settings.claude_base_url:
             vision_options["base_url"] = settings.claude_base_url
         vision_model = ChatAnthropic(**vision_options)
+        legacy_writer = (
+            FeishuDeliveryWriter(
+                feishu,
+                repository,
+                owner_open_id=settings.lark_output_owner_open_id or "",
+            )
+            if legacy_configured
+            else None
+        )
+        delivery_writer = legacy_writer
+        if bitable_configured:
+            location = parse_bitable_url(
+                settings.lark_bitable_url or "",
+                settings.lark_bitable_table_id or "",
+                settings.lark_bitable_view_id or "",
+            )
+            bitable_client = FeishuBitableClient(feishu)
+            bitable_store = await BitableTaskStore.open(
+                settings.data_dir / "bitable.sqlite3"
+            )
+            bitable_factory = BitableServiceFactory(
+                bitable=bitable_client,
+                store=bitable_store,
+                location=location,
+            )
+            bitable_writer = BitableResultWriter(
+                bitable_client,
+                repository,
+                bitable_store,
+            )
+            delivery_writer = RoutingDeliveryWriter(
+                bitable_store,
+                bitable=bitable_writer,
+                legacy=legacy_writer,
+            )
+        assert delivery_writer is not None
         services = GraphServices(
             document_source=FeishuDocumentSource(feishu, file_store),
             vision_analyzer=ClaudeVisionAnalyzer(
@@ -139,17 +242,19 @@ async def open_services(settings: Settings) -> AsyncIterator[GraphServices]:
                 api_key=settings.ark_api_key,
                 model=settings.seedance_model,
             ),
-            delivery_writer=FeishuDeliveryWriter(
-                feishu,
-                repository,
-                owner_open_id=settings.lark_output_owner_open_id or "",
-            ),
+            delivery_writer=delivery_writer,
             repository=repository,
             file_store=file_store,
             settings=settings,
         )
-        yield services
+        yield ApplicationServices(
+            graph=services,
+            bitable_factory=bitable_factory,
+            legacy_delivery_configured=legacy_configured,
+        )
     finally:
+        if bitable_factory is not None:
+            await bitable_factory.close_unclaimed()
         if file_store is not None:
             file_store.close()
         await feishu.close()

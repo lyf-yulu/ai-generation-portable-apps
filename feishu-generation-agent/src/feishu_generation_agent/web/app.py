@@ -18,7 +18,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 
 from feishu_generation_agent.graph.builder import build_graph
-from feishu_generation_agent.bootstrap import open_services, runtime_is_configured
+from feishu_generation_agent.bitable.mvp_service import BitableMvpService
+from feishu_generation_agent.bootstrap import (
+    open_application_services,
+    runtime_is_configured,
+)
 from feishu_generation_agent.config import Settings
 from feishu_generation_agent.graph.nodes import GraphServices
 from feishu_generation_agent.graph.runtime import (
@@ -27,8 +31,15 @@ from feishu_generation_agent.graph.runtime import (
     RunNotFound,
     RunValidationError,
 )
+from feishu_generation_agent.integrations.bitable_delivery import (
+    BitableResultConflict,
+)
+from feishu_generation_agent.integrations.feishu_bitable import BitableSchemaError
+from feishu_generation_agent.storage.bitable_tasks import TaskAlreadyClaimed
 from feishu_generation_agent.storage.checkpoints import open_checkpointer
 from feishu_generation_agent.web.schemas import (
+    BitableClaimResponse,
+    BitableRetryResponse,
     CreateRunRequest,
     DecisionRequest,
     ReferenceListRequest,
@@ -40,6 +51,7 @@ def create_app(
     runtime: GraphRuntime | None = None,
     services: GraphServices | None = None,
     settings: Settings | None = None,
+    bitable_service: BitableMvpService | None = None,
 ) -> FastAPI:
     if sum(value is not None for value in (runtime, services, settings)) > 1:
         raise ValueError("runtime, services and settings are mutually exclusive")
@@ -79,6 +91,8 @@ def create_app(
     @asynccontextmanager
     async def activated_services(
         active_services: GraphServices,
+        *,
+        resume: bool = True,
     ) -> AsyncIterator[GraphRuntime]:
         async with open_checkpointer(active_services.settings) as checkpointer:
             active = GraphRuntime(
@@ -89,7 +103,8 @@ def create_app(
                 delivery_writer=active_services.delivery_writer,
             )
             try:
-                await active.resume_pending_runs()
+                if resume:
+                    await active.resume_pending_runs()
                 yield active
             finally:
                 await active.close()
@@ -100,17 +115,25 @@ def create_app(
             async with tracing_environment(services.settings):
                 async with activated_services(services) as active:
                     app.state.runtime = active
+                    app.state.bitable_service = bitable_service
                     try:
                         yield
                     finally:
+                        if bitable_service is not None:
+                            await bitable_service.close()
+                        app.state.bitable_service = None
                         app.state.runtime = None
             return
 
         if runtime is not None:
             app.state.runtime = runtime
+            app.state.bitable_service = bitable_service
             try:
                 yield
             finally:
+                if bitable_service is not None:
+                    await bitable_service.close()
+                app.state.bitable_service = None
                 await runtime.close()
                 app.state.runtime = None
             return
@@ -118,20 +141,42 @@ def create_app(
         local_settings = settings or Settings()
         if runtime_is_configured(local_settings):
             async with tracing_environment(local_settings):
-                async with open_services(local_settings) as built_services:
-                    async with activated_services(built_services) as active:
+                async with open_application_services(local_settings) as application:
+                    async with activated_services(
+                        application.graph, resume=False
+                    ) as active:
                         app.state.runtime = active
+                        active_bitable = (
+                            application.bitable_factory.create(active)
+                            if application.bitable_factory is not None
+                            else None
+                        )
+                        app.state.bitable_service = active_bitable
                         try:
+                            if active_bitable is not None:
+                                try:
+                                    await active_bitable.resume_incomplete()
+                                except Exception:
+                                    # Keep the local UI available so a later scan can
+                                    # report a safe, actionable readiness error.
+                                    pass
+                            else:
+                                await active.resume_pending_runs()
                             yield
                         finally:
+                            if active_bitable is not None:
+                                await active_bitable.close()
+                            app.state.bitable_service = None
                             app.state.runtime = None
             return
 
         async with tracing_environment(local_settings):
             app.state.runtime = None
+            app.state.bitable_service = None
             try:
                 yield
             finally:
+                app.state.bitable_service = None
                 app.state.runtime = None
 
     app = FastAPI(title="本地飞书生成任务 Agent", lifespan=lifespan)
@@ -164,6 +209,20 @@ def create_app(
                 "lark_output_owner_open_id",
                 "lark_output_folder_token",
             ),
+            "bitable_read": configured(
+                "lark_app_id",
+                "lark_app_secret",
+                "lark_bitable_url",
+                "lark_bitable_table_id",
+                "lark_bitable_view_id",
+            ),
+            "bitable_write": configured(
+                "lark_app_id",
+                "lark_app_secret",
+                "lark_bitable_url",
+                "lark_bitable_table_id",
+                "lark_bitable_view_id",
+            ),
             "planning": configured("deepseek_api_key", "deepseek_model"),
             "vision": configured("claude_api_key", "claude_model"),
             "image_generation": configured(
@@ -181,7 +240,19 @@ def create_app(
             for name, value in checks.items()
         }
         return {
-            "ready": all(checks.values()),
+            "ready": (
+                checks["local_storage"]
+                and checks["feishu_read"]
+                and checks["planning"]
+                and checks["vision"]
+                and checks["image_generation"]
+                and checks["video_generation"]
+                and (checks["bitable_write"] or checks["feishu_write"])
+            ),
+            "modes": {
+                "bitable": checks["bitable_read"],
+                "legacy_delivery": checks["feishu_write"],
+            },
             "capabilities": capabilities,
         }
 
@@ -210,6 +281,75 @@ def create_app(
             )
         return active
 
+    def get_bitable_service(request: Request) -> BitableMvpService:
+        active = getattr(request.app.state, "bitable_service", None)
+        if active is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="多维表格服务尚未配置",
+            )
+        return active
+
+    def raise_bitable_error(exc: Exception) -> None:
+        if isinstance(exc, BitableSchemaError):
+            raise HTTPException(
+                status_code=422,
+                detail="多维表格字段配置不兼容，请检查文本、需求来源、执行人和结果列",
+            ) from None
+        if isinstance(exc, BitableResultConflict):
+            raise HTTPException(
+                status_code=409,
+                detail="结果列已有附件，已停止回写",
+            ) from None
+        if isinstance(exc, (TaskAlreadyClaimed, RunConflict)):
+            raise HTTPException(
+                status_code=409,
+                detail="该任务已被领取或当前不可处理",
+            ) from None
+        if isinstance(exc, RunNotFound):
+            raise HTTPException(status_code=404, detail="多维表格运行不存在") from None
+        raise HTTPException(
+            status_code=502,
+            detail="读取多维表格失败，请检查链接、权限和字段配置",
+        ) from None
+
+    @app.get("/api/bitable/tasks")
+    async def scan_bitable_tasks(request: Request) -> list[dict]:
+        active = get_bitable_service(request)
+        try:
+            tasks = await active.scan()
+        except Exception as exc:
+            raise_bitable_error(exc)
+        return [task.model_dump(mode="json") for task in tasks]
+
+    @app.post(
+        "/api/bitable/tasks/{record_id}/claim",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def claim_bitable_task(
+        record_id: str, request: Request
+    ) -> BitableClaimResponse:
+        active = get_bitable_service(request)
+        try:
+            run_id = await active.claim(record_id)
+        except Exception as exc:
+            raise_bitable_error(exc)
+        return BitableClaimResponse(run_id=run_id)
+
+    @app.post(
+        "/api/bitable/runs/{run_id}/retry-delivery",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def retry_bitable_delivery(
+        run_id: str, request: Request
+    ) -> BitableRetryResponse:
+        active = get_bitable_service(request)
+        try:
+            await active.retry_delivery(run_id)
+        except Exception as exc:
+            raise_bitable_error(exc)
+        return BitableRetryResponse(run_id=run_id)
+
     @app.post("/api/runs", status_code=status.HTTP_202_ACCEPTED)
     async def create_run(payload: CreateRunRequest, request: Request) -> dict[str, str]:
         active = get_runtime(request)
@@ -219,6 +359,14 @@ def create_app(
     @app.get("/api/runs/{run_id}")
     async def get_run(run_id: str, request: Request):
         active = get_runtime(request)
+        active_bitable = getattr(request.app.state, "bitable_service", None)
+        if active_bitable is not None:
+            try:
+                await active_bitable.sync_once(run_id)
+            except RunNotFound:
+                pass
+            except Exception as exc:
+                raise_bitable_error(exc)
         try:
             return await active.get_run_view(run_id)
         except RunNotFound as exc:
