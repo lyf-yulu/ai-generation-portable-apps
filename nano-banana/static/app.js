@@ -458,13 +458,19 @@ function NanoBananaApp() {
       this.keyHint = data.has_key ? '已检测到 key: ' + (data.masked_key || '') : '未检测到本地 key';
     },
 
-    applyProvider(provider) {
+    applyProvider(provider, skipDefaults) {
       var cfg = this.providers[provider];
       if (!cfg) return;
       this.provider = provider;
       this.baseUrl = cfg.base_url || '';
       this.providerHint = cfg.hint || '';
       this.models = cfg.models || [];
+      // When restoring a saved draft/preset the form already carries this tab's
+      // own aspect_ratio / image_size / etc. Re-applying provider defaults here
+      // (async, after applyPreset filled the fields) would clobber them back to
+      // defaults on every tab switch. skipDefaults lets the restore path keep
+      // provider metadata (base_url/models) without overwriting form values.
+      if (skipDefaults) return;
       var self = this;
       setTimeout(function () {
         var defaults = cfg.defaults || {};
@@ -884,7 +890,7 @@ function NanoBananaApp() {
       if (!r) { alert('该记录无法恢复'); return; }
       this.applyPreset(r);
       if (r.values && r.values.provider && this.providers[r.values.provider]) {
-        this.applyProvider(r.values.provider);
+        this.applyProvider(r.values.provider, true);
       }
       this.wsTab = 'jobs';
     },
@@ -910,9 +916,10 @@ function NanoBananaApp() {
       if (values.base_url !== undefined) this.baseUrl = values.base_url;
       if (values.workspace_name !== undefined) this.workspaceName = values.workspace_name;
 
-      // Update provider if needed
+      // Update provider if needed. skipDefaults: the draft's own field values
+      // were just applied above; don't let applyProvider reset them to defaults.
       if (values.provider && this.providers[values.provider]) {
-        this.applyProvider(values.provider);
+        this.applyProvider(values.provider, true);
       }
 
       // Update resize state
@@ -946,10 +953,16 @@ function NanoBananaApp() {
     },
 
     async loadInitialPreset() {
-      // In standalone mode, prefer workspace draft
-      if (this.isStandalone && this.loadWorkspaceDraft()) return;
+      // Always prefer the per-tab workspace draft (localStorage). It holds this
+      // tab's api_key / provider / prompt — which the server preset intentionally
+      // strips (api_key is masked/omitted server-side). Gating this on
+      // isStandalone meant that in the portal (isStandalone === false) every tab
+      // switch re-fetched the empty server preset and wiped the form. Matches
+      // seedance's loadPreset() draft-first behavior.
+      if (this.loadWorkspaceDraft()) return;
 
-      // Otherwise load server preset
+      // Fall back to the server preset only when this tab has no local draft
+      // yet (e.g. first visit on a fresh browser, or a tab restored from server).
       var wsId = getActiveWorkspaceId();
       var res = await fetch(APP_PATH + '/api/preset?ws=' + encodeURIComponent(wsId), { headers: { 'X-Workspace-Id': wsId } });
       if (res.ok) {

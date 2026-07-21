@@ -456,13 +456,20 @@ function SeedanceApp() {
       }
     },
 
-    applyProvider(providerKey) {
+    applyProvider(providerKey, skipDefaults) {
       const cfg = this.providers[providerKey];
       if (!cfg) return;
       this.provider = providerKey;
       this.baseUrl = cfg.base_url || '';
       this.providerHint = cfg.hint || '';
       this.models = cfg.models || [];
+
+      // When restoring a saved draft/preset the form already carries this tab's
+      // own resolution / ratio / duration. Re-applying provider defaults here
+      // (async, after applyPreset filled the fields) would clobber them back to
+      // defaults on every tab switch. skipDefaults keeps provider metadata
+      // without overwriting the restored form values.
+      if (skipDefaults) return;
 
       // Apply provider defaults after a tick to let DOM render
       setTimeout(() => {
@@ -1004,8 +1011,10 @@ function SeedanceApp() {
         // API key is server-managed; never restore from saved draft.
         if (name === 'api_key') continue;
         // Provider is locked to volcengine; ignore stale saved values.
+        // skipDefaults: the draft's own resolution/ratio/duration were/are being
+        // applied in this same loop; don't reset them to provider defaults.
         if (name === 'provider') {
-          this.applyProvider('volcengine');
+          this.applyProvider('volcengine', true);
           continue;
         }
         if (name === 'base_url') { this.baseUrl = value; continue; }
