@@ -17,11 +17,16 @@ class Settings(BaseSettings):
 
     lark_app_id: str | None = None
     lark_app_secret: SecretStr | None = None
+    lark_bitable_url: str | None = None
+    lark_bitable_table_id: str | None = None
+    lark_bitable_view_id: str | None = None
+    lark_local_operator_open_id: str | None = None
+    lark_bot_enabled: bool = False
     lark_output_owner_open_id: str | None = None
     lark_output_folder_token: str | None = None
     deepseek_api_key: SecretStr | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
-    deepseek_model: Literal["deepseek-v4-pro"] = "deepseek-v4-pro"
+    deepseek_model: str = "deepseek-v4-pro"
     claude_api_key: SecretStr | None = None
     claude_base_url: str | None = None
     claude_model: str | None = None
@@ -39,6 +44,8 @@ class Settings(BaseSettings):
     provider_poll_interval_seconds: float = Field(default=1.0, ge=0.0)
     provider_poll_max_attempts: int = Field(default=120, ge=1, le=10_000)
     submission_intent_lease_seconds: float = Field(default=180.0, ge=0.03)
+    bot_scan_page_size: int = Field(default=10, ge=1, le=50)
+    coordinator_poll_interval_seconds: float = Field(default=1.0, ge=0.05)
 
     def ensure_paths(self) -> None:
         for path in (

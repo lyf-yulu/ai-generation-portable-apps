@@ -26,31 +26,61 @@ from feishu_generation_agent.storage.provider_results import ProviderResultStore
 from feishu_generation_agent.storage.repository import Repository
 
 
+CAPABILITY_FIELDS: dict[str, tuple[str, ...]] = {
+    "core": (
+        "lark_app_id", "lark_app_secret", "deepseek_api_key",
+        "claude_api_key", "claude_model",
+    ),
+    "generation": (
+        "chiyun_api_key", "chiyun_model", "ark_api_key",
+        "seedance_model",
+    ),
+    "bitable": (
+        "lark_app_id", "lark_app_secret", "lark_bitable_url",
+        "lark_bitable_table_id", "lark_bitable_view_id",
+    ),
+    "local_claim": ("lark_local_operator_open_id",),
+    "legacy_delivery": (
+        "lark_output_owner_open_id", "lark_output_folder_token",
+    ),
+}
+
+# Compatibility for the existing configuration probe; runtime checks use
+# CAPABILITY_FIELDS so Bitable mode does not depend on legacy delivery fields.
 REQUIRED_RUNTIME_FIELDS = (
-    "lark_app_id",
-    "lark_app_secret",
-    "lark_output_owner_open_id",
-    "lark_output_folder_token",
-    "deepseek_api_key",
-    "claude_api_key",
-    "claude_model",
-    "chiyun_api_key",
-    "chiyun_model",
-    "ark_api_key",
+    *CAPABILITY_FIELDS["core"],
+    *CAPABILITY_FIELDS["generation"],
+    *CAPABILITY_FIELDS["legacy_delivery"],
 )
 
 
-def runtime_is_configured(settings: Settings) -> bool:
+def capability_is_configured(settings: Settings, name: str) -> bool:
     try:
-        settings.require(*REQUIRED_RUNTIME_FIELDS)
-    except ValueError:
+        settings.require(*CAPABILITY_FIELDS[name])
+    except (KeyError, ValueError):
         return False
     return True
 
 
+def runtime_is_configured(settings: Settings) -> bool:
+    return (
+        capability_is_configured(settings, "core")
+        and capability_is_configured(settings, "generation")
+        and (
+            capability_is_configured(settings, "bitable")
+            or capability_is_configured(settings, "legacy_delivery")
+        )
+    )
+
+
 @asynccontextmanager
 async def open_services(settings: Settings) -> AsyncIterator[GraphServices]:
-    settings.require(*REQUIRED_RUNTIME_FIELDS)
+    settings.require(*CAPABILITY_FIELDS["core"])
+    settings.require(*CAPABILITY_FIELDS["generation"])
+    if capability_is_configured(settings, "bitable"):
+        settings.require(*CAPABILITY_FIELDS["bitable"])
+    else:
+        settings.require(*CAPABILITY_FIELDS["legacy_delivery"])
     settings.ensure_paths()
     repository = await Repository.open(settings.business_db_path)
     provider_http = httpx.AsyncClient(trust_env=False)
