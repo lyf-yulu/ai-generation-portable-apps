@@ -166,7 +166,7 @@ class SeedanceVideoGenerator:
             operation="submit",
         )
         provider_task_id = self._official_task_id(body.get("id"), "submit")
-        status = self._status(body.get("status"), "submit")
+        status = self._status(body.get("status", "queued"), "submit")
         if status in _TERMINAL_FAILURE_STATUSES:
             raise self._terminal_status_error("submit", status)
         result_items = (

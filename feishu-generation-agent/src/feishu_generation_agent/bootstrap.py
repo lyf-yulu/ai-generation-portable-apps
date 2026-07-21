@@ -145,7 +145,10 @@ async def _open_application_services(
     settings.ensure_paths()
     repository = await Repository.open(settings.business_db_path)
     provider_http = httpx.AsyncClient(trust_env=False)
-    downloader = SafeResultDownloader(max_bytes=settings.max_download_bytes)
+    downloader = SafeResultDownloader(
+        max_bytes=settings.max_download_bytes,
+        allow_benchmark_dns=settings.allow_benchmark_fake_ips,
+    )
     feishu = FeishuClient(settings)
     file_store: FileStore | None = None
     bitable_factory: BitableServiceFactory | None = None

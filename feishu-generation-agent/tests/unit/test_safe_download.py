@@ -211,6 +211,69 @@ async def test_downloader_rejects_any_private_dns_answer_without_http() -> None:
 
 
 @pytest.mark.asyncio
+async def test_downloader_allows_dns_fake_ip_only_with_explicit_opt_in() -> None:
+    requests: list[httpx.Request] = []
+
+    async def fake_ip_resolver(host: str, port: int) -> Sequence[str]:
+        assert (host, port) == ("cdn.fictional.test", 443)
+        return ["198.18.0.52"]
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            content=b"fictional-video",
+            headers={"Content-Type": "video/mp4"},
+        )
+
+    downloader = SafeResultDownloader(
+        transport=httpx.MockTransport(respond),
+        resolver=fake_ip_resolver,
+        max_bytes=1024,
+        allow_benchmark_dns=True,
+    )
+    try:
+        content = await downloader.download(
+            "https://cdn.fictional.test/result.mp4",
+            expected_mime_type="video/mp4",
+        )
+    finally:
+        await downloader.aclose()
+
+    assert content == b"fictional-video"
+    assert len(requests) == 1
+    assert requests[0].url.host == "198.18.0.52"
+    assert requests[0].headers["host"] == "cdn.fictional.test"
+    assert requests[0].extensions["sni_hostname"] == "cdn.fictional.test"
+
+
+@pytest.mark.asyncio
+async def test_downloader_never_allows_literal_benchmark_address() -> None:
+    requests: list[httpx.Request] = []
+
+    def unexpected(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500)
+
+    downloader = SafeResultDownloader(
+        transport=httpx.MockTransport(unexpected),
+        resolver=_public_resolver,
+        max_bytes=1024,
+        allow_benchmark_dns=True,
+    )
+    try:
+        with pytest.raises(AgentError):
+            await downloader.download(
+                "https://198.18.0.52/result.mp4",
+                expected_mime_type="video/mp4",
+            )
+    finally:
+        await downloader.aclose()
+
+    assert requests == []
+
+
+@pytest.mark.asyncio
 async def test_downloader_revalidates_redirects_and_never_sends_credentials() -> None:
     requests: list[httpx.Request] = []
     resolved: list[tuple[str, int]] = []

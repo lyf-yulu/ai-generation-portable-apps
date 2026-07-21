@@ -195,6 +195,35 @@ async def test_submit_preserves_explicit_reference_order_and_official_payload(
 
 
 @pytest.mark.asyncio
+async def test_submit_treats_official_id_only_response_as_queued(
+    tmp_path: Path,
+) -> None:
+    def create(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"id": "task-ark-id-only"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(create)
+    ) as client:
+        generator = SeedanceVideoGenerator(
+            client,
+            base_url="https://ark.fictional.test/api/v3",
+            api_key="fictional-key",
+            model="fictional-model",
+        )
+        submission = await generator.submit(
+            _video_task(),
+            _assets(tmp_path),
+        )
+
+    assert submission.provider_task_id == "task-ark-id-only"
+    assert submission.status == "queued"
+    assert submission.result_items == []
+
+
+@pytest.mark.asyncio
 async def test_submit_accepts_origin_base_and_valid_first_last_frames(
     tmp_path: Path,
 ) -> None:

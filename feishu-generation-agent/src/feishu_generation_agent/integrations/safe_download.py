@@ -16,6 +16,7 @@ from feishu_generation_agent.domain.errors import (
 
 HostResolver = Callable[[str, int], Awaitable[Sequence[str]]]
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_BENCHMARK_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 
 
 @runtime_checkable
@@ -37,6 +38,7 @@ class SafeResultDownloader:
         resolver: HostResolver | None = None,
         max_bytes: int,
         max_redirects: int = 3,
+        allow_benchmark_dns: bool = False,
     ) -> None:
         if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
@@ -54,6 +56,7 @@ class SafeResultDownloader:
         self._resolver = resolver or self._resolve_host
         self._max_bytes = max_bytes
         self._max_redirects = max_redirects
+        self._allow_benchmark_dns = allow_benchmark_dns
 
     async def aclose(self) -> None:
         await self._http_client.aclose()
@@ -203,7 +206,9 @@ class SafeResultDownloader:
                 address = ipaddress.ip_address(value)
             except ValueError:
                 raise self._provider_error("invalid_dns_address") from None
-            if not self._is_public_address(address):
+            if not self._is_public_address(address) and not (
+                self._allow_benchmark_dns and address in _BENCHMARK_NETWORK
+            ):
                 raise self._provider_error("unsafe_address")
             validated.append(address)
         return normalized_host, validated[0]

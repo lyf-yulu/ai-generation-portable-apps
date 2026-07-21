@@ -208,6 +208,30 @@ class FeishuClient:
         )
         return self._file_token(payload, "upload_all")
 
+    async def upload_media_all(
+        self,
+        filename: str,
+        content: bytes,
+        mime_type: str,
+        *,
+        parent_type: str,
+        parent_node: str,
+    ) -> str:
+        target = self._upload_parent(parent_type, parent_node)
+        payload = await self._request_multipart(
+            "/open-apis/drive/v1/medias/upload_all",
+            data={
+                "file_name": filename,
+                "parent_type": parent_type,
+                "parent_node": target,
+                "size": str(len(content)),
+            },
+            filename=filename,
+            content=content,
+            mime_type=mime_type,
+        )
+        return self._file_token(payload, "media_upload_all")
+
     async def prepare_file_upload(
         self,
         filename: str,
@@ -237,11 +261,52 @@ class FeishuClient:
             )
         return upload_id, block_size
 
+    async def prepare_media_upload(
+        self,
+        filename: str,
+        size: int,
+        *,
+        parent_type: str,
+        parent_node: str,
+    ) -> tuple[str, int]:
+        target = self._upload_parent(parent_type, parent_node)
+        payload = await self.request_json(
+            "POST",
+            "/open-apis/drive/v1/medias/upload_prepare",
+            json_body={
+                "file_name": filename,
+                "parent_type": parent_type,
+                "parent_node": target,
+                "size": size,
+            },
+        )
+        data = payload.get("data", {})
+        upload_id = data.get("upload_id")
+        block_size = data.get("block_size")
+        if not isinstance(upload_id, str) or not isinstance(block_size, int):
+            raise self._document_error(
+                "飞书分片上传预处理响应无效",
+                "media upload_prepare response missing upload_id or block_size",
+            )
+        return upload_id, block_size
+
     async def upload_file_part(
         self, upload_id: str, sequence: int, content: bytes
     ) -> None:
         await self._request_multipart(
             "/open-apis/drive/v1/files/upload_part",
+            data={"upload_id": upload_id, "seq": str(sequence),
+                  "size": str(len(content))},
+            filename=f"part-{sequence}",
+            content=content,
+            mime_type="application/octet-stream",
+        )
+
+    async def upload_media_part(
+        self, upload_id: str, sequence: int, content: bytes
+    ) -> None:
+        await self._request_multipart(
+            "/open-apis/drive/v1/medias/upload_part",
             data={"upload_id": upload_id, "seq": str(sequence),
                   "size": str(len(content))},
             filename=f"part-{sequence}",
@@ -256,6 +321,14 @@ class FeishuClient:
             json_body={"upload_id": upload_id, "block_num": block_count},
         )
         return self._file_token(payload, "upload_finish")
+
+    async def finish_media_upload(self, upload_id: str, block_count: int) -> str:
+        payload = await self.request_json(
+            "POST",
+            "/open-apis/drive/v1/medias/upload_finish",
+            json_body={"upload_id": upload_id, "block_num": block_count},
+        )
+        return self._file_token(payload, "media_upload_finish")
 
     async def add_document_member(
         self, document_id: str, owner_open_id: str

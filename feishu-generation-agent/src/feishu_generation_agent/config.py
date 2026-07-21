@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     langsmith_project: str = "feishu-generation-agent-local"
     max_output_count: int = 4
     max_download_bytes: int = 500 * 1024 * 1024
+    allow_benchmark_fake_ips: bool = False
     provider_poll_interval_seconds: float = Field(default=1.0, ge=0.0)
     provider_poll_max_attempts: int = Field(default=120, ge=1, le=10_000)
     submission_intent_lease_seconds: float = Field(default=180.0, ge=0.03)

@@ -47,7 +47,7 @@ class FeishuJsonClient(Protocol):
         self, path: str, *, params: dict | None = None
     ) -> list[dict]: ...
 
-    async def upload_file_all(
+    async def upload_media_all(
         self,
         filename: str,
         content: bytes,
@@ -57,7 +57,7 @@ class FeishuJsonClient(Protocol):
         parent_node: str,
     ) -> str: ...
 
-    async def prepare_file_upload(
+    async def prepare_media_upload(
         self,
         filename: str,
         size: int,
@@ -66,11 +66,11 @@ class FeishuJsonClient(Protocol):
         parent_node: str,
     ) -> tuple[str, int]: ...
 
-    async def upload_file_part(
+    async def upload_media_part(
         self, upload_id: str, sequence: int, content: bytes
     ) -> None: ...
 
-    async def finish_file_upload(self, upload_id: str, block_count: int) -> str: ...
+    async def finish_media_upload(self, upload_id: str, block_count: int) -> str: ...
 
 
 class FeishuBitableClient:
@@ -214,7 +214,7 @@ class FeishuBitableClient:
         parent_type: str,
         parent_node: str,
     ) -> str:
-        return await self._client.upload_file_all(
+        return await self._client.upload_media_all(
             filename,
             content,
             mime_type,
@@ -230,7 +230,7 @@ class FeishuBitableClient:
         parent_type: str,
         parent_node: str,
     ) -> tuple[str, int]:
-        return await self._client.prepare_file_upload(
+        return await self._client.prepare_media_upload(
             filename,
             size,
             parent_type=parent_type,
@@ -240,10 +240,10 @@ class FeishuBitableClient:
     async def upload_file_part(
         self, upload_id: str, sequence: int, content: bytes
     ) -> None:
-        await self._client.upload_file_part(upload_id, sequence, content)
+        await self._client.upload_media_part(upload_id, sequence, content)
 
     async def finish_file_upload(self, upload_id: str, block_count: int) -> str:
-        return await self._client.finish_file_upload(upload_id, block_count)
+        return await self._client.finish_media_upload(upload_id, block_count)
 
 
 def record_has_result(record: Mapping[str, Any]) -> bool:

@@ -14,9 +14,16 @@ def test_settings_are_local_and_create_runtime_paths(tmp_path: Path):
     settings = Settings(data_dir=tmp_path / "data", outputs_dir=tmp_path / "outputs")
     assert settings.app_host == "127.0.0.1"
     assert settings.app_port == 8765
+    assert settings.allow_benchmark_fake_ips is False
     settings.ensure_paths()
     assert settings.data_dir.is_dir()
     assert settings.outputs_dir.is_dir()
+
+
+def test_settings_can_explicitly_enable_benchmark_fake_ips():
+    settings = Settings(_env_file=None, allow_benchmark_fake_ips=True)
+
+    assert settings.allow_benchmark_fake_ips is True
 
 
 def test_require_reports_missing_secret_names():

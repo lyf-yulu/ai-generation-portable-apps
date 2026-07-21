@@ -224,9 +224,10 @@ async def test_get_record_refreshes_and_write_result_uses_attachment_payload() -
 
 async def test_feishu_upload_accepts_bitable_parent_target() -> None:
     upload_body = b""
+    upload_path = ""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal upload_body
+        nonlocal upload_body, upload_path
         if request.url.path.endswith("tenant_access_token/internal"):
             return httpx.Response(
                 200,
@@ -237,6 +238,7 @@ async def test_feishu_upload_accepts_bitable_parent_target() -> None:
                 },
             )
         if request.url.path.endswith("upload_all"):
+            upload_path = request.url.path
             upload_body = request.content
             return httpx.Response(
                 200, json={"code": 0, "data": {"file_token": "bitable-file"}}
@@ -247,9 +249,14 @@ async def test_feishu_upload_accepts_bitable_parent_target() -> None:
         base_url="https://open.feishu.cn",
         transport=httpx.MockTransport(handler),
     ) as http_client:
-        client = FeishuClient(
-            Settings(lark_app_id="fiction-app", lark_app_secret="fiction-secret"),
-            http_client=http_client,
+        client = FeishuBitableClient(
+            FeishuClient(
+                Settings(
+                    lark_app_id="fiction-app",
+                    lark_app_secret="fiction-secret",
+                ),
+                http_client=http_client,
+            )
         )
         token = await client.upload_file_all(
             "result.png",
@@ -260,5 +267,64 @@ async def test_feishu_upload_accepts_bitable_parent_target() -> None:
         )
 
     assert token == "bitable-file"
+    assert upload_path == "/open-apis/drive/v1/medias/upload_all"
     assert b"bitable_file" in upload_body
     assert b"appTABLE" in upload_body
+
+
+async def test_feishu_bitable_chunked_upload_uses_media_api_paths() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "tenant_access_token": "fiction-token",
+                    "expire": 7200,
+                },
+            )
+        if request.url.path.endswith("upload_prepare"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {"upload_id": "upload-1", "block_size": 4},
+                },
+            )
+        if request.url.path.endswith("upload_part"):
+            return httpx.Response(200, json={"code": 0, "data": {}})
+        if request.url.path.endswith("upload_finish"):
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"file_token": "bitable-file"}},
+            )
+        raise AssertionError(request.url)
+
+    async with httpx.AsyncClient(
+        base_url="https://open.feishu.cn",
+        transport=httpx.MockTransport(handler),
+    ) as http_client:
+        client = FeishuBitableClient(
+            FeishuClient(
+                Settings(
+                    lark_app_id="fiction-app",
+                    lark_app_secret="fiction-secret",
+                ),
+                http_client=http_client,
+            )
+        )
+        assert await client.prepare_file_upload(
+            "result.mp4",
+            8,
+            parent_type="bitable_file",
+            parent_node="appTABLE",
+        ) == ("upload-1", 4)
+        await client.upload_file_part("upload-1", 0, b"1234")
+        assert await client.finish_file_upload("upload-1", 2) == "bitable-file"
+
+    assert "/open-apis/drive/v1/medias/upload_prepare" in paths
+    assert "/open-apis/drive/v1/medias/upload_part" in paths
+    assert "/open-apis/drive/v1/medias/upload_finish" in paths
