@@ -1,8 +1,11 @@
 import asyncio
 import base64
+from io import BytesIO
+import math
 from typing import Any
 
 import httpx
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import ValidationError
 
 from feishu_generation_agent.domain.document import (
@@ -25,6 +28,11 @@ _SYSTEM_PROMPT = """你是严格的图片观察与转录工具。
 5. 严格按给定结构返回结果，不要附加解释或原始响应。
 """
 
+_MAX_VISION_EDGE = 1568
+_MAX_VISION_PIXELS = 1_150_000
+_MAX_VISION_SOURCE_BYTES = 1_500_000
+_VISION_JPEG_QUALITY = 90
+
 
 class _ModelRefusal(RuntimeError):
     pass
@@ -34,6 +42,50 @@ class _AssetReadFailure(RuntimeError):
     def __init__(self, cause_name: str) -> None:
         super().__init__()
         self.cause_name = cause_name
+
+
+def _prepare_model_image(
+    image_bytes: bytes,
+    mime_type: str,
+) -> tuple[bytes, str]:
+    try:
+        with Image.open(BytesIO(image_bytes)) as opened:
+            image = ImageOps.exif_transpose(opened)
+            width, height = image.size
+            scale = min(
+                1.0,
+                _MAX_VISION_EDGE / max(width, height),
+                math.sqrt(_MAX_VISION_PIXELS / (width * height)),
+            )
+            needs_resize = scale < 1.0
+            needs_reencode = (
+                needs_resize or len(image_bytes) > _MAX_VISION_SOURCE_BYTES
+            )
+            if not needs_reencode:
+                return image_bytes, mime_type
+            if needs_resize:
+                target = (
+                    max(1, math.floor(width * scale)),
+                    max(1, math.floor(height * scale)),
+                )
+                image = image.resize(target, Image.Resampling.LANCZOS)
+            if image.mode in {"RGBA", "LA"}:
+                background = Image.new("RGB", image.size, "white")
+                alpha = image.getchannel("A")
+                background.paste(image.convert("RGB"), mask=alpha)
+                image = background
+            elif image.mode != "RGB":
+                image = image.convert("RGB")
+            output = BytesIO()
+            image.save(
+                output,
+                format="JPEG",
+                quality=_VISION_JPEG_QUALITY,
+                optimize=True,
+            )
+            return output.getvalue(), "image/jpeg"
+    except (OSError, UnidentifiedImageError, ValueError):
+        return image_bytes, mime_type
 
 
 class ClaudeVisionAnalyzer:
@@ -112,7 +164,12 @@ class ClaudeVisionAnalyzer:
         if read_error is not None:
             raise read_error
 
-        image_data = base64.b64encode(image_bytes).decode("ascii")
+        model_bytes, model_mime_type = await asyncio.to_thread(
+            _prepare_model_image,
+            image_bytes,
+            asset.mime_type,
+        )
+        image_data = base64.b64encode(model_bytes).decode("ascii")
         messages = [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {
@@ -122,7 +179,7 @@ class ClaudeVisionAnalyzer:
                         "type": "image",
                         "source": {
                             "type": "base64",
-                            "media_type": asset.mime_type,
+                            "media_type": model_mime_type,
                             "data": image_data,
                         },
                     },
