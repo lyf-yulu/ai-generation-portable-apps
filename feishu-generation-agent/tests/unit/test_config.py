@@ -11,7 +11,11 @@ from feishu_generation_agent.bootstrap import (
 
 
 def test_settings_are_local_and_create_runtime_paths(tmp_path: Path):
-    settings = Settings(data_dir=tmp_path / "data", outputs_dir=tmp_path / "outputs")
+    settings = Settings(
+        _env_file=None,
+        data_dir=tmp_path / "data",
+        outputs_dir=tmp_path / "outputs",
+    )
     assert settings.app_host == "127.0.0.1"
     assert settings.app_port == 8765
     assert settings.allow_benchmark_fake_ips is False
