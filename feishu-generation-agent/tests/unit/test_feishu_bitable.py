@@ -1,4 +1,5 @@
 from copy import deepcopy
+import json
 
 import httpx
 import pytest
@@ -219,6 +220,40 @@ async def test_get_record_refreshes_and_write_result_uses_attachment_payload() -
             "/open-apis/bitable/v1/apps/appTABLE/tables/tblTABLE/records/rec1",
             {"fields": {"结果": [{"file_token": "fileA"}, {"file_token": "fileB"}]}},
         ),
+    ]
+
+
+async def test_creates_result_bitable_in_explicit_folder_and_grants_editor() -> None:
+    requests: list[tuple[str, str, dict, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return httpx.Response(200, json={"code": 0, "tenant_access_token": "token", "expire": 7200})
+        body = json.loads(request.content)
+        requests.append((request.method, request.url.path, dict(request.url.params), body))
+        if request.url.path == "/open-apis/bitable/v1/apps":
+            return httpx.Response(200, json={"code": 0, "data": {"app": {
+                "app_token": "app-result", "default_table_id": "tbl-result",
+                "url": "https://tenant.feishu.cn/base/app-result",
+            }}})
+        if request.url.path == "/open-apis/drive/v1/permissions/app-result/members":
+            return httpx.Response(200, json={"code": 0, "data": {}})
+        raise AssertionError(request.url)
+
+    async with httpx.AsyncClient(base_url="https://open.feishu.cn", transport=httpx.MockTransport(handler)) as http_client:
+        client = FeishuClient(Settings(lark_app_id="app", lark_app_secret="secret"), http_client=http_client)
+        created = await client.create_bitable_app("AI生成结果－制作人", "fldResults")
+        await client.grant_bitable_editor("app-result", "ou-maker")
+
+    assert created.app_token == "app-result"
+    assert created.table_id == "tbl-result"
+    assert requests == [
+        ("POST", "/open-apis/bitable/v1/apps", {}, {
+            "name": "AI生成结果－制作人", "folder_token": "fldResults", "time_zone": "Asia/Shanghai",
+        }),
+        ("POST", "/open-apis/drive/v1/permissions/app-result/members", {
+            "type": "bitable", "need_notification": "false",
+        }, {"member_type": "openid", "member_id": "ou-maker", "perm": "edit", "type": "user"}),
     ]
 
 

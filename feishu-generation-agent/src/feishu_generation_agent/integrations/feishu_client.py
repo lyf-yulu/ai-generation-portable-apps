@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Mapping
+from dataclasses import dataclass
 from time import monotonic
 from typing import Any
 
@@ -28,6 +29,13 @@ _PERMISSION_CODES = frozenset(
         1770034,
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class CreatedBitableApp:
+    app_token: str
+    table_id: str
+    url: str
 
 
 class FeishuClient:
@@ -172,6 +180,42 @@ class FeishuClient:
                 "POST /open-apis/docx/v1/documents: missing document_id",
             )
         return document_id
+
+    async def create_bitable_app(
+        self, name: str, folder_token: str
+    ) -> CreatedBitableApp:
+        payload = await self.request_json(
+            "POST",
+            "/open-apis/bitable/v1/apps",
+            json_body={
+                "name": name,
+                "folder_token": folder_token,
+                "time_zone": "Asia/Shanghai",
+            },
+        )
+        app = payload.get("data", {}).get("app", {})
+        app_token = app.get("app_token")
+        table_id = app.get("default_table_id")
+        url = app.get("url")
+        if not all(isinstance(value, str) and value for value in (app_token, table_id, url)):
+            raise self._document_error(
+                "飞书创建结果多维表格响应无效",
+                "POST /open-apis/bitable/v1/apps: missing app identity",
+            )
+        return CreatedBitableApp(app_token=app_token, table_id=table_id, url=url)
+
+    async def grant_bitable_editor(self, app_token: str, open_id: str) -> None:
+        await self.request_json(
+            "POST",
+            f"/open-apis/drive/v1/permissions/{app_token}/members",
+            params={"type": "bitable", "need_notification": "false"},
+            json_body={
+                "member_type": "openid",
+                "member_id": open_id,
+                "perm": "edit",
+                "type": "user",
+            },
+        )
 
     async def append_document_blocks(
         self, document_id: str, blocks: list[dict]
