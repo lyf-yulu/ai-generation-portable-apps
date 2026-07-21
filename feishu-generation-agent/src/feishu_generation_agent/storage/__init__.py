@@ -39,11 +39,6 @@ def __getattr__(name: str) -> Any:
         module_name, attribute_name = _EXPORTS[name]
     except KeyError:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
-    if module_name == "feishu_generation_agent.storage.files":
-        # integrations.__init__ imports feishu_source, which imports storage.files.
-        # Loading integrations first lets that cycle complete before this export is
-        # resolved, while keeping unrelated storage submodules lightweight.
-        import_module("feishu_generation_agent.integrations")
     value = getattr(import_module(module_name), attribute_name)
     globals()[name] = value
     return value

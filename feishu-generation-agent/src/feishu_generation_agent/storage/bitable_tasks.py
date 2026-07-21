@@ -57,43 +57,10 @@ _RELEASE_STATUSES = {
     TableTaskStatus.FAILED,
     TableTaskStatus.WRITEBACK_FAILED,
 }
-_MAX_COMMAND_JSON_BYTES = 64 * 1024
-_SENSITIVE_COMMAND_KEYS = {
-    "api_key",
-    "app_secret",
-    "auth",
-    "authorization",
-    "bearer_token",
-    "client_secret",
-    "client_token",
-    "cookie",
-    "cookies",
-    "credential",
-    "credentials",
-    "event",
-    "headers",
-    "id_token",
-    "private_key",
-    "payload",
-    "raw_event",
-    "raw_payload",
-    "refresh_token",
-    "secret",
-    "signature",
-    "signed_url",
-    "tenant_access_token",
-    "token",
-}
-_SENSITIVE_COMMAND_KEY_SUFFIXES = (
-    "_access_token",
-    "_api_key",
-    "_authorization",
-    "_credential",
-    "_headers",
-    "_private_key",
-    "_secret",
-    "_signature",
-)
+_MAX_JSON_BYTES = 64 * 1024
+_MAX_JSON_DEPTH = 12
+_MAX_JSON_NODES = 1024
+_MAX_TEXT_BYTES = 16 * 1024
 _SENSITIVE_QUERY_MARKERS = (
     "access_key",
     "api_key",
@@ -103,6 +70,45 @@ _SENSITIVE_QUERY_MARKERS = (
     "token",
 )
 _URL_CANDIDATE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_DATA_URL = re.compile(r"data:[^,\s]*;base64,", re.IGNORECASE)
+_BEARER_CREDENTIAL = re.compile(r"\bbearer\s+[^\s,;]+", re.IGNORECASE)
+_LABELED_CREDENTIAL = re.compile(
+    r"\b(?:(?:[a-z0-9]+[\s_-]+)*token|access[\s_-]*key(?:[\s_-]*id)?|"
+    r"api[\s_-]*key|authorization|jwt|password|secret)"
+    r"\s*[:=]\s*[^\s,;]+",
+    re.IGNORECASE,
+)
+_SENSITIVE_SINGLE_KEY_SEGMENTS = {
+    "auth",
+    "authorization",
+    "cookie",
+    "cookies",
+    "credential",
+    "credentials",
+    "header",
+    "headers",
+    "jwt",
+    "password",
+    "passwd",
+    "secret",
+    "signature",
+}
+_SENSITIVE_KEY_PAIRS = {
+    ("access", "token"),
+    ("access", "key"),
+    ("api", "key"),
+    ("app", "secret"),
+    ("bearer", "token"),
+    ("client", "secret"),
+    ("client", "token"),
+    ("id", "token"),
+    ("private", "key"),
+    ("refresh", "token"),
+    ("session", "token"),
+    ("tenant", "token"),
+    ("user", "token"),
+}
+_SAFE_RESOURCE_TOKEN_KEYS = {"app_token", "file_token", "wiki_token"}
 
 
 class TaskAlreadyClaimed(RuntimeError):
@@ -149,7 +155,7 @@ class BitableTaskStore:
         thread_id: str,
         reply_context: dict[str, str],
     ) -> BitableBinding:
-        reply_context_json = _json_object(reply_context, field_name="reply_context")
+        reply_context_json = _reply_context_json(reply_context)
         async with self._lock:
             try:
                 await self._connection.execute("BEGIN IMMEDIATE")
@@ -212,9 +218,9 @@ class BitableTaskStore:
                 )
                 row = await cursor.fetchone()
                 await cursor.close()
-                await self._connection.commit()
+                await _commit_durably(self._connection)
             except BaseException:
-                await asyncio.shield(self._connection.rollback())
+                await _rollback_durably(self._connection)
                 raise
 
         assert row is not None
@@ -254,6 +260,7 @@ class BitableTaskStore:
         status: TableTaskStatus,
         last_error: str | None = None,
     ) -> BitableBinding:
+        last_error = _safe_optional_text(last_error, field_name="last_error")
         return await self._update_run(
             run_id,
             """
@@ -273,6 +280,7 @@ class BitableTaskStore:
     ) -> BitableBinding:
         if status not in _RELEASE_STATUSES:
             raise ValueError(f"invalid release status: {status}")
+        last_error = _safe_optional_text(last_error, field_name="last_error")
         return await self._update_run(
             run_id,
             """
@@ -288,14 +296,15 @@ class BitableTaskStore:
         self,
         run_id: str,
         plan_fingerprint: str,
-    ) -> BitableBinding:
+    ) -> tuple[BitableBinding, bool]:
         async with self._lock:
             try:
                 await self._connection.execute("BEGIN IMMEDIATE")
                 row = await self._fetch_run(run_id)
                 if row is None:
                     raise KeyError(f"unknown run_id: {run_id}")
-                if row["plan_fingerprint"] != plan_fingerprint:
+                changed = row["plan_fingerprint"] != plan_fingerprint
+                if changed:
                     await self._connection.execute(
                         """
                         UPDATE bitable_tasks
@@ -306,13 +315,13 @@ class BitableTaskStore:
                         (plan_fingerprint, run_id),
                     )
                     row = await self._fetch_run(run_id)
-                await self._connection.commit()
+                await _commit_durably(self._connection)
             except BaseException:
-                await asyncio.shield(self._connection.rollback())
+                await _rollback_durably(self._connection)
                 raise
 
         assert row is not None
-        return _binding_from_row(row)
+        return _binding_from_row(row), changed
 
     async def accept_ingress(
         self,
@@ -383,18 +392,25 @@ class BitableTaskStore:
         kind: str,
         command: dict[str, Any],
     ) -> bool:
-        command_json = _command_json(command)
+        command_json = _json_object(command, field_name="command")
         async with self._lock:
-            cursor = await self._connection.execute(
-                f"""
-                INSERT OR IGNORE INTO {table} (
-                  {id_column}, kind, command_json, status, created_at, updated_at
-                ) VALUES (?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                """,
-                (item_id, kind, command_json),
-            )
-            inserted = cursor.rowcount == 1
-            await cursor.close()
+            try:
+                await self._connection.execute("BEGIN IMMEDIATE")
+                cursor = await self._connection.execute(
+                    f"""
+                    INSERT INTO {table} (
+                      {id_column}, kind, command_json, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT({id_column}) DO NOTHING
+                    """,
+                    (item_id, kind, command_json),
+                )
+                inserted = cursor.rowcount == 1
+                await cursor.close()
+                await _commit_durably(self._connection)
+            except BaseException:
+                await _rollback_durably(self._connection)
+                raise
         return inserted
 
     async def _finish_once(
@@ -421,16 +437,22 @@ class BitableTaskStore:
             raise TypeError("result must be a JSON object")
         result_json = _json_object(result, field_name="result")
         async with self._lock:
-            cursor = await self._connection.execute(
-                f"""
-                UPDATE {table}
-                SET status = ?, result_json = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE {id_column} = ? AND status = 'pending'
-                """,
-                (status, result_json, item_id),
-            )
-            finished = cursor.rowcount == 1
-            await cursor.close()
+            try:
+                await self._connection.execute("BEGIN IMMEDIATE")
+                cursor = await self._connection.execute(
+                    f"""
+                    UPDATE {table}
+                    SET status = ?, result_json = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE {id_column} = ? AND status = 'pending'
+                    """,
+                    (status, result_json, item_id),
+                )
+                finished = cursor.rowcount == 1
+                await cursor.close()
+                await _commit_durably(self._connection)
+            except BaseException:
+                await _rollback_durably(self._connection)
+                raise
         return finished
 
     async def _update_run(
@@ -448,9 +470,9 @@ class BitableTaskStore:
                 if not updated:
                     raise KeyError(f"unknown run_id: {run_id}")
                 row = await self._fetch_run(run_id)
-                await self._connection.commit()
+                await _commit_durably(self._connection)
             except BaseException:
-                await asyncio.shield(self._connection.rollback())
+                await _rollback_durably(self._connection)
                 raise
 
         assert row is not None
@@ -469,8 +491,9 @@ class BitableTaskStore:
 def _json_object(value: dict[str, Any], *, field_name: str) -> str:
     if not isinstance(value, dict):
         raise TypeError(f"{field_name} must be a JSON object")
+    _validate_json_content(value, field_name=field_name)
     try:
-        return json.dumps(
+        serialized = json.dumps(
             value,
             ensure_ascii=False,
             allow_nan=False,
@@ -478,36 +501,78 @@ def _json_object(value: dict[str, Any], *, field_name: str) -> str:
         )
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{field_name} must be JSON serializable") from exc
-
-
-def _command_json(command: dict[str, Any]) -> str:
-    if not isinstance(command, dict):
-        raise TypeError("command must be a JSON object")
-    _reject_sensitive_command_content(command, path="command")
-    serialized = _json_object(command, field_name="command")
-    if len(serialized.encode("utf-8")) > _MAX_COMMAND_JSON_BYTES:
-        raise ValueError("command JSON is too large")
+    if len(serialized.encode("utf-8")) > _MAX_JSON_BYTES:
+        raise ValueError(f"{field_name} JSON is too large")
     return serialized
 
 
-def _reject_sensitive_command_content(value: Any, *, path: str) -> None:
-    if isinstance(value, dict):
-        for key, nested in value.items():
-            if not isinstance(key, str):
-                raise ValueError(f"command JSON object key at {path} must be a string")
-            normalized_key = _normalize_key(key)
-            if normalized_key in _SENSITIVE_COMMAND_KEYS or normalized_key.endswith(
-                _SENSITIVE_COMMAND_KEY_SUFFIXES
-            ):
-                raise ValueError(f"command contains sensitive field at {path}.{key}")
-            _reject_sensitive_command_content(nested, path=f"{path}.{key}")
-        return
-    if isinstance(value, (list, tuple)):
-        for index, nested in enumerate(value):
-            _reject_sensitive_command_content(nested, path=f"{path}[{index}]")
-        return
-    if isinstance(value, str) and _contains_sensitive_url_query(value):
-        raise ValueError(f"command contains sensitive URL at {path}")
+def _reply_context_json(value: dict[str, str]) -> str:
+    if not isinstance(value, dict) or any(
+        not isinstance(key, str) or not isinstance(item, str)
+        for key, item in value.items()
+    ):
+        raise TypeError("reply_context must contain only string keys and values")
+    return _json_object(value, field_name="reply_context")
+
+
+def _validate_json_content(value: dict[str, Any], *, field_name: str) -> None:
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    nodes = 0
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_JSON_NODES:
+            raise ValueError(f"{field_name} JSON has too many nodes")
+        if depth > _MAX_JSON_DEPTH:
+            raise ValueError(f"{field_name} JSON is too deep")
+        if isinstance(current, dict):
+            for key, nested in current.items():
+                if not isinstance(key, str):
+                    raise ValueError(f"{field_name} JSON object keys must be strings")
+                if _is_sensitive_key(key):
+                    raise ValueError(f"{field_name} contains sensitive content")
+                stack.append((nested, depth + 1))
+        elif isinstance(current, (list, tuple)):
+            stack.extend((nested, depth + 1) for nested in current)
+        elif isinstance(current, str):
+            _validate_safe_text(current, field_name=field_name)
+
+
+def _safe_optional_text(value: str | None, *, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be text or None")
+    if len(value.encode("utf-8")) > _MAX_TEXT_BYTES:
+        raise ValueError(f"{field_name} is too large")
+    _validate_safe_text(value, field_name=field_name)
+    return value
+
+
+def _validate_safe_text(value: str, *, field_name: str) -> None:
+    if (
+        _DATA_URL.search(value)
+        or _BEARER_CREDENTIAL.search(value)
+        or _LABELED_CREDENTIAL.search(value)
+        or _contains_sensitive_url_query(value)
+    ):
+        raise ValueError(f"{field_name} contains sensitive content")
+
+
+def _is_sensitive_key(value: str) -> bool:
+    normalized = _normalize_key(value)
+    segments = tuple(segment for segment in normalized.split("_") if segment)
+    if not segments:
+        return False
+    if any(segment in _SENSITIVE_SINGLE_KEY_SEGMENTS for segment in segments):
+        return True
+    if segments == ("token",) or segments == ("event",) or segments == ("payload",):
+        return True
+    if "token" in segments and normalized not in _SAFE_RESOURCE_TOKEN_KEYS:
+        return True
+    if any(pair in _SENSITIVE_KEY_PAIRS for pair in zip(segments, segments[1:])):
+        return True
+    return "raw" in segments and bool({"body", "event", "payload"} & set(segments))
 
 
 def _normalize_key(value: str) -> str:
@@ -561,3 +626,23 @@ def _binding_from_row(row: aiosqlite.Row) -> BitableBinding:
         reply_context=json.loads(row["reply_context_json"]),
         last_error=row["last_error"],
     )
+
+
+async def _commit_durably(connection: aiosqlite.Connection) -> None:
+    await _await_sqlite_operation_durably(connection.commit())
+
+
+async def _rollback_durably(connection: aiosqlite.Connection) -> None:
+    await _await_sqlite_operation_durably(connection.rollback())
+
+
+async def _await_sqlite_operation_durably(operation: Any) -> None:
+    operation_task = asyncio.create_task(operation)
+    while True:
+        try:
+            await asyncio.shield(operation_task)
+            return
+        except asyncio.CancelledError:
+            if operation_task.done():
+                operation_task.result()
+                return
