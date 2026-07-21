@@ -54,6 +54,8 @@ class _Runtime(Protocol):
 
     async def retry_delivery(self, run_id: str) -> None: ...
 
+    async def delete_run(self, run_id: str) -> None: ...
+
     async def resume_pending_runs(self) -> None: ...
 
 
@@ -183,6 +185,19 @@ class BitableMvpService:
             raise RunConflict("只有交付失败的运行可以重试交付")
         await self._runtime.retry_delivery(run_id)
         await self._store.set_status(run_id, TableTaskStatus.WRITING_BACK)
+
+    async def delete_run(self, run_id: str) -> None:
+        binding = await self._store.get_by_run(run_id)
+        await self._runtime.delete_run(run_id)
+        if binding is not None and binding.status not in {
+            TableTaskStatus.COMPLETED,
+            TableTaskStatus.FAILED,
+        }:
+            await self._store.release(
+                run_id,
+                status=TableTaskStatus.FAILED,
+                last_error="本地运行已删除",
+            )
 
     async def resume_incomplete(self) -> list[str]:
         location, _ = await self._prepared()

@@ -213,7 +213,7 @@ class PaidSmokeRunner:
                 update={
                     "output_count": 1,
                     "duration": 4,
-                    "resolution": "480p",
+                    "resolution": "720p",
                     "generate_audio": False,
                 }
             )

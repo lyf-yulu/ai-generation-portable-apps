@@ -424,7 +424,8 @@ def create_app(
 
     @app.delete("/api/runs/{run_id}")
     async def delete_run(run_id: str, request: Request) -> dict[str, str]:
-        active = get_runtime(request)
+        active_bitable = getattr(request.app.state, "bitable_service", None)
+        active = active_bitable or get_runtime(request)
         try:
             await active.delete_run(run_id)
         except (RunNotFound, RunConflict, RunValidationError) as exc:

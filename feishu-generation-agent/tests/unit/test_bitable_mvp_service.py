@@ -80,6 +80,7 @@ class _FakeRuntime:
         self.started: list[tuple[RequirementRequest, str, str]] = []
         self.views: dict[str, dict] = {}
         self.retry_calls: list[str] = []
+        self.delete_calls: list[str] = []
         self.resume_calls = 0
 
     async def start_run(self, request, *, run_id=None, thread_id=None):
@@ -103,6 +104,9 @@ class _FakeRuntime:
 
     async def retry_delivery(self, run_id: str):
         self.retry_calls.append(run_id)
+
+    async def delete_run(self, run_id: str):
+        self.delete_calls.append(run_id)
 
     async def resume_pending_runs(self):
         self.resume_calls += 1
@@ -211,6 +215,27 @@ async def test_active_runs_are_available_for_browser_session_restore(
         assert active[0].run_id == run_id
         assert active[0].display_text == "任务 rec-1"
         assert active[0].status is TableTaskStatus.WAITING_APPROVAL
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_delete_run_releases_bitable_claim_after_runtime_cleanup(
+    tmp_path: Path,
+) -> None:
+    runtime = _FakeRuntime()
+    service, store = await _service(tmp_path, runtime=runtime)
+    try:
+        run_id = await service.claim("rec-1")
+
+        await service.delete_run(run_id)
+
+        assert runtime.delete_calls == [run_id]
+        binding = await store.get_by_run(run_id)
+        assert binding is not None
+        assert binding.status is TableTaskStatus.FAILED
+        assert await service.active_runs() == []
+        assert [task.record_id for task in await service.scan()] == ["rec-1"]
     finally:
         await service.close()
 
