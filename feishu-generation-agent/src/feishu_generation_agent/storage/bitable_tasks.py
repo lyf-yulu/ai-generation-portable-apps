@@ -70,19 +70,11 @@ _MAX_SOURCE_URL_BYTES = 2 * 1024
 _MAX_DISPLAY_TEXT_BYTES = 4 * 1024
 _MAX_IDENTIFIER_BYTES = 256
 _MAX_KIND_BYTES = 64
-_SENSITIVE_QUERY_MARKERS = (
-    "access_key",
-    "api_key",
-    "credential",
-    "secret",
-    "signature",
-    "token",
-)
 _URL_CANDIDATE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 _CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
 _DATA_URL = re.compile(r"data:[^,\s]*;base64,", re.IGNORECASE)
 _BASE64_CANDIDATE = re.compile(
-    r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/_-]{16,}={0,2}"
+    r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/_-]{4,}={0,2}"
     r"(?![A-Za-z0-9+/=_-])"
 )
 _WRAPPED_BASE64_CANDIDATE = re.compile(
@@ -139,17 +131,23 @@ _SENSITIVE_COMPACT_KEY_MARKERS = {
     "apikey",
     "appsecret",
     "authorization",
+    "bearer",
     "clientsecret",
     "credential",
     "oauthtoken",
     "password",
+    "privatekey",
+    "secretkey",
     "signature",
     "verificationtoken",
+    "xapikey",
 }
 _STRUCTURAL_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
 _PLAN_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
 _SOURCE_PATH = re.compile(r"/(?:docx|wiki)/[A-Za-z0-9_-]+\Z")
-_JSON_UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
+_JSON_UNICODE_ESCAPE = re.compile(r"(?<!\\)\\u([0-9a-fA-F]{4})")
+_JSON_ESCAPE = re.compile(r'''\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})''')
+_JSON_SOLIDUS_ESCAPE = re.compile(r"(?<!\\)\\/")
 
 
 class TaskAlreadyClaimed(RuntimeError):
@@ -595,7 +593,7 @@ def _safe_identifier(
         raise TypeError(f"{field_name} must be text")
     if (
         not value
-        or len(value.encode("utf-8")) > max_bytes
+        or _bounded_utf8_size(value, max_bytes=max_bytes) is None
         or _STRUCTURAL_IDENTIFIER.fullmatch(value) is None
     ):
         raise ValueError(f"{field_name} has an invalid format")
@@ -619,7 +617,7 @@ def _safe_plan_fingerprint(value: str) -> str:
 def _safe_required_text(value: str, *, field_name: str, max_bytes: int) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be text")
-    if not value or len(value.encode("utf-8")) > max_bytes:
+    if not value or _bounded_utf8_size(value, max_bytes=max_bytes) is None:
         raise ValueError(f"{field_name} is empty or too large")
     _validate_safe_text(value, field_name=field_name)
     return value
@@ -659,6 +657,14 @@ def _safe_requirement_source(value: str) -> str:
 def _validate_json_content(value: dict[str, Any], *, field_name: str) -> None:
     stack: list[tuple[Any, int]] = [(value, 0)]
     nodes = 0
+    byte_budget = 0
+
+    def consume_bytes(amount: int) -> None:
+        nonlocal byte_budget
+        byte_budget += amount
+        if byte_budget > _MAX_JSON_BYTES:
+            raise ValueError(f"{field_name} JSON is too large")
+
     while stack:
         current, depth = stack.pop()
         nodes += 1
@@ -667,15 +673,25 @@ def _validate_json_content(value: dict[str, Any], *, field_name: str) -> None:
         if depth > _MAX_JSON_DEPTH:
             raise ValueError(f"{field_name} JSON is too deep")
         if isinstance(current, dict):
+            consume_bytes(2 + max(0, len(current) - 1))
             for key, nested in current.items():
                 if not isinstance(key, str):
                     raise ValueError(f"{field_name} JSON object keys must be strings")
+                key_size = _bounded_utf8_size(key, max_bytes=_MAX_JSON_BYTES)
+                if key_size is None:
+                    raise ValueError(f"{field_name} JSON is too large")
+                consume_bytes(key_size + 3)
                 if _is_sensitive_key(key):
                     raise ValueError(f"{field_name} contains sensitive content")
                 stack.append((nested, depth + 1))
         elif isinstance(current, (list, tuple)):
+            consume_bytes(2 + max(0, len(current) - 1))
             stack.extend((nested, depth + 1) for nested in current)
         elif isinstance(current, str):
+            text_size = _bounded_utf8_size(current, max_bytes=_MAX_JSON_BYTES)
+            if text_size is None:
+                raise ValueError(f"{field_name} JSON is too large")
+            consume_bytes(text_size + 2)
             _validate_safe_text(current, field_name=field_name)
 
 
@@ -684,22 +700,46 @@ def _safe_optional_text(value: str | None, *, field_name: str) -> str | None:
         return None
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be text or None")
-    if len(value.encode("utf-8")) > _MAX_TEXT_BYTES:
+    if _bounded_utf8_size(value, max_bytes=_MAX_TEXT_BYTES) is None:
         raise ValueError(f"{field_name} is too large")
     _validate_safe_text(value, field_name=field_name)
     return value
 
 
+def _bounded_utf8_size(value: str, *, max_bytes: int) -> int | None:
+    if len(value) > max_bytes:
+        return None
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        return None
+    return size if size <= max_bytes else None
+
+
 def _validate_safe_text(value: str, *, field_name: str) -> None:
-    if (
+    decoded = value
+    for _ in range(_MAX_JSON_DEPTH):
+        if _contains_sensitive_text(decoded):
+            raise ValueError(f"{field_name} contains sensitive content")
+        unescaped = _decode_json_text_layer(decoded)
+        if _bounded_utf8_size(unescaped, max_bytes=_MAX_JSON_BYTES) is None:
+            raise ValueError(f"{field_name} is too large")
+        if unescaped == decoded:
+            return
+        decoded = unescaped
+    if _JSON_ESCAPE.search(decoded) or _contains_sensitive_text(decoded):
+        raise ValueError(f"{field_name} contains sensitive content")
+
+
+def _contains_sensitive_text(value: str) -> bool:
+    return bool(
         _DATA_URL.search(value)
         or _BEARER_CREDENTIAL.search(value)
         or _LABELED_CREDENTIAL.search(value)
         or _contains_sensitive_url_query(value)
         or _contains_sensitive_quoted_label(value)
         or _contains_bare_base64(value)
-    ):
-        raise ValueError(f"{field_name} contains sensitive content")
+    )
 
 
 def _is_sensitive_key(value: str) -> bool:
@@ -710,7 +750,11 @@ def _is_sensitive_key(value: str) -> bool:
     if value in _SAFE_RESOURCE_TOKEN_KEYS:
         return False
     compact = "".join(segments)
-    if compact in _SENSITIVE_COMPACT_KEY_MARKERS:
+    if any(
+        segment in _SENSITIVE_COMPACT_KEY_MARKERS for segment in segments
+    ) or any(
+        compact.endswith(marker) for marker in _SENSITIVE_COMPACT_KEY_MARKERS
+    ):
         return True
     if (
         "token" in segments
@@ -734,21 +778,24 @@ def _is_sensitive_key(value: str) -> bool:
 
 
 def _contains_sensitive_quoted_label(value: str) -> bool:
-    decoded = value
-    for _ in range(_MAX_JSON_DEPTH):
-        unescaped = _JSON_UNICODE_ESCAPE.sub(
-            lambda match: chr(int(match.group(1), 16)),
-            decoded,
-        )
-        if unescaped == decoded:
-            break
-        decoded = unescaped
-    if _JSON_UNICODE_ESCAPE.search(decoded):
-        return True
     return any(
         _is_sensitive_key(match.group(1))
-        for match in _QUOTED_LABEL.finditer(decoded)
+        for match in _QUOTED_LABEL.finditer(value)
     )
+
+
+def _decode_json_text_layer(value: str) -> str:
+    try:
+        decoded = json.loads(f'"{value}"')
+    except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
+        decoded = value
+    if not isinstance(decoded, str):
+        decoded = value
+    decoded = _JSON_UNICODE_ESCAPE.sub(
+        lambda match: chr(int(match.group(1), 16)),
+        decoded,
+    )
+    return _JSON_SOLIDUS_ESCAPE.sub("/", decoded)
 
 
 def _contains_bare_base64(value: str) -> bool:
@@ -780,6 +827,8 @@ def _has_image_magic(value: bytes) -> bool:
         value.startswith(b"\x89PNG\r\n\x1a\n")
         or value.startswith(b"\xff\xd8\xff")
         or value.startswith((b"GIF87a", b"GIF89a"))
+        or value.startswith(b"BM")
+        or value.startswith((b"II*\x00", b"MM\x00*"))
         or (
             len(value) >= 12
             and value.startswith(b"RIFF")
@@ -824,12 +873,8 @@ def _has_sensitive_url_query(value: str) -> bool:
         return False
     return any(
         key in {"key", "sig"}
+        or key in _SAFE_RESOURCE_TOKEN_KEYS
         or _is_sensitive_key(key)
-        or any(
-            marker in key
-            or marker.replace("_", "") in key.replace("_", "")
-            for marker in _SENSITIVE_QUERY_MARKERS
-        )
         for key in query_keys
     )
 

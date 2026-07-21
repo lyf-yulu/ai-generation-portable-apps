@@ -8,6 +8,7 @@ import sys
 import aiosqlite
 import pytest
 
+import feishu_generation_agent.storage.bitable_tasks as bitable_tasks_module
 from feishu_generation_agent.domain.bitable import BitableBinding, TableTaskStatus
 from feishu_generation_agent.storage.bitable_tasks import (
     BitableTaskStore,
@@ -17,6 +18,18 @@ from feishu_generation_agent.storage.bitable_tasks import (
 
 PLAN_FINGERPRINT_A = "a" * 64
 PLAN_FINGERPRINT_B = "b" * 64
+BMP_1X1_BASE64 = (
+    "Qk1CAAAAAAAAAD4AAAAoAAAAAQAAAAEAAAABAAEAAAAAAAQAAADEDgAAxA4AAAIAAA"
+    "ACAAAAAAAAAP///wAAAAAA"
+)
+TIFF_II_1X1_BASE64 = (
+    "SUkqAAgAAAAIAAABBAABAAAAAQAAAAEBBAABAAAAAQAAAAMBAwABAAAAAQAAABYBAw"
+    "ABAAAAAQAAABEBBAABAAAAbgAAABYBBAABAAAAAQAAABcBBAABAAAAAQAAABwBAwAB"
+    "AAAAAQAAAAAAAAAA"
+)
+TIFF_MM_MAGIC_BASE64 = base64.b64encode(
+    b"MM\x00*\x00\x00\x00\x08\x00\x00\x00\x00"
+).decode()
 
 
 def _wrap_base64(value: str, width: int = 12) -> str:
@@ -40,6 +53,12 @@ def _deeply_escaped_sensitive_json() -> str:
     for _ in range(13):
         label = label.replace("\\", r"\u005c")
     return f'{{"{label}":"fictional-token"}}'
+
+
+def _escape_json_text(value: str, layers: int) -> str:
+    for _ in range(layers):
+        value = json.dumps(value, ensure_ascii=True)[1:-1]
+    return value
 
 
 @pytest.mark.parametrize(
@@ -695,6 +714,22 @@ async def test_commands_must_be_json_objects(tmp_path):
         {"api_key": "fictional-key"},
         {"apikey": "fictional-key"},
         {"accesskey": "fictional-key"},
+        {"privatekey": "fictional-key"},
+        {"xprivatekey": "fictional-key"},
+        {"privateKey": "fictional-key"},
+        {"private-key": "fictional-key"},
+        {"privatekey_pem": "fictional-key"},
+        {"secretkey": "fictional-key"},
+        {"xsecretkey": "fictional-key"},
+        {"secretKey": "fictional-key"},
+        {"secret-key": "fictional-key"},
+        {"secretkey_value": "fictional-key"},
+        {"xapikey": "fictional-key"},
+        {"xApiKey": "fictional-key"},
+        {"x-api-key": "fictional-key"},
+        {"xapikey_value": "fictional-key"},
+        {"bearer": "fictional-token"},
+        {"bearer_value": "fictional-token"},
         {"appsecret": "fictional-secret"},
         {"clientSecret": "fictional-secret"},
         {"access-token": "fictional-token"},
@@ -719,6 +754,8 @@ async def test_commands_must_be_json_objects(tmp_path):
         {"callback": "https://files.example/x?X-Amz-Signature=fictional"},
         {"download": "https://files.example/x?credential=fictional"},
         {"media": ["https://files.example/x?access_token=fictional"]},
+        {"media": ["https://files.example/x?privatekey_pem=fictional"]},
+        {"media": ["https://files.example/x?xapikey_value=fictional"]},
         {"image": "data:image/png;base64,ZmFrZQ=="},
         {"feedback": "Authorization: Bearer fictional-token"},
         {"feedback": "调试值 api-key=fictional-secret"},
@@ -759,13 +796,17 @@ async def test_commands_allow_minimal_ids_feedback_and_unsigned_urls(tmp_path):
                 "actor_open_id": "ou_1",
                 "selected_task_ids": ["task-1"],
                 "feedback": "改成暖色\n保留主体构图",
-                "content": "iVBORw0KGgo",
+                "content": "YWJjZA==",
                 "secretary_name": "林秘书",
                 "tokenizer_model": "cl100k_base",
                 "passwordless_mode": "enabled",
                 "chat_id": "oc_1",
                 "message_id": "om_1",
                 "source_url": "https://tenant.feishu.cn/docx/doc?view=compact",
+                "metadata_url": (
+                    "https://files.example/x?tokenizer_model=cl100k_base&"
+                    "secretary_name=lin&passwordless_mode=enabled"
+                ),
             },
         )
     finally:
@@ -841,6 +882,62 @@ async def test_json_write_entries_reject_bare_image_or_long_base64(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "encoded",
+    [BMP_1X1_BASE64, TIFF_II_1X1_BASE64, TIFF_MM_MAGIC_BASE64],
+)
+@pytest.mark.parametrize(
+    "entry",
+    ["command", "reply_context", "result", "last_error"],
+)
+async def test_all_text_write_entries_reject_short_bmp_and_tiff_base64(
+    tmp_path, encoded, entry
+):
+    store = await BitableTaskStore.open(tmp_path / "agent.sqlite3")
+    try:
+        with pytest.raises(ValueError, match="sensitive"):
+            if entry == "command":
+                await store.accept_action(
+                    action_id="action-1",
+                    kind="approve",
+                    command={"content": encoded},
+                )
+            elif entry == "reply_context":
+                await store.claim(
+                    app_token="app",
+                    table_id="tbl",
+                    view_id="vew",
+                    record_id="rec",
+                    source_url="https://x.feishu.cn/docx/doc",
+                    display_text="1",
+                    claimant_open_id="ou_a",
+                    run_id="run-1",
+                    thread_id="thread-1",
+                    reply_context={"content": encoded},
+                )
+            elif entry == "result":
+                assert await store.accept_ingress(
+                    dedupe_id="event-1",
+                    kind="approve",
+                    command={"run_id": "run-1"},
+                )
+                await store.finish_ingress(
+                    "event-1",
+                    status="completed",
+                    result={"content": encoded},
+                )
+            else:
+                await _claim(store)
+                await store.set_status(
+                    "run-1",
+                    TableTaskStatus.FAILED,
+                    last_error=encoded,
+                )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("entry", ["command", "reply_context", "result"])
 @pytest.mark.parametrize(
     "serialized",
@@ -892,6 +989,84 @@ async def test_json_write_entries_reject_quoted_sensitive_labels(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "serialized",
+    [
+        _escape_json_text('{"token":"fictional-token"}', 1),
+        _escape_json_text('{"tenant_access_token":"fictional-token"}', 2),
+        _escape_json_text(r'{"\u0072aw_event_body":{"sender":"ou_1"}}', 4),
+        _escape_json_text(
+            r'{"url":"https:\/\/files.example\/x?X-Amz-Signature=fictional"}',
+            2,
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "entry",
+    ["command", "reply_context", "result", "last_error", "display_text"],
+)
+async def test_all_text_write_entries_reject_repeated_json_string_escaping(
+    tmp_path, serialized, entry
+):
+    store = await BitableTaskStore.open(tmp_path / "agent.sqlite3")
+    try:
+        with pytest.raises(ValueError, match="sensitive") as raised:
+            if entry == "command":
+                await store.accept_action(
+                    action_id="action-1",
+                    kind="approve",
+                    command={"text": serialized},
+                )
+            elif entry == "reply_context":
+                await store.claim(
+                    app_token="app",
+                    table_id="tbl",
+                    view_id="vew",
+                    record_id="rec",
+                    source_url="https://x.feishu.cn/docx/doc",
+                    display_text="1",
+                    claimant_open_id="ou_a",
+                    run_id="run-1",
+                    thread_id="thread-1",
+                    reply_context={"text": serialized},
+                )
+            elif entry == "result":
+                assert await store.accept_ingress(
+                    dedupe_id="event-1",
+                    kind="approve",
+                    command={"run_id": "run-1"},
+                )
+                await store.finish_ingress(
+                    "event-1",
+                    status="completed",
+                    result={"text": serialized},
+                )
+            elif entry == "last_error":
+                await _claim(store)
+                await store.set_status(
+                    "run-1",
+                    TableTaskStatus.FAILED,
+                    last_error=serialized,
+                )
+            else:
+                await store.claim(
+                    app_token="app",
+                    table_id="tbl",
+                    view_id="vew",
+                    record_id="rec",
+                    source_url="https://x.feishu.cn/docx/doc",
+                    display_text=serialized,
+                    claimant_open_id="ou_a",
+                    run_id="run-1",
+                    thread_id="thread-1",
+                    reply_context={},
+                )
+        assert "fictional-token" not in str(raised.value)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_commands_reject_oversized_json(tmp_path):
     store = await BitableTaskStore.open(tmp_path / "agent.sqlite3")
     try:
@@ -901,6 +1076,95 @@ async def test_commands_reject_oversized_json(tmp_path):
                 kind="message",
                 command={"feedback": "x" * (64 * 1024)},
             )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_oversized_json_value_is_rejected_before_text_scanners(
+    tmp_path, monkeypatch
+):
+    store = await BitableTaskStore.open(tmp_path / "agent.sqlite3")
+
+    def unexpected_scan(*args, **kwargs):
+        raise AssertionError("oversized value reached text scanner")
+
+    monkeypatch.setattr(
+        bitable_tasks_module,
+        "_validate_safe_text",
+        unexpected_scan,
+    )
+    try:
+        with pytest.raises(ValueError, match="too large"):
+            await store.accept_ingress(
+                dedupe_id="event-large",
+                kind="message",
+                command={"content": "x" * (64 * 1024)},
+            )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_oversized_json_key_is_rejected_before_key_scanner(
+    tmp_path, monkeypatch
+):
+    store = await BitableTaskStore.open(tmp_path / "agent.sqlite3")
+
+    def unexpected_scan(*args, **kwargs):
+        raise AssertionError("oversized key reached key scanner")
+
+    monkeypatch.setattr(
+        bitable_tasks_module,
+        "_is_sensitive_key",
+        unexpected_scan,
+    )
+    try:
+        with pytest.raises(ValueError, match="too large"):
+            await store.accept_ingress(
+                dedupe_id="event-large",
+                kind="message",
+                command={"x" * (64 * 1024): "value"},
+            )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["command", "last_error", "display_text"])
+async def test_invalid_unicode_is_rejected_without_echoing_text(tmp_path, entry):
+    store = await BitableTaskStore.open(tmp_path / "agent.sqlite3")
+    invalid = "\ud800fictional-secret"
+    try:
+        with pytest.raises(ValueError) as raised:
+            if entry == "command":
+                await store.accept_action(
+                    action_id="action-1",
+                    kind="approve",
+                    command={"text": invalid},
+                )
+            elif entry == "last_error":
+                await _claim(store)
+                await store.set_status(
+                    "run-1",
+                    TableTaskStatus.FAILED,
+                    last_error=invalid,
+                )
+            else:
+                await store.claim(
+                    app_token="app",
+                    table_id="tbl",
+                    view_id="vew",
+                    record_id="rec",
+                    source_url="https://x.feishu.cn/docx/doc",
+                    display_text=invalid,
+                    claimant_open_id="ou_a",
+                    run_id="run-1",
+                    thread_id="thread-1",
+                    reply_context={},
+                )
+        assert type(raised.value) is ValueError
+        assert "fictional-secret" not in str(raised.value)
     finally:
         await store.close()
 
