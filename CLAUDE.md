@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+！！！核心：每次更新都要检查是否会影响统计功能的实现！！！！
+！！！核心：每次更新都要检查是否会影响统计功能的实现！！！！
+！！！核心：每次更新都要检查是否会影响统计功能的实现！！！！
+！！！核心：每次更新都要检查是否会影响统计功能的实现！！！！
+
 ## 项目定位
 
 这是一个部署在**服务机**（用户本机 Mac）上的多子应用聚合平台，聚合 Seedance / Nano Banana / Dreamina / Volcengine Portrait 等 AI 生成能力，统一 Portal 前端 + 反向代理暴露给使用者。
