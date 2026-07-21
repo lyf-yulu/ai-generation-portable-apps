@@ -5,6 +5,11 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+import feishu_generation_agent.cli.smoke as smoke_module
+from feishu_generation_agent.cli.smoke import (
+    BitableApprovalSmokeRunner,
+    BitableReadOnlySmokeRunner,
+)
 import feishu_generation_agent.web.app as web_app_module
 from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain import BitableTaskSummary
@@ -89,6 +94,41 @@ class _BitableService:
         self.closed = True
 
 
+class _ApprovalSmokeRuntime:
+    def __init__(self) -> None:
+        self.views = [
+            {"status": "running"},
+            {"status": "waiting_approval"},
+        ]
+        self.requested: list[str] = []
+
+    async def get_run_view(self, run_id: str) -> dict:
+        self.requested.append(run_id)
+        return self.views.pop(0)
+
+
+class _ApprovalSmokeService:
+    def __init__(self) -> None:
+        self.claimed: list[str] = []
+        self.synced: list[str] = []
+
+    async def scan(self) -> list[BitableTaskSummary]:
+        return [
+            BitableTaskSummary(
+                record_id="rec-1",
+                display_text="等待审批的任务",
+                source_url="https://tenant.feishu.cn/docx/doc1",
+            )
+        ]
+
+    async def claim(self, record_id: str) -> str:
+        self.claimed.append(record_id)
+        return "run-approval-gate"
+
+    async def sync_once(self, run_id: str) -> None:
+        self.synced.append(run_id)
+
+
 async def _client(tmp_path: Path, service: _BitableService | None):
     runtime = _Runtime(tmp_path)
     app = create_app(runtime=runtime, bitable_service=service)
@@ -127,6 +167,78 @@ async def test_scan_claim_duplicate_and_run_detail_sync(tmp_path: Path) -> None:
     assert service.synced == ["run-bitable-1"]
     assert runtime.closed is True
     assert service.closed is True
+
+
+async def test_bitable_approval_smoke_stops_at_waiting_approval() -> None:
+    service = _ApprovalSmokeService()
+    runtime = _ApprovalSmokeRuntime()
+    runner = BitableApprovalSmokeRunner(
+        bitable_service=service,
+        runtime=runtime,
+        record_id="rec-1",
+        poll_interval_seconds=0,
+    )
+
+    run_id = await runner.run()
+
+    assert run_id == "run-approval-gate"
+    assert service.claimed == ["rec-1"]
+    assert service.synced == ["run-approval-gate", "run-approval-gate"]
+    assert runtime.requested == ["run-approval-gate", "run-approval-gate"]
+
+
+async def test_bitable_read_only_smoke_does_not_claim_or_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class Client:
+        def __init__(self, settings: Settings) -> None:
+            assert settings.lark_bitable_table_id == "tblTABLE"
+
+        async def close(self) -> None:
+            calls.append("close")
+
+    class Bitable:
+        def __init__(self, client: Client) -> None:
+            assert isinstance(client, Client)
+
+        async def resolve_location(self, location):
+            calls.append("resolve")
+            return location.model_copy(update={"app_token": "appTABLE"})
+
+        async def ensure_schema(self, location):
+            calls.append("schema")
+            return object()
+
+        async def list_tasks(self, location, schema):
+            del location, schema
+            calls.append("list")
+            return [object(), object()]
+
+    settings = Settings(
+        _env_file=None,
+        data_dir=tmp_path / "data",
+        outputs_dir=tmp_path / "outputs",
+        business_db_path=tmp_path / "business.sqlite3",
+        checkpoint_db_path=tmp_path / "checkpoints.sqlite3",
+        lark_app_id="cli-test",
+        lark_app_secret="fictional-secret",
+        lark_bitable_url=(
+            "https://tenant.feishu.cn/wiki/wikiTABLE"
+            "?table=tblTABLE&view=vewTASKS"
+        ),
+        lark_bitable_table_id="tblTABLE",
+        lark_bitable_view_id="vewTASKS",
+    )
+    monkeypatch.setattr(smoke_module, "FeishuClient", Client)
+    monkeypatch.setattr(smoke_module, "FeishuBitableClient", Bitable)
+
+    count = await BitableReadOnlySmokeRunner(settings).run()
+
+    assert count == 2
+    assert calls == ["resolve", "schema", "list", "close"]
 
 
 async def test_scan_maps_schema_and_read_errors_without_raw_details(

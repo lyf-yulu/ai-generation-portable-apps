@@ -2,7 +2,7 @@ import httpx
 import pytest
 
 import feishu_generation_agent.cli.config_probe as config_probe_module
-from feishu_generation_agent.cli.config_probe import _http_probe, probe
+from feishu_generation_agent.cli.config_probe import _http_probe, main, probe
 from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain import BitableTaskSummary
 from feishu_generation_agent.integrations.feishu_bitable import BitableSchema
@@ -159,3 +159,21 @@ async def test_network_probe_performs_read_only_bitable_schema_and_scan(
     assert result["capabilities"]["bitable_schema"]["permission_ok"] is True
     assert result["capabilities"]["bitable_read"]["permission_ok"] is True
     assert calls == ["auth", "resolve", "schema", "read", "close"]
+
+
+def test_config_probe_accepts_explicit_network_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[bool] = []
+
+    async def fake_probe(settings, *, network: bool):
+        del settings
+        calls.append(network)
+        return {"ready": False, "capabilities": {}}
+
+    monkeypatch.setattr(config_probe_module, "probe", fake_probe)
+
+    result = main(["--network"])
+
+    assert result == 1
+    assert calls == [True]

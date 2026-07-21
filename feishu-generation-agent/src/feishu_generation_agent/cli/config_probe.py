@@ -320,7 +320,13 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="检查本地目录、凭证配置和只读接口可达性"
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--network",
+        action="store_true",
+        help="显式执行只读飞书、多维表格和模型鉴权检查（默认行为）",
+    )
+    mode.add_argument(
         "--no-network",
         action="store_true",
         help="只检查本地配置，不访问外部接口",
