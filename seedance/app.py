@@ -812,18 +812,35 @@ def media_item_to_file(field: str, item: Any) -> tuple[str, bytes] | None:
             url,
             headers={"User-Agent": "Mozilla/5.0"},
         )
-        try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                blob = resp.read()
-                mime = resp.headers.get_content_type() or mimetypes.guess_type(url)[0] or "application/octet-stream"
-        except urllib.error.HTTPError as exc:
+        blob = b""
+        mime = "application/octet-stream"
+        attempts = 3
+        for attempt in range(1, attempts + 1):
             try:
-                detail = exc.read().decode("utf-8", errors="replace")[:500]
-            except Exception:
-                detail = ""
-            raise RuntimeError(f"参考素材下载失败 (HTTP {exc.code}): {url} — {detail}") from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise RuntimeError(f"参考素材下载失败 (连接错误): {url} — {exc}") from exc
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    blob = resp.read()
+                    mime = resp.headers.get_content_type() or mimetypes.guess_type(url)[0] or "application/octet-stream"
+                break
+            except urllib.error.HTTPError as exc:
+                try:
+                    detail = exc.read().decode("utf-8", errors="replace")[:500]
+                except Exception:
+                    detail = ""
+                raise RuntimeError(f"参考素材下载失败 (HTTP {exc.code}): {url} — {detail}") from exc
+            except http.client.IncompleteRead as exc:
+                # IncompleteRead subclasses HTTPException, not URLError/OSError —
+                # retry the transfer before giving up (transient CDN cutoff).
+                if attempt < attempts:
+                    time.sleep(min(2 ** attempt, 8))
+                    continue
+                raise RuntimeError(
+                    f"参考素材下载中断 (IncompleteRead,已重试 {attempts} 次): {url} — {exc}"
+                ) from exc
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                if attempt < attempts:
+                    time.sleep(min(2 ** attempt, 8))
+                    continue
+                raise RuntimeError(f"参考素材下载失败 (连接错误): {url} — {exc}") from exc
         if not blob:
             raise ValueError(f"media.{field} url returned empty content")
         return filename_from_media(field, item, mime), blob
@@ -1382,17 +1399,34 @@ def download_video(url: str, out_path: Path) -> None:
             )
         },
     )
-    try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            out_path.write_bytes(resp.read())
-    except urllib.error.HTTPError as exc:
+    attempts = 3
+    for attempt in range(1, attempts + 1):
         try:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
-        except Exception:
-            detail = ""
-        raise RuntimeError(f"视频下载失败 (HTTP {exc.code}): {url[:120]} — {detail}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError(f"视频下载失败 (连接错误): {url[:120]} — {exc}") from exc
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                out_path.write_bytes(resp.read())
+            return
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                detail = ""
+            raise RuntimeError(f"视频下载失败 (HTTP {exc.code}): {url[:120]} — {detail}") from exc
+        except http.client.IncompleteRead as exc:
+            # CDN closed the connection before Content-Length bytes arrived.
+            # IncompleteRead subclasses HTTPException (not URLError/OSError),
+            # so it slipped past the handler below and surfaced raw to users.
+            # The video itself was generated — just retry the transfer.
+            if attempt < attempts:
+                time.sleep(min(2 ** attempt, 8))
+                continue
+            raise RuntimeError(
+                f"视频下载中断 (IncompleteRead,已重试 {attempts} 次): {url[:120]} — {exc}"
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if attempt < attempts:
+                time.sleep(min(2 ** attempt, 8))
+                continue
+            raise RuntimeError(f"视频下载失败 (连接错误): {url[:120]} — {exc}") from exc
 
 
 def set_job(job_id: str, **updates: Any) -> None:

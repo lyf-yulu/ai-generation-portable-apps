@@ -2788,11 +2788,15 @@ class Handler(SimpleHTTPRequestHandler):
             return
         mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
         content = file_path.read_bytes()
-        filename = file_path.name
         self.send_response(200)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(content)))
-        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        # NO Content-Disposition here: these are the app's own static assets
+        # (index.html / app.js / styles.css). Sending attachment made the
+        # browser download index.html instead of rendering it, so the standalone
+        # :8888 front-end showed a blank page + "Failed to fetch" (app.js never
+        # loaded). serve_file (below) is where attachment vs inline matters.
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.end_headers()
         try:
             self.wfile.write(content)

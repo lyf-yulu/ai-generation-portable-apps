@@ -6,6 +6,7 @@ import cgi
 import concurrent.futures
 import hashlib
 import hmac
+import http.client
 import json
 import mimetypes
 import os
@@ -506,18 +507,35 @@ def media_item_to_file(field: str, item: Any) -> tuple[str, bytes] | None:
     if item.get("url"):
         url = str(item["url"])
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                blob = resp.read()
-                mime = resp.headers.get_content_type() or mimetypes.guess_type(url)[0] or "image/png"
-        except urllib.error.HTTPError as exc:
+        blob = b""
+        mime = "image/png"
+        attempts = 3
+        for attempt in range(1, attempts + 1):
             try:
-                detail = exc.read().decode("utf-8", errors="replace")[:500]
-            except Exception:
-                detail = ""
-            raise RuntimeError(f"参考素材下载失败 (HTTP {exc.code}): {url} — {detail}") from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise RuntimeError(f"参考素材下载失败 (连接错误): {url} — {exc}") from exc
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    blob = resp.read()
+                    mime = resp.headers.get_content_type() or mimetypes.guess_type(url)[0] or "image/png"
+                break
+            except urllib.error.HTTPError as exc:
+                try:
+                    detail = exc.read().decode("utf-8", errors="replace")[:500]
+                except Exception:
+                    detail = ""
+                raise RuntimeError(f"参考素材下载失败 (HTTP {exc.code}): {url} — {detail}") from exc
+            except http.client.IncompleteRead as exc:
+                # IncompleteRead subclasses HTTPException, not URLError/OSError —
+                # retry the transfer before giving up (transient CDN cutoff).
+                if attempt < attempts:
+                    time.sleep(min(2 ** attempt, 8))
+                    continue
+                raise RuntimeError(
+                    f"参考素材下载中断 (IncompleteRead,已重试 {attempts} 次): {url} — {exc}"
+                ) from exc
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                if attempt < attempts:
+                    time.sleep(min(2 ** attempt, 8))
+                    continue
+                raise RuntimeError(f"参考素材下载失败 (连接错误): {url} — {exc}") from exc
         if not blob:
             raise ValueError(f"media.{field} url returned empty content")
         return filename_from_media(field, item, mime), blob
@@ -1176,19 +1194,35 @@ def extract_items(result: dict[str, Any]) -> list[dict[str, Any]]:
     return [x for x in data if isinstance(x, dict)]
 
 
-def download_url(url: str, out_path: Path) -> None:
+def download_url(url: str, out_path: Path, *, attempts: int = 3) -> None:
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            out_path.write_bytes(resp.read())
-    except urllib.error.HTTPError as exc:
+    for attempt in range(1, attempts + 1):
         try:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
-        except Exception:
-            detail = ""
-        raise RuntimeError(f"生成结果下载失败 (HTTP {exc.code}): {url[:120]} — {detail}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError(f"生成结果下载失败 (连接错误): {url[:120]} — {exc}") from exc
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                out_path.write_bytes(resp.read())
+            return
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                detail = ""
+            raise RuntimeError(f"生成结果下载失败 (HTTP {exc.code}): {url[:120]} — {detail}") from exc
+        except http.client.IncompleteRead as exc:
+            # CDN closed the connection before Content-Length bytes arrived.
+            # IncompleteRead subclasses HTTPException (not URLError/OSError),
+            # so it slipped past the handler below and surfaced raw to users.
+            # The generation itself succeeded — just retry the transfer.
+            if attempt < attempts:
+                time.sleep(min(2 ** attempt, 8))
+                continue
+            raise RuntimeError(
+                f"生成结果下载中断 (IncompleteRead,已重试 {attempts} 次): {url[:120]} — {exc}"
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if attempt < attempts:
+                time.sleep(min(2 ** attempt, 8))
+                continue
+            raise RuntimeError(f"生成结果下载失败 (连接错误): {url[:120]} — {exc}") from exc
 
 
 def save_image_item(item: dict[str, Any], out_dir: Path, prefix: str, idx: int) -> tuple[str, str]:
@@ -1219,6 +1253,21 @@ def extract_gemini_images(result: dict[str, Any]) -> list[dict[str, str]]:
                     "b64_json": str(image_node["data"]),
                     "mime_type": str(image_node.get("mimeType") or image_node.get("mime_type") or "image/png"),
                 })
+                continue
+            # Gemini generateContent may return an image by URL reference
+            # (fileData.fileUri) instead of inline base64 — e.g. Chiyun's
+            # gemini-*-image models under load. Treat it like any other URL
+            # result so save_image_item's existing url branch downloads it.
+            # Without this the caller raises "No image result found" even
+            # though the image was generated successfully.
+            file_node = part.get("fileData") or part.get("file_data")
+            if isinstance(file_node, dict):
+                file_uri = file_node.get("fileUri") or file_node.get("file_uri")
+                if file_uri:
+                    images.append({
+                        "url": str(file_uri),
+                        "mime_type": str(file_node.get("mimeType") or file_node.get("mime_type") or "image/png"),
+                    })
     return images
 
 
