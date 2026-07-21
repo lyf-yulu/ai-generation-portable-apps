@@ -119,7 +119,7 @@ async def test_resolves_wiki_validates_schema_and_lists_eligible_view_records(
 
 @pytest.mark.parametrize(
     ("field_name", "wrong_type"),
-    [("文本", 3), ("需求来源", 1), ("执行人", 1), ("结果", 15)],
+    [("需求来源", 1), ("执行人", 1), ("结果", 15)],
 )
 async def test_ensure_schema_rejects_incompatible_exact_field_types(
     fixture_json, field_name: str, wrong_type: int
@@ -137,6 +137,37 @@ async def test_ensure_schema_rejects_incompatible_exact_field_types(
     client = FeishuBitableClient(FakeClient())
     with pytest.raises(BitableSchemaError, match=field_name):
         await client.ensure_schema(_location().model_copy(update={"app_token": "app"}))
+
+
+async def test_primary_autonumber_title_is_accepted_and_displayed() -> None:
+    fields = [
+        {"field_id": "fld_title", "field_name": "文本", "type": 1005},
+        {"field_id": "fld_source", "field_name": "需求来源", "type": 15},
+        {"field_id": "fld_executor", "field_name": "执行人", "type": 11},
+        {"field_id": "fld_result", "field_name": "结果", "type": 17},
+    ]
+    records = [
+        {
+            "record_id": "rec-numbered",
+            "fields": {
+                "文本": 1,
+                "需求来源": "https://tenant.feishu.cn/docx/docNUMBERED",
+                "执行人": [],
+                "结果": [],
+            },
+        }
+    ]
+
+    class FakeClient:
+        async def iter_items(self, path: str, *, params=None):
+            return records if path.endswith("/records") else fields
+
+    client = FeishuBitableClient(FakeClient())
+    location = _location().model_copy(update={"app_token": "app"})
+    schema = await client.ensure_schema(location)
+    tasks = await client.list_tasks(location, schema)
+
+    assert tasks[0].display_text == "1"
 
 
 async def test_ensure_schema_rejects_duplicate_required_field_names(

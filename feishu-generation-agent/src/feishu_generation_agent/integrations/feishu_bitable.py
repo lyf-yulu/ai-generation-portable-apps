@@ -12,11 +12,13 @@ from feishu_generation_agent.integrations.bitable_url import (
 )
 
 
-_EXPECTED_FIELDS = {
-    "文本": 1,
-    "需求来源": 15,
-    "执行人": 11,
-    "结果": 17,
+_EXPECTED_FIELDS: dict[str, frozenset[int] | None] = {
+    # The primary display column may be text, auto-number, number, or another
+    # displayable Bitable type. It is never used as record identity.
+    "文本": None,
+    "需求来源": frozenset({15}),
+    "执行人": frozenset({11}),
+    "结果": frozenset({17}),
 }
 
 
@@ -107,13 +109,17 @@ class FeishuBitableClient:
                 by_name[name] = item
 
         field_ids: dict[str, str] = {}
-        for name, expected_type in _EXPECTED_FIELDS.items():
+        for name, expected_types in _EXPECTED_FIELDS.items():
             field = by_name.get(name)
             if field is None:
                 raise BitableSchemaError(f"多维表格缺少字段：{name}")
-            if field.get("type") != expected_type:
+            if (
+                expected_types is not None
+                and field.get("type") not in expected_types
+            ):
                 raise BitableSchemaError(
-                    f"多维表格字段类型不兼容：{name} 应为 {expected_type}"
+                    f"多维表格字段类型不兼容：{name} 应为 "
+                    f"{sorted(expected_types)}"
                 )
             field_id = field.get("field_id")
             if not isinstance(field_id, str) or not field_id:
@@ -264,6 +270,8 @@ def _display_text(value: Any) -> str:
     def visit(item: Any) -> None:
         if isinstance(item, str):
             parts.append(item)
+        elif isinstance(item, (int, float)) and not isinstance(item, bool):
+            parts.append(str(item))
         elif isinstance(item, Mapping):
             text = item.get("text")
             if isinstance(text, str):

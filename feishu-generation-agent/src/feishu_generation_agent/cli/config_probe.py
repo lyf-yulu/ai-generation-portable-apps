@@ -272,7 +272,7 @@ async def probe(settings: Settings, *, network: bool = True) -> dict[str, Any]:
         ),
         "seedance": (
             _configured(settings, "ark_api_key", "seedance_model"),
-            f"{settings.ark_base_url.rstrip('/')}/models/{settings.seedance_model}",
+            f"{settings.ark_base_url.rstrip('/')}/models",
             {
                 "Authorization": "Bearer "
                 + (
@@ -281,7 +281,7 @@ async def probe(settings: Settings, *, network: bool = True) -> dict[str, Any]:
                     else ""
                 )
             },
-            None,
+            settings.seedance_model,
         ),
     }
     async with httpx.AsyncClient(timeout=15, trust_env=False) as client:

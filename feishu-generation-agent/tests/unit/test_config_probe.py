@@ -161,6 +161,32 @@ async def test_network_probe_performs_read_only_bitable_schema_and_scan(
     assert calls == ["auth", "resolve", "schema", "read", "close"]
 
 
+async def test_seedance_probe_reads_model_list_instead_of_unsupported_detail(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str | None]] = []
+
+    async def fake_http_probe(client, method, url, *, headers, expected_model):
+        del client, method, headers
+        calls.append((url, expected_model))
+        return True, True, "只读鉴权检查通过"
+
+    monkeypatch.setattr(config_probe_module, "_http_probe", fake_http_probe)
+
+    await probe(_bitable_settings(tmp_path), network=True)
+
+    seedance_calls = [
+        item for item in calls if item[0].startswith("https://ark.cn-beijing")
+    ]
+    assert seedance_calls == [
+        (
+            "https://ark.cn-beijing.volces.com/api/v3/models",
+            "seedance-model",
+        )
+    ]
+
+
 def test_config_probe_accepts_explicit_network_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
