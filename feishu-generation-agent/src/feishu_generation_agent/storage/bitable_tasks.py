@@ -309,6 +309,26 @@ class BitableTaskStore:
             await cursor.close()
         return None if row is None else _binding_from_row(row)
 
+    async def list_active(
+        self,
+        app_token: str,
+        table_id: str,
+    ) -> list[BitableBinding]:
+        app_token = _safe_identifier(app_token, field_name="app_token")
+        table_id = _safe_identifier(table_id, field_name="table_id")
+        async with self._lock:
+            cursor = await self._connection.execute(
+                """
+                SELECT * FROM bitable_tasks
+                WHERE app_token = ? AND table_id = ? AND active = 1
+                ORDER BY created_at ASC, record_id ASC
+                """,
+                (app_token, table_id),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [_binding_from_row(row) for row in rows]
+
     async def set_status(
         self,
         run_id: str,

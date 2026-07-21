@@ -67,6 +67,7 @@ class GraphRuntime:
         self.delivery_writer = delivery_writer
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._run_locks: dict[str, asyncio.Lock] = {}
+        self._start_lock = asyncio.Lock()
         self._closed = False
 
     def _start_background(self, coroutine: Any, *, name: str) -> None:
@@ -74,24 +75,57 @@ class GraphRuntime:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
-    async def start_run(self, request: RequirementRequest) -> str:
+    async def start_run(
+        self,
+        request: RequirementRequest,
+        *,
+        run_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> str:
         if self._closed:
             raise RunConflict("运行时正在关闭")
-        run_id = str(uuid4())
-        thread_id = str(uuid4())
-        await self.repository.create_run(
-            run_id,
-            thread_id,
-            request.source_url,
-            status="created",
-        )
-        task = asyncio.create_task(
-            self._run_to_approval(run_id, thread_id, request),
-            name=f"approval-run-{run_id}",
-        )
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        run_id = run_id or str(uuid4())
+        thread_id = thread_id or str(uuid4())
+        async with self._start_lock:
+            existing = await self.repository.get_run(run_id)
+            if existing is not None:
+                if (
+                    existing["thread_id"] != thread_id
+                    or existing["source_url"] != request.source_url
+                ):
+                    raise RunConflict("预留的运行 ID 与现有运行不一致")
+                approval_name = f"approval-run-{run_id}"
+                if (
+                    existing["status"] in {"created", "running"}
+                    and not self._has_background(approval_name)
+                ):
+                    snapshot = await self.graph.aget_state(
+                        self._config(thread_id)
+                    )
+                    if not dict(snapshot.values or {}):
+                        self._start_background(
+                            self._run_to_approval(run_id, thread_id, request),
+                            name=approval_name,
+                        )
+                return run_id
+            await self.repository.create_run(
+                run_id,
+                thread_id,
+                request.source_url,
+                status="created",
+            )
+            self._start_background(
+                self._run_to_approval(run_id, thread_id, request),
+                name=f"approval-run-{run_id}",
+            )
         return run_id
+
+    def _has_background(self, name: str) -> bool:
+        return any(
+            task.get_name() == name
+            for task in self._background_tasks
+            if not task.done()
+        )
 
     async def resume_pending_runs(self) -> None:
         if self._closed:
@@ -106,7 +140,7 @@ class GraphRuntime:
                 task.get_name() == f"recovery-run-{run_id}"
                 for task in self._background_tasks
                 if not task.done()
-            ):
+            ) or self._has_background(f"approval-run-{run_id}"):
                 continue
             self._start_background(
                 self._recover_run(run_id), name=f"recovery-run-{run_id}"
