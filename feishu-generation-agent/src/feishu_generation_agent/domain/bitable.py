@@ -28,6 +28,7 @@ class BitableTaskSummary(BaseModel):
     source_url: str
     status: TableTaskStatus = TableTaskStatus.PENDING
     executor_open_ids: list[str] = Field(default_factory=list)
+    executor_names: list[str] = Field(default_factory=list)
     has_result: bool = False
 
 

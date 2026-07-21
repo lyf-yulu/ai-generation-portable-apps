@@ -58,6 +58,7 @@ class _BitableService:
                 display_text="雨中纸船",
                 source_url="https://tenant.feishu.cn/docx/doc1",
                 executor_open_ids=["ou_alice"],
+                executor_names=["Alice"],
             )
         ]
         self.claimed: set[str] = set()
@@ -156,6 +157,7 @@ async def test_scan_claim_duplicate_and_run_detail_sync(tmp_path: Path) -> None:
             "source_url": "https://tenant.feishu.cn/docx/doc1",
             "status": "待处理",
             "executor_open_ids": ["ou_alice"],
+            "executor_names": ["Alice"],
             "has_result": False,
         }
     ]

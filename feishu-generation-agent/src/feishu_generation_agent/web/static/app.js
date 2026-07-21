@@ -99,7 +99,9 @@
     const nodes = state.bitable.tasks.map((task) => {
       const card = element("article", "bitable-task");
       const identity = element("div", "");
-      const executors = task.executor_open_ids?.length
+      const executors = task.executor_names?.length
+        ? task.executor_names.join("、")
+        : task.executor_open_ids?.length
         ? task.executor_open_ids.join("、")
         : "未指定";
       identity.append(

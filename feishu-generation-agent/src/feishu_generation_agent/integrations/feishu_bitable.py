@@ -161,6 +161,7 @@ class FeishuBitableClient:
                     display_text=_display_text(fields.get("文本")) or record_id,
                     source_url=source_url,
                     executor_open_ids=_executor_ids(fields.get("执行人")),
+                    executor_names=_executor_names(fields.get("执行人")),
                     has_result=False,
                 )
             )
@@ -296,4 +297,17 @@ def _executor_ids(value: Any) -> list[str]:
         identity = item.get("open_id") or item.get("id") or item.get("user_id")
         if isinstance(identity, str) and identity and identity not in result:
             result.append(identity)
+    return result
+
+
+def _executor_names(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        name = item.get("name")
+        if isinstance(name, str) and name.strip() and name.strip() not in result:
+            result.append(name.strip())
     return result

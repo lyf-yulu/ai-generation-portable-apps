@@ -111,7 +111,9 @@ async def test_resolves_wiki_validates_schema_and_lists_eligible_view_records(
     assert [task.record_id for task in tasks] == ["rec_valid", "rec_second_page"]
     assert tasks[0].display_text == "纸船短片"
     assert tasks[0].executor_open_ids == ["ou_alice", "ou_bob"]
+    assert tasks[0].executor_names == ["Alice", "Bob"]
     assert tasks[1].executor_open_ids == ["ou_carol"]
+    assert tasks[1].executor_names == ["Carol"]
     assert all(task.has_result is False for task in tasks)
     assert any(params.get("page_token") == "fields-next" for _, _, params in requests)
     assert any(params.get("page_token") == "records-next" for _, _, params in requests)
