@@ -55,6 +55,9 @@ def _iter_source_candidates(value: Any):
 def _normalize_document_url(url: str) -> str:
     source_type, token = parse_feishu_url(url)
     parsed = urlsplit(url)
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    port = parsed.port
+    authority = hostname if port in {None, 443} else f"{hostname}:{port}"
     return urlunsplit(
-        (parsed.scheme, parsed.netloc, f"/{source_type.value}/{token}", "", "")
+        (parsed.scheme, authority, f"/{source_type.value}/{token}", "", "")
     )
