@@ -1,6 +1,10 @@
 import asyncio
+import base64
+import binascii
 import json
 import re
+from collections import Counter
+from math import log2
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlsplit
@@ -8,6 +12,7 @@ from urllib.parse import parse_qsl, urlsplit
 import aiosqlite
 
 from feishu_generation_agent.domain.bitable import BitableBinding, TableTaskStatus
+from feishu_generation_agent.integrations.bitable_url import parse_requirement_source
 
 
 _SCHEMA = """
@@ -61,6 +66,10 @@ _MAX_JSON_BYTES = 64 * 1024
 _MAX_JSON_DEPTH = 12
 _MAX_JSON_NODES = 1024
 _MAX_TEXT_BYTES = 16 * 1024
+_MAX_SOURCE_URL_BYTES = 2 * 1024
+_MAX_DISPLAY_TEXT_BYTES = 4 * 1024
+_MAX_IDENTIFIER_BYTES = 256
+_MAX_KIND_BYTES = 64
 _SENSITIVE_QUERY_MARKERS = (
     "access_key",
     "api_key",
@@ -70,13 +79,27 @@ _SENSITIVE_QUERY_MARKERS = (
     "token",
 )
 _URL_CANDIDATE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
 _DATA_URL = re.compile(r"data:[^,\s]*;base64,", re.IGNORECASE)
+_BASE64_CANDIDATE = re.compile(
+    r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/_-]{16,}={0,2}"
+    r"(?![A-Za-z0-9+/=_-])"
+)
+_WRAPPED_BASE64_CANDIDATE = re.compile(
+    r"(?<![A-Za-z0-9+/=_-])"
+    r"(?:(?:[A-Za-z0-9+/_-]{4})+[ \t\r\n]+)+"
+    r"[A-Za-z0-9+/_-]{2,}={0,2}"
+    r"(?![A-Za-z0-9+/=_-])"
+)
 _BEARER_CREDENTIAL = re.compile(r"\bbearer\s+[^\s,;]+", re.IGNORECASE)
 _LABELED_CREDENTIAL = re.compile(
     r"\b(?:(?:[a-z0-9]+[\s_-]+)*token|access[\s_-]*key(?:[\s_-]*id)?|"
     r"api[\s_-]*key|authorization|jwt|password|secret)"
     r"\s*[:=]\s*[^\s,;]+",
     re.IGNORECASE,
+)
+_QUOTED_LABEL = re.compile(
+    r'''["']\s*([A-Za-z][A-Za-z0-9 _-]{0,79})\s*["']\s*:'''
 )
 _SENSITIVE_SINGLE_KEY_SEGMENTS = {
     "auth",
@@ -109,6 +132,24 @@ _SENSITIVE_KEY_PAIRS = {
     ("user", "token"),
 }
 _SAFE_RESOURCE_TOKEN_KEYS = {"app_token", "file_token", "wiki_token"}
+_SENSITIVE_COMPACT_KEY_MARKERS = {
+    "accesskey",
+    "accesskeyid",
+    "accesstoken",
+    "apikey",
+    "appsecret",
+    "authorization",
+    "clientsecret",
+    "credential",
+    "oauthtoken",
+    "password",
+    "signature",
+    "verificationtoken",
+}
+_STRUCTURAL_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
+_PLAN_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
+_SOURCE_PATH = re.compile(r"/(?:docx|wiki)/[A-Za-z0-9_-]+\Z")
+_JSON_UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
 
 
 class TaskAlreadyClaimed(RuntimeError):
@@ -155,6 +196,22 @@ class BitableTaskStore:
         thread_id: str,
         reply_context: dict[str, str],
     ) -> BitableBinding:
+        app_token = _safe_identifier(app_token, field_name="app_token")
+        table_id = _safe_identifier(table_id, field_name="table_id")
+        view_id = _safe_identifier(view_id, field_name="view_id")
+        record_id = _safe_identifier(record_id, field_name="record_id")
+        run_id = _safe_identifier(run_id, field_name="run_id")
+        thread_id = _safe_identifier(thread_id, field_name="thread_id")
+        claimant_open_id = _safe_identifier(
+            claimant_open_id,
+            field_name="claimant_open_id",
+        )
+        source_url = _safe_requirement_source(source_url)
+        display_text = _safe_required_text(
+            display_text,
+            field_name="display_text",
+            max_bytes=_MAX_DISPLAY_TEXT_BYTES,
+        )
         reply_context_json = _reply_context_json(reply_context)
         async with self._lock:
             try:
@@ -260,6 +317,8 @@ class BitableTaskStore:
         status: TableTaskStatus,
         last_error: str | None = None,
     ) -> BitableBinding:
+        run_id = _safe_identifier(run_id, field_name="run_id")
+        status = _task_status(status)
         last_error = _safe_optional_text(last_error, field_name="last_error")
         return await self._update_run(
             run_id,
@@ -278,6 +337,8 @@ class BitableTaskStore:
         status: TableTaskStatus,
         last_error: str | None = None,
     ) -> BitableBinding:
+        run_id = _safe_identifier(run_id, field_name="run_id")
+        status = _task_status(status)
         if status not in _RELEASE_STATUSES:
             raise ValueError(f"invalid release status: {status}")
         last_error = _safe_optional_text(last_error, field_name="last_error")
@@ -297,6 +358,8 @@ class BitableTaskStore:
         run_id: str,
         plan_fingerprint: str,
     ) -> tuple[BitableBinding, bool]:
+        run_id = _safe_identifier(run_id, field_name="run_id")
+        plan_fingerprint = _safe_plan_fingerprint(plan_fingerprint)
         async with self._lock:
             try:
                 await self._connection.execute("BEGIN IMMEDIATE")
@@ -392,6 +455,12 @@ class BitableTaskStore:
         kind: str,
         command: dict[str, Any],
     ) -> bool:
+        item_id = _safe_identifier(item_id, field_name=id_column)
+        kind = _safe_identifier(
+            kind,
+            field_name="kind",
+            max_bytes=_MAX_KIND_BYTES,
+        )
         command_json = _json_object(command, field_name="command")
         async with self._lock:
             try:
@@ -422,6 +491,7 @@ class BitableTaskStore:
         status: Literal["completed", "failed"],
         result: dict[str, Any] | None,
     ) -> bool:
+        item_id = _safe_identifier(item_id, field_name=id_column)
         if status not in {"completed", "failed"}:
             raise ValueError(f"invalid finish status: {status}")
         if result is None:
@@ -515,6 +585,77 @@ def _reply_context_json(value: dict[str, str]) -> str:
     return _json_object(value, field_name="reply_context")
 
 
+def _safe_identifier(
+    value: str,
+    *,
+    field_name: str,
+    max_bytes: int = _MAX_IDENTIFIER_BYTES,
+) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be text")
+    if (
+        not value
+        or len(value.encode("utf-8")) > max_bytes
+        or _STRUCTURAL_IDENTIFIER.fullmatch(value) is None
+    ):
+        raise ValueError(f"{field_name} has an invalid format")
+    return value
+
+
+def _task_status(value: TableTaskStatus) -> TableTaskStatus:
+    if not isinstance(value, TableTaskStatus):
+        raise ValueError("status must be a valid TableTaskStatus")
+    return value
+
+
+def _safe_plan_fingerprint(value: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError("plan_fingerprint must be text")
+    if _PLAN_FINGERPRINT.fullmatch(value) is None:
+        raise ValueError("plan_fingerprint must be a lowercase SHA-256 digest")
+    return value
+
+
+def _safe_required_text(value: str, *, field_name: str, max_bytes: int) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be text")
+    if not value or len(value.encode("utf-8")) > max_bytes:
+        raise ValueError(f"{field_name} is empty or too large")
+    _validate_safe_text(value, field_name=field_name)
+    return value
+
+
+def _safe_requirement_source(value: str) -> str:
+    value = _safe_required_text(
+        value,
+        field_name="source_url",
+        max_bytes=_MAX_SOURCE_URL_BYTES,
+    )
+    try:
+        source = urlsplit(value)
+        if (
+            source.username is not None
+            or source.password is not None
+            or source.port not in {None, 443}
+        ):
+            raise ValueError
+        normalized = parse_requirement_source(value)
+        if _CONTROL_CHARACTER.search(normalized):
+            raise ValueError
+        _validate_safe_text(normalized, field_name="source_url")
+        parsed = urlsplit(normalized)
+        if (
+            parsed.port is not None
+            or parsed.query
+            or parsed.fragment
+            or _SOURCE_PATH.fullmatch(parsed.path) is None
+        ):
+            raise ValueError
+        return normalized
+    except (TypeError, ValueError):
+        raise ValueError("source_url must be a safe Feishu docx/wiki URL") from None
+
+
 def _validate_json_content(value: dict[str, Any], *, field_name: str) -> None:
     stack: list[tuple[Any, int]] = [(value, 0)]
     nodes = 0
@@ -555,6 +696,8 @@ def _validate_safe_text(value: str, *, field_name: str) -> None:
         or _BEARER_CREDENTIAL.search(value)
         or _LABELED_CREDENTIAL.search(value)
         or _contains_sensitive_url_query(value)
+        or _contains_sensitive_quoted_label(value)
+        or _contains_bare_base64(value)
     ):
         raise ValueError(f"{field_name} contains sensitive content")
 
@@ -564,15 +707,96 @@ def _is_sensitive_key(value: str) -> bool:
     segments = tuple(segment for segment in normalized.split("_") if segment)
     if not segments:
         return False
+    if value in _SAFE_RESOURCE_TOKEN_KEYS:
+        return False
+    compact = "".join(segments)
+    if compact in _SENSITIVE_COMPACT_KEY_MARKERS:
+        return True
+    if (
+        "token" in segments
+        or compact.endswith("token")
+        or "secret" in segments
+        or compact.endswith("secret")
+        or "jwt" in segments
+    ):
+        return True
     if any(segment in _SENSITIVE_SINGLE_KEY_SEGMENTS for segment in segments):
         return True
-    if segments == ("token",) or segments == ("event",) or segments == ("payload",):
+    if "payload" in segments or segments in {("event",), ("raw",)}:
         return True
-    if "token" in segments and normalized not in _SAFE_RESOURCE_TOKEN_KEYS:
+    if "event" in segments and bool(
+        {"body", "data", "json", "raw"} & set(segments)
+    ):
         return True
     if any(pair in _SENSITIVE_KEY_PAIRS for pair in zip(segments, segments[1:])):
         return True
     return "raw" in segments and bool({"body", "event", "payload"} & set(segments))
+
+
+def _contains_sensitive_quoted_label(value: str) -> bool:
+    decoded = value
+    for _ in range(_MAX_JSON_DEPTH):
+        unescaped = _JSON_UNICODE_ESCAPE.sub(
+            lambda match: chr(int(match.group(1), 16)),
+            decoded,
+        )
+        if unescaped == decoded:
+            break
+        decoded = unescaped
+    if _JSON_UNICODE_ESCAPE.search(decoded):
+        return True
+    return any(
+        _is_sensitive_key(match.group(1))
+        for match in _QUOTED_LABEL.finditer(decoded)
+    )
+
+
+def _contains_bare_base64(value: str) -> bool:
+    for pattern in (_BASE64_CANDIDATE, _WRAPPED_BASE64_CANDIDATE):
+        for match in pattern.finditer(value):
+            encoded = re.sub(r"[ \t\r\n]+", "", match.group(0))
+            padded = encoded + "=" * (-len(encoded) % 4)
+            try:
+                decoded = base64.b64decode(
+                    padded,
+                    altchars=b"-_",
+                    validate=True,
+                )
+            except (binascii.Error, ValueError):
+                continue
+            if _has_image_magic(decoded):
+                return True
+            if (
+                len(encoded) >= 128
+                and len(decoded) >= 96
+                and _entropy(encoded) >= 4.5
+            ):
+                return True
+    return False
+
+
+def _has_image_magic(value: bytes) -> bool:
+    return (
+        value.startswith(b"\x89PNG\r\n\x1a\n")
+        or value.startswith(b"\xff\xd8\xff")
+        or value.startswith((b"GIF87a", b"GIF89a"))
+        or (
+            len(value) >= 12
+            and value.startswith(b"RIFF")
+            and value[8:12] == b"WEBP"
+        )
+    )
+
+
+def _entropy(value: str) -> float:
+    symbols = value.rstrip("=")
+    if not symbols:
+        return 0.0
+    counts = Counter(symbols)
+    length = len(symbols)
+    return -sum(
+        (count / length) * log2(count / length) for count in counts.values()
+    )
 
 
 def _normalize_key(value: str) -> str:
@@ -600,6 +824,7 @@ def _has_sensitive_url_query(value: str) -> bool:
         return False
     return any(
         key in {"key", "sig"}
+        or _is_sensitive_key(key)
         or any(
             marker in key
             or marker.replace("_", "") in key.replace("_", "")

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import sqlite3
 import subprocess
@@ -12,6 +13,33 @@ from feishu_generation_agent.storage.bitable_tasks import (
     BitableTaskStore,
     TaskAlreadyClaimed,
 )
+
+
+PLAN_FINGERPRINT_A = "a" * 64
+PLAN_FINGERPRINT_B = "b" * 64
+
+
+def _wrap_base64(value: str, width: int = 12) -> str:
+    return " ".join(
+        value[index : index + width]
+        for index in range(0, len(value), width)
+    )
+
+
+def _split_base64_once(value: str) -> str:
+    return f"{value[:12]}\n{value[12:]}"
+
+
+def _split_base64_in_half(value: str) -> str:
+    midpoint = (len(value) // 8) * 4
+    return f"{value[:midpoint]}\n{value[midpoint:]}"
+
+
+def _deeply_escaped_sensitive_json() -> str:
+    label = r"\u0074enant_access_token"
+    for _ in range(13):
+        label = label.replace("\\", r"\u005c")
+    return f'{{"{label}":"fictional-token"}}'
 
 
 @pytest.mark.parametrize(
@@ -178,19 +206,57 @@ async def test_action_id_is_accepted_once(tmp_path):
     ("method_name", "id_name"),
     [("accept_ingress", "dedupe_id"), ("accept_action", "action_id")],
 )
-async def test_dedupe_only_ignores_primary_key_conflicts(
+async def test_dedupe_rejects_invalid_kind_before_conflict_handling(
     tmp_path, method_name, id_name
 ):
     store = await BitableTaskStore.open(tmp_path / "agent.sqlite3")
     try:
         method = getattr(store, method_name)
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(TypeError, match="kind"):
             await method(
                 **{
                     id_name: "item-1",
                     "kind": None,
                     "command": {"run_id": "run-1"},
                 }
+            )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_dedupe_writes_reject_invalid_identifiers_and_kind(tmp_path):
+    store = await BitableTaskStore.open(tmp_path / "agent.sqlite3")
+    try:
+        with pytest.raises(ValueError, match="dedupe_id"):
+            await store.accept_ingress(
+                dedupe_id="bad/id",
+                kind="message",
+                command={},
+            )
+        with pytest.raises(ValueError, match="action_id"):
+            await store.accept_action(
+                action_id="bad action",
+                kind="approve",
+                command={},
+            )
+        with pytest.raises(ValueError, match="kind"):
+            await store.accept_ingress(
+                dedupe_id="event-1",
+                kind="k" * 65,
+                command={},
+            )
+        with pytest.raises(TypeError, match="kind"):
+            await store.accept_action(
+                action_id="action-1",
+                kind=None,  # type: ignore[arg-type]
+                command={},
+            )
+        with pytest.raises(ValueError, match="dedupe_id"):
+            await store.finish_ingress(
+                "bad/id",
+                status="completed",
+                result={},
             )
     finally:
         await store.close()
@@ -209,6 +275,142 @@ async def test_claim_can_be_read_by_record_and_run(tmp_path):
         assert await store.get_by_run("run-1") == claimed
         assert await store.get_by_record("app", "tbl", "missing") is None
         assert await store.get_by_run("missing") is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_claim_normalizes_safe_feishu_requirement_source(tmp_path):
+    store = await BitableTaskStore.open(tmp_path / "agent.sqlite3")
+    try:
+        claimed = await store.claim(
+            app_token="app",
+            table_id="tbl",
+            view_id="vew",
+            record_id="rec",
+            source_url=(
+                "https://TENANT.FEISHU.CN./docx/docABC?from=bitable#section"
+            ),
+            display_text="任务 1",
+            claimant_open_id="ou_a",
+            run_id="run-1",
+            thread_id="thread-1",
+            reply_context={},
+        )
+
+        assert claimed.source_url == "https://tenant.feishu.cn/docx/docABC"
+        assert (await store.get_by_run("run-1")).source_url == claimed.source_url
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_url",
+    [
+        "http://tenant.feishu.cn/docx/docABC",
+        "https://evil.example/docx/docABC",
+        "https://tenant.feishu.cn/docx/docABC?access_token=fictional",
+        "https://tenant.feishu.cn/wiki/wikiABC?X-Amz-Signature=fictional",
+        "https://tenant.feishu.cn/docx/docABC?password=fictional",
+        "https://tenant.feishu.cn/docx/docABC?jwt=fictional",
+        "https://tenant.feishu.cn/docx/doc%3Faccess_token%3Dfictional",
+        "https://tenant.feishu.cn/docx/doc%23tenant_access_token%3Dfictional",
+        "https://tenant.feishu.cn/docx/doc%09fictional",
+        "https://tenant.feishu.cn:444/docx/docABC",
+        "https://user:fictional@tenant.feishu.cn/docx/docABC",
+        "x" * 2_049,
+    ],
+)
+async def test_claim_rejects_unsafe_requirement_source(tmp_path, source_url):
+    store = await BitableTaskStore.open(tmp_path / "agent.sqlite3")
+    try:
+        with pytest.raises(ValueError, match="source_url"):
+            await store.claim(
+                app_token="app",
+                table_id="tbl",
+                view_id="vew",
+                record_id="rec",
+                source_url=source_url,
+                display_text="任务 1",
+                claimant_open_id="ou_a",
+                run_id="run-1",
+                thread_id="thread-1",
+                reply_context={},
+            )
+        assert await store.get_by_record("app", "tbl", "rec") is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "display_text",
+    [
+        "x" * 4_097,
+        "Authorization: Bearer fictional-token",
+        '{"raw_event_body": {"sender": "ou_1"}}',
+        r'{"\u0074enant_access_token":"fictional-token"}',
+        _wrap_base64(
+            base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"p" * 128).decode()
+        ),
+        base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"p" * 128).decode(),
+        "下载 https://files.example/x?credential=fictional",
+    ],
+)
+async def test_claim_rejects_unsafe_display_text(tmp_path, display_text):
+    store = await BitableTaskStore.open(tmp_path / "agent.sqlite3")
+    try:
+        with pytest.raises(ValueError, match="display_text"):
+            await store.claim(
+                app_token="app",
+                table_id="tbl",
+                view_id="vew",
+                record_id="rec",
+                source_url="https://tenant.feishu.cn/docx/docABC",
+                display_text=display_text,
+                claimant_open_id="ou_a",
+                run_id="run-1",
+                thread_id="thread-1",
+                reply_context={},
+            )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("app_token", ""),
+        ("table_id", "bad/table"),
+        ("view_id", "bad view"),
+        ("record_id", "r" * 257),
+        ("run_id", "run/1"),
+        ("thread_id", "thread 1"),
+        ("claimant_open_id", "ou/1"),
+    ],
+)
+async def test_claim_rejects_invalid_structural_identifiers(
+    tmp_path, field_name, invalid_value
+):
+    store = await BitableTaskStore.open(tmp_path / "agent.sqlite3")
+    parameters = {
+        "app_token": "app",
+        "table_id": "tbl",
+        "view_id": "vew",
+        "record_id": "rec",
+        "source_url": "https://tenant.feishu.cn/docx/docABC",
+        "display_text": "任务 1",
+        "claimant_open_id": "ou_a",
+        "run_id": "run-1",
+        "thread_id": "thread-1",
+        "reply_context": {},
+    }
+    parameters[field_name] = invalid_value
+    try:
+        with pytest.raises(ValueError, match=field_name):
+            await store.claim(**parameters)
     finally:
         await store.close()
 
@@ -235,7 +437,7 @@ async def test_release_allows_a_fresh_claim_and_resets_approval(tmp_path):
     store = await BitableTaskStore.open(tmp_path / "agent.sqlite3")
     try:
         await _claim(store)
-        await store.advance_approval("run-1", "plan-a")
+        await store.advance_approval("run-1", PLAN_FINGERPRINT_A)
         released = await store.release(
             "run-1", status=TableTaskStatus.FAILED, last_error="provider failed"
         )
@@ -275,7 +477,7 @@ async def test_unknown_run_cannot_be_updated_or_released(tmp_path):
         with pytest.raises(KeyError, match="missing"):
             await store.release("missing", status=TableTaskStatus.FAILED)
         with pytest.raises(KeyError, match="missing"):
-            await store.advance_approval("missing", "plan-a")
+            await store.advance_approval("missing", PLAN_FINGERPRINT_A)
     finally:
         await store.close()
 
@@ -286,9 +488,15 @@ async def test_approval_version_only_advances_for_a_new_fingerprint(tmp_path):
     try:
         await _claim(store)
 
-        first, first_changed = await store.advance_approval("run-1", "plan-a")
-        replay, replay_changed = await store.advance_approval("run-1", "plan-a")
-        changed, plan_changed = await store.advance_approval("run-1", "plan-b")
+        first, first_changed = await store.advance_approval(
+            "run-1", PLAN_FINGERPRINT_A
+        )
+        replay, replay_changed = await store.advance_approval(
+            "run-1", PLAN_FINGERPRINT_A
+        )
+        changed, plan_changed = await store.advance_approval(
+            "run-1", PLAN_FINGERPRINT_B
+        )
 
         assert first.approval_version == 1
         assert first_changed
@@ -296,7 +504,45 @@ async def test_approval_version_only_advances_for_a_new_fingerprint(tmp_path):
         assert not replay_changed
         assert changed.approval_version == 2
         assert plan_changed
-        assert changed.plan_fingerprint == "plan-b"
+        assert changed.plan_fingerprint == PLAN_FINGERPRINT_B
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fingerprint",
+    ["", "plan-a", "a" * 63, "A" * 64, "g" * 64, "a" * 65],
+)
+async def test_approval_rejects_non_sha256_fingerprint(tmp_path, fingerprint):
+    store = await BitableTaskStore.open(tmp_path / "agent.sqlite3")
+    try:
+        await _claim(store)
+        with pytest.raises(ValueError, match="plan_fingerprint"):
+            await store.advance_approval("run-1", fingerprint)
+        binding = await store.get_by_run("run-1")
+        assert binding.approval_version == 0
+        assert binding.plan_fingerprint is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_task_updates_reject_invalid_run_id_and_status(tmp_path):
+    store = await BitableTaskStore.open(tmp_path / "agent.sqlite3")
+    try:
+        await _claim(store)
+        with pytest.raises(ValueError, match="run_id"):
+            await store.set_status("bad/run", TableTaskStatus.FAILED)
+        with pytest.raises(ValueError, match="run_id"):
+            await store.release("bad run", status=TableTaskStatus.FAILED)
+        with pytest.raises(ValueError, match="run_id"):
+            await store.advance_approval("bad/run", PLAN_FINGERPRINT_A)
+        with pytest.raises(ValueError, match="status"):
+            await store.set_status(
+                "run-1",
+                "failed",  # type: ignore[arg-type]
+            )
     finally:
         await store.close()
 
@@ -320,14 +566,16 @@ async def test_two_connections_emit_one_approval_change_for_same_fingerprint(tmp
             if ready == len(stores):
                 start.set()
         await start.wait()
-        return await store.advance_approval("run-1", "plan-a")
+        return await store.advance_approval("run-1", PLAN_FINGERPRINT_A)
 
     try:
         results = await asyncio.gather(*(advance(store) for store in stores))
 
         assert sum(changed for _, changed in results) == 1
         assert {binding.approval_version for binding, _ in results} == {1}
-        assert {binding.plan_fingerprint for binding, _ in results} == {"plan-a"}
+        assert {binding.plan_fingerprint for binding, _ in results} == {
+            PLAN_FINGERPRINT_A
+        }
     finally:
         await asyncio.gather(*(store.close() for store in stores))
 
@@ -445,6 +693,15 @@ async def test_commands_must_be_json_objects(tmp_path):
         {"context": {"Authorization": "Bearer fictional-secret"}},
         {"context": [{"tenant_access_token": "fictional-token"}]},
         {"api_key": "fictional-key"},
+        {"apikey": "fictional-key"},
+        {"accesskey": "fictional-key"},
+        {"appsecret": "fictional-secret"},
+        {"clientSecret": "fictional-secret"},
+        {"access-token": "fictional-token"},
+        {"verificationtoken": "fictional-token"},
+        {"oauth token": "fictional-token"},
+        {"fileToken": "fictional-token"},
+        {"app-token": "fictional-token"},
         {"user_access_token": "fictional-token"},
         {"appAccessToken": "fictional-token"},
         {"oauth_token": "fictional-token"},
@@ -453,6 +710,9 @@ async def test_commands_must_be_json_objects(tmp_path):
         {"jwt": "eyJmaWN0aW9uYWw.payload.signature"},
         {"authorization_header": "Bearer fictional-token"},
         {"raw_event_body": {"sender": "ou_1"}},
+        {"event_json": "fictional-event"},
+        {"event_data": {"sender": "ou_1"}},
+        {"raw": {"sender": "ou_1"}},
         {"event": {"sender": {"open_id": "ou_1"}, "text": "raw"}},
         {"payload": {"action": {"value": {"run_id": "run-1"}}}},
         {"auth": "Bearer fictional-secret"},
@@ -494,14 +754,139 @@ async def test_commands_allow_minimal_ids_feedback_and_unsigned_urls(tmp_path):
                 "run_id": "run-1",
                 "record_id": "rec-1",
                 "app_token": "app-resource-id",
+                "file_token": "file-resource-id",
+                "wiki_token": "wiki-resource-id",
                 "actor_open_id": "ou_1",
                 "selected_task_ids": ["task-1"],
-                "feedback": "改成暖色",
+                "feedback": "改成暖色\n保留主体构图",
+                "content": "iVBORw0KGgo",
+                "secretary_name": "林秘书",
+                "tokenizer_model": "cl100k_base",
+                "passwordless_mode": "enabled",
                 "chat_id": "oc_1",
                 "message_id": "om_1",
                 "source_url": "https://tenant.feishu.cn/docx/doc?view=compact",
             },
         )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"p" * 128).decode(),
+        base64.b64encode(b"\xff\xd8\xff\xe0" + b"j" * 128).decode(),
+        base64.b64encode(b"GIF89a" + b"g" * 128).decode(),
+        base64.b64encode(b"RIFF" + b"\x80\x00\x00\x00WEBP" + b"w" * 128).decode(),
+        base64.b64encode(bytes(range(256))).decode(),
+        base64.urlsafe_b64encode(bytes(range(256))).decode().rstrip("="),
+        _wrap_base64(
+            base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"p" * 128).decode()
+        ),
+        _wrap_base64(base64.b64encode(bytes(range(256))).decode()),
+        _wrap_base64(
+            base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"p" * 128).decode(),
+            width=4,
+        ),
+        _wrap_base64(base64.b64encode(bytes(range(256))).decode(), width=4),
+        _split_base64_once(
+            base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"p" * 128).decode()
+        ),
+        _split_base64_once(base64.b64encode(bytes(range(256))).decode()),
+        _split_base64_in_half(base64.b64encode(bytes(range(96))).decode()),
+        base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"p" * 128)
+        .decode()
+        .rstrip("="),
+    ],
+)
+@pytest.mark.parametrize("entry", ["command", "reply_context", "result"])
+async def test_json_write_entries_reject_bare_image_or_long_base64(
+    tmp_path, encoded, entry
+):
+    store = await BitableTaskStore.open(tmp_path / "agent.sqlite3")
+    try:
+        with pytest.raises(ValueError, match="sensitive"):
+            if entry == "command":
+                await store.accept_action(
+                    action_id="action-1",
+                    kind="approve",
+                    command={"content": encoded},
+                )
+            elif entry == "reply_context":
+                await store.claim(
+                    app_token="app",
+                    table_id="tbl",
+                    view_id="vew",
+                    record_id="rec",
+                    source_url="https://x.feishu.cn/docx/doc",
+                    display_text="1",
+                    claimant_open_id="ou_a",
+                    run_id="run-1",
+                    thread_id="thread-1",
+                    reply_context={"content": encoded},
+                )
+            else:
+                assert await store.accept_ingress(
+                    dedupe_id="event-1",
+                    kind="approve",
+                    command={"run_id": "run-1"},
+                )
+                await store.finish_ingress(
+                    "event-1", status="completed", result={"content": encoded}
+                )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["command", "reply_context", "result"])
+@pytest.mark.parametrize(
+    "serialized",
+    [
+        '{"tenant_access_token":"fictional-token"}',
+        '{"token": "fictional-token"}',
+        '{"raw_event_body": {"sender": "ou_1"}}',
+        r'{"\u0074enant_access_token":"fictional-token"}',
+        r'{"\u0072aw_event_body":{"sender":"ou_1"}}',
+        _deeply_escaped_sensitive_json(),
+    ],
+)
+async def test_json_write_entries_reject_quoted_sensitive_labels(
+    tmp_path, entry, serialized
+):
+    store = await BitableTaskStore.open(tmp_path / "agent.sqlite3")
+    try:
+        with pytest.raises(ValueError, match="sensitive"):
+            if entry == "command":
+                await store.accept_action(
+                    action_id="action-1",
+                    kind="approve",
+                    command={"text": serialized},
+                )
+            elif entry == "reply_context":
+                await store.claim(
+                    app_token="app",
+                    table_id="tbl",
+                    view_id="vew",
+                    record_id="rec",
+                    source_url="https://x.feishu.cn/docx/doc",
+                    display_text="1",
+                    claimant_open_id="ou_a",
+                    run_id="run-1",
+                    thread_id="thread-1",
+                    reply_context={"text": serialized},
+                )
+            else:
+                assert await store.accept_ingress(
+                    dedupe_id="event-1",
+                    kind="approve",
+                    command={"run_id": "run-1"},
+                )
+                await store.finish_ingress(
+                    "event-1", status="completed", result={"text": serialized}
+                )
     finally:
         await store.close()
 
@@ -622,6 +1007,16 @@ async def test_finish_rejects_sensitive_result_and_keeps_pending(tmp_path, resul
         "tenant_access_token=fictional-token",
         "access_key_id=fictional-access-key",
         "jwt=eyJmaWN0aW9uYWw.payload.signature",
+        '{"tenant_access_token":"fictional-token"}',
+        '{"token": "fictional-token"}',
+        '{"raw_event_body": {"sender": "ou_1"}}',
+        r'{"\u0074enant_access_token":"fictional-token"}',
+        r'{"\u0072aw_event_body":{"sender":"ou_1"}}',
+        _wrap_base64(
+            base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"p" * 128).decode()
+        ),
+        base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"p" * 128).decode(),
+        base64.b64encode(bytes(range(256))).decode(),
     ],
 )
 async def test_status_writes_reject_sensitive_last_error(
