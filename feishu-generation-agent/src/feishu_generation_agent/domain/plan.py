@@ -1,7 +1,7 @@
 from enum import StrEnum
 from typing import Literal, Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class TaskType(StrEnum):
@@ -11,8 +11,15 @@ class TaskType(StrEnum):
 
 class ImageReference(BaseModel):
     asset_id: str
-    role: str
+    role: Literal["reference_image", "first_frame", "last_frame"]
     order: int = Field(ge=1)
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def normalize_saved_planner_role(cls, value: object) -> object:
+        if value == "character_and_style_reference":
+            return "reference_image"
+        return value
 
 
 class GenerationTask(BaseModel):

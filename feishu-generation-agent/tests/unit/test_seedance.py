@@ -15,7 +15,7 @@ from pydantic import SecretStr
 from feishu_generation_agent.domain.artifact import ProviderSubmission
 from feishu_generation_agent.domain.document import MediaAsset
 from feishu_generation_agent.domain.errors import AgentError, ErrorCategory
-from feishu_generation_agent.domain.plan import GenerationTask
+from feishu_generation_agent.domain.plan import GenerationTask, ImageReference
 from feishu_generation_agent.integrations.seedance import SeedanceVideoGenerator
 
 
@@ -440,7 +440,17 @@ async def test_submit_rejects_invalid_reference_mapping_before_http(
         references[0]["role"] = "first_frame"
         references[1]["role"] = "first_frame"
 
-    task = _video_task(references=references)
+    if case == "invalid_role":
+        task = _video_task().model_copy(
+            update={
+                "reference_images": [
+                    ImageReference.model_construct(**reference)
+                    for reference in references
+                ]
+            }
+        )
+    else:
+        task = _video_task(references=references)
     requests: list[httpx.Request] = []
     async with _recording_client(requests) as client:
         generator = SeedanceVideoGenerator(
