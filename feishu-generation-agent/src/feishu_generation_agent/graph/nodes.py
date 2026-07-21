@@ -544,9 +544,6 @@ async def revalidate_approval(
                 max_output_count=services.settings.max_output_count,
             )
         )
-        audit = AuditReport.model_validate(state.get("audit_report", {}))
-        if audit.corrections_required:
-            issues.extend(f"audit: {issue}" for issue in audit.issues)
         if issues:
             raise _validation_error("The approved plan is not valid")
         return {"validation_issues": [], "status": "approved"}

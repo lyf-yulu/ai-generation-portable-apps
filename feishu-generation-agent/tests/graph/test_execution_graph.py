@@ -274,6 +274,44 @@ async def test_revalidate_approval_rejects_task_not_in_formal_draft(
 
 
 @pytest.mark.asyncio
+async def test_revalidate_approval_allows_human_approved_audit_caveats(
+    fake_services: GraphServices,
+) -> None:
+    graph = build_graph(fake_services, InMemorySaver())
+    thread_id = "thread-approved-audit-caveats"
+    config = _config(thread_id)
+    await graph.ainvoke(
+        _input("run-approved-audit-caveats", thread_id),
+        config=config,
+    )
+    snapshot = await graph.aget_state(config)
+    state = dict(snapshot.values)
+    approved_tasks = state["draft_plan"]["tasks"]
+    state.update(
+        {
+            "audit_report": {
+                "issues": ["The requested sequence may be difficult to render."],
+                "corrections_required": True,
+            },
+            "approval_decision": {
+                "action": "approve",
+                "selected_task_ids": [approved_tasks[0]["task_id"]],
+                "tasks": approved_tasks,
+            },
+            "approval_revision": state["document_revision"],
+            "approved_tasks": approved_tasks,
+        }
+    )
+
+    result = await revalidate_approval(state, config, services=fake_services)
+
+    assert result["status"] == "approved"
+    assert result["validation_issues"] == []
+    _assert_zero_generation(fake_services)
+    assert await fake_services.repository.count_operations() == 0
+
+
+@pytest.mark.asyncio
 async def test_source_revision_read_error_fails_closed_before_generation(
     fake_services: GraphServices,
     monkeypatch: pytest.MonkeyPatch,
