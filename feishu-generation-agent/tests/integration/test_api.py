@@ -970,6 +970,7 @@ async def test_static_review_workspace_is_served_and_uses_safe_dom_updates():
         assert text in page.text
     assert "setInterval" in script.text
     assert "1000" in script.text
+    assert "/api/bitable/active-runs" in script.text
     assert "textContent" in script.text
     assert "response.ok" in script.text
     assert "detail" in script.text

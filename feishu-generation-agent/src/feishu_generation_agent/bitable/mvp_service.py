@@ -107,6 +107,13 @@ class BitableMvpService:
             if not task.has_result and task.record_id not in active
         ]
 
+    async def active_runs(self) -> list[BitableBinding]:
+        location, _ = await self._prepared()
+        return await self._store.list_active(
+            location.app_token or "",
+            location.table_id,
+        )
+
     async def claim(self, record_id: str) -> str:
         location, schema = await self._prepared()
         tasks = await self._bitable.list_tasks(location, schema)

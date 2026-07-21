@@ -190,6 +190,22 @@
       message.textContent = "当前未配置旧版文档交付，请从下方多维表格任务开始。";
       message.hidden = false;
     }
+    if (state.modes.bitable && !state.runId) {
+      try {
+        const activeRuns = await api("/api/bitable/active-runs");
+        const latest = Array.isArray(activeRuns) ? activeRuns.at(-1) : null;
+        if (latest?.run_id) {
+          state.runId = latest.run_id;
+          state.runMode = "bitable";
+          state.review = ReviewState.createReviewState();
+          await poll(true);
+          bitableStatus.textContent = `已恢复进行中任务：${latest.display_text || latest.run_id}`;
+          document.querySelector(".workspace")?.scrollIntoView({ behavior: "smooth" });
+        }
+      } catch (error) {
+        showError(error);
+      }
+    }
   }
 
   function updateActionAvailability() {

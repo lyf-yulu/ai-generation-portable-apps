@@ -322,6 +322,22 @@ def create_app(
             raise_bitable_error(exc)
         return [task.model_dump(mode="json") for task in tasks]
 
+    @app.get("/api/bitable/active-runs")
+    async def list_active_bitable_runs(request: Request) -> list[dict]:
+        active = get_bitable_service(request)
+        try:
+            bindings = await active.active_runs()
+        except Exception as exc:
+            raise_bitable_error(exc)
+        return [
+            {
+                "run_id": binding.run_id,
+                "display_text": binding.display_text,
+                "status": binding.status.value,
+            }
+            for binding in bindings
+        ]
+
     @app.post(
         "/api/bitable/tasks/{record_id}/claim",
         status_code=status.HTTP_202_ACCEPTED,

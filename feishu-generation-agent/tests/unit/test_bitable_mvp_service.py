@@ -197,6 +197,25 @@ async def test_claim_reserves_before_runtime_start_with_local_identity(
 
 
 @pytest.mark.asyncio
+async def test_active_runs_are_available_for_browser_session_restore(
+    tmp_path: Path,
+) -> None:
+    service, store = await _service(tmp_path)
+    try:
+        run_id = await service.claim("rec-1")
+        await store.set_status(run_id, TableTaskStatus.WAITING_APPROVAL)
+
+        active = await service.active_runs()
+
+        assert len(active) == 1
+        assert active[0].run_id == run_id
+        assert active[0].display_text == "任务 rec-1"
+        assert active[0].status is TableTaskStatus.WAITING_APPROVAL
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
 async def test_two_concurrent_services_claim_exactly_once(tmp_path: Path) -> None:
     path = tmp_path / "bitable.sqlite3"
     stores = [await BitableTaskStore.open(path), await BitableTaskStore.open(path)]
