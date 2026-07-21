@@ -32,6 +32,14 @@ from feishu_generation_agent.domain.plan import (
     TaskPlan,
     TaskType,
 )
+from feishu_generation_agent.domain.production_bitable import (
+    ProductionBinding,
+    ProductionDelivery,
+    ProductionSchema,
+    ProductionSourceSnapshot,
+    ProductionTaskSummary,
+    ResultTableTarget,
+)
 
 __all__ = [
     "AgentError",
@@ -52,7 +60,13 @@ __all__ = [
     "NormalizedDocument",
     "ProviderResult",
     "ProviderSubmission",
+    "ProductionBinding",
+    "ProductionDelivery",
+    "ProductionSchema",
+    "ProductionSourceSnapshot",
+    "ProductionTaskSummary",
     "RequirementRequest",
+    "ResultTableTarget",
     "SourceType",
     "TaskPlan",
     "TableTaskStatus",

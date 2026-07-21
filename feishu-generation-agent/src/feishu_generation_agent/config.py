@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     lark_bitable_url: str | None = None
     lark_bitable_table_id: str | None = None
     lark_bitable_view_id: str | None = None
+    lark_production_bitable_url: str | None = None
+    lark_production_table_id: str | None = None
+    lark_production_view_id: str | None = None
+    lark_result_folder_token: str | None = None
+    lark_include_completed_for_test: bool = False
     lark_local_operator_open_id: str | None = None
     lark_bot_enabled: bool = False
     lark_output_owner_open_id: str | None = None
@@ -47,6 +52,18 @@ class Settings(BaseSettings):
     submission_intent_lease_seconds: float = Field(default=180.0, ge=0.03)
     bot_scan_page_size: int = Field(default=10, ge=1, le=50)
     coordinator_poll_interval_seconds: float = Field(default=1.0, ge=0.05)
+
+    @property
+    def production_bitable_configured(self) -> bool:
+        return all(
+            isinstance(value, str) and bool(value.strip())
+            for value in (
+                self.lark_production_bitable_url,
+                self.lark_production_table_id,
+                self.lark_production_view_id,
+                self.lark_result_folder_token,
+            )
+        )
 
     def ensure_paths(self) -> None:
         for path in (

@@ -47,6 +47,11 @@ CAPABILITY_FIELDS: dict[str, tuple[str, ...]] = {
         "lark_app_id", "lark_app_secret", "lark_bitable_url",
         "lark_bitable_table_id", "lark_bitable_view_id",
     ),
+    "production_bitable": (
+        "lark_app_id", "lark_app_secret", "lark_production_bitable_url",
+        "lark_production_table_id", "lark_production_view_id",
+        "lark_result_folder_token",
+    ),
     "local_claim": ("lark_local_operator_open_id",),
     "legacy_delivery": (
         "lark_output_owner_open_id", "lark_output_folder_token",
@@ -75,6 +80,7 @@ def runtime_is_configured(settings: Settings) -> bool:
         and capability_is_configured(settings, "generation")
         and (
             capability_is_configured(settings, "bitable")
+            or capability_is_configured(settings, "production_bitable")
             or capability_is_configured(settings, "legacy_delivery")
         )
     )

@@ -30,6 +30,27 @@ def test_settings_can_explicitly_enable_benchmark_fake_ips():
     assert settings.allow_benchmark_fake_ips is True
 
 
+def test_runtime_accepts_complete_production_bitable_configuration() -> None:
+    settings = Settings(
+        _env_file=None,
+        lark_app_id="cli_test",
+        lark_app_secret="secret",
+        lark_production_bitable_url="https://tenant.feishu.cn/wiki/wikiProd",
+        lark_production_table_id="tblProd",
+        lark_production_view_id="vewProd",
+        lark_result_folder_token="fldResults",
+        deepseek_api_key="deepseek",
+        claude_api_key="claude",
+        claude_model="claude-model",
+        chiyun_api_key="chiyun",
+        chiyun_model="chiyun-model",
+        ark_api_key="ark",
+    )
+
+    assert capability_is_configured(settings, "production_bitable")
+    assert runtime_is_configured(settings)
+
+
 def test_require_reports_missing_secret_names():
     settings = Settings(deepseek_api_key=None, ark_api_key=None)
     with pytest.raises(ValueError, match="DEEPSEEK_API_KEY, ARK_API_KEY"):
