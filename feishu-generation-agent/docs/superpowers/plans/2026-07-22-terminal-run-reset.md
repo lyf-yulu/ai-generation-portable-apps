@@ -11,7 +11,10 @@
 ## Global Constraints
 
 - 生产需求表只读；结果只写入现有每位制作人的飞书结果表。
+- 客户端仅调用同源相对 API 路径；禁止写入本机路径、IP、密钥或服务端数据库位置。
+- SQLite 历史表通过幂等建表/迁移创建，沿用配置化数据目录，支持迁移到另一台服务机。
 - 重跑必须新建 `run_id`、`thread_id` 和结果表行，不能覆盖旧产物或旧记录。
+- `production_task_history` 保存被新版本替换的终态绑定；当前表与历史表共同提供运行详情和最近记录。
 - 重跑必须再次经过人工批准，批准前不得调用生成供应商。
 - 终态为 `succeeded`、`completed_with_errors`、`failed`、`cancelled`、`delivery_failed`。
 - 新增后端行为先写失败测试，再写最小实现。
@@ -53,10 +56,10 @@ Expected: FAIL，因为 `recent_runs` 和 `rerun` 尚不存在。
 
 ```python
 async def list_recent(self, app_token: str, table_id: str, *, limit: int = 10):
-    # SELECT active = 0 AND 同一 source location ORDER BY updated_at DESC LIMIT ?
+    # UNION 当前表和 production_task_history 的终态绑定，按 updated_at DESC LIMIT ?
 
 async def rerun(self, run_id: str) -> str:
-    # 验证原 binding 已释放；复制原审批计划为新 run；不得调用 resume_run。
+    # 归档原 binding 后创建新 binding；复制原审批计划为新 run；不得调用 resume_run。
 ```
 
 - [ ] **Step 4: 验证通过并提交**
