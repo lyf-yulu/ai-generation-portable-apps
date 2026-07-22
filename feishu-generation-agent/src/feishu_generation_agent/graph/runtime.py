@@ -550,6 +550,7 @@ class GraphRuntime:
         *,
         task_id: str,
         references: list[ImageReference],
+        reference_mode: str | None = None,
     ) -> None:
         lock = self._run_locks.setdefault(run_id, asyncio.Lock())
         if lock.locked():
@@ -562,7 +563,12 @@ class GraphRuntime:
                 MediaAsset.model_validate(item)
                 for item in state.get("media_assets", [])
             ]
-            updated_task = self._task_with_references(task, references, assets)
+            updated_task = self._task_with_references(
+                task,
+                references,
+                assets,
+                reference_mode=reference_mode,
+            )
             updated_plan = self._replace_task(plan, task_index, updated_task)
             await self._persist_draft(run, state, updated_plan, assets)
 
@@ -660,6 +666,8 @@ class GraphRuntime:
         task: GenerationTask,
         references: list[ImageReference],
         assets: list[MediaAsset],
+        *,
+        reference_mode: str | None = None,
     ) -> GenerationTask:
         try:
             updated = GenerationTask.model_validate(
@@ -668,7 +676,8 @@ class GraphRuntime:
                     "reference_images": [
                         reference.model_dump(mode="json")
                         for reference in references
-                    ]
+                    ],
+                    "reference_mode": reference_mode or task.reference_mode,
                 }
             )
             self._validate_references(

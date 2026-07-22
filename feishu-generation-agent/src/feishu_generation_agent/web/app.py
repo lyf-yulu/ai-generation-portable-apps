@@ -511,6 +511,7 @@ def create_app(
                 run_id,
                 task_id=task_id,
                 references=payload.references,
+                reference_mode=payload.reference_mode,
             )
         except (RunNotFound, RunConflict, RunValidationError) as exc:
             raise_runtime_error(exc)

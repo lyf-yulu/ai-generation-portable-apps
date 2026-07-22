@@ -29,6 +29,7 @@ from feishu_generation_agent.domain.plan import (
     AuditReport,
     GenerationTask,
     ImageReference,
+    ReferenceMode,
     TaskPlan,
     TaskType,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "ExecutionRecord",
     "GenerationTask",
     "ImageReference",
+    "ReferenceMode",
     "MediaAsset",
     "NormalizedDocument",
     "ProviderResult",

@@ -139,6 +139,42 @@
     };
   }
 
+  function setReferenceMode(state, taskId, referenceMode) {
+    assertEditable(state);
+    if (!taskIds(state.serverView).includes(taskId)) {
+      throw new Error(`未知任务：${taskId}`);
+    }
+    if (!['multi_reference', 'first_last_frame'].includes(referenceMode)) {
+      throw new Error('参考模式无效');
+    }
+    const task = draftTasks(state).find((item) => item.task_id === taskId);
+    if (!task) throw new Error(`未知任务：${taskId}`);
+    const references = [...(task.reference_images || [])]
+      .sort((left, right) => left.order - right.order);
+    if (referenceMode === 'first_last_frame') {
+      if (task.task_type !== 'image_to_video') {
+        throw new Error('图生图只能使用多参考模式');
+      }
+      if (references.length !== 2) {
+        throw new Error('首尾帧模式需要恰好两张图片');
+      }
+      return patchTask(state, taskId, {
+        reference_mode: referenceMode,
+        reference_images: references.map((reference, index) => ({
+          ...reference,
+          role: index === 0 ? 'first_frame' : 'last_frame',
+        })),
+      });
+    }
+    return patchTask(state, taskId, {
+      reference_mode: referenceMode,
+      reference_images: references.map((reference) => ({
+        ...reference,
+        role: 'reference_image',
+      })),
+    });
+  }
+
   function draftTasks(state) {
     return (state.serverView?.approval?.tasks || []).map((task) => ({
       ...clone(task),
@@ -224,7 +260,9 @@
     if (state.submitting || state.conflict || state.selectionDirty) return false;
     return Object.entries(state.editsByTaskId).every(([editedTaskId, patch]) => (
       editedTaskId === taskId
-      && Object.keys(patch).every((fieldName) => fieldName === "reference_images")
+      && Object.keys(patch).every((fieldName) => (
+        fieldName === "reference_images" || fieldName === "reference_mode"
+      ))
     ));
   }
 
@@ -245,6 +283,7 @@
     mergeServerView,
     patchTask,
     selectedTaskIds,
+    setReferenceMode,
     setTaskSelected,
   };
 });

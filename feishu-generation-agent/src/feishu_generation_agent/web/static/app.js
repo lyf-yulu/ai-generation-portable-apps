@@ -313,6 +313,18 @@
     updateTask(taskId, { reference_images: references });
   }
 
+  function updateReferenceMode(taskId, referenceMode) {
+    try {
+      state.review = ReviewState.setReferenceMode(state.review, taskId, referenceMode);
+      state.view = ReviewState.draftView(state.review);
+      updateActionAvailability();
+      render();
+    } catch (error) {
+      showError(error);
+      render();
+    }
+  }
+
   function requireCleanDraftForReferenceMutation() {
     if (!ReviewState.hasDirty(state.review)) return true;
     showError(new Error("请先提交或放弃本地任务编辑，再增添、替换或删除参考图片"));
@@ -324,11 +336,15 @@
       showError(new Error("请先处理其他本地任务编辑，再保存参考图片用途与顺序"));
       return;
     }
-    const references = currentTask(task.task_id)?.reference_images || [];
+    const current = currentTask(task.task_id);
+    const references = current?.reference_images || [];
     await mutate(`/api/runs/${state.runId}/tasks/${encodeURIComponent(task.task_id)}/references`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ references }),
+      body: JSON.stringify({
+        references,
+        reference_mode: current?.reference_mode || "multi_reference",
+      }),
     }, true);
   }
 
@@ -337,6 +353,10 @@
     const file = fileInput.files[0];
     if (!file) {
       showError(new Error("请选择图片文件"));
+      return;
+    }
+    if (task.reference_mode === "first_last_frame" && !replacesAssetId) {
+      showError(new Error("首尾帧模式只能保留两张图片；请先切换到多参考模式再增添图片"));
       return;
     }
     const body = new FormData();
@@ -389,17 +409,15 @@
       : "本地新增图片，尚无视觉描述";
     const descriptionNode = element("div", "reference-description", descriptionText);
 
-    const role = document.createElement("select");
-    ["reference_image", "first_frame", "last_frame"].forEach((value) => {
-      const option = element("option", "", value);
-      option.value = value;
-      option.selected = value === reference.role;
-      role.append(option);
-    });
-    role.setAttribute("aria-label", "图片用途");
-    role.addEventListener("change", () => {
-      updateReference(task.task_id, reference.asset_id, { role: role.value });
-    });
+    const role = element(
+      "div",
+      "reference-role",
+      reference.role === "first_frame"
+        ? "首帧"
+        : reference.role === "last_frame"
+          ? "尾帧"
+          : "普通参考图",
+    );
 
     const order = document.createElement("input");
     order.type = "number";
@@ -419,7 +437,7 @@
     replace.type = "button";
     replace.addEventListener("click", () => replaceInput.click());
     replaceInput.addEventListener("change", () => {
-      uploadReference(task, replaceInput, role.value, Number(order.value), reference.asset_id);
+      uploadReference(task, replaceInput, reference.role, Number(order.value), reference.asset_id);
     });
     const remove = element("button", "quiet-button", "删除");
     remove.type = "button";
@@ -433,6 +451,20 @@
     const section = element("section", "reference-section");
     const heading = element("div", "panel-heading");
     heading.append(element("h3", "", "参考图片"));
+    const referenceMode = task.reference_mode || "multi_reference";
+    const mode = document.createElement("select");
+    mode.setAttribute("aria-label", "参考模式");
+    [
+      ["multi_reference", "多参考模式"],
+      ["first_last_frame", "首尾帧模式"],
+    ].forEach(([value, label]) => {
+      const option = element("option", "", label);
+      option.value = value;
+      option.selected = value === referenceMode;
+      mode.append(option);
+    });
+    mode.addEventListener("change", () => updateReferenceMode(task.task_id, mode.value));
+    heading.append(mode);
     const save = element("button", "quiet-button", "保存用途与顺序");
     save.type = "button";
     save.addEventListener("click", () => patchReferences(task));
@@ -442,27 +474,31 @@
       .sort((a, b) => a.order - b.order)
       .forEach((reference) => list.append(referenceRow(task, reference)));
 
-    const upload = element("div", "upload-row");
-    const fileInput = document.createElement("input");
-    fileInput.type = "file";
-    fileInput.accept = "image/*";
-    const role = document.createElement("select");
-    ["reference_image", "first_frame", "last_frame"].forEach((value) => {
-      const option = element("option", "", value);
-      option.value = value;
-      role.append(option);
-    });
-    const order = document.createElement("input");
-    order.type = "number";
-    order.min = "1";
-    order.value = String(task.reference_images.length + 1);
-    const add = element("button", "secondary", "增添图片");
-    add.type = "button";
-    add.addEventListener("click", () => {
-      uploadReference(task, fileInput, role.value, Number(order.value));
-    });
-    upload.append(fileInput, role, order, add);
-    section.append(heading, list, upload);
+    const modeHint = element(
+      "p",
+      "mode-message",
+      referenceMode === "first_last_frame"
+        ? "首尾帧模式仅提交两张图片：首帧和尾帧。"
+        : "多参考模式会把所有图片作为普通参考图；首尾效果请在提示词中描述。",
+    );
+    section.append(heading, modeHint, list);
+    if (referenceMode === "multi_reference") {
+      const upload = element("div", "upload-row");
+      const fileInput = document.createElement("input");
+      fileInput.type = "file";
+      fileInput.accept = "image/*";
+      const order = document.createElement("input");
+      order.type = "number";
+      order.min = "1";
+      order.value = String(task.reference_images.length + 1);
+      const add = element("button", "secondary", "增添图片");
+      add.type = "button";
+      add.addEventListener("click", () => {
+        uploadReference(task, fileInput, "reference_image", Number(order.value));
+      });
+      upload.append(fileInput, order, add);
+      section.append(upload);
+    }
     return section;
   }
 
