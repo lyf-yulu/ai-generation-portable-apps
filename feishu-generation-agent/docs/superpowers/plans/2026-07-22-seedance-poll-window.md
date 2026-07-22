@@ -29,7 +29,7 @@
 - Produces: `Settings().provider_poll_max_attempts == 900`，且 `Settings().provider_poll_interval_seconds == 1.0`。
 - Preserves: 从环境变量读取这两个字段的既有 Pydantic Settings 行为。
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 def test_provider_polling_defaults_to_fifteen_minutes(monkeypatch):
@@ -40,25 +40,25 @@ def test_provider_polling_defaults_to_fifteen_minutes(monkeypatch):
     assert settings.provider_poll_max_attempts == 900
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `/Users/260413a/ai-generation-portable-apps/feishu-generation-agent/.venv/bin/python -m pytest tests/unit/test_config.py -q`
 
 Expected: FAIL because the current default is 120 attempts.
 
-- [ ] **Step 3: Implement the minimal setting change**
+- [x] **Step 3: Implement the minimal setting change**
 
 ```python
 provider_poll_max_attempts: int = Field(default=900, ge=1, le=10_000)
 ```
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
 Run: `/Users/260413a/ai-generation-portable-apps/feishu-generation-agent/.venv/bin/python -m pytest tests/unit/test_config.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/feishu_generation_agent/config.py tests/unit/test_config.py
@@ -71,22 +71,21 @@ git commit -m "fix(agent): extend Seedance polling window"
 
 - Modify: `docs/superpowers/plans/2026-07-22-seedance-poll-window.md`
 
-- [ ] **Step 1: Run the complete automated suite**
+- [x] **Step 1: Run the complete automated suite**
 
 Run: `/Users/260413a/ai-generation-portable-apps/feishu-generation-agent/.venv/bin/python -m pytest -q`
 
 Expected: all tests pass; the fixture's explicit 4-attempt setting keeps graph tests fast.
 
-- [ ] **Step 2: Verify the production process receives the default**
+- [x] **Step 2: Verify the production process receives the default**
 
 Run: `/Users/260413a/ai-generation-portable-apps/feishu-generation-agent/.venv/bin/python -c 'from feishu_generation_agent.config import Settings; print(Settings().provider_poll_max_attempts)'`
 
 Expected: `900`.
 
-- [ ] **Step 3: Commit the completed plan**
+- [x] **Step 3: Commit the completed plan**
 
 ```bash
 git add docs/superpowers/plans/2026-07-22-seedance-poll-window.md
 git commit -m "docs(agent): record poll window verification"
 ```
-
