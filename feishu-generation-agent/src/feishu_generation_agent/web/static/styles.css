@@ -122,6 +122,12 @@ button {
 .bitable-task-warning { margin: .28rem 0 0; color: #a24b12; font-size: .76rem; }
 .bitable-task a { color: var(--brand); font-size: .8rem; overflow-wrap: anywhere; }
 .bitable-empty { margin: 0; color: var(--muted); font-size: .82rem; }
+.recent-runs { margin-top: 1.1rem; border-top: 1px solid var(--line); padding-top: .85rem; }
+.recent-runs h3 { margin: 0 0 .55rem; font-size: .9rem; }
+.recent-run-list { display: grid; gap: .45rem; }
+.recent-run { display: flex; align-items: center; justify-content: space-between; gap: .7rem; padding: .6rem .7rem; border: 1px solid var(--line); border-radius: .55rem; background: #fcfdfb; }
+.recent-run-actions { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; }
+.recent-run-actions a { color: var(--brand); font-size: .8rem; }
 
 .workspace {
   display: grid;

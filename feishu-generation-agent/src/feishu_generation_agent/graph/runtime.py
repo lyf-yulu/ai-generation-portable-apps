@@ -1,4 +1,5 @@
 import asyncio
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -118,6 +119,70 @@ class GraphRuntime:
                 self._run_to_approval(run_id, thread_id, request),
                 name=f"approval-run-{run_id}",
             )
+        return run_id
+
+    async def clone_run_for_approval(
+        self,
+        source_run_id: str,
+        request: RequirementRequest,
+        *,
+        run_id: str,
+        thread_id: str,
+    ) -> str:
+        """Create an independent approval checkpoint from a prior run's draft."""
+        if self._closed:
+            raise RunConflict("运行时正在关闭")
+        async with self._start_lock:
+            source = await self.repository.get_run(source_run_id)
+            if source is None:
+                raise RunNotFound("原运行不存在")
+            if source["source_url"] != request.source_url:
+                raise RunConflict("重跑来源与原运行不一致")
+            existing = await self.repository.get_run(run_id)
+            if existing is not None:
+                raise RunConflict("重跑运行 ID 已存在")
+            snapshot = await self.graph.aget_state(self._config(source["thread_id"]))
+            source_state = dict(snapshot.values or {})
+            if not isinstance(source_state.get("draft_plan") or source_state.get("task_plan"), dict):
+                raise RunValidationError("原运行没有可重跑的审批计划")
+            approved_tasks = source_state.get("approved_tasks")
+            if not isinstance(approved_tasks, list) or not approved_tasks:
+                raise RunValidationError("原运行没有已批准任务")
+
+            state = deepcopy(source_state)
+            state.update(
+                run_id=run_id,
+                thread_id=thread_id,
+                source_url=request.source_url,
+                status="waiting_approval",
+                approval_decision=None,
+                approval_revision=None,
+                approved_tasks=deepcopy(approved_tasks),
+                execution_records=[],
+                artifacts=[],
+                delivery_record=None,
+                last_error=None,
+            )
+            state.pop("error", None)
+            await self.repository.create_run(
+                run_id, thread_id, request.source_url, status="created"
+            )
+            config = self._config(thread_id)
+            try:
+                await self.graph.aupdate_state(
+                    config, state, as_node="validate_plan"
+                )
+                result = await self.graph.ainvoke(None, config=config)
+            except Exception:
+                await self.repository.update_run_status(run_id, "failed")
+                raise RunConflict("重跑审批 checkpoint 初始化失败") from None
+            if not self._has_interrupt(result):
+                await self.repository.update_run_status(run_id, "failed")
+                raise RunConflict("重跑未进入等待审批状态")
+            await self.repository.append_event(
+                run_id, "clone_approved_plan", "completed", "Previous approved plan copied"
+            )
+            await self.repository.update_run_status(run_id, "waiting_approval")
         return run_id
 
     def _has_background(self, name: str) -> bool:

@@ -39,6 +39,10 @@
         点击扫描，读取需求附件可访问且进度符合扫描规则的记录。
       </p>
       <div id="bitable-task-list" class="bitable-task-list"></div>
+      <section class="recent-runs" aria-label="最近完成任务">
+        <h3>最近完成任务</h3>
+        <div id="recent-run-list" class="recent-run-list"></div>
+      </section>
     </section>
 
     <main class="workspace">
@@ -94,6 +98,8 @@
     <footer class="action-bar">
       <span id="polling-note">每 1 秒自动刷新运行状态</span>
       <div class="action-buttons">
+        <button id="next-task-button" type="button" class="secondary" disabled>开始下一任务</button>
+        <button id="rerun-button" type="button" class="secondary" disabled>重跑此任务</button>
         <button id="retry-delivery-button" type="button" class="secondary">仅重试交付</button>
         <button id="delete-run-button" type="button" class="quiet-button">删除本地运行</button>
         <button id="reject-button" type="button" class="secondary">退回重新规划</button>

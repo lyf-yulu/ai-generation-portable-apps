@@ -24,6 +24,7 @@ from feishu_generation_agent.bootstrap import (
     runtime_is_configured,
 )
 from feishu_generation_agent.config import Settings
+from feishu_generation_agent.domain.bitable import TableTaskStatus
 from feishu_generation_agent.domain.errors import AgentError, ErrorCategory
 from feishu_generation_agent.graph.nodes import GraphServices
 from feishu_generation_agent.graph.runtime import (
@@ -360,6 +361,34 @@ def create_app(
             for binding in bindings
         ]
 
+    @app.get("/api/bitable/recent-runs")
+    async def list_recent_bitable_runs(request: Request) -> list[dict]:
+        active = get_bitable_service(request)
+        try:
+            bindings = await active.recent_runs()
+        except Exception as exc:
+            raise_bitable_error(exc)
+        payload: list[dict] = []
+        for binding in bindings:
+            try:
+                result_table_url = await active.result_table_url(binding.run_id)
+            except AttributeError:
+                result_table_url = None
+            payload.append(
+                {
+                    "run_id": binding.run_id,
+                    "display_text": binding.display_text,
+                    "status": binding.status.value,
+                    "updated_at": binding.updated_at,
+                    "result_table_url": result_table_url,
+                    "rerunnable": binding.status in {
+                        TableTaskStatus.COMPLETED,
+                        TableTaskStatus.FAILED,
+                    },
+                }
+            )
+        return payload
+
     @app.post(
         "/api/bitable/tasks/{record_id}/claim",
         status_code=status.HTTP_202_ACCEPTED,
@@ -387,6 +416,18 @@ def create_app(
         except Exception as exc:
             raise_bitable_error(exc)
         return BitableRetryResponse(run_id=run_id)
+
+    @app.post(
+        "/api/bitable/runs/{run_id}/rerun",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def rerun_bitable_run(run_id: str, request: Request) -> BitableClaimResponse:
+        active = get_bitable_service(request)
+        try:
+            new_run_id = await active.rerun(run_id)
+        except Exception as exc:
+            raise_bitable_error(exc)
+        return BitableClaimResponse(run_id=new_run_id)
 
     @app.post("/api/runs", status_code=status.HTTP_202_ACCEPTED)
     async def create_run(payload: CreateRunRequest, request: Request) -> dict[str, str]:

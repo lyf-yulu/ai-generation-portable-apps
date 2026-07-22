@@ -16,6 +16,7 @@
       scan: { phase: "idle", error: "" },
       claim: { phase: "idle", recordId: null, runId: null, error: "" },
       deliveryRetry: { phase: "idle", runId: null, error: "" },
+      recentRuns: [],
     };
   }
 
@@ -90,6 +91,21 @@
     };
   }
 
+  function recentSucceeded(state, recentRuns) {
+    return {
+      ...state,
+      recentRuns: Array.isArray(recentRuns) ? JSON.parse(JSON.stringify(recentRuns)) : [],
+    };
+  }
+
+  function resetRunContext(state) {
+    return {
+      ...state,
+      claim: { phase: "idle", recordId: null, runId: null, error: "" },
+      deliveryRetry: { phase: "idle", runId: null, error: "" },
+    };
+  }
+
   return {
     createState,
     scanStarted,
@@ -101,5 +117,7 @@
     retryStarted,
     retrySucceeded,
     retryFailed,
+    recentSucceeded,
+    resetRunContext,
   };
 });

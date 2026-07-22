@@ -3,6 +3,7 @@ from uuid import uuid4
 
 from feishu_generation_agent.domain.bitable import BitableLocation, TableTaskStatus
 from feishu_generation_agent.domain.document import RequirementRequest
+from feishu_generation_agent.domain.production_bitable import ProductionTaskSummary
 from feishu_generation_agent.graph.runtime import RunConflict, RunValidationError
 from feishu_generation_agent.storage.production_tasks import ProductionTaskStore
 
@@ -77,6 +78,56 @@ class ProductionBitableService:
     async def active_runs(self):
         location = await self._prepared_location()
         return await self._store.list_active(location.app_token or "", location.table_id)
+
+    async def recent_runs(self):
+        location = await self._prepared_location()
+        return await self._store.list_recent(location.app_token or "", location.table_id)
+
+    async def result_table_url(self, run_id: str) -> str | None:
+        binding = await self._store.get_by_run(run_id)
+        if binding is None or binding.maker_open_id is None:
+            return None
+        target = await self._store.get_result_target(binding.maker_open_id)
+        return target.url if target is not None else None
+
+    async def rerun(self, run_id: str) -> str:
+        source = await self._store.get_by_run(run_id)
+        if source is None or source.status not in {
+            TableTaskStatus.COMPLETED,
+            TableTaskStatus.FAILED,
+        }:
+            raise RunConflict("只有已经结束的多维表格任务可以重跑")
+        task = ProductionTaskSummary(
+            record_id=source.record_id,
+            display_text=source.display_text,
+            source_url=source.source_url,
+            progress=source.progress,
+            maker_open_id=source.maker_open_id,
+            maker_name=source.maker_name,
+            snapshot=source.snapshot,
+        )
+        rerun = await self._store.claim(
+            self._location,
+            task,
+            run_id=str(uuid4()),
+            thread_id=str(uuid4()),
+        )
+        try:
+            return await self._runtime.clone_run_for_approval(
+                run_id,
+                RequirementRequest(
+                    source_url=rerun.source_url, trigger_type="production_bitable"
+                ),
+                run_id=rerun.run_id,
+                thread_id=rerun.thread_id,
+            )
+        except Exception:
+            await self._store.release(
+                rerun.run_id,
+                status=TableTaskStatus.FAILED,
+                last_error="重跑初始化失败",
+            )
+            raise
 
     async def sync_once(self, run_id: str):
         binding = await self._store.get_by_run(run_id)

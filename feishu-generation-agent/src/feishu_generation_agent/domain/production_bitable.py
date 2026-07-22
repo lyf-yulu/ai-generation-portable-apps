@@ -55,6 +55,8 @@ class ProductionBinding(BaseModel):
     thread_id: str
     status: TableTaskStatus
     last_error: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
 class ResultTableTarget(BaseModel):

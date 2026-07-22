@@ -211,7 +211,7 @@ class FakeApprovalGraph:
         as_node: str | None = None,
     ) -> None:
         del as_node
-        self.states[self._thread_id(config)].update(values)
+        self.states.setdefault(self._thread_id(config), {}).update(values)
 
 
 @asynccontextmanager
@@ -263,6 +263,99 @@ async def _wait_for_status(
             return response.json()
         await asyncio.sleep(0.01)
     raise AssertionError(f"run did not reach {expected}")
+
+
+async def test_clone_run_for_approval_reuses_approved_draft_without_generation(
+    tmp_path: Path,
+) -> None:
+    async with _environment(tmp_path) as (client, runtime, graph, _repository):
+        created = await client.post(
+            "/api/runs", json={"source_url": "https://tenant.feishu.cn/docx/source"}
+        )
+        original_run_id = created.json()["run_id"]
+        original = await _wait_for_status(client, original_run_id, "waiting_approval")
+        graph.states[original["thread_id"]]["approved_tasks"] = [
+            original["approval"]["tasks"][0]
+        ]
+
+        cloned_run_id = await runtime.clone_run_for_approval(
+            original_run_id,
+            RequirementRequest(source_url=original["source_url"]),
+            run_id="rerun-1",
+            thread_id="rerun-thread-1",
+        )
+        cloned = await _wait_for_status(client, cloned_run_id, "waiting_approval")
+
+    assert cloned_run_id == "rerun-1"
+    assert cloned["approval"]["tasks"] == original["approval"]["tasks"]
+    assert cloned["approval"]["selected_task_ids"] == ["task-1"]
+    assert graph.resume_calls == 0
+
+
+async def test_clone_run_for_approval_requires_a_previously_approved_task(
+    tmp_path: Path,
+) -> None:
+    async with _environment(tmp_path) as (client, runtime, _graph, _repository):
+        created = await client.post(
+            "/api/runs", json={"source_url": "https://tenant.feishu.cn/docx/source"}
+        )
+        original_run_id = created.json()["run_id"]
+        original = await _wait_for_status(client, original_run_id, "waiting_approval")
+
+        with pytest.raises(Exception, match="原运行没有已批准任务"):
+            await runtime.clone_run_for_approval(
+                original_run_id,
+                RequirementRequest(source_url=original["source_url"]),
+                run_id="rerun-without-approval",
+                thread_id="rerun-without-approval-thread",
+            )
+
+
+async def test_clone_run_for_approval_initializes_a_real_langgraph_checkpoint(
+    fake_services: GraphServices,
+) -> None:
+    graph = build_graph(fake_services, InMemorySaver())
+    runtime = GraphRuntime(
+        graph=graph,
+        repository=fake_services.repository,
+        file_store=fake_services.file_store,
+        settings=fake_services.settings,
+        delivery_writer=fake_services.delivery_writer,
+    )
+    try:
+        original_run_id = await runtime.start_run(
+            RequirementRequest(source_url="https://tenant.feishu.cn/docx/clone-source"),
+            run_id="clone-original",
+            thread_id="clone-original-thread",
+        )
+        for _ in range(100):
+            original = await runtime.get_run_view(original_run_id)
+            if original["status"] == "waiting_approval":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("original run did not reach approval")
+        await graph.aupdate_state(
+            {"configurable": {"thread_id": original["thread_id"]}},
+            {"approved_tasks": [original["approval"]["tasks"][0]]},
+            as_node="validate_plan",
+        )
+
+        cloned_run_id = await runtime.clone_run_for_approval(
+            original_run_id,
+            RequirementRequest(source_url="https://tenant.feishu.cn/docx/clone-source"),
+            run_id="clone-real",
+            thread_id="clone-real-thread",
+        )
+        cloned = await runtime.get_run_view(cloned_run_id)
+    finally:
+        await runtime.close()
+
+    assert cloned["status"] == "waiting_approval"
+    assert cloned["approval"]["tasks"] == original["approval"]["tasks"]
+    assert fake_services.planner.plan_calls == 1
+    assert fake_services.image_generator.submit_calls == 0
+    assert fake_services.video_generator.submit_calls == 0
 
 
 def _png_bytes(color: tuple[int, int, int] = (40, 110, 210)) -> bytes:

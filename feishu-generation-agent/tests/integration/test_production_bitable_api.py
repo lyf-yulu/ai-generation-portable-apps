@@ -3,6 +3,7 @@ from pathlib import Path
 import httpx
 
 from feishu_generation_agent.config import Settings
+from feishu_generation_agent.domain.bitable import TableTaskStatus
 from feishu_generation_agent.domain.production_bitable import (
     ProductionSourceSnapshot,
     ProductionTaskSummary,
@@ -31,6 +32,9 @@ class _Runtime:
 
 
 class _ProductionService:
+    def __init__(self) -> None:
+        self.rerun_calls: list[str] = []
+
     async def scan(self):
         return [
             ProductionTaskSummary(
@@ -52,6 +56,24 @@ class _ProductionService:
     async def validate_approval(self, run_id: str) -> None:
         assert run_id == "run-no-maker"
         raise RunValidationError("缺少需求制作人；请先在生产表补齐后再批准")
+
+    async def recent_runs(self):
+        from types import SimpleNamespace
+
+        return [
+            SimpleNamespace(
+                run_id="run-old", display_text="需求 A", status=TableTaskStatus.COMPLETED,
+                updated_at="2026-07-22T12:00:00+00:00",
+            )
+        ]
+
+    async def rerun(self, run_id: str) -> str:
+        self.rerun_calls.append(run_id)
+        return "run-new"
+
+    async def result_table_url(self, run_id: str) -> str | None:
+        assert run_id == "run-old"
+        return "https://tenant.feishu.cn/base/result-table"
 
     async def close(self) -> None:
         pass
@@ -80,3 +102,23 @@ async def test_scan_and_missing_maker_approval_gate(tmp_path) -> None:
     assert rejected.status_code == 422
     assert "缺少需求制作人" in rejected.json()["detail"]
     assert runtime.resume_calls == []
+
+
+async def test_recent_runs_and_rerun_endpoints(tmp_path) -> None:
+    runtime = _Runtime(tmp_path)
+    production = _ProductionService()
+    app = create_app(runtime=runtime, bitable_service=production)
+    transport = httpx.ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app), httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        recent = await client.get("/api/bitable/recent-runs")
+        rerun = await client.post("/api/bitable/runs/run-old/rerun")
+
+    assert recent.status_code == 200
+    assert recent.json()[0]["run_id"] == "run-old"
+    assert recent.json()[0]["rerunnable"] is True
+    assert rerun.status_code == 202
+    assert rerun.json() == {"run_id": "run-new"}
+    assert production.rerun_calls == ["run-old"]

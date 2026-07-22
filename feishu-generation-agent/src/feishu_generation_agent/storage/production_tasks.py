@@ -34,6 +34,25 @@ CREATE TABLE IF NOT EXISTS production_tasks (
   updated_at TEXT NOT NULL,
   PRIMARY KEY (source_app_token, source_table_id, source_record_id)
 );
+CREATE TABLE IF NOT EXISTS production_task_history (
+  source_app_token TEXT NOT NULL,
+  source_table_id TEXT NOT NULL,
+  source_record_id TEXT NOT NULL,
+  source_location_json TEXT NOT NULL,
+  source_url TEXT NOT NULL,
+  display_text TEXT NOT NULL,
+  progress TEXT NOT NULL,
+  maker_open_id TEXT,
+  maker_name TEXT,
+  snapshot_json TEXT NOT NULL,
+  run_id TEXT NOT NULL PRIMARY KEY,
+  thread_id TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL,
+  last_error TEXT,
+  active INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS maker_result_tables (
   maker_open_id TEXT PRIMARY KEY,
   maker_name TEXT NOT NULL,
@@ -95,6 +114,14 @@ class ProductionTaskStore:
                 await cursor.close()
                 if existing is not None and existing["active"] == 1:
                     raise ProductionTaskAlreadyClaimed("生产表任务已被领取")
+                if existing is not None:
+                    await self._connection.execute(
+                        """INSERT OR IGNORE INTO production_task_history
+                        SELECT * FROM production_tasks
+                        WHERE source_app_token = ? AND source_table_id = ?
+                        AND source_record_id = ?""",
+                        (app_token, location.table_id, task.record_id),
+                    )
                 payload = (
                     json.dumps(location.model_dump(mode="json"), ensure_ascii=False),
                     task.source_url,
@@ -148,6 +175,26 @@ class ProductionTaskStore:
                 WHERE source_app_token = ? AND source_table_id = ? AND active = 1
                 ORDER BY created_at ASC""",
                 (app_token, table_id),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [_binding_from_row(row) for row in rows]
+
+    async def list_recent(
+        self, app_token: str, table_id: str, *, limit: int = 10
+    ) -> list[ProductionBinding]:
+        if limit < 1:
+            return []
+        async with self._lock:
+            cursor = await self._connection.execute(
+                """SELECT * FROM (
+                    SELECT * FROM production_tasks
+                    WHERE source_app_token = ? AND source_table_id = ? AND active = 0
+                    UNION ALL
+                    SELECT * FROM production_task_history
+                    WHERE source_app_token = ? AND source_table_id = ? AND active = 0
+                ) ORDER BY updated_at DESC LIMIT ?""",
+                (app_token, table_id, app_token, table_id, limit),
             )
             rows = await cursor.fetchall()
             await cursor.close()
@@ -246,6 +293,12 @@ class ProductionTaskStore:
         )
         row = await cursor.fetchone()
         await cursor.close()
+        if row is None:
+            cursor = await self._connection.execute(
+                "SELECT * FROM production_task_history WHERE run_id = ?", (run_id,)
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
         return _binding_from_row(row) if row is not None else None
 
     async def _get_delivery_locked(self, run_id: str) -> ProductionDelivery:
@@ -266,6 +319,13 @@ class ProductionTaskStore:
                 cursor = await self._connection.execute(statement, parameters)
                 updated = cursor.rowcount == 1
                 await cursor.close()
+                if not updated:
+                    cursor = await self._connection.execute(
+                        statement.replace("production_tasks", "production_task_history"),
+                        parameters,
+                    )
+                    updated = cursor.rowcount == 1
+                    await cursor.close()
                 if not updated:
                     raise KeyError(f"unknown run_id: {run_id}")
                 binding = await self._get_by_run_locked(run_id)
@@ -291,7 +351,8 @@ def _binding_from_row(row: aiosqlite.Row) -> ProductionBinding:
         maker_open_id=row["maker_open_id"], maker_name=row["maker_name"],
         snapshot=json.loads(row["snapshot_json"]), run_id=row["run_id"],
         thread_id=row["thread_id"], status=TableTaskStatus(row["status"]),
-        last_error=row["last_error"],
+        last_error=row["last_error"], created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
 
 

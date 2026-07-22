@@ -11,6 +11,7 @@
     view: null,
     busy: false,
     runMode: null,
+    pollTimer: null,
     modes: { bitable: false, legacy_delivery: false },
     bitable: BitableState.createState(),
     review: ReviewState.createReviewState(),
@@ -30,6 +31,16 @@
   const scanBitableButton = byId("scan-bitable-button");
   const bitableTaskList = byId("bitable-task-list");
   const bitableStatus = byId("bitable-status");
+  const recentRunList = byId("recent-run-list");
+  const nextTaskButton = byId("next-task-button");
+  const rerunButton = byId("rerun-button");
+  const pollingNote = byId("polling-note");
+  const TERMINAL_RUN_STATUSES = new Set([
+    "succeeded", "completed_with_errors", "failed", "cancelled", "delivery_failed",
+  ]);
+  const RERUNNABLE_RUN_STATUSES = new Set([
+    "succeeded", "completed_with_errors", "failed", "cancelled",
+  ]);
 
   function element(tag, className, text) {
     const node = document.createElement(tag);
@@ -84,6 +95,17 @@
     updateActionAvailability();
   }
 
+  function stopPolling() {
+    if (state.pollTimer !== null) globalThis.clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+
+  function startPolling() {
+    stopPolling();
+    if (!state.runId || TERMINAL_RUN_STATUSES.has(state.view?.status)) return;
+    state.pollTimer = globalThis.setInterval(() => poll(false), 1000);
+  }
+
   function renderBitableTasks() {
     const scan = state.bitable.scan;
     if (scan.phase === "loading") bitableStatus.textContent = "正在读取多维表格…";
@@ -131,6 +153,54 @@
       nodes.push(element("p", "bitable-empty", "没有可领取任务。"));
     }
     bitableTaskList.replaceChildren(...nodes);
+    renderRecentRuns();
+  }
+
+  function renderRecentRuns() {
+    const runs = state.bitable.recentRuns || [];
+    const nodes = runs.map((run) => {
+      const row = element("article", "recent-run");
+      const details = element("div", "");
+      details.append(
+        element("strong", "", run.display_text || run.run_id),
+        element("p", "bitable-task-meta", `状态：${run.status || "—"}`),
+      );
+      const actions = element("div", "recent-run-actions");
+      const view = element("button", "quiet-button", "查看详情");
+      view.type = "button";
+      view.disabled = state.busy;
+      view.addEventListener("click", () => viewRecentRun(run.run_id));
+      actions.append(view);
+      if (run.result_table_url) {
+        const link = element("a", "", "结果表");
+        link.href = run.result_table_url;
+        link.target = "_blank";
+        link.rel = "noreferrer";
+        actions.append(link);
+      }
+      if (run.rerunnable) {
+        const rerun = element("button", "quiet-button", "重跑");
+        rerun.type = "button";
+        rerun.disabled = state.busy;
+        rerun.addEventListener("click", () => rerunBitableTask(run.run_id));
+        actions.append(rerun);
+      }
+      row.append(details, actions);
+      return row;
+    });
+    if (!nodes.length) nodes.push(element("p", "bitable-empty", "暂无已完成任务。"));
+    recentRunList.replaceChildren(...nodes);
+  }
+
+  async function loadRecentRuns() {
+    if (!state.modes.bitable) return;
+    try {
+      const runs = await api("/api/bitable/recent-runs");
+      state.bitable = BitableState.recentSucceeded(state.bitable, runs);
+      renderRecentRuns();
+    } catch (error) {
+      showError(error);
+    }
   }
 
   async function scanBitableTasks() {
@@ -167,6 +237,7 @@
       state.runMode = "bitable";
       state.review = ReviewState.createReviewState();
       await poll(true);
+      startPolling();
       document.querySelector(".workspace")?.scrollIntoView({ behavior: "smooth" });
     } catch (error) {
       state.bitable = error.status === 409
@@ -199,6 +270,7 @@
       message.hidden = false;
     }
     if (state.modes.bitable && !state.runId) {
+      await loadRecentRuns();
       try {
         const activeRuns = await api("/api/bitable/active-runs");
         const latest = Array.isArray(activeRuns) ? activeRuns.at(-1) : null;
@@ -207,6 +279,7 @@
           state.runMode = "bitable";
           state.review = ReviewState.createReviewState();
           await poll(true);
+          startPolling();
           bitableStatus.textContent = `已恢复进行中任务：${latest.display_text || latest.run_id}`;
           document.querySelector(".workspace")?.scrollIntoView({ behavior: "smooth" });
         }
@@ -223,6 +296,11 @@
     cancelButton.disabled = state.busy || !canReview;
     approveButton.disabled = state.busy || !ReviewState.canApprove(state.review);
     retryDeliveryButton.disabled = state.busy || state.view?.status !== "delivery_failed";
+    const terminal = TERMINAL_RUN_STATUSES.has(state.view?.status);
+    nextTaskButton.disabled = state.busy || !terminal;
+    rerunButton.disabled = state.busy
+      || state.runMode !== "bitable"
+      || !RERUNNABLE_RUN_STATUSES.has(state.view?.status);
     const deletable = [
       "waiting_approval", "succeeded", "completed_with_errors",
       "delivery_failed", "failed", "cancelled",
@@ -627,8 +705,79 @@
         ? ReviewState.mergeServerView(ReviewState.createReviewState(), serverView)
         : ReviewState.mergeServerView(state.review, serverView);
       render(ReviewState.draftView(state.review));
+      if (TERMINAL_RUN_STATUSES.has(serverView.status)) {
+        stopPolling();
+        pollingNote.textContent = "任务已结束，可开始下一任务或重跑。";
+        await loadRecentRuns();
+      } else {
+        pollingNote.textContent = "每 1 秒自动刷新运行状态";
+      }
     } catch (error) {
       showError(error);
+    }
+  }
+
+  async function viewRecentRun(runId) {
+    if (state.busy) return;
+    stopPolling();
+    setBusy(true);
+    clearError();
+    try {
+      state.runId = runId;
+      state.runMode = "bitable";
+      state.review = ReviewState.createReviewState();
+      await poll(true);
+      document.querySelector(".workspace")?.scrollIntoView({ behavior: "smooth" });
+    } catch (error) {
+      showError(error);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resetForNextTask() {
+    stopPolling();
+    state.runId = null;
+    state.runMode = null;
+    state.view = null;
+    state.review = ReviewState.createReviewState();
+    state.bitable = BitableState.resetRunContext(state.bitable);
+    byId("status-badge").textContent = "尚未创建";
+    byId("run-status").textContent = "—";
+    byId("thread-id").textContent = "—";
+    byId("current-node").textContent = "—";
+    byId("run-duration").textContent = "—";
+    byId("document-title").textContent = "等待选择多维表格任务";
+    byId("document-summary").textContent = "";
+    byId("delivery-target").hidden = true;
+    byId("event-list").replaceChildren();
+    taskList.replaceChildren();
+    pollingNote.textContent = "请选择下一条任务开始分析";
+    updateActionAvailability();
+    await scanBitableTasks();
+    await loadRecentRuns();
+  }
+
+  async function rerunBitableTask(runId = state.runId) {
+    if (!runId || state.busy) return;
+    setBusy(true);
+    clearError();
+    try {
+      const created = await api(`/api/bitable/runs/${encodeURIComponent(runId)}/rerun`, {
+        method: "POST",
+      });
+      state.runId = created.run_id;
+      state.runMode = "bitable";
+      state.review = ReviewState.createReviewState();
+      await poll(true);
+      startPolling();
+      document.querySelector(".workspace")?.scrollIntoView({ behavior: "smooth" });
+    } catch (error) {
+      showError(error);
+      await loadRecentRuns();
+    } finally {
+      setBusy(false);
+      renderRecentRuns();
     }
   }
 
@@ -691,6 +840,8 @@
   byId("reject-button").addEventListener("click", () => submitDecision("reject"));
   byId("cancel-button").addEventListener("click", () => submitDecision("cancel"));
   byId("approve-button").addEventListener("click", () => submitDecision("approve"));
+  nextTaskButton.addEventListener("click", resetForNextTask);
+  rerunButton.addEventListener("click", () => rerunBitableTask());
   retryDeliveryButton.addEventListener("click", async () => {
     if (!state.runId || state.busy) return;
     const url = state.runMode === "bitable"
@@ -736,7 +887,6 @@
     render(ReviewState.draftView(state.review));
   });
   scanBitableButton.addEventListener("click", scanBitableTasks);
-  setInterval(() => poll(false), 1000);
   updateActionAvailability();
   configureModes();
 })();

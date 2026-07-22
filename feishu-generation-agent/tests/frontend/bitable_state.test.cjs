@@ -86,3 +86,17 @@ test("production task keeps delivery block state through a scan", () => {
   assert.equal(state.tasks[0].deliverable, false);
   assert.equal(state.tasks[0].delivery_block_reason, "缺少需求制作人");
 });
+
+test("recent runs survive resetting the active task context", () => {
+  let state = BitableState.createState();
+  state = BitableState.claimStarted(state, "rec-1");
+  state = BitableState.claimSucceeded(state, "run-active");
+  state = BitableState.recentSucceeded(state, [
+    { run_id: "run-old", status: "succeeded" },
+  ]);
+  state = BitableState.resetRunContext(state);
+
+  assert.equal(state.claim.runId, null);
+  assert.equal(state.claim.phase, "idle");
+  assert.deepEqual(state.recentRuns, [{ run_id: "run-old", status: "succeeded" }]);
+});
