@@ -30,7 +30,7 @@
 - Produces: `ReferenceMode = Literal["multi_reference", "first_last_frame"]` 及 `GenerationTask.reference_mode`。
 - Produces: 旧的混用角色计划被规范成 `multi_reference`，所有图片改为 `reference_image`，提示词保留开场或结尾意图。
 
-- [ ] **Step 1: Write the failing domain tests**
+- [x] **Step 1: Write the failing domain tests**
 
 ```python
 def test_video_task_normalizes_mixed_frames_to_multi_reference():
@@ -54,13 +54,13 @@ def test_video_task_keeps_exact_first_and_last_frames():
     assert task.reference_mode == "first_last_frame"
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `/Users/260413a/ai-generation-portable-apps/feishu-generation-agent/.venv/bin/python -m pytest tests/unit/test_domain.py -q`
 
 Expected: FAIL because `reference_mode` does not exist and mixed roles remain unchanged.
 
-- [ ] **Step 3: Implement the minimal domain rule**
+- [x] **Step 3: Implement the minimal domain rule**
 
 ```python
 ReferenceMode = Literal["multi_reference", "first_last_frame"]
@@ -75,13 +75,13 @@ class GenerationTask(BaseModel):
         # mixed legacy input -> all reference_image plus a Chinese prompt constraint
 ```
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
 Run: `/Users/260413a/ai-generation-portable-apps/feishu-generation-agent/.venv/bin/python -m pytest tests/unit/test_domain.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/feishu_generation_agent/domain/plan.py tests/unit/test_domain.py
@@ -104,7 +104,7 @@ git commit -m "feat(agent): normalize Seedance reference modes"
 - Consumes: `GenerationTask.reference_mode` from Task 1.
 - Produces: `validate_plan()` 的稳定模式错误；审批 API 保留 `RunValidationError` 的中文原因。
 
-- [ ] **Step 1: Write failing validation tests**
+- [x] **Step 1: Write failing validation tests**
 
 ```python
 def test_validator_rejects_frame_mode_without_two_frame_roles(narrative_document):
@@ -125,13 +125,13 @@ def test_runtime_reports_mixed_reference_modes_in_chinese():
         )
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `/Users/260413a/ai-generation-portable-apps/feishu-generation-agent/.venv/bin/python -m pytest tests/unit/test_planner.py tests/graph/test_execution_graph.py tests/unit/test_seedance.py -q`
 
 Expected: FAIL because mode is not checked consistently and approval replaces detailed errors with “审批任务无效”.
 
-- [ ] **Step 3: Implement the shared rules**
+- [x] **Step 3: Implement the shared rules**
 
 ```python
 # planner system prompt: exactly two endpoint images and no extras -> first_last_frame;
@@ -141,13 +141,13 @@ Expected: FAIL because mode is not checked consistently and approval replaces de
 # _validate_decision: except RunValidationError: raise
 ```
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
 Run: `/Users/260413a/ai-generation-portable-apps/feishu-generation-agent/.venv/bin/python -m pytest tests/unit/test_planner.py tests/graph/test_execution_graph.py tests/unit/test_seedance.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/feishu_generation_agent/integrations/planner.py src/feishu_generation_agent/graph/runtime.py src/feishu_generation_agent/integrations/seedance.py tests/unit/test_planner.py tests/graph/test_execution_graph.py tests/unit/test_seedance.py
@@ -169,7 +169,7 @@ git commit -m "fix(agent): validate Seedance reference modes"
 - Produces: `ReviewState.setReferenceMode(state, taskId, mode)`。
 - Produces: PATCH `/references` 接收并持久化 `reference_mode`。
 
-- [ ] **Step 1: Write failing browser-state and API tests**
+- [x] **Step 1: Write failing browser-state and API tests**
 
 ```javascript
 test("switching to multi-reference converts every image", () => {
@@ -198,13 +198,13 @@ async def test_reference_patch_persists_multi_reference_mode(tmp_path: Path):
         assert (await client.get(f"/api/runs/{run_id}")).json()["approval"]["tasks"][0]["reference_mode"] == "multi_reference"
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `node --test tests/frontend/review_state.test.cjs && /Users/260413a/ai-generation-portable-apps/feishu-generation-agent/.venv/bin/python -m pytest tests/integration/test_api.py -q`
 
 Expected: FAIL because mode selection and request field do not yet exist.
 
-- [ ] **Step 3: Implement mode control**
+- [x] **Step 3: Implement mode control**
 
 ```javascript
 // Render a “参考模式” select with “多参考模式” and “首尾帧模式”.
@@ -219,13 +219,13 @@ class ReferenceListRequest(BaseModel):
     reference_mode: ReferenceMode | None = None
 ```
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
 Run: `node --test tests/frontend/review_state.test.cjs && /Users/260413a/ai-generation-portable-apps/feishu-generation-agent/.venv/bin/python -m pytest tests/integration/test_api.py -q`
 
 Expected: PASS; mode changes survive save/reload and invalid frame counts return a concrete 422.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/feishu_generation_agent/web/static/review-state.js src/feishu_generation_agent/web/static/app.js src/feishu_generation_agent/web/schemas.py src/feishu_generation_agent/web/app.py tests/frontend/review_state.test.cjs tests/integration/test_api.py
@@ -238,19 +238,19 @@ git commit -m "feat(agent): add approval reference mode control"
 
 - Modify: `docs/superpowers/specs/2026-07-22-seedance-reference-modes-design.md` only if delivered behavior differs from the approved specification.
 
-- [ ] **Step 1: Run complete automated checks**
+- [x] **Step 1: Run complete automated checks**
 
 Run: `/Users/260413a/ai-generation-portable-apps/feishu-generation-agent/.venv/bin/python -m pytest -q && node --test tests/frontend/review_state.test.cjs`
 
 Expected: Python and front-end suites pass.
 
-- [ ] **Step 2: Check the local CLI without contacting production**
+- [x] **Step 2: Check the local CLI without contacting production**
 
 Run: `/Users/260413a/ai-generation-portable-apps/feishu-generation-agent/.venv/bin/agent-smoke --help`
 
 Expected: help output only; do not write to the production Bitable or submit a real generation.
 
-- [ ] **Step 3: Commit the completed plan and any necessary documentation update**
+- [x] **Step 3: Commit the completed plan and any necessary documentation update**
 
 ```bash
 git add docs/superpowers/plans/2026-07-22-seedance-reference-modes.md docs/superpowers/specs/2026-07-22-seedance-reference-modes-design.md
