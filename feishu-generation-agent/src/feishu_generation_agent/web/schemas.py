@@ -8,6 +8,7 @@ from feishu_generation_agent.domain.plan import (
     ApprovalDecision,
     GenerationTask,
     ImageReference,
+    ReferenceMode,
 )
 from feishu_generation_agent.integrations.feishu_source import parse_feishu_url
 
@@ -65,6 +66,7 @@ class ReferenceListRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     references: list[ImageReference] = Field(min_length=1)
+    reference_mode: ReferenceMode | None = None
 
 
 class BitableClaimResponse(BaseModel):

@@ -184,7 +184,8 @@ button {
 .reference-row img { width: 84px; height: 64px; object-fit: cover; border-radius: .4rem; background: #edf1ee; }
 .reference-description { color: var(--muted); font-size: .76rem; line-height: 1.4; }
 .reference-actions { display: flex; flex-wrap: wrap; gap: .35rem; }
-.upload-row { display: grid; grid-template-columns: minmax(160px, 1fr) 130px 80px auto; gap: .55rem; margin-top: .7rem; }
+.reference-role { color: var(--muted); font-size: .82rem; font-weight: 700; }
+.upload-row { display: grid; grid-template-columns: minmax(160px, 1fr) 80px auto; gap: .55rem; margin-top: .7rem; }
 .feedback-box { margin-top: 1.25rem; }
 
 .action-bar {

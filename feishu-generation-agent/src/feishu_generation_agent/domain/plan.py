@@ -9,6 +9,9 @@ class TaskType(StrEnum):
     IMAGE_TO_VIDEO = "image_to_video"
 
 
+ReferenceMode = Literal["multi_reference", "first_last_frame"]
+
+
 class ImageReference(BaseModel):
     asset_id: str
     role: Literal["reference_image", "first_frame", "last_frame"]
@@ -31,6 +34,7 @@ class GenerationTask(BaseModel):
     prompt: str
     negative_constraints: list[str] = Field(default_factory=list)
     reference_images: list[ImageReference] = Field(min_length=1)
+    reference_mode: ReferenceMode | None = None
     aspect_ratio: str
     image_size: str | None = None
     duration: int | None = None
@@ -66,6 +70,9 @@ class GenerationTask(BaseModel):
                     raise ValueError(
                         f"{field_name} is not allowed for image_to_image"
                     )
+            if self.reference_mode not in {None, "multi_reference"}:
+                raise ValueError("image_to_image only supports multi_reference")
+            self.reference_mode = "multi_reference"
             return self
 
         if self.duration is None:
@@ -74,7 +81,52 @@ class GenerationTask(BaseModel):
             raise ValueError("resolution is required for image_to_video")
         if self.image_size is not None:
             raise ValueError("image_size is not allowed for image_to_video")
+        self._normalize_video_reference_mode()
         return self
+
+    def _normalize_video_reference_mode(self) -> None:
+        references = sorted(self.reference_images, key=lambda item: item.order)
+        roles = [reference.role for reference in references]
+        is_exact_frame_pair = roles == ["first_frame", "last_frame"]
+        if self.reference_mode == "first_last_frame":
+            if not is_exact_frame_pair:
+                raise ValueError(
+                    "first_last_frame requires exactly one first_frame and one last_frame"
+                )
+            return
+        if self.reference_mode == "multi_reference":
+            if any(role != "reference_image" for role in roles):
+                raise ValueError("multi_reference only accepts reference_image")
+            return
+        if is_exact_frame_pair:
+            self.reference_mode = "first_last_frame"
+            return
+
+        frame_orders = {
+            reference.role: reference.order
+            for reference in references
+            if reference.role in {"first_frame", "last_frame"}
+        }
+        if frame_orders:
+            constraints: list[str] = []
+            first_order = frame_orders.get("first_frame")
+            last_order = frame_orders.get("last_frame")
+            if first_order is not None:
+                constraints.append(f"第 {first_order} 张参考图定义开场状态")
+            if last_order is not None:
+                constraints.append(f"第 {last_order} 张参考图定义结尾状态")
+            constraint = "；".join(constraints) + "。"
+            if constraint not in self.prompt:
+                self.prompt = f"{self.prompt}\n{constraint}"
+            self.reference_images = [
+                ImageReference(
+                    asset_id=reference.asset_id,
+                    role="reference_image",
+                    order=reference.order,
+                )
+                for reference in self.reference_images
+            ]
+        self.reference_mode = "multi_reference"
 
 
 class TaskPlan(BaseModel):

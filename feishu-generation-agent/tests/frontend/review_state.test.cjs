@@ -210,3 +210,45 @@ test("reference revision changes conflict with dirty fields and discard removes 
     { asset_id: "asset-2", preview_url: "/asset-2" },
   ]);
 });
+
+test("switching to multi-reference converts every image role", () => {
+  let state = ReviewState.mergeServerView(ReviewState.createReviewState(), view());
+  state = ReviewState.patchTask(state, "task-1", {
+    reference_images: [
+      { asset_id: "asset-1", role: "first_frame", order: 1 },
+      { asset_id: "asset-2", role: "last_frame", order: 2 },
+    ],
+  });
+
+  state = ReviewState.setReferenceMode(state, "task-1", "multi_reference");
+
+  const taskOne = ReviewState.draftView(state).approval.tasks[0];
+  assert.equal(taskOne.reference_mode, "multi_reference");
+  assert.deepEqual(
+    taskOne.reference_images.map((reference) => reference.role),
+    ["reference_image", "reference_image"],
+  );
+});
+
+test("switching to frame mode requires exactly two images and assigns endpoints", () => {
+  let state = ReviewState.mergeServerView(ReviewState.createReviewState(), view());
+  assert.throws(
+    () => ReviewState.setReferenceMode(state, "task-1", "first_last_frame"),
+    /恰好两张/,
+  );
+
+  state = ReviewState.patchTask(state, "task-1", {
+    reference_images: [
+      { asset_id: "asset-1", role: "reference_image", order: 1 },
+      { asset_id: "asset-2", role: "reference_image", order: 2 },
+    ],
+  });
+  state = ReviewState.setReferenceMode(state, "task-1", "first_last_frame");
+
+  const taskOne = ReviewState.draftView(state).approval.tasks[0];
+  assert.equal(taskOne.reference_mode, "first_last_frame");
+  assert.deepEqual(
+    taskOne.reference_images.map((reference) => reference.role),
+    ["first_frame", "last_frame"],
+  );
+});

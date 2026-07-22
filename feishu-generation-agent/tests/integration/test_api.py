@@ -620,7 +620,7 @@ async def test_replace_and_unlink_reference_keep_content_file(tmp_path: Path):
             f"/api/runs/{run_id}/references",
             data={
                 "task_id": "task-1",
-                "role": "first_frame",
+                "role": "reference_image",
                 "order": "1",
                 "replaces_asset_id": "asset-1",
             },
@@ -630,7 +630,11 @@ async def test_replace_and_unlink_reference_keep_content_file(tmp_path: Path):
         replacement_id = replaced.json()["asset_id"]
         added = await client.post(
             f"/api/runs/{run_id}/references",
-            data={"task_id": "task-1", "role": "last_frame", "order": "2"},
+            data={
+                "task_id": "task-1",
+                "role": "reference_image",
+                "order": "2",
+            },
             files={"file": ("last.png", _png_bytes((220, 80, 40)), "image/png")},
         )
         assert added.status_code == 201
@@ -658,7 +662,7 @@ async def test_replace_and_unlink_reference_keep_content_file(tmp_path: Path):
         assert retained_content.status_code == 200
         after = (await client.get(f"/api/runs/{run_id}")).json()
         assert after["approval"]["tasks"][0]["reference_images"] == [
-            {"asset_id": replacement_id, "role": "first_frame", "order": 1}
+            {"asset_id": replacement_id, "role": "reference_image", "order": 1}
         ]
 
 
@@ -814,7 +818,8 @@ async def test_reference_patch_updates_role_and_order(tmp_path: Path):
                 "references": [
                     {"asset_id": asset_id, "role": "first_frame", "order": 1},
                     {"asset_id": "asset-1", "role": "last_frame", "order": 2},
-                ]
+                ],
+                "reference_mode": "first_last_frame",
             },
         )
         assert updated.status_code == 200
@@ -823,6 +828,32 @@ async def test_reference_patch_updates_role_and_order(tmp_path: Path):
             {"asset_id": asset_id, "role": "first_frame", "order": 1},
             {"asset_id": "asset-1", "role": "last_frame", "order": 2},
         ]
+
+
+async def test_reference_patch_persists_multi_reference_mode(tmp_path: Path):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime, graph, repository
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/multi-mode"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+
+        updated = await client.patch(
+            f"/api/runs/{run_id}/tasks/task-1/references",
+            json={
+                "references": [
+                    {"asset_id": "asset-1", "role": "reference_image", "order": 1}
+                ],
+                "reference_mode": "multi_reference",
+            },
+        )
+
+        assert updated.status_code == 200
+        view = (await client.get(f"/api/runs/{run_id}")).json()
+        assert view["approval"]["tasks"][0]["reference_mode"] == "multi_reference"
 
 
 async def test_unlink_last_reference_and_oversized_upload_are_rejected(

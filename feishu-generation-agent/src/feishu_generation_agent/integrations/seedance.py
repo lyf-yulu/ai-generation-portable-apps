@@ -638,6 +638,22 @@ class SeedanceVideoGenerator:
         self, task: GenerationTask, references: list[Any]
     ) -> None:
         roles = [reference.role for reference in references]
+        if task.reference_mode == "first_last_frame":
+            if roles != ["first_frame", "last_frame"]:
+                raise self._validation_error(
+                    task.task_id,
+                    "首尾帧模式必须且只能按顺序指定一张首帧和一张尾帧",
+                    "cause=invalid_first_last_frame_mode",
+                )
+            return
+        if task.reference_mode == "multi_reference":
+            if any(role != "reference_image" for role in roles):
+                raise self._validation_error(
+                    task.task_id,
+                    "多参考模式只能使用普通参考图",
+                    "cause=invalid_multi_reference_mode",
+                )
+            return
         if "reference_image" in roles and any(
             role in {"first_frame", "last_frame"} for role in roles
         ):
