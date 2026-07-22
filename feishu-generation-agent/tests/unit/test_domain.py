@@ -105,6 +105,37 @@ def test_reference_role_normalizes_saved_planner_alias():
     assert task.reference_images[0].role == "reference_image"
 
 
+def test_video_task_normalizes_mixed_frames_to_multi_reference():
+    task = video_task(
+        reference_images=[
+            {"asset_id": "first", "role": "first_frame", "order": 1},
+            {"asset_id": "style", "role": "reference_image", "order": 2},
+        ]
+    )
+
+    assert task.reference_mode == "multi_reference"
+    assert [item.role for item in task.reference_images] == [
+        "reference_image",
+        "reference_image",
+    ]
+    assert "第 1 张参考图" in task.prompt
+
+
+def test_video_task_keeps_exact_first_and_last_frames():
+    task = video_task(
+        reference_images=[
+            {"asset_id": "first", "role": "first_frame", "order": 1},
+            {"asset_id": "last", "role": "last_frame", "order": 2},
+        ]
+    )
+
+    assert task.reference_mode == "first_last_frame"
+    assert [item.role for item in task.reference_images] == [
+        "first_frame",
+        "last_frame",
+    ]
+
+
 def test_reference_role_rejects_unknown_values():
     payload = task_payload("image_to_video")
     payload.update(duration=10, resolution="720p")
