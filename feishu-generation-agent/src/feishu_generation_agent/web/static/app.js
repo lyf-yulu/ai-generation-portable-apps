@@ -93,21 +93,29 @@
     } else if (scan.phase === "ready") {
       bitableStatus.textContent = state.bitable.tasks.length
         ? `发现 ${state.bitable.tasks.length} 条可处理任务，请手动选择一条。`
-        : "当前没有来源有效且结果为空的可处理任务。";
+        : "当前没有需求附件可读且进度符合规则的可处理任务。";
     }
 
     const nodes = state.bitable.tasks.map((task) => {
       const card = element("article", "bitable-task");
       const identity = element("div", "");
-      const executors = task.executor_names?.length
-        ? task.executor_names.join("、")
-        : task.executor_open_ids?.length
-        ? task.executor_open_ids.join("、")
-        : "未指定";
-      identity.append(
-        element("h3", "", task.display_text || task.record_id),
-        element("p", "bitable-task-meta", `执行人：${executors}`),
-      );
+      identity.append(element("h3", "", task.display_text || task.record_id));
+      if (Object.hasOwn(task, "progress")) {
+        identity.append(
+          element("p", "bitable-task-meta", `进度：${task.progress || "—"}`),
+          element("p", "bitable-task-meta", `制作人：${task.maker_name || "未填写"}`),
+        );
+        if (!task.deliverable && task.delivery_block_reason) {
+          identity.append(element("p", "bitable-task-warning", task.delivery_block_reason));
+        }
+      } else {
+        const executors = task.executor_names?.length
+          ? task.executor_names.join("、")
+          : task.executor_open_ids?.length
+          ? task.executor_open_ids.join("、")
+          : "未指定";
+        identity.append(element("p", "bitable-task-meta", `执行人：${executors}`));
+      }
       const link = element("a", "", "查看需求来源");
       link.href = task.source_url;
       link.target = "_blank";
@@ -550,6 +558,19 @@
     byId("source-link").href = view.source_url;
     byId("document-revision").textContent = view.approval.revision ?? "—";
     byId("document-summary").textContent = view.approval.document_summary || "";
+    const deliveryTarget = byId("delivery-target");
+    const delivery = view.delivery || {};
+    deliveryTarget.replaceChildren();
+    if (delivery.target_type === "production_result_record" && delivery.result_table_url) {
+      const link = element("a", "", "打开结果表");
+      link.href = delivery.result_table_url;
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      deliveryTarget.append("生成结果已写入：", link);
+      deliveryTarget.hidden = false;
+    } else {
+      deliveryTarget.hidden = true;
+    }
     byId("langsmith-warning").hidden = !view.privacy?.langsmith_tracing;
     renderEvents(view.events);
 

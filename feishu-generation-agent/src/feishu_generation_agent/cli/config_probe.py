@@ -14,6 +14,9 @@ from feishu_generation_agent.config import Settings
 from feishu_generation_agent.integrations.bitable_url import parse_bitable_url
 from feishu_generation_agent.integrations.feishu_bitable import FeishuBitableClient
 from feishu_generation_agent.integrations.feishu_client import FeishuClient
+from feishu_generation_agent.integrations.production_bitable import (
+    ProductionBitableClient,
+)
 
 
 def _configured(settings: Settings, *names: str) -> bool:
@@ -226,6 +229,95 @@ async def probe(settings: Settings, *, network: bool = True) -> dict[str, Any]:
                     permission_ok=True,
                     message="多维表格只读扫描通过",
                 )
+
+    production_configured = _configured(
+        settings,
+        "lark_app_id",
+        "lark_app_secret",
+        "lark_production_bitable_url",
+        "lark_production_table_id",
+        "lark_production_view_id",
+        "lark_result_folder_token",
+    )
+    if not production_configured:
+        checks["production_bitable_schema"] = _result(False, message="缺少配置")
+        checks["production_bitable_read"] = _result(False, message="缺少配置")
+        checks["result_bitable_write"] = _result(False, message="缺少配置")
+    else:
+        checks["result_bitable_write"] = _result(
+            True,
+            message="已配置；创建结果表与授权权限未验证（预检只读）",
+        )
+        if not network:
+            checks["production_bitable_schema"] = _result(
+                True, message="已配置，跳过网络检查"
+            )
+            checks["production_bitable_read"] = _result(
+                True, message="已配置，跳过网络检查"
+            )
+        elif not feishu_permission or feishu_client is None:
+            checks["production_bitable_schema"] = _result(
+                True,
+                reachable=feishu_reachable,
+                permission_ok=False,
+                message="飞书鉴权失败，未执行生产表字段检查",
+            )
+            checks["production_bitable_read"] = _result(
+                True,
+                reachable=feishu_reachable,
+                permission_ok=False,
+                message="飞书鉴权失败，未执行生产表读取",
+            )
+        else:
+            production = ProductionBitableClient(feishu_client)
+            try:
+                location = parse_bitable_url(
+                    settings.lark_production_bitable_url or "",
+                    settings.lark_production_table_id or "",
+                    settings.lark_production_view_id or "",
+                )
+                location = await production.resolve_location(location)
+                schema = await production.ensure_schema(location)
+            except Exception:
+                checks["production_bitable_schema"] = _result(
+                    True,
+                    reachable=True,
+                    permission_ok=False,
+                    message="生产表字段或权限检查失败",
+                )
+                checks["production_bitable_read"] = _result(
+                    True,
+                    reachable=True,
+                    permission_ok=False,
+                    message="字段检查未通过，未读取生产表记录",
+                )
+            else:
+                checks["production_bitable_schema"] = _result(
+                    True,
+                    reachable=True,
+                    permission_ok=True,
+                    message="生产表六个字段检查通过",
+                )
+                try:
+                    await production.list_tasks(
+                        location,
+                        schema,
+                        include_completed=settings.lark_include_completed_for_test,
+                    )
+                except Exception:
+                    checks["production_bitable_read"] = _result(
+                        True,
+                        reachable=True,
+                        permission_ok=False,
+                        message="生产表记录读取失败",
+                    )
+                else:
+                    checks["production_bitable_read"] = _result(
+                        True,
+                        reachable=True,
+                        permission_ok=True,
+                        message="生产表只读扫描通过",
+                    )
 
     if feishu_client is not None:
         await feishu_client.close()

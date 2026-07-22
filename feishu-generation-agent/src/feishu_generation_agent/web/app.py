@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 import os
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import (
     FastAPI,
@@ -52,7 +52,7 @@ def create_app(
     runtime: GraphRuntime | None = None,
     services: GraphServices | None = None,
     settings: Settings | None = None,
-    bitable_service: BitableMvpService | None = None,
+    bitable_service: BitableMvpService | Any | None = None,
 ) -> FastAPI:
     if sum(value is not None for value in (runtime, services, settings)) > 1:
         raise ValueError("runtime, services and settings are mutually exclusive")
@@ -282,7 +282,7 @@ def create_app(
             )
         return active
 
-    def get_bitable_service(request: Request) -> BitableMvpService:
+    def get_bitable_service(request: Request) -> Any:
         active = getattr(request.app.state, "bitable_service", None)
         if active is None:
             raise HTTPException(
@@ -408,6 +408,10 @@ def create_app(
     ) -> dict[str, str]:
         active = get_runtime(request)
         try:
+            active_bitable = getattr(request.app.state, "bitable_service", None)
+            validate_approval = getattr(active_bitable, "validate_approval", None)
+            if payload.action == "approve" and callable(validate_approval):
+                await validate_approval(run_id)
             await active.resume_run(run_id, payload.to_domain())
         except RunNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from None

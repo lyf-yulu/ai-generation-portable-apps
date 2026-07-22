@@ -8,6 +8,7 @@ from langchain_openai import ChatOpenAI
 
 from feishu_generation_agent.config import Settings
 from feishu_generation_agent.bitable.mvp_service import BitableMvpService
+from feishu_generation_agent.bitable.production_service import ProductionBitableService
 from feishu_generation_agent.domain import BitableLocation
 from feishu_generation_agent.graph.nodes import GraphServices
 from feishu_generation_agent.integrations.chiyun import ChiyunImageGenerator
@@ -23,6 +24,11 @@ from feishu_generation_agent.integrations.feishu_source import (
 )
 from feishu_generation_agent.integrations.planner import DeepSeekPlanner
 from feishu_generation_agent.integrations.routing_delivery import RoutingDeliveryWriter
+from feishu_generation_agent.integrations.production_bitable import ProductionBitableClient
+from feishu_generation_agent.integrations.production_delivery import ProductionResultWriter
+from feishu_generation_agent.integrations.production_routing import (
+    ProductionRoutingDeliveryWriter,
+)
 from feishu_generation_agent.integrations.safe_download import (
     SafeResultDownloader,
 )
@@ -30,6 +36,7 @@ from feishu_generation_agent.integrations.seedance import SeedanceVideoGenerator
 from feishu_generation_agent.integrations.vision import ClaudeVisionAnalyzer
 from feishu_generation_agent.storage.files import FileStore
 from feishu_generation_agent.storage.bitable_tasks import BitableTaskStore
+from feishu_generation_agent.storage.production_tasks import ProductionTaskStore
 from feishu_generation_agent.storage.provider_results import ProviderResultStore
 from feishu_generation_agent.storage.repository import Repository
 
@@ -109,10 +116,35 @@ class BitableServiceFactory:
             await self.store.close()
 
 
+@dataclass(slots=True)
+class ProductionBitableServiceFactory:
+    bitable: ProductionBitableClient
+    store: ProductionTaskStore
+    location: BitableLocation
+    include_completed_for_test: bool
+    _claimed: bool = False
+
+    def create(self, runtime) -> ProductionBitableService:
+        if self._claimed:
+            raise RuntimeError("生产多维表格服务已创建")
+        self._claimed = True
+        return ProductionBitableService(
+            bitable=self.bitable,
+            store=self.store,
+            runtime=runtime,
+            location=self.location,
+            include_completed_for_test=self.include_completed_for_test,
+        )
+
+    async def close_unclaimed(self) -> None:
+        if not self._claimed:
+            await self.store.close()
+
+
 @dataclass(frozen=True, slots=True)
 class ApplicationServices:
     graph: GraphServices
-    bitable_factory: BitableServiceFactory | None
+    bitable_factory: BitableServiceFactory | ProductionBitableServiceFactory | None
     legacy_delivery_configured: bool
 
 
@@ -145,8 +177,11 @@ async def _open_application_services(
     bitable_configured = enable_bitable and capability_is_configured(
         settings, "bitable"
     )
+    production_bitable_configured = enable_bitable and capability_is_configured(
+        settings, "production_bitable"
+    )
     legacy_configured = capability_is_configured(settings, "legacy_delivery")
-    if not bitable_configured and not legacy_configured:
+    if not bitable_configured and not production_bitable_configured and not legacy_configured:
         settings.require(*CAPABILITY_FIELDS["legacy_delivery"])
     settings.ensure_paths()
     repository = await Repository.open(settings.business_db_path)
@@ -157,7 +192,7 @@ async def _open_application_services(
     )
     feishu = FeishuClient(settings)
     file_store: FileStore | None = None
-    bitable_factory: BitableServiceFactory | None = None
+    bitable_factory: BitableServiceFactory | ProductionBitableServiceFactory | None = None
     try:
         provider_results = ProviderResultStore(
             settings.data_dir / "provider-results",
@@ -224,6 +259,34 @@ async def _open_application_services(
                 bitable=bitable_writer,
                 legacy=legacy_writer,
             )
+        if production_bitable_configured:
+            production_location = parse_bitable_url(
+                settings.lark_production_bitable_url or "",
+                settings.lark_production_table_id or "",
+                settings.lark_production_view_id or "",
+            )
+            production_store = await ProductionTaskStore.open(
+                settings.data_dir / "production-bitable.sqlite3"
+            )
+            production_factory = ProductionBitableServiceFactory(
+                bitable=ProductionBitableClient(feishu),
+                store=production_store,
+                location=production_location,
+                include_completed_for_test=settings.lark_include_completed_for_test,
+            )
+            production_writer = ProductionResultWriter(
+                client=feishu,
+                store=production_store,
+                repository=repository,
+                result_folder_token=settings.lark_result_folder_token or "",
+            )
+            delivery_writer = ProductionRoutingDeliveryWriter(
+                production_store,
+                production=production_writer,
+                legacy=delivery_writer,
+            )
+            # The production table is the operator-facing source when enabled.
+            bitable_factory = production_factory
         assert delivery_writer is not None
         services = GraphServices(
             document_source=FeishuDocumentSource(feishu, file_store),

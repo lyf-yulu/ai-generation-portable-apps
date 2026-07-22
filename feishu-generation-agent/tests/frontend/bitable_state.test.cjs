@@ -70,3 +70,19 @@ test("retry delivery has loading, success and failure states", () => {
   assert.equal(state.deliveryRetry.phase, "error");
   assert.equal(state.deliveryRetry.error, "结果列冲突");
 });
+
+test("production task keeps delivery block state through a scan", () => {
+  let state = BitableState.createState();
+  state = BitableState.scanSucceeded(state, [{
+    record_id: "rec-no-maker",
+    display_text: "需求 A",
+    progress: "制作中",
+    maker_name: null,
+    deliverable: false,
+    delivery_block_reason: "缺少需求制作人",
+  }]);
+
+  assert.equal(state.tasks[0].progress, "制作中");
+  assert.equal(state.tasks[0].deliverable, false);
+  assert.equal(state.tasks[0].delivery_block_reason, "缺少需求制作人");
+});

@@ -139,6 +139,49 @@ class ProductionTaskStore:
         async with self._lock:
             return await self._get_by_run_locked(run_id)
 
+    async def list_active(
+        self, app_token: str, table_id: str
+    ) -> list[ProductionBinding]:
+        async with self._lock:
+            cursor = await self._connection.execute(
+                """SELECT * FROM production_tasks
+                WHERE source_app_token = ? AND source_table_id = ? AND active = 1
+                ORDER BY created_at ASC""",
+                (app_token, table_id),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [_binding_from_row(row) for row in rows]
+
+    async def set_status(
+        self,
+        run_id: str,
+        status: TableTaskStatus,
+        last_error: str | None = None,
+    ) -> ProductionBinding:
+        return await self._update_run(
+            run_id,
+            """UPDATE production_tasks
+            SET status = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE run_id = ?""",
+            (status.value, last_error, run_id),
+        )
+
+    async def release(
+        self,
+        run_id: str,
+        *,
+        status: TableTaskStatus,
+        last_error: str | None = None,
+    ) -> ProductionBinding:
+        return await self._update_run(
+            run_id,
+            """UPDATE production_tasks
+            SET status = ?, last_error = ?, active = 0,
+            updated_at = CURRENT_TIMESTAMP WHERE run_id = ?""",
+            (status.value, last_error, run_id),
+        )
+
     async def get_result_target(self, maker_open_id: str) -> ResultTableTarget | None:
         async with self._lock:
             cursor = await self._connection.execute(
@@ -213,6 +256,25 @@ class ProductionTaskStore:
         await cursor.close()
         assert row is not None
         return _delivery_from_row(row)
+
+    async def _update_run(
+        self, run_id: str, statement: str, parameters: tuple[object, ...]
+    ) -> ProductionBinding:
+        async with self._lock:
+            await self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await self._connection.execute(statement, parameters)
+                updated = cursor.rowcount == 1
+                await cursor.close()
+                if not updated:
+                    raise KeyError(f"unknown run_id: {run_id}")
+                binding = await self._get_by_run_locked(run_id)
+                await self._connection.commit()
+            except BaseException:
+                await self._connection.rollback()
+                raise
+        assert binding is not None
+        return binding
 
 
 def _app_token(location: BitableLocation) -> str:

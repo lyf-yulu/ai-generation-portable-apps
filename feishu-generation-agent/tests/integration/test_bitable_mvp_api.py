@@ -9,6 +9,7 @@ import feishu_generation_agent.cli.smoke as smoke_module
 from feishu_generation_agent.cli.smoke import (
     BitableApprovalSmokeRunner,
     BitableReadOnlySmokeRunner,
+    ProductionBitableReadOnlySmokeRunner,
 )
 import feishu_generation_agent.web.app as web_app_module
 from feishu_generation_agent.config import Settings
@@ -246,6 +247,54 @@ async def test_bitable_read_only_smoke_does_not_claim_or_write(
 
     assert count == 2
     assert calls == ["resolve", "schema", "list", "close"]
+
+
+async def test_production_read_only_smoke_reads_one_document_without_claiming(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class Client:
+        def __init__(self, settings): pass
+        async def close(self): calls.append("close")
+
+    class Bitable:
+        def __init__(self, client): pass
+        async def resolve_location(self, location):
+            calls.append("GET resolve")
+            return location.model_copy(update={"app_token": "appProd"})
+        async def ensure_schema(self, location):
+            calls.append("GET schema")
+            return object()
+        async def list_tasks(self, location, schema, *, include_completed):
+            calls.append("GET records")
+            return [SimpleNamespace(source_url="https://tenant.feishu.cn/docx/docA")]
+
+    class Source:
+        def __init__(self, client, file_store): pass
+        async def ingest(self, request):
+            calls.append("GET document")
+            assert request.source_url.endswith("/docA")
+            return object()
+
+    settings = Settings(
+        _env_file=None,
+        data_dir=tmp_path / "data", outputs_dir=tmp_path / "outputs",
+        business_db_path=tmp_path / "business.sqlite3", checkpoint_db_path=tmp_path / "checkpoints.sqlite3",
+        lark_app_id="app", lark_app_secret="secret",
+        lark_production_bitable_url="https://tenant.feishu.cn/wiki/wikiProd?table=tblProd&view=vewProd",
+        lark_production_table_id="tblProd", lark_production_view_id="vewProd",
+        lark_result_folder_token="fldResults",
+    )
+    monkeypatch.setattr(smoke_module, "FeishuClient", Client)
+    monkeypatch.setattr(smoke_module, "ProductionBitableClient", Bitable)
+    monkeypatch.setattr(smoke_module, "FeishuDocumentSource", Source)
+
+    count = await ProductionBitableReadOnlySmokeRunner(settings).run()
+
+    assert count == 1
+    assert calls == ["GET resolve", "GET schema", "GET records", "GET document", "close"]
 
 
 async def test_scan_maps_schema_and_read_errors_without_raw_details(

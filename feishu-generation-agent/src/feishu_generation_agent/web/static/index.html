@@ -36,7 +36,7 @@
         </button>
       </div>
       <p id="bitable-status" class="mode-message">
-        点击扫描，读取需求来源有效且结果为空的记录。
+        点击扫描，读取需求附件可访问且进度符合扫描规则的记录。
       </p>
       <div id="bitable-task-list" class="bitable-task-list"></div>
     </section>
@@ -71,6 +71,7 @@
           <a id="source-link" href="#" target="_blank" rel="noreferrer">查看源文档</a>
         </div>
         <p class="document-meta">文档版本 <span id="document-revision">—</span></p>
+        <p id="delivery-target" class="document-meta" hidden></p>
         <p id="document-summary" class="document-summary"></p>
         <p class="document-meta">可编辑提示词、负面约束、生成参数与参考图片。</p>
         <div id="validation-issues" class="validation-issues" hidden></div>

@@ -28,7 +28,12 @@ from feishu_generation_agent.graph.runtime import GraphRuntime
 from feishu_generation_agent.integrations.bitable_url import parse_bitable_url
 from feishu_generation_agent.integrations.feishu_bitable import FeishuBitableClient
 from feishu_generation_agent.integrations.feishu_client import FeishuClient
+from feishu_generation_agent.integrations.production_bitable import (
+    ProductionBitableClient,
+)
+from feishu_generation_agent.integrations.feishu_source import FeishuDocumentSource
 from feishu_generation_agent.storage.checkpoints import open_checkpointer
+from feishu_generation_agent.storage.files import FileStore
 
 
 _TERMINAL_STATUSES = frozenset(
@@ -107,6 +112,53 @@ class BitableReadOnlySmokeRunner:
         except Exception as exc:
             raise RuntimeError("多维表格只读扫描失败") from exc
         finally:
+            await client.close()
+
+
+@dataclass(slots=True)
+class ProductionBitableReadOnlySmokeRunner:
+    """Reads the production source and one requirement document without mutation."""
+
+    settings: Settings
+
+    async def run(self) -> int:
+        self.settings.require(
+            "lark_app_id",
+            "lark_app_secret",
+            "lark_production_bitable_url",
+            "lark_production_table_id",
+            "lark_production_view_id",
+            "lark_result_folder_token",
+        )
+        self.settings.ensure_paths()
+        client = FeishuClient(self.settings)
+        file_store = FileStore(
+            self.settings.data_dir,
+            self.settings.outputs_dir,
+            max_bytes=self.settings.max_download_bytes,
+        )
+        try:
+            bitable = ProductionBitableClient(client)
+            location = parse_bitable_url(
+                self.settings.lark_production_bitable_url or "",
+                self.settings.lark_production_table_id or "",
+                self.settings.lark_production_view_id or "",
+            )
+            location = await bitable.resolve_location(location)
+            schema = await bitable.ensure_schema(location)
+            tasks = await bitable.list_tasks(
+                location,
+                schema,
+                include_completed=self.settings.lark_include_completed_for_test,
+            )
+            if tasks:
+                source = FeishuDocumentSource(client, file_store)
+                await source.ingest(RequirementRequest(source_url=tasks[0].source_url))
+            return len(tasks)
+        except Exception as exc:
+            raise RuntimeError("生产多维表格只读扫描失败") from exc
+        finally:
+            file_store.close()
             await client.close()
 
 
@@ -318,6 +370,12 @@ def build_bitable_read_only_smoke_runner(
     return BitableReadOnlySmokeRunner(settings=settings)
 
 
+def build_production_bitable_read_only_smoke_runner(
+    settings: Settings,
+) -> ProductionBitableReadOnlySmokeRunner:
+    return ProductionBitableReadOnlySmokeRunner(settings=settings)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="执行飞书多维表格只读或审批门禁冒烟；付费生成须显式确认"
@@ -327,6 +385,11 @@ def _parser() -> argparse.ArgumentParser:
         "--bitable-read-only",
         action="store_true",
         help="只读取多维表格字段和任务视图，不领取、不调用模型或生成器",
+    )
+    mode.add_argument(
+        "--production-bitable-read-only",
+        action="store_true",
+        help="只读取生产表和一条需求附件，不锁定、不生成、不创建结果表",
     )
     mode.add_argument(
         "--bitable-record-id",
@@ -359,6 +422,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(str(exc), file=sys.stderr)
             return 1
         print(f"多维表格只读扫描通过：当前可处理记录 {count} 条")
+        return 0
+    if args.production_bitable_read_only:
+        if args.source_url:
+            print("生产表只读扫描不接受文档 URL", file=sys.stderr)
+            return 2
+        try:
+            count = asyncio.run(
+                build_production_bitable_read_only_smoke_runner(Settings()).run()
+            )
+        except (ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"生产多维表格只读扫描通过：当前可处理记录 {count} 条")
         return 0
     if args.bitable_record_id:
         if args.source_url:
