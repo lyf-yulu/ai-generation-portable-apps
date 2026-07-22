@@ -75,6 +75,8 @@ async def test_scan_and_missing_maker_approval_gate(tmp_path) -> None:
     assert scanned.status_code == 200
     assert scanned.json()[0]["progress"] == "未开始"
     assert scanned.json()[0]["deliverable"] is False
+    assert "snapshot" not in scanned.json()[0]
+    assert "maker_open_id" not in scanned.json()[0]
     assert rejected.status_code == 422
     assert "缺少需求制作人" in rejected.json()["detail"]
     assert runtime.resume_calls == []

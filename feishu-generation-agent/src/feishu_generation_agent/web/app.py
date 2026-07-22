@@ -329,7 +329,20 @@ def create_app(
             tasks = await active.scan()
         except Exception as exc:
             raise_bitable_error(exc)
-        return [task.model_dump(mode="json") for task in tasks]
+        return [_task_payload(task) for task in tasks]
+
+    def _task_payload(task: Any) -> dict:
+        if hasattr(task, "progress") and hasattr(task, "deliverable"):
+            return {
+                "record_id": task.record_id,
+                "display_text": task.display_text,
+                "source_url": task.source_url,
+                "progress": task.progress,
+                "maker_name": task.maker_name,
+                "deliverable": task.deliverable,
+                "delivery_block_reason": task.delivery_block_reason,
+            }
+        return task.model_dump(mode="json")
 
     @app.get("/api/bitable/active-runs")
     async def list_active_bitable_runs(request: Request) -> list[dict]:
