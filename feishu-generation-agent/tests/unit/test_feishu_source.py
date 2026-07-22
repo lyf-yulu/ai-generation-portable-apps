@@ -504,6 +504,37 @@ async def test_ingest_docx_preserves_hierarchy_and_stable_references(
     )
 
 
+async def test_ingest_accepts_feishu_empty_root_parent_and_null_leaf_children(
+    file_store: FileStore,
+):
+    blocks = [
+        {
+            "block_id": "doccn123",
+            "block_type": 1,
+            "parent_id": "",
+            "children": ["paragraph"],
+        },
+        {
+            "block_id": "paragraph",
+            "block_type": 2,
+            "parent_id": "doccn123",
+            "children": None,
+            "text": {"elements": []},
+        },
+    ]
+    source = FeishuDocumentSource(FakeFeishuClient(blocks, b""), file_store)
+
+    document = await source.ingest(
+        RequirementRequest(source_url="https://fiction.feishu.cn/docx/doccn123")
+    )
+
+    assert [block.block_id for block in document.blocks] == [
+        "doccn123",
+        "paragraph",
+    ]
+    assert document.blocks[1].path == ["doccn123", "paragraph"]
+
+
 async def test_wiki_resolution_requires_docx_and_get_revision(file_store: FileStore):
     fixture = _fixture("feishu_docx_blocks.json")
     client = FakeFeishuClient(

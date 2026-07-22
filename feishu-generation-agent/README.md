@@ -1,6 +1,6 @@
 # 飞书生成任务 Agent
 
-这是一个只绑定 `127.0.0.1` 的本地应用：读取飞书 `docx` 或 `wiki` 需求，下载并理解文档图片，用 LangGraph 拆解为图生图与图生视频任务，在网页中等待人工审批，然后调用 Chiyun 和火山方舟 Seedance，最后把产物写入新的飞书文档。
+这是一个只绑定 `127.0.0.1` 的本地应用：它可扫描飞书多维表格中的任务，读取 `docx` 或 `wiki` 需求，下载并理解文档图片，用 LangGraph 拆解为图生图与图生视频任务，在网页中等待人工审批，然后调用 Chiyun 和火山方舟 Seedance，最后把产物作为附件写回原表格记录。保留的“新建飞书交付文档”模式仅用于兼容旧流程。
 
 默认原则是“先看计划，再花钱”。未经网页批准，生成器不会提交任务；真实冒烟也有独立的双重门禁。
 
@@ -75,8 +75,9 @@ UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple uv sync --locked
 | `BUSINESS_DB_PATH` | 业务 SQLite 路径 |
 | `CHECKPOINT_DB_PATH` | LangGraph checkpoint SQLite 路径 |
 | `LARK_APP_ID` / `LARK_APP_SECRET` | 飞书自建应用凭证 |
-| `LARK_OUTPUT_OWNER_OPEN_ID` | 交付文档协作者的 Open ID |
-| `LARK_OUTPUT_FOLDER_TOKEN` | 新交付文档和上传文件所在的飞书文件夹 token |
+| `LARK_BITABLE_URL` / `LARK_BITABLE_TABLE_ID` / `LARK_BITABLE_VIEW_ID` | 多维表格链接、数据表 ID 与视图 ID；本地 MVP 使用这三项扫描并回写 |
+| `LARK_OUTPUT_OWNER_OPEN_ID` | 旧版交付文档协作者的 Open ID；多维表格模式不需要 |
+| `LARK_OUTPUT_FOLDER_TOKEN` | 旧版新建交付文档所在的文件夹 token；多维表格模式不需要 |
 | `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` | 需求规划模型配置，默认模型名为 `deepseek-v4-pro` |
 | `CLAUDE_API_KEY` / `CLAUDE_BASE_URL` / `CLAUDE_MODEL` | 图片理解模型配置 |
 | `CHIYUN_API_KEY` / `CHIYUN_BASE_URL` / `CHIYUN_MODEL` | Chiyun 图生图配置 |
@@ -89,7 +90,7 @@ UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple uv sync --locked
 
 ## 飞书网页配置
 
-在飞书开放平台创建企业自建应用，启用机器人不是本地链接版的必要条件。应用至少需要这些能力：
+在飞书开放平台创建企业自建应用，启用机器人不是本地 MVP 的必要条件。应用至少需要这些能力：
 
 - 获取 tenant access token。
 - 读取新版文档元数据和文档块。
@@ -100,7 +101,9 @@ UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple uv sync --locked
 - 写入文档块。
 - 为交付文档添加用户协作者。
 
-把测试需求文档和输出文件夹授权给该应用。`LARK_OUTPUT_FOLDER_TOKEN` 是文件夹 URL 中的 token。`LARK_OUTPUT_OWNER_OPEN_ID` 可从飞书开放平台 API 调试台的用户查询结果、机器人事件测试载荷中的 `open_id`，或管理员提供的用户 Open ID 获取；它不是手机号、union_id 或 user_id。
+多维表格 MVP 还需要应用拥有目标空间、数据表和视图的读取权限，以及“结果”附件字段的写入权限。把表格链接填入 `LARK_BITABLE_URL`，并填入 URL 中对应的 table/view ID；不要把带 token 的完整调试响应、事件载荷或附件 Base64 写入 `.env`、日志或 SQLite。
+
+旧版交付文档模式才需要把测试需求文档和输出文件夹授权给应用。`LARK_OUTPUT_FOLDER_TOKEN` 是文件夹 URL 中的 token。`LARK_OUTPUT_OWNER_OPEN_ID` 可从飞书开放平台 API 调试台的用户查询结果、机器人事件测试载荷中的 `open_id`，或管理员提供的用户 Open ID 获取；它不是手机号、union_id 或 user_id。
 
 权限变更后需要在飞书管理后台重新发布应用版本，并确认组织管理员已批准。
 
@@ -131,6 +134,19 @@ uv run feishu-generation-agent
 
 “删除本地运行”只允许等待审批或已结束的 run；会删除业务记录、checkpoint、输入和产物目录，但不会删除已经创建的飞书交付文档。
 
+## 多维表格本地 MVP
+
+多维表格模式只使用既有的四列：`文本`、`需求来源`、`执行人`、`结果`。不会自动创建、修改或填充任何字段。
+
+1. 在 `.env` 配置 `LARK_BITABLE_URL`、`LARK_BITABLE_TABLE_ID` 和 `LARK_BITABLE_VIEW_ID`，并确保应用能读取目标视图、上传附件及更新“结果”列。
+2. 启动应用后，在首页点击“扫描多维表格任务”。列表只显示“需求来源”是有效飞书文档链接且“结果”为空的记录；“执行人”只展示，不作为筛选条件。
+3. 手动点击一条记录的“开始分析”。本机 SQLite 会先原子领取记录；重复领取会提示冲突，不会启动第二个运行。
+4. 等页面到达“等待审批”。检查计划、任务参数和参考图；在这里退回或取消不会调用 Chiyun 或 Seedance。批准所选任务才会触发生成。
+5. 成功后系统在写回前重新读取该记录。若“结果”仍为空，则上传全部产物并一次性写入附件列；若外部已填入结果，系统显示冲突且绝不覆盖。
+6. 若生成失败或取消，结果列保持为空并释放本地领取，可重新扫描。若只有写回失败，使用“仅重试交付”；它只复用已保存的产物和上传 token，不重新生成。
+
+本地状态只保存任务绑定、审批指纹、运行状态、产物和幂等信息；不保存 API Key、飞书原始事件载荷、附件 Base64 或带凭证的链接。应用重启后，`waiting_approval` 仍停在审批门禁，已提交的供应商任务只轮询恢复，不会二次提交。
+
 ## 恢复语义
 
 - `waiting_approval` 在重启后只恢复展示，不会自动批准。
@@ -147,7 +163,22 @@ uv run pytest -q
 uv run python -m compileall -q src tests
 ```
 
-真实冒烟会产生模型和生成费用，并创建飞书文档。必须同时满足两个门禁：
+先用真实表格做完全只读的检查；它只读取 wiki/表格定位、四个字段和目标视图，既不领取任务，也不调用模型或生成器：
+
+```bash
+uv run agent-config-probe --network
+uv run agent-smoke --bitable-read-only
+```
+
+需要验证从表格记录到审批页的链路时，可指定一条专用测试记录：
+
+```bash
+uv run agent-smoke --bitable-record-id recxxxxxxxx
+```
+
+该命令会读取需求并运行已有分析/规划流程，但在 `waiting_approval` 停止，绝不提交 Chiyun 或 Seedance。请只对已获准的测试内容使用它。不要在终端、截图或工单中粘贴凭证、原始事件载荷或媒体 Base64。
+
+真实付费冒烟会产生模型和生成费用，并创建飞书文档。必须同时满足两个门禁：
 
 ```bash
 ALLOW_PAID_SMOKE=YES uv run agent-smoke \
@@ -163,13 +194,15 @@ ALLOW_PAID_SMOKE=YES uv run agent-smoke \
 ## 常见问题
 
 - 飞书 401：检查 App ID/Secret、应用版本是否发布，以及凭证是否属于当前租户。
-- 飞书 403：检查文档、wiki、素材下载、文件夹、创建文档、上传和协作者权限；修改权限后重新发布应用。
+- 飞书 403：多维表格模式检查空间/数据表/视图读取权限和“结果”附件列写入权限；旧版模式还需检查文档、wiki、素材下载、文件夹、创建文档、上传和协作者权限。修改权限后重新发布应用。
 - 429：供应商或飞书限流。保留 run，等待后重启或按页面允许的动作重试。
 - 文档图片失败：确认图片块对应用可见，素材下载权限已批准，文件没有被删除；审批页也可替换为本地图片。
 - 模型 JSON 无效：规划器会进行有限次数的结构修复；持续失败时先用探针确认模型名，再查看已脱敏的节点事件。
 - Ark 长轮询：不要重复批准。重启后系统会依据官方任务 ID 继续轮询。
 - 飞书分片失败：点击“仅重试交付”；已完成的 part 不会重复上传。
-- `/api/health` 显示未就绪：先执行 `agent-config-probe --no-network`，按 capability 补齐配置，再执行联网探针。
+- 多维表格字段检查失败：确认字段名称精确为“文本、需求来源、执行人、结果”，且“结果”为附件字段；MVP 不会自动修表。
+- 扫描为空：确认“需求来源”是一个可读取的飞书 docx/wiki 链接、“结果”列为空，且记录没有被另一条本地运行领取。
+- `/api/health` 显示未就绪：先执行 `agent-config-probe --no-network`，按 capability 补齐配置，再执行 `agent-config-probe --network`。
 
 ## 未来飞书机器人入口
 

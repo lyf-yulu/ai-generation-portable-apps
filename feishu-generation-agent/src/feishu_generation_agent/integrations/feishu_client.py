@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Mapping
+from dataclasses import dataclass
 from time import monotonic
 from typing import Any
 
@@ -28,6 +29,13 @@ _PERMISSION_CODES = frozenset(
         1770034,
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class CreatedBitableApp:
+    app_token: str
+    table_id: str
+    url: str
 
 
 class FeishuClient:
@@ -173,6 +181,102 @@ class FeishuClient:
             )
         return document_id
 
+    async def create_bitable_app(
+        self, name: str, folder_token: str
+    ) -> CreatedBitableApp:
+        payload = await self.request_json(
+            "POST",
+            "/open-apis/bitable/v1/apps",
+            json_body={
+                "name": name,
+                "folder_token": folder_token,
+                "time_zone": "Asia/Shanghai",
+            },
+        )
+        app = payload.get("data", {}).get("app", {})
+        app_token = app.get("app_token")
+        table_id = app.get("default_table_id")
+        url = app.get("url")
+        if not all(isinstance(value, str) and value for value in (app_token, table_id, url)):
+            raise self._document_error(
+                "飞书创建结果多维表格响应无效",
+                "POST /open-apis/bitable/v1/apps: missing app identity",
+            )
+        return CreatedBitableApp(app_token=app_token, table_id=table_id, url=url)
+
+    async def grant_bitable_editor(self, app_token: str, open_id: str) -> None:
+        await self.request_json(
+            "POST",
+            f"/open-apis/drive/v1/permissions/{app_token}/members",
+            params={"type": "bitable", "need_notification": "false"},
+            json_body={
+                "member_type": "openid",
+                "member_id": open_id,
+                "perm": "edit",
+                "type": "user",
+            },
+        )
+
+    async def create_bitable_field(
+        self, app_token: str, table_id: str, field_name: str, field_type: int
+    ) -> str:
+        payload = await self.request_json(
+            "POST",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
+            json_body={"field_name": field_name, "type": field_type},
+        )
+        field_id = payload.get("data", {}).get("field", {}).get("field_id")
+        if not isinstance(field_id, str) or not field_id:
+            raise self._document_error(
+                "飞书创建结果表字段响应无效",
+                "POST bitable fields: missing field_id",
+            )
+        return field_id
+
+    async def list_bitable_fields(self, app_token: str, table_id: str) -> list[dict[str, object]]:
+        return await self.iter_items(
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields"
+        )
+
+    async def update_bitable_field(
+        self,
+        app_token: str,
+        table_id: str,
+        field_id: str,
+        field_name: str,
+        field_type: int,
+    ) -> None:
+        await self.request_json(
+            "PUT",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields/{field_id}",
+            json_body={"field_name": field_name, "type": field_type},
+        )
+
+    async def create_bitable_record(
+        self, app_token: str, table_id: str, fields: dict[str, object]
+    ) -> str:
+        payload = await self.request_json(
+            "POST",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records",
+            json_body={"fields": fields},
+        )
+        record_id = payload.get("data", {}).get("record", {}).get("record_id")
+        if not isinstance(record_id, str) or not record_id:
+            raise self._document_error(
+                "飞书创建结果表记录响应无效",
+                "POST bitable records: missing record_id",
+            )
+        return record_id
+
+    async def update_bitable_record(
+        self, app_token: str, table_id: str, record_id: str, fields: dict[str, object]
+    ) -> None:
+        await self.request_json(
+            "PUT",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}",
+            json_body={"fields": fields},
+        )
+
     async def append_document_blocks(
         self, document_id: str, blocks: list[dict]
     ) -> None:
@@ -185,15 +289,21 @@ class FeishuClient:
         )
 
     async def upload_file_all(
-        self, filename: str, content: bytes, mime_type: str
+        self,
+        filename: str,
+        content: bytes,
+        mime_type: str,
+        *,
+        parent_type: str = "explorer",
+        parent_node: str | None = None,
     ) -> str:
-        folder = self._require_output_folder()
+        target = self._upload_parent(parent_type, parent_node)
         payload = await self._request_multipart(
             "/open-apis/drive/v1/files/upload_all",
             data={
                 "file_name": filename,
-                "parent_type": "explorer",
-                "parent_node": folder,
+                "parent_type": parent_type,
+                "parent_node": target,
                 "size": str(len(content)),
             },
             filename=filename,
@@ -202,15 +312,46 @@ class FeishuClient:
         )
         return self._file_token(payload, "upload_all")
 
-    async def prepare_file_upload(self, filename: str, size: int) -> tuple[str, int]:
-        folder = self._require_output_folder()
+    async def upload_media_all(
+        self,
+        filename: str,
+        content: bytes,
+        mime_type: str,
+        *,
+        parent_type: str,
+        parent_node: str,
+    ) -> str:
+        target = self._upload_parent(parent_type, parent_node)
+        payload = await self._request_multipart(
+            "/open-apis/drive/v1/medias/upload_all",
+            data={
+                "file_name": filename,
+                "parent_type": parent_type,
+                "parent_node": target,
+                "size": str(len(content)),
+            },
+            filename=filename,
+            content=content,
+            mime_type=mime_type,
+        )
+        return self._file_token(payload, "media_upload_all")
+
+    async def prepare_file_upload(
+        self,
+        filename: str,
+        size: int,
+        *,
+        parent_type: str = "explorer",
+        parent_node: str | None = None,
+    ) -> tuple[str, int]:
+        target = self._upload_parent(parent_type, parent_node)
         payload = await self.request_json(
             "POST",
             "/open-apis/drive/v1/files/upload_prepare",
             json_body={
                 "file_name": filename,
-                "parent_type": "explorer",
-                "parent_node": folder,
+                "parent_type": parent_type,
+                "parent_node": target,
                 "size": size,
             },
         )
@@ -221,6 +362,35 @@ class FeishuClient:
             raise self._document_error(
                 "飞书分片上传预处理响应无效",
                 "upload_prepare response missing upload_id or block_size",
+            )
+        return upload_id, block_size
+
+    async def prepare_media_upload(
+        self,
+        filename: str,
+        size: int,
+        *,
+        parent_type: str,
+        parent_node: str,
+    ) -> tuple[str, int]:
+        target = self._upload_parent(parent_type, parent_node)
+        payload = await self.request_json(
+            "POST",
+            "/open-apis/drive/v1/medias/upload_prepare",
+            json_body={
+                "file_name": filename,
+                "parent_type": parent_type,
+                "parent_node": target,
+                "size": size,
+            },
+        )
+        data = payload.get("data", {})
+        upload_id = data.get("upload_id")
+        block_size = data.get("block_size")
+        if not isinstance(upload_id, str) or not isinstance(block_size, int):
+            raise self._document_error(
+                "飞书分片上传预处理响应无效",
+                "media upload_prepare response missing upload_id or block_size",
             )
         return upload_id, block_size
 
@@ -236,6 +406,18 @@ class FeishuClient:
             mime_type="application/octet-stream",
         )
 
+    async def upload_media_part(
+        self, upload_id: str, sequence: int, content: bytes
+    ) -> None:
+        await self._request_multipart(
+            "/open-apis/drive/v1/medias/upload_part",
+            data={"upload_id": upload_id, "seq": str(sequence),
+                  "size": str(len(content))},
+            filename=f"part-{sequence}",
+            content=content,
+            mime_type="application/octet-stream",
+        )
+
     async def finish_file_upload(self, upload_id: str, block_count: int) -> str:
         payload = await self.request_json(
             "POST",
@@ -243,6 +425,14 @@ class FeishuClient:
             json_body={"upload_id": upload_id, "block_num": block_count},
         )
         return self._file_token(payload, "upload_finish")
+
+    async def finish_media_upload(self, upload_id: str, block_count: int) -> str:
+        payload = await self.request_json(
+            "POST",
+            "/open-apis/drive/v1/medias/upload_finish",
+            json_body={"upload_id": upload_id, "block_num": block_count},
+        )
+        return self._file_token(payload, "media_upload_finish")
 
     async def add_document_member(
         self, document_id: str, owner_open_id: str
@@ -294,6 +484,17 @@ class FeishuClient:
                 "LARK_OUTPUT_FOLDER_TOKEN is missing",
             )
         return self._output_folder_token
+
+    def _upload_parent(self, parent_type: str, parent_node: str | None) -> str:
+        if not isinstance(parent_type, str) or not parent_type:
+            raise ValueError("upload parent_type is required")
+        if parent_node is not None:
+            if not isinstance(parent_node, str) or not parent_node:
+                raise ValueError("upload parent_node is invalid")
+            return parent_node
+        if parent_type != "explorer":
+            raise ValueError("non-explorer upload requires parent_node")
+        return self._require_output_folder()
 
     def _file_token(self, payload: dict, operation: str) -> str:
         token = payload.get("data", {}).get("file_token")

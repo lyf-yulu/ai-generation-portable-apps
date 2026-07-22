@@ -80,6 +80,7 @@ _OPERATION_TRANSITIONS = {
         {
             ("intent_created", "submitted"),
             ("intent_created", "submission_uncertain"),
+            ("intent_created", "failed"),
             ("submitted", "succeeded"),
             ("submitted", "submission_uncertain"),
             ("submitted", "failed"),

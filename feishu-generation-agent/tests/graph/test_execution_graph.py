@@ -146,6 +146,17 @@ def _transient_error() -> AgentError:
     )
 
 
+def _validation_error() -> AgentError:
+    return AgentError(
+        ErrorDetail(
+            category=ErrorCategory.VALIDATION,
+            message="invalid local provider parameters",
+            technical_detail="cause=preflight_validation",
+            retryable=False,
+        )
+    )
+
+
 def _chiyun_staging_poll_error() -> AgentError:
     return AgentError(
         ErrorDetail(
@@ -258,6 +269,44 @@ async def test_revalidate_approval_rejects_task_not_in_formal_draft(
     assert "task-forged" not in json.dumps(
         caught.value.detail.model_dump(mode="json"), ensure_ascii=False
     )
+    _assert_zero_generation(fake_services)
+    assert await fake_services.repository.count_operations() == 0
+
+
+@pytest.mark.asyncio
+async def test_revalidate_approval_allows_human_approved_audit_caveats(
+    fake_services: GraphServices,
+) -> None:
+    graph = build_graph(fake_services, InMemorySaver())
+    thread_id = "thread-approved-audit-caveats"
+    config = _config(thread_id)
+    await graph.ainvoke(
+        _input("run-approved-audit-caveats", thread_id),
+        config=config,
+    )
+    snapshot = await graph.aget_state(config)
+    state = dict(snapshot.values)
+    approved_tasks = state["draft_plan"]["tasks"]
+    state.update(
+        {
+            "audit_report": {
+                "issues": ["The requested sequence may be difficult to render."],
+                "corrections_required": True,
+            },
+            "approval_decision": {
+                "action": "approve",
+                "selected_task_ids": [approved_tasks[0]["task_id"]],
+                "tasks": approved_tasks,
+            },
+            "approval_revision": state["document_revision"],
+            "approved_tasks": approved_tasks,
+        }
+    )
+
+    result = await revalidate_approval(state, config, services=fake_services)
+
+    assert result["status"] == "approved"
+    assert result["validation_issues"] == []
     _assert_zero_generation(fake_services)
     assert await fake_services.repository.count_operations() == 0
 
@@ -467,8 +516,8 @@ async def test_preexisting_intent_is_uncertain_without_provider_calls(
 
     assert result["status"] == "completed_with_errors"
     assert result["execution_records"][0]["status"] == "intent_created"
-    assert fake_services.delivery_writer.deliver_calls == 1
-    assert result["delivery_record"]["status"] == "succeeded"
+    assert fake_services.delivery_writer.deliver_calls == 0
+    assert result["delivery_record"] is None
     _assert_zero_generation(fake_services)
     operation = await fake_services.repository.get_operation(
         run_id, "task-video", "submit"
@@ -575,8 +624,48 @@ async def test_seedance_submit_error_is_uncertain_and_never_retried(
     )
     assert operation is not None
     assert operation["phase"] == "submission_uncertain"
+    assert services.delivery_writer.deliver_calls == 0
     serialized = json.dumps(result, ensure_ascii=False)
     assert "fictional transient" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_local_submit_validation_failure_is_failed_without_delivery(
+    fake_services: GraphServices,
+) -> None:
+    video = _ScriptedGenerator(
+        "seedance",
+        submit_error=_validation_error(),
+    )
+    services = replace(fake_services, video_generator=video)
+    graph = build_graph(services, InMemorySaver())
+    thread_id = "thread-submit-validation-error"
+    config = _config(thread_id)
+    first = await graph.ainvoke(
+        _input("run-submit-validation-error", thread_id), config=config
+    )
+    plan = _interrupt_payload(first)["draft_plan"]
+
+    result = await graph.ainvoke(
+        Command(
+            resume={
+                "action": "approve",
+                "selected_task_ids": ["task-video"],
+                "tasks": plan["tasks"],
+            }
+        ),
+        config=config,
+    )
+
+    assert result["status"] == "completed_with_errors"
+    assert result["execution_records"][0]["status"] == "failed"
+    assert result["artifacts"] == []
+    assert services.delivery_writer.deliver_calls == 0
+    operation = await services.repository.get_operation(
+        "run-submit-validation-error", "task-video", "submit"
+    )
+    assert operation is not None
+    assert operation["phase"] == "failed"
 
 
 @pytest.mark.asyncio

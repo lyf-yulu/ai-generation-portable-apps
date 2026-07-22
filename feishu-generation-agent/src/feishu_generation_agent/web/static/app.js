@@ -3,11 +3,16 @@
 
   const ReviewState = globalThis.ReviewState;
   if (!ReviewState) throw new Error("审批草稿状态模块加载失败");
+  const BitableState = globalThis.BitableState;
+  if (!BitableState) throw new Error("多维表格状态模块加载失败");
 
   const state = {
     runId: null,
     view: null,
     busy: false,
+    runMode: null,
+    modes: { bitable: false, legacy_delivery: false },
+    bitable: BitableState.createState(),
     review: ReviewState.createReviewState(),
   };
   const byId = (id) => document.getElementById(id);
@@ -22,6 +27,9 @@
   const conflictBox = byId("review-conflict");
   const conflictText = byId("review-conflict-text");
   const discardButton = byId("discard-review-draft");
+  const scanBitableButton = byId("scan-bitable-button");
+  const bitableTaskList = byId("bitable-task-list");
+  const bitableStatus = byId("bitable-status");
 
   function element(tag, className, text) {
     const node = document.createElement(tag);
@@ -57,7 +65,9 @@
       : await response.text();
     if (!response.ok) {
       const detail = payload && typeof payload === "object" ? payload.detail : payload;
-      throw new Error(detailText(detail));
+      const error = new Error(detailText(detail));
+      error.status = response.status;
+      throw error;
     }
     return payload;
   }
@@ -65,9 +75,145 @@
   function setBusy(value) {
     state.busy = value;
     runForm.querySelectorAll("input, button").forEach((control) => {
+      control.disabled = value || !state.modes.legacy_delivery;
+    });
+    scanBitableButton.disabled = value || !state.modes.bitable;
+    bitableTaskList.querySelectorAll("button").forEach((control) => {
       control.disabled = value;
     });
     updateActionAvailability();
+  }
+
+  function renderBitableTasks() {
+    const scan = state.bitable.scan;
+    if (scan.phase === "loading") bitableStatus.textContent = "正在读取多维表格…";
+    else if (scan.phase === "error") bitableStatus.textContent = scan.error;
+    else if (state.bitable.claim.phase === "conflict") {
+      bitableStatus.textContent = state.bitable.claim.error;
+    } else if (scan.phase === "ready") {
+      bitableStatus.textContent = state.bitable.tasks.length
+        ? `发现 ${state.bitable.tasks.length} 条可处理任务，请手动选择一条。`
+        : "当前没有需求附件可读且进度符合规则的可处理任务。";
+    }
+
+    const nodes = state.bitable.tasks.map((task) => {
+      const card = element("article", "bitable-task");
+      const identity = element("div", "");
+      identity.append(element("h3", "", task.display_text || task.record_id));
+      if (Object.hasOwn(task, "progress")) {
+        identity.append(
+          element("p", "bitable-task-meta", `进度：${task.progress || "—"}`),
+          element("p", "bitable-task-meta", `制作人：${task.maker_name || "未填写"}`),
+        );
+        if (!task.deliverable && task.delivery_block_reason) {
+          identity.append(element("p", "bitable-task-warning", task.delivery_block_reason));
+        }
+      } else {
+        const executors = task.executor_names?.length
+          ? task.executor_names.join("、")
+          : task.executor_open_ids?.length
+          ? task.executor_open_ids.join("、")
+          : "未指定";
+        identity.append(element("p", "bitable-task-meta", `执行人：${executors}`));
+      }
+      const link = element("a", "", "查看需求来源");
+      link.href = task.source_url;
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      const claim = element("button", "primary", "开始分析");
+      claim.type = "button";
+      claim.disabled = state.busy || state.bitable.claim.phase === "loading";
+      claim.addEventListener("click", () => claimBitableTask(task.record_id));
+      card.append(identity, link, claim);
+      return card;
+    });
+    if (scan.phase === "ready" && nodes.length === 0) {
+      nodes.push(element("p", "bitable-empty", "没有可领取任务。"));
+    }
+    bitableTaskList.replaceChildren(...nodes);
+  }
+
+  async function scanBitableTasks() {
+    if (state.busy || !state.modes.bitable) return;
+    state.bitable = BitableState.scanStarted(state.bitable);
+    renderBitableTasks();
+    setBusy(true);
+    clearError();
+    try {
+      const tasks = await api("/api/bitable/tasks");
+      state.bitable = BitableState.scanSucceeded(state.bitable, tasks);
+    } catch (error) {
+      state.bitable = BitableState.scanFailed(state.bitable, error.message);
+      showError(error);
+    } finally {
+      setBusy(false);
+      renderBitableTasks();
+    }
+  }
+
+  async function claimBitableTask(recordId) {
+    if (state.busy) return;
+    state.bitable = BitableState.claimStarted(state.bitable, recordId);
+    renderBitableTasks();
+    setBusy(true);
+    clearError();
+    try {
+      const created = await api(
+        `/api/bitable/tasks/${encodeURIComponent(recordId)}/claim`,
+        { method: "POST" },
+      );
+      state.bitable = BitableState.claimSucceeded(state.bitable, created.run_id);
+      state.runId = created.run_id;
+      state.runMode = "bitable";
+      state.review = ReviewState.createReviewState();
+      await poll(true);
+      document.querySelector(".workspace")?.scrollIntoView({ behavior: "smooth" });
+    } catch (error) {
+      state.bitable = error.status === 409
+        ? BitableState.claimConflict(state.bitable, error.message)
+        : BitableState.claimConflict(state.bitable, error.message);
+      showError(error);
+    } finally {
+      setBusy(false);
+      renderBitableTasks();
+    }
+  }
+
+  async function configureModes() {
+    try {
+      const health = await api("/api/health");
+      state.modes = health.modes || state.modes;
+    } catch (error) {
+      showError(error);
+    }
+    scanBitableButton.disabled = !state.modes.bitable;
+    if (!state.modes.bitable) {
+      bitableStatus.textContent = "多维表格尚未配置，请先补全表格链接、数据表和视图。";
+    }
+    if (!state.modes.legacy_delivery) {
+      runForm.querySelectorAll("input, button").forEach((control) => {
+        control.disabled = true;
+      });
+      const message = byId("legacy-mode-message");
+      message.textContent = "当前未配置旧版文档交付，请从下方多维表格任务开始。";
+      message.hidden = false;
+    }
+    if (state.modes.bitable && !state.runId) {
+      try {
+        const activeRuns = await api("/api/bitable/active-runs");
+        const latest = Array.isArray(activeRuns) ? activeRuns.at(-1) : null;
+        if (latest?.run_id) {
+          state.runId = latest.run_id;
+          state.runMode = "bitable";
+          state.review = ReviewState.createReviewState();
+          await poll(true);
+          bitableStatus.textContent = `已恢复进行中任务：${latest.display_text || latest.run_id}`;
+          document.querySelector(".workspace")?.scrollIntoView({ behavior: "smooth" });
+        }
+      } catch (error) {
+        showError(error);
+      }
+    }
   }
 
   function updateActionAvailability() {
@@ -412,6 +558,19 @@
     byId("source-link").href = view.source_url;
     byId("document-revision").textContent = view.approval.revision ?? "—";
     byId("document-summary").textContent = view.approval.document_summary || "";
+    const deliveryTarget = byId("delivery-target");
+    const delivery = view.delivery || {};
+    deliveryTarget.replaceChildren();
+    if (delivery.target_type === "production_result_record" && delivery.result_table_url) {
+      const link = element("a", "", "打开结果表");
+      link.href = delivery.result_table_url;
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      deliveryTarget.append("生成结果已写入：", link);
+      deliveryTarget.hidden = false;
+    } else {
+      deliveryTarget.hidden = true;
+    }
     byId("langsmith-warning").hidden = !view.privacy?.langsmith_tracing;
     renderEvents(view.events);
 
@@ -483,6 +642,7 @@
         body: JSON.stringify({ source_url: byId("source-url").value }),
       });
       state.runId = created.run_id;
+      state.runMode = "legacy";
       state.review = ReviewState.createReviewState();
       await poll(true);
     } catch (error) {
@@ -497,7 +657,26 @@
   byId("approve-button").addEventListener("click", () => submitDecision("approve"));
   retryDeliveryButton.addEventListener("click", async () => {
     if (!state.runId || state.busy) return;
-    await mutate(`/api/runs/${state.runId}/retry-delivery`, { method: "POST" });
+    const url = state.runMode === "bitable"
+      ? `/api/bitable/runs/${state.runId}/retry-delivery`
+      : `/api/runs/${state.runId}/retry-delivery`;
+    if (state.runMode !== "bitable") {
+      await mutate(url, { method: "POST" });
+      return;
+    }
+    state.bitable = BitableState.retryStarted(state.bitable, state.runId);
+    setBusy(true);
+    clearError();
+    try {
+      await api(url, { method: "POST" });
+      state.bitable = BitableState.retrySucceeded(state.bitable);
+      await poll(true);
+    } catch (error) {
+      state.bitable = BitableState.retryFailed(state.bitable, error.message);
+      showError(error);
+    } finally {
+      setBusy(false);
+    }
   });
   deleteRunButton.addEventListener("click", async () => {
     if (!state.runId || state.busy) return;
@@ -520,6 +699,8 @@
     clearError();
     render(ReviewState.draftView(state.review));
   });
+  scanBitableButton.addEventListener("click", scanBitableTasks);
   setInterval(() => poll(false), 1000);
   updateActionAvailability();
+  configureModes();
 })();

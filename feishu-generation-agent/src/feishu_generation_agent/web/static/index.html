@@ -19,10 +19,27 @@
             placeholder="https://company.feishu.cn/docx/..." required>
           <button type="submit" class="primary">读取并规划</button>
         </div>
+        <p id="legacy-mode-message" class="mode-message" hidden></p>
       </form>
     </header>
 
     <p id="error-message" class="error-message" role="alert" hidden></p>
+
+    <section id="bitable-panel" class="bitable-panel panel" aria-label="多维表格任务">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">BITABLE TASKS</p>
+          <h2>多维表格任务</h2>
+        </div>
+        <button id="scan-bitable-button" type="button" class="secondary">
+          扫描任务
+        </button>
+      </div>
+      <p id="bitable-status" class="mode-message">
+        点击扫描，读取需求附件可访问且进度符合扫描规则的记录。
+      </p>
+      <div id="bitable-task-list" class="bitable-task-list"></div>
+    </section>
 
     <main class="workspace">
       <aside class="trace-panel panel" aria-label="LangGraph 执行信息">
@@ -54,6 +71,7 @@
           <a id="source-link" href="#" target="_blank" rel="noreferrer">查看源文档</a>
         </div>
         <p class="document-meta">文档版本 <span id="document-revision">—</span></p>
+        <p id="delivery-target" class="document-meta" hidden></p>
         <p id="document-summary" class="document-summary"></p>
         <p class="document-meta">可编辑提示词、负面约束、生成参数与参考图片。</p>
         <div id="validation-issues" class="validation-issues" hidden></div>
@@ -85,6 +103,7 @@
     </footer>
 
     <script src="/static/review-state.js" defer></script>
+    <script src="/static/bitable-state.js" defer></script>
     <script src="/static/app.js" defer></script>
   </body>
 </html>

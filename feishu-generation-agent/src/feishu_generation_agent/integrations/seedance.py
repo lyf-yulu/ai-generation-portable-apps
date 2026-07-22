@@ -41,9 +41,7 @@ _REFERENCE_ROLES = frozenset(
 _ASPECT_RATIOS = frozenset(
     {"16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "9:21", "adaptive"}
 )
-_RESOLUTIONS = frozenset(
-    {"480p", "720p", "1080p", "native1080p", "2k", "4k"}
-)
+_RESOLUTIONS = frozenset({"720p", "1080p"})
 _DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024
 _DEFAULT_MAX_INPUT_BYTES = 32 * 1024 * 1024
 _DEFAULT_MAX_TOTAL_INPUT_BYTES = 64 * 1024 * 1024
@@ -168,7 +166,7 @@ class SeedanceVideoGenerator:
             operation="submit",
         )
         provider_task_id = self._official_task_id(body.get("id"), "submit")
-        status = self._status(body.get("status"), "submit")
+        status = self._status(body.get("status", "queued"), "submit")
         if status in _TERMINAL_FAILURE_STATUSES:
             raise self._terminal_status_error("submit", status)
         result_items = (

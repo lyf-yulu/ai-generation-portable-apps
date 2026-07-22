@@ -9,9 +9,14 @@ from typing import Any
 
 import httpx
 
-from feishu_generation_agent.bootstrap import REQUIRED_RUNTIME_FIELDS
+from feishu_generation_agent.bootstrap import runtime_is_configured
 from feishu_generation_agent.config import Settings
+from feishu_generation_agent.integrations.bitable_url import parse_bitable_url
+from feishu_generation_agent.integrations.feishu_bitable import FeishuBitableClient
 from feishu_generation_agent.integrations.feishu_client import FeishuClient
+from feishu_generation_agent.integrations.production_bitable import (
+    ProductionBitableClient,
+)
 
 
 def _configured(settings: Settings, *names: str) -> bool:
@@ -106,10 +111,11 @@ async def probe(settings: Settings, *, network: bool = True) -> dict[str, Any]:
     feishu_reachable: bool | None = None
     feishu_permission: bool | None = None
     feishu_message = "缺少飞书应用凭证"
+    feishu_client: FeishuClient | None = None
     if feishu_configured and network:
-        client = FeishuClient(settings)
+        feishu_client = FeishuClient(settings)
         try:
-            await client.tenant_token()
+            await feishu_client.tenant_token()
         except Exception:
             feishu_reachable = False
             feishu_permission = False
@@ -118,8 +124,6 @@ async def probe(settings: Settings, *, network: bool = True) -> dict[str, Any]:
             feishu_reachable = True
             feishu_permission = True
             feishu_message = "tenant token 鉴权通过"
-        finally:
-            await client.close()
     elif feishu_configured:
         feishu_message = "已配置，跳过网络检查"
     checks["feishu_auth"] = _result(
@@ -147,6 +151,176 @@ async def probe(settings: Settings, *, network: bool = True) -> dict[str, Any]:
                 else "缺少配置"
             ),
         )
+
+    bitable_configured = _configured(
+        settings,
+        "lark_app_id",
+        "lark_app_secret",
+        "lark_bitable_url",
+        "lark_bitable_table_id",
+        "lark_bitable_view_id",
+    )
+    if not bitable_configured:
+        checks["bitable_schema"] = _result(False, message="缺少配置")
+        checks["bitable_read"] = _result(False, message="缺少配置")
+    elif not network:
+        checks["bitable_schema"] = _result(
+            True, message="已配置，跳过网络检查"
+        )
+        checks["bitable_read"] = _result(
+            True, message="已配置，跳过网络检查"
+        )
+    elif not feishu_permission or feishu_client is None:
+        checks["bitable_schema"] = _result(
+            True,
+            reachable=feishu_reachable,
+            permission_ok=False,
+            message="飞书鉴权失败，未执行字段检查",
+        )
+        checks["bitable_read"] = _result(
+            True,
+            reachable=feishu_reachable,
+            permission_ok=False,
+            message="飞书鉴权失败，未执行记录读取",
+        )
+    else:
+        bitable = FeishuBitableClient(feishu_client)
+        try:
+            location = parse_bitable_url(
+                settings.lark_bitable_url or "",
+                settings.lark_bitable_table_id or "",
+                settings.lark_bitable_view_id or "",
+            )
+            location = await bitable.resolve_location(location)
+            schema = await bitable.ensure_schema(location)
+        except Exception:
+            checks["bitable_schema"] = _result(
+                True,
+                reachable=True,
+                permission_ok=False,
+                message="多维表格字段或权限检查失败",
+            )
+            checks["bitable_read"] = _result(
+                True,
+                reachable=True,
+                permission_ok=False,
+                message="字段检查未通过，未读取记录",
+            )
+        else:
+            checks["bitable_schema"] = _result(
+                True,
+                reachable=True,
+                permission_ok=True,
+                message="四个既有字段检查通过",
+            )
+            try:
+                await bitable.list_tasks(location, schema)
+            except Exception:
+                checks["bitable_read"] = _result(
+                    True,
+                    reachable=True,
+                    permission_ok=False,
+                    message="多维表格记录读取失败",
+                )
+            else:
+                checks["bitable_read"] = _result(
+                    True,
+                    reachable=True,
+                    permission_ok=True,
+                    message="多维表格只读扫描通过",
+                )
+
+    production_configured = _configured(
+        settings,
+        "lark_app_id",
+        "lark_app_secret",
+        "lark_production_bitable_url",
+        "lark_production_table_id",
+        "lark_production_view_id",
+        "lark_result_folder_token",
+    )
+    if not production_configured:
+        checks["production_bitable_schema"] = _result(False, message="缺少配置")
+        checks["production_bitable_read"] = _result(False, message="缺少配置")
+        checks["result_bitable_write"] = _result(False, message="缺少配置")
+    else:
+        checks["result_bitable_write"] = _result(
+            True,
+            message="已配置；创建结果表与授权权限未验证（预检只读）",
+        )
+        if not network:
+            checks["production_bitable_schema"] = _result(
+                True, message="已配置，跳过网络检查"
+            )
+            checks["production_bitable_read"] = _result(
+                True, message="已配置，跳过网络检查"
+            )
+        elif not feishu_permission or feishu_client is None:
+            checks["production_bitable_schema"] = _result(
+                True,
+                reachable=feishu_reachable,
+                permission_ok=False,
+                message="飞书鉴权失败，未执行生产表字段检查",
+            )
+            checks["production_bitable_read"] = _result(
+                True,
+                reachable=feishu_reachable,
+                permission_ok=False,
+                message="飞书鉴权失败，未执行生产表读取",
+            )
+        else:
+            production = ProductionBitableClient(feishu_client)
+            try:
+                location = parse_bitable_url(
+                    settings.lark_production_bitable_url or "",
+                    settings.lark_production_table_id or "",
+                    settings.lark_production_view_id or "",
+                )
+                location = await production.resolve_location(location)
+                schema = await production.ensure_schema(location)
+            except Exception:
+                checks["production_bitable_schema"] = _result(
+                    True,
+                    reachable=True,
+                    permission_ok=False,
+                    message="生产表字段或权限检查失败",
+                )
+                checks["production_bitable_read"] = _result(
+                    True,
+                    reachable=True,
+                    permission_ok=False,
+                    message="字段检查未通过，未读取生产表记录",
+                )
+            else:
+                checks["production_bitable_schema"] = _result(
+                    True,
+                    reachable=True,
+                    permission_ok=True,
+                    message="生产表六个字段检查通过",
+                )
+                try:
+                    await production.list_tasks(
+                        location,
+                        schema,
+                        include_completed=settings.lark_include_completed_for_test,
+                    )
+                except Exception:
+                    checks["production_bitable_read"] = _result(
+                        True,
+                        reachable=True,
+                        permission_ok=False,
+                        message="生产表记录读取失败",
+                    )
+                else:
+                    checks["production_bitable_read"] = _result(
+                        True,
+                        reachable=True,
+                        permission_ok=True,
+                        message="生产表只读扫描通过",
+                    )
+
+    if feishu_client is not None:
+        await feishu_client.close()
 
     endpoints = {
         "deepseek": (
@@ -190,7 +364,7 @@ async def probe(settings: Settings, *, network: bool = True) -> dict[str, Any]:
         ),
         "seedance": (
             _configured(settings, "ark_api_key", "seedance_model"),
-            f"{settings.ark_base_url.rstrip('/')}/models/{settings.seedance_model}",
+            f"{settings.ark_base_url.rstrip('/')}/models",
             {
                 "Authorization": "Bearer "
                 + (
@@ -199,7 +373,7 @@ async def probe(settings: Settings, *, network: bool = True) -> dict[str, Any]:
                     else ""
                 )
             },
-            None,
+            settings.seedance_model,
         ),
     }
     async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
@@ -222,9 +396,7 @@ async def probe(settings: Settings, *, network: bool = True) -> dict[str, Any]:
                     permission_ok=permission,
                     message=message,
                 )
-    configured = all(
-        _configured(settings, field) for field in REQUIRED_RUNTIME_FIELDS
-    )
+    configured = runtime_is_configured(settings)
     reachable_values = [
         item["reachable"] for item in checks.values() if item["configured"]
     ]
@@ -240,7 +412,13 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="检查本地目录、凭证配置和只读接口可达性"
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--network",
+        action="store_true",
+        help="显式执行只读飞书、多维表格和模型鉴权检查（默认行为）",
+    )
+    mode.add_argument(
         "--no-network",
         action="store_true",
         help="只检查本地配置，不访问外部接口",

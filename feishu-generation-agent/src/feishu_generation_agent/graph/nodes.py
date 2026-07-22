@@ -544,9 +544,6 @@ async def revalidate_approval(
                 max_output_count=services.settings.max_output_count,
             )
         )
-        audit = AuditReport.model_validate(state.get("audit_report", {}))
-        if audit.corrections_required:
-            issues.extend(f"audit: {issue}" for issue in audit.issues)
         if issues:
             raise _validation_error("The approved plan is not valid")
         return {"validation_issues": [], "status": "approved"}
@@ -1132,13 +1129,18 @@ async def _execute_one_task(
             latest = await services.repository.get_operation(
                 run_id, task.task_id, "submit"
             )
+            local_preflight_failure = (
+                isinstance(exc, AgentError)
+                and exc.detail.category
+                in {ErrorCategory.VALIDATION, ErrorCategory.DOCUMENT}
+            )
             if latest is not None and latest["phase"] == "intent_created":
                 await _transition_operation(
                     services,
                     run_id,
                     task.task_id,
                     latest,
-                    "submission_uncertain",
+                    "failed" if local_preflight_failure else "submission_uncertain",
                     None,
                 )
                 latest = await services.repository.get_operation(

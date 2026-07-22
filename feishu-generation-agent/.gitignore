@@ -3,6 +3,7 @@
 data/
 outputs/
 .pytest_cache/
+.firecrawl/
 __pycache__/
 *.pyc
 tests/.tmp/

@@ -21,6 +21,10 @@ from .nodes import (
 from .state import AgentState
 
 
+def _route_after_artifact_verification(state: AgentState) -> str:
+    return "deliver_to_feishu" if state.get("artifacts") else END
+
+
 def build_graph(services: GraphServices, checkpointer: Any):
     builder = StateGraph(AgentState)
     builder.add_node(
@@ -82,6 +86,9 @@ def build_graph(services: GraphServices, checkpointer: Any):
     builder.add_edge(
         "execute_selected_tasks", "verify_and_download_artifacts"
     )
-    builder.add_edge("verify_and_download_artifacts", "deliver_to_feishu")
+    builder.add_conditional_edges(
+        "verify_and_download_artifacts",
+        _route_after_artifact_verification,
+    )
     builder.add_edge("deliver_to_feishu", END)
     return builder.compile(checkpointer=checkpointer)

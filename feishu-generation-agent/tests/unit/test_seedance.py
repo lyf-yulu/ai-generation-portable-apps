@@ -15,7 +15,7 @@ from pydantic import SecretStr
 from feishu_generation_agent.domain.artifact import ProviderSubmission
 from feishu_generation_agent.domain.document import MediaAsset
 from feishu_generation_agent.domain.errors import AgentError, ErrorCategory
-from feishu_generation_agent.domain.plan import GenerationTask
+from feishu_generation_agent.domain.plan import GenerationTask, ImageReference
 from feishu_generation_agent.integrations.seedance import SeedanceVideoGenerator
 
 
@@ -192,6 +192,35 @@ async def test_submit_preserves_explicit_reference_order_and_official_payload(
     assert submission.provider_task_id == "task-ark-fictional-123"
     assert submission.provider_task_id != "client-correlation-only"
     assert submission.status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_submit_treats_official_id_only_response_as_queued(
+    tmp_path: Path,
+) -> None:
+    def create(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"id": "task-ark-id-only"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(create)
+    ) as client:
+        generator = SeedanceVideoGenerator(
+            client,
+            base_url="https://ark.fictional.test/api/v3",
+            api_key="fictional-key",
+            model="fictional-model",
+        )
+        submission = await generator.submit(
+            _video_task(),
+            _assets(tmp_path),
+        )
+
+    assert submission.provider_task_id == "task-ark-id-only"
+    assert submission.status == "queued"
+    assert submission.result_items == []
 
 
 @pytest.mark.asyncio
@@ -440,7 +469,17 @@ async def test_submit_rejects_invalid_reference_mapping_before_http(
         references[0]["role"] = "first_frame"
         references[1]["role"] = "first_frame"
 
-    task = _video_task(references=references)
+    if case == "invalid_role":
+        task = _video_task().model_copy(
+            update={
+                "reference_images": [
+                    ImageReference.model_construct(**reference)
+                    for reference in references
+                ]
+            }
+        )
+    else:
+        task = _video_task(references=references)
     requests: list[httpx.Request] = []
     async with _recording_client(requests) as client:
         generator = SeedanceVideoGenerator(

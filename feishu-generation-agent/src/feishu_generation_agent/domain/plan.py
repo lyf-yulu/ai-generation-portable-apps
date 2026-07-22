@@ -1,7 +1,7 @@
 from enum import StrEnum
 from typing import Literal, Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class TaskType(StrEnum):
@@ -11,8 +11,15 @@ class TaskType(StrEnum):
 
 class ImageReference(BaseModel):
     asset_id: str
-    role: str
+    role: Literal["reference_image", "first_frame", "last_frame"]
     order: int = Field(ge=1)
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def normalize_saved_planner_role(cls, value: object) -> object:
+        if value == "character_and_style_reference":
+            return "reference_image"
+        return value
 
 
 class GenerationTask(BaseModel):
@@ -27,13 +34,27 @@ class GenerationTask(BaseModel):
     aspect_ratio: str
     image_size: str | None = None
     duration: int | None = None
-    resolution: str | None = None
+    resolution: Literal["720p", "1080p"] | None = None
     generate_audio: bool | None = None
     output_count: int = Field(default=1, ge=1)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     assumptions: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     blocking_issues: list[str] = Field(default_factory=list)
+
+    @field_validator("resolution", mode="before")
+    @classmethod
+    def normalize_video_resolution(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip().lower().replace("×", "x")
+        aliases = {
+            "720x1280": "720p",
+            "1280x720": "720p",
+            "1080x1920": "1080p",
+            "1920x1080": "1080p",
+        }
+        return aliases.get(normalized, normalized)
 
     @model_validator(mode="after")
     def validate_type_specific_fields(self) -> Self:

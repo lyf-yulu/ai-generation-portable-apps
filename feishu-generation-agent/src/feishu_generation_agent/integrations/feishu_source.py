@@ -290,6 +290,8 @@ class FeishuDocumentSource:
 
         for block_id in source_ids:
             raw_parent = blocks_by_id[block_id].get("parent_id")
+            if raw_parent == "":
+                raw_parent = None
             if raw_parent is not None and (
                 not isinstance(raw_parent, str) or not raw_parent
             ):
@@ -316,6 +318,8 @@ class FeishuDocumentSource:
     @staticmethod
     def _children(raw: dict[str, Any]) -> list[tuple[str, int | None, int | None]]:
         children = raw.get("children", [])
+        if children is None:
+            children = []
         if not isinstance(children, list) or not all(
             isinstance(item, str) and item for item in children
         ):

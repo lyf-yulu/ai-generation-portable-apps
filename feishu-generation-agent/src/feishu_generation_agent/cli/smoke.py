@@ -3,10 +3,13 @@ import asyncio
 import os
 import sys
 from collections.abc import Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import Any, AsyncIterator, Protocol
 from uuid import uuid4
 
-from feishu_generation_agent.bootstrap import open_services
+from feishu_generation_agent.bootstrap import open_application_services, open_services
+from feishu_generation_agent.bitable.mvp_service import BitableMvpService
 from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain import (
     Artifact,
@@ -20,6 +23,166 @@ from feishu_generation_agent.graph.nodes import (
     _task_assets,
     verify_and_download_artifacts,
 )
+from feishu_generation_agent.graph.builder import build_graph
+from feishu_generation_agent.graph.runtime import GraphRuntime
+from feishu_generation_agent.integrations.bitable_url import parse_bitable_url
+from feishu_generation_agent.integrations.feishu_bitable import FeishuBitableClient
+from feishu_generation_agent.integrations.feishu_client import FeishuClient
+from feishu_generation_agent.integrations.production_bitable import (
+    ProductionBitableClient,
+)
+from feishu_generation_agent.integrations.feishu_source import FeishuDocumentSource
+from feishu_generation_agent.storage.checkpoints import open_checkpointer
+from feishu_generation_agent.storage.files import FileStore
+
+
+_TERMINAL_STATUSES = frozenset(
+    {
+        "succeeded",
+        "completed_with_errors",
+        "delivery_failed",
+        "failed",
+        "cancelled",
+    }
+)
+
+
+class _BitableSmokeService(Protocol):
+    async def scan(self) -> list[Any]: ...
+
+    async def claim(self, record_id: str) -> str: ...
+
+    async def sync_once(self, run_id: str) -> Any: ...
+
+
+class _SmokeRuntime(Protocol):
+    async def get_run_view(self, run_id: str) -> dict[str, Any]: ...
+
+
+@dataclass(slots=True)
+class BitableApprovalSmokeRunner:
+    """Runs one Bitable task only until the existing human approval gate."""
+
+    bitable_service: _BitableSmokeService
+    runtime: _SmokeRuntime
+    record_id: str
+    poll_interval_seconds: float = 0.2
+
+    async def run(self) -> str:
+        tasks = await self.bitable_service.scan()
+        if not any(task.record_id == self.record_id for task in tasks):
+            raise RuntimeError("指定记录不在当前可领取任务中")
+        run_id = await self.bitable_service.claim(self.record_id)
+        while True:
+            await self.bitable_service.sync_once(run_id)
+            view = await self.runtime.get_run_view(run_id)
+            status = view.get("status")
+            if status == "waiting_approval":
+                return run_id
+            if status in _TERMINAL_STATUSES:
+                raise RuntimeError("运行未到审批门禁即已结束")
+            await asyncio.sleep(self.poll_interval_seconds)
+
+
+@dataclass(slots=True)
+class BitableReadOnlySmokeRunner:
+    """Verifies Bitable location, schema and view access without claiming work."""
+
+    settings: Settings
+
+    async def run(self) -> int:
+        self.settings.require(
+            "lark_app_id",
+            "lark_app_secret",
+            "lark_bitable_url",
+            "lark_bitable_table_id",
+            "lark_bitable_view_id",
+        )
+        client = FeishuClient(self.settings)
+        try:
+            bitable = FeishuBitableClient(client)
+            location = parse_bitable_url(
+                self.settings.lark_bitable_url or "",
+                self.settings.lark_bitable_table_id or "",
+                self.settings.lark_bitable_view_id or "",
+            )
+            location = await bitable.resolve_location(location)
+            schema = await bitable.ensure_schema(location)
+            return len(await bitable.list_tasks(location, schema))
+        except Exception as exc:
+            raise RuntimeError("多维表格只读扫描失败") from exc
+        finally:
+            await client.close()
+
+
+@dataclass(slots=True)
+class ProductionBitableReadOnlySmokeRunner:
+    """Reads the production source and one requirement document without mutation."""
+
+    settings: Settings
+
+    async def run(self) -> int:
+        self.settings.require(
+            "lark_app_id",
+            "lark_app_secret",
+            "lark_production_bitable_url",
+            "lark_production_table_id",
+            "lark_production_view_id",
+            "lark_result_folder_token",
+        )
+        self.settings.ensure_paths()
+        client = FeishuClient(self.settings)
+        file_store = FileStore(
+            self.settings.data_dir,
+            self.settings.outputs_dir,
+            max_bytes=self.settings.max_download_bytes,
+        )
+        try:
+            bitable = ProductionBitableClient(client)
+            location = parse_bitable_url(
+                self.settings.lark_production_bitable_url or "",
+                self.settings.lark_production_table_id or "",
+                self.settings.lark_production_view_id or "",
+            )
+            location = await bitable.resolve_location(location)
+            schema = await bitable.ensure_schema(location)
+            tasks = await bitable.list_tasks(
+                location,
+                schema,
+                include_completed=self.settings.lark_include_completed_for_test,
+            )
+            if tasks:
+                source = FeishuDocumentSource(client, file_store)
+                await source.ingest(RequirementRequest(source_url=tasks[0].source_url))
+            return len(tasks)
+        except Exception as exc:
+            raise RuntimeError("生产多维表格只读扫描失败") from exc
+        finally:
+            file_store.close()
+            await client.close()
+
+
+@asynccontextmanager
+async def _open_bitable_approval_smoke(
+    settings: Settings,
+) -> AsyncIterator[tuple[BitableMvpService, GraphRuntime]]:
+    async with open_application_services(settings) as application:
+        if application.bitable_factory is None:
+            raise RuntimeError("尚未配置多维表格")
+        async with open_checkpointer(application.graph.settings) as checkpointer:
+            runtime = GraphRuntime(
+                graph=build_graph(application.graph, checkpointer),
+                repository=application.graph.repository,
+                file_store=application.graph.file_store,
+                settings=application.graph.settings,
+                delivery_writer=application.graph.delivery_writer,
+            )
+            bitable_service = application.bitable_factory.create(runtime)
+            try:
+                yield bitable_service, runtime
+            finally:
+                await bitable_service.close()
+                await runtime.close()
 
 
 @dataclass(slots=True)
@@ -102,7 +265,7 @@ class PaidSmokeRunner:
                 update={
                     "output_count": 1,
                     "duration": 4,
-                    "resolution": "480p",
+                    "resolution": "720p",
                     "generate_audio": False,
                 }
             )
@@ -201,21 +364,103 @@ def build_paid_smoke_runner(settings: Settings, source_url: str) -> PaidSmokeRun
     return PaidSmokeRunner(settings=settings, source_url=source_url)
 
 
+def build_bitable_read_only_smoke_runner(
+    settings: Settings,
+) -> BitableReadOnlySmokeRunner:
+    return BitableReadOnlySmokeRunner(settings=settings)
+
+
+def build_production_bitable_read_only_smoke_runner(
+    settings: Settings,
+) -> ProductionBitableReadOnlySmokeRunner:
+    return ProductionBitableReadOnlySmokeRunner(settings=settings)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="显式门禁下执行一次真实图像与视频付费冒烟"
+        description="执行飞书多维表格只读或审批门禁冒烟；付费生成须显式确认"
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--bitable-read-only",
+        action="store_true",
+        help="只读取多维表格字段和任务视图，不领取、不调用模型或生成器",
+    )
+    mode.add_argument(
+        "--production-bitable-read-only",
+        action="store_true",
+        help="只读取生产表和一条需求附件，不锁定、不生成、不创建结果表",
+    )
+    mode.add_argument(
+        "--bitable-record-id",
+        help="领取一条任务并在 waiting_approval 门禁停止，不提交图像或视频生成",
     )
     parser.add_argument(
         "--confirm-paid-smoke",
         action="store_true",
         help="第一道门禁；同时还必须设置 ALLOW_PAID_SMOKE=YES",
     )
-    parser.add_argument("source_url", help="专用飞书测试文档 URL")
+    parser.add_argument(
+        "source_url",
+        nargs="?",
+        help="专用飞书测试文档 URL；仅真实付费冒烟模式需要",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.bitable_read_only:
+        if args.source_url:
+            print("只读扫描不接受文档 URL", file=sys.stderr)
+            return 2
+        try:
+            count = asyncio.run(
+                build_bitable_read_only_smoke_runner(Settings()).run()
+            )
+        except (ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"多维表格只读扫描通过：当前可处理记录 {count} 条")
+        return 0
+    if args.production_bitable_read_only:
+        if args.source_url:
+            print("生产表只读扫描不接受文档 URL", file=sys.stderr)
+            return 2
+        try:
+            count = asyncio.run(
+                build_production_bitable_read_only_smoke_runner(Settings()).run()
+            )
+        except (ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"生产多维表格只读扫描通过：当前可处理记录 {count} 条")
+        return 0
+    if args.bitable_record_id:
+        if args.source_url:
+            print("审批门禁冒烟不接受文档 URL", file=sys.stderr)
+            return 2
+        try:
+            async def run_to_gate() -> str:
+                async with _open_bitable_approval_smoke(
+                    Settings()
+                ) as (bitable_service, runtime):
+                    runner = BitableApprovalSmokeRunner(
+                        bitable_service=bitable_service,
+                        runtime=runtime,
+                        record_id=args.bitable_record_id,
+                    )
+                    return await runner.run()
+
+            run_id = asyncio.run(run_to_gate())
+        except (ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"已到人工审批门禁：{run_id}；未提交图像或视频生成")
+        return 0
+    if not args.source_url:
+        print("请指定 --bitable-read-only、--bitable-record-id 或专用文档 URL", file=sys.stderr)
+        return 2
     if not args.confirm_paid_smoke or os.environ.get("ALLOW_PAID_SMOKE") != "YES":
         print(
             "拒绝执行：必须同时传入 --confirm-paid-smoke 并设置 "

@@ -5,6 +5,12 @@ from feishu_generation_agent.domain.artifact import (
     ProviderResult,
     ProviderSubmission,
 )
+from feishu_generation_agent.domain.bitable import (
+    BitableBinding,
+    BitableLocation,
+    BitableTaskSummary,
+    TableTaskStatus,
+)
 from feishu_generation_agent.domain.document import (
     DocumentBlock,
     MediaAsset,
@@ -26,12 +32,23 @@ from feishu_generation_agent.domain.plan import (
     TaskPlan,
     TaskType,
 )
+from feishu_generation_agent.domain.production_bitable import (
+    ProductionBinding,
+    ProductionDelivery,
+    ProductionSchema,
+    ProductionSourceSnapshot,
+    ProductionTaskSummary,
+    ResultTableTarget,
+)
 
 __all__ = [
     "AgentError",
     "ApprovalDecision",
     "Artifact",
     "AuditReport",
+    "BitableBinding",
+    "BitableLocation",
+    "BitableTaskSummary",
     "DeliveryRecord",
     "DocumentBlock",
     "ErrorCategory",
@@ -43,9 +60,16 @@ __all__ = [
     "NormalizedDocument",
     "ProviderResult",
     "ProviderSubmission",
+    "ProductionBinding",
+    "ProductionDelivery",
+    "ProductionSchema",
+    "ProductionSourceSnapshot",
+    "ProductionTaskSummary",
     "RequirementRequest",
+    "ResultTableTarget",
     "SourceType",
     "TaskPlan",
+    "TableTaskStatus",
     "TaskType",
     "VisionDescription",
 ]

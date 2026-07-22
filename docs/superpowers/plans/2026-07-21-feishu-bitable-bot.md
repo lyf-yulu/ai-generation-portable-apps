@@ -161,8 +161,11 @@ deepseek_model: str = "deepseek-v4-pro"
 CAPABILITY_FIELDS = {
     "core": (
         "lark_app_id", "lark_app_secret", "deepseek_api_key",
-        "claude_api_key", "claude_model", "chiyun_api_key",
-        "chiyun_model", "ark_api_key",
+        "claude_api_key", "claude_model",
+    ),
+    "generation": (
+        "chiyun_api_key", "chiyun_model", "ark_api_key",
+        "seedance_model",
     ),
     "bitable": (
         "lark_app_id", "lark_app_secret", "lark_bitable_url",
@@ -184,9 +187,13 @@ def capability_is_configured(settings: Settings, name: str) -> bool:
 
 
 def runtime_is_configured(settings: Settings) -> bool:
-    return capability_is_configured(settings, "core") and (
-        capability_is_configured(settings, "bitable")
-        or capability_is_configured(settings, "legacy_delivery")
+    return (
+        capability_is_configured(settings, "core")
+        and capability_is_configured(settings, "generation")
+        and (
+            capability_is_configured(settings, "bitable")
+            or capability_is_configured(settings, "legacy_delivery")
+        )
     )
 ```
 
@@ -1621,7 +1628,8 @@ cd feishu-generation-agent
 uv run pytest -q
 node --test tests/frontend/*.test.cjs
 git diff --check
-if git diff -- . ':!*.lock' | rg -n 'sk-[A-Za-z0-9]|ark-[A-Za-z0-9]{8}|SecretAccessKey|LARK_APP_SECRET=.+'; then
+feature_base=$(git merge-base main HEAD)
+if git diff "$feature_base"..HEAD -- . ':!*.lock' | rg -n 'sk-[A-Za-z0-9]|ark-[A-Za-z0-9]{8}|SecretAccessKey|LARK_APP_SECRET=.+'; then
   echo "检测到疑似凭证，停止提交"
   exit 1
 fi

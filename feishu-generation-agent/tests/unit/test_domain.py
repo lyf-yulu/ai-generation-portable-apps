@@ -95,6 +95,54 @@ def test_video_task_rejects_image_size_and_all_tasks_require_references():
             GenerationTask.model_validate(payload)
 
 
+def test_reference_role_normalizes_saved_planner_alias():
+    payload = task_payload("image_to_video")
+    payload.update(duration=10, resolution="720p")
+    payload["reference_images"][0]["role"] = "character_and_style_reference"
+
+    task = GenerationTask.model_validate(payload)
+
+    assert task.reference_images[0].role == "reference_image"
+
+
+def test_reference_role_rejects_unknown_values():
+    payload = task_payload("image_to_video")
+    payload.update(duration=10, resolution="720p")
+    payload["reference_images"][0]["role"] = "fictional_role"
+
+    with pytest.raises(ValidationError, match="role"):
+        GenerationTask.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("raw_resolution", "expected"),
+    [
+        ("1080x1920", "1080p"),
+        ("1920x1080", "1080p"),
+        ("720x1280", "720p"),
+        ("1280x720", "720p"),
+    ],
+)
+def test_video_resolution_normalizes_common_pixel_dimensions(
+    raw_resolution: str,
+    expected: str,
+):
+    payload = task_payload("image_to_video")
+    payload.update(duration=15, resolution=raw_resolution)
+
+    task = GenerationTask.model_validate(payload)
+
+    assert task.resolution == expected
+
+
+def test_video_resolution_rejects_unsupported_values():
+    payload = task_payload("image_to_video")
+    payload.update(duration=10, resolution="4k")
+
+    with pytest.raises(ValidationError, match="resolution"):
+        GenerationTask.model_validate(payload)
+
+
 def test_blocking_task_cannot_be_approved():
     task = image_task(blocking_issues=["图片用途不明确"])
     plan = TaskPlan(tasks=[task])

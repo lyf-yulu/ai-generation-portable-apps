@@ -1,11 +1,13 @@
 import asyncio
 import base64
+from io import BytesIO
 import json
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+from PIL import Image
 
 from feishu_generation_agent.domain.document import (
     MediaAsset,
@@ -120,6 +122,39 @@ async def test_analyze_sends_original_mime_and_caches_by_hash(
         webp_asset.local_path.read_bytes()
     )
     assert model.structured_schema is VisionDescription
+
+
+async def test_analyze_downscales_large_image_for_model_only(
+    repository: Repository,
+    tmp_path: Path,
+):
+    image_path = tmp_path / "large-reference.png"
+    image = Image.effect_noise((1600, 2848), 100).convert("RGB")
+    image.save(image_path, format="PNG")
+    original_bytes = image_path.read_bytes()
+    asset = MediaAsset(
+        asset_id="asset-large",
+        source_block_id="block-large",
+        origin="feishu",
+        local_path=image_path,
+        mime_type="image/png",
+        size=len(original_bytes),
+        sha256="large-image-hash",
+    )
+    model = FakeVisionModel()
+    analyzer = ClaudeVisionAnalyzer(model, repository, prompt_version="vision-v1")
+
+    await analyzer.analyze(asset)
+
+    prepared_bytes = base64.b64decode(model.last_image_data or "")
+    with Image.open(BytesIO(prepared_bytes)) as prepared:
+        width, height = prepared.size
+        assert prepared.format == "JPEG"
+    assert model.last_media_type == "image/jpeg"
+    assert max(width, height) <= 1568
+    assert width * height <= 1_150_000
+    assert len(prepared_bytes) < len(original_bytes)
+    assert image_path.read_bytes() == original_bytes
 
 
 async def test_analyze_uses_strict_visible_content_system_prompt(

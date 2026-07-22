@@ -65,3 +65,11 @@ class ReferenceListRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     references: list[ImageReference] = Field(min_length=1)
+
+
+class BitableClaimResponse(BaseModel):
+    run_id: str
+
+
+class BitableRetryResponse(BitableClaimResponse):
+    status: Literal["accepted"] = "accepted"
