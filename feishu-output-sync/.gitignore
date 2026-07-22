@@ -1,0 +1,6 @@
+# Local runtime state — never commit the sync DB or real config.
+state/
+config.json
+__pycache__/
+*.pyc
+.pytest_cache/

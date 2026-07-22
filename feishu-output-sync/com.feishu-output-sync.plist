@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.feishu-output-sync</string>
+
+	<!-- Independent from com.ai-portal. Loops sync.py (no --once) so it polls
+	     every poll_interval_seconds and moves new outputs into Feishu well
+	     before the 1-day cleanup removes them. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/python3.12</string>
+		<string>sync.py</string>
+	</array>
+
+	<key>WorkingDirectory</key>
+	<string>/Users/260413a/ai-generation-portable-apps/feishu-output-sync</string>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/260413a</string>
+		<key>PATH</key>
+		<string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+	</dict>
+
+	<!-- Restart if it crashes; start at login. ThrottleInterval avoids a tight
+	     crash-loop hammering Feishu if config is broken. -->
+	<key>KeepAlive</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+
+	<key>StandardOutPath</key>
+	<string>/Users/260413a/Library/Logs/feishu-output-sync.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/260413a/Library/Logs/feishu-output-sync.err</string>
+</dict>
+</plist>
