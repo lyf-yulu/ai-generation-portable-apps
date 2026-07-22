@@ -30,6 +30,16 @@ def test_settings_can_explicitly_enable_benchmark_fake_ips():
     assert settings.allow_benchmark_fake_ips is True
 
 
+def test_provider_polling_defaults_to_fifteen_minutes(monkeypatch):
+    monkeypatch.delenv("PROVIDER_POLL_INTERVAL_SECONDS", raising=False)
+    monkeypatch.delenv("PROVIDER_POLL_MAX_ATTEMPTS", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.provider_poll_interval_seconds == 1.0
+    assert settings.provider_poll_max_attempts == 900
+
+
 def test_runtime_accepts_complete_production_bitable_configuration() -> None:
     settings = Settings(
         _env_file=None,
