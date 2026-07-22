@@ -748,6 +748,20 @@ def test_validator_accepts_task_plan_and_valid_raw_plan(
     assert validate_plan(typed_plan, narrative_document, 4) == []
 
 
+def test_validator_rejects_frame_mode_without_exactly_two_frame_roles(
+    narrative_document: NormalizedDocument,
+):
+    raw_plan = json.loads(_plan_json(_video_task()))
+    raw_plan["tasks"][0].update(reference_mode="first_last_frame")
+    raw_plan["tasks"][0]["reference_images"] = [
+        {"asset_id": "asset-1", "role": "first_frame", "order": 1}
+    ]
+
+    issues = validate_plan(raw_plan, narrative_document, 4)
+
+    assert "首尾帧模式" in " ".join(issues)
+
+
 @pytest.mark.parametrize(
     ("mutation", "expected"),
     [

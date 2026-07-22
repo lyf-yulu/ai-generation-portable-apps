@@ -264,6 +264,37 @@ async def test_submit_accepts_origin_base_and_valid_first_last_frames(
 
 
 @pytest.mark.asyncio
+async def test_submit_rejects_frame_mode_with_non_frame_references(
+    tmp_path: Path,
+) -> None:
+    task = _video_task().model_copy(
+        update={
+            "reference_mode": "first_last_frame",
+            "reference_images": [
+                ImageReference.model_construct(
+                    asset_id="asset-blue", role="reference_image", order=1
+                ),
+                ImageReference.model_construct(
+                    asset_id="asset-green", role="reference_image", order=2
+                ),
+            ],
+        }
+    )
+    requests: list[httpx.Request] = []
+    async with _recording_client(requests) as client:
+        generator = SeedanceVideoGenerator(
+            client,
+            base_url="https://ark.fictional.test/api/v3",
+            api_key="fictional-key",
+            model="fictional-model",
+        )
+        with pytest.raises(AgentError, match="首尾帧模式"):
+            await generator.submit(task, _assets(tmp_path))
+
+    assert requests == []
+
+
+@pytest.mark.asyncio
 async def test_origin_base_poll_uses_official_api_v3_path() -> None:
     requests: list[httpx.Request] = []
 
@@ -476,6 +507,16 @@ async def test_submit_rejects_invalid_reference_mapping_before_http(
                     ImageReference.model_construct(**reference)
                     for reference in references
                 ]
+            }
+        )
+    elif case in {"mixed_roles", "last_without_first", "duplicate_first"}:
+        task = _video_task().model_copy(
+            update={
+                "reference_mode": "first_last_frame",
+                "reference_images": [
+                    ImageReference.model_construct(**reference)
+                    for reference in references
+                ],
             }
         )
     else:

@@ -675,6 +675,7 @@ class GraphRuntime:
                 updated.task_type.value,
                 updated.reference_images,
                 {asset.asset_id for asset in assets},
+                updated.reference_mode,
             )
             return updated
         except RunValidationError:
@@ -782,13 +783,20 @@ class GraphRuntime:
                 if isinstance(item, dict) and isinstance(item.get("asset_id"), str)
             }
             for task in candidate.tasks:
-                self._validate_references(task.task_type.value, task.reference_images, assets)
+                self._validate_references(
+                    task.task_type.value,
+                    task.reference_images,
+                    assets,
+                    task.reference_mode,
+                )
             approved = candidate.approved_subset(
                 decision.selected_task_ids,
                 self.settings.max_output_count,
             )
             if not approved.tasks:
                 raise ValueError("没有可批准的任务")
+        except RunValidationError:
+            raise
         except Exception as exc:
             message = str(exc)
             if "unknown selected task_id" in message:
@@ -801,6 +809,7 @@ class GraphRuntime:
         task_type: str,
         references: Any,
         known_assets: set[str],
+        reference_mode: str | None = None,
     ) -> None:
         asset_ids = [reference.asset_id for reference in references]
         if any(asset_id not in known_assets for asset_id in asset_ids):
@@ -814,13 +823,31 @@ class GraphRuntime:
         allowed_roles = {"reference_image", "first_frame", "last_frame"}
         if any(role not in allowed_roles for role in roles):
             raise RunValidationError("图片用途无效")
+        ordered_roles = [
+            reference.role
+            for reference in sorted(references, key=lambda reference: reference.order)
+        ]
+        if task_type == "image_to_image":
+            if reference_mode == "first_last_frame":
+                raise RunValidationError("图生图只能使用多参考模式")
+            if any(role != "reference_image" for role in roles):
+                raise RunValidationError("图生图只接受普通参考图")
+            return
+        if reference_mode == "first_last_frame":
+            if ordered_roles != ["first_frame", "last_frame"]:
+                raise RunValidationError(
+                    "首尾帧模式必须且只能按顺序指定一张首帧和一张尾帧"
+                )
+            return
+        if reference_mode == "multi_reference":
+            if any(role != "reference_image" for role in roles):
+                raise RunValidationError("多参考模式只能使用普通参考图")
+            return
         if roles.count("first_frame") > 1 or roles.count("last_frame") > 1:
             raise RunValidationError("首帧或尾帧用途不能重复")
         frame_roles = {"first_frame", "last_frame"}.intersection(roles)
         if "reference_image" in roles and frame_roles:
             raise RunValidationError("普通参考图不能与首尾帧混用")
-        if task_type == "image_to_image" and frame_roles:
-            raise RunValidationError("图生图只接受普通参考图")
 
     async def close(self) -> None:
         if self._closed:

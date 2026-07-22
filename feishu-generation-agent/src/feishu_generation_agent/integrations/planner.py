@@ -25,6 +25,7 @@ _STORYBOARD_HEADER = re.compile(r"^\s*(?:镜头|镜号|镜头号)\s*[：:]?\s*$"
 _STORYBOARD_ROW_NUMBER = re.compile(r"^\s*([0-9]{1,3})\s*[、.．]?\s*$")
 _PLAN_SYSTEM_PROMPT = """你是 AI 图片与视频生成需求规划器。
 只根据给定文档、稳定引用和视觉描述输出 TaskPlan JSON，不得虚构素材或需求。
+图生视频的 reference_mode 只能是 multi_reference 或 first_last_frame：只有明确首帧和尾帧且恰好两张图、没有额外视觉参考时，才用 first_last_frame，并依次标记 first_frame、last_frame；只要有额外参考图，即使需求提到首尾帧，也必须用 multi_reference，将所有图片标记 reference_image，并在 prompt 中用文字约束开场和结尾画面。
 不要输出思维过程、推理原文、Markdown 或 JSON 之外的说明。
 """
 _AUDIT_SYSTEM_PROMPT = """你是独立审查员，与需求规划角色相互独立。
@@ -282,6 +283,50 @@ def validate_plan(
             if not asset.mime_type.startswith("image/"):
                 issues.append(
                     f"{reference_prefix}.asset_id: asset {asset_id} must have image MIME"
+                )
+
+        reference_mode = task.get("reference_mode")
+        if reference_mode not in {None, "multi_reference", "first_last_frame"}:
+            issues.append(
+                f"{prefix}.reference_mode: must be multi_reference or first_last_frame"
+            )
+        roles = [
+            reference.get("role")
+            for reference in references
+            if isinstance(reference, dict)
+        ]
+        if task_type == "image_to_image":
+            if reference_mode == "first_last_frame":
+                issues.append(
+                    f"{prefix}.reference_mode: 图生图只能使用多参考模式"
+                )
+            elif any(role != "reference_image" for role in roles):
+                issues.append(
+                    f"{prefix}.reference_images: 图生图只接受普通参考图"
+                )
+        elif task_type == "image_to_video":
+            if reference_mode == "first_last_frame":
+                ordered_roles = [
+                    reference.get("role")
+                    for reference in sorted(
+                        (
+                            reference
+                            for reference in references
+                            if isinstance(reference, dict)
+                            and isinstance(reference.get("order"), int)
+                        ),
+                        key=lambda reference: reference["order"],
+                    )
+                ]
+                if ordered_roles != ["first_frame", "last_frame"]:
+                    issues.append(
+                        f"{prefix}.reference_mode: 首尾帧模式必须且只能按顺序指定一张首帧和一张尾帧"
+                    )
+            elif reference_mode == "multi_reference" and any(
+                role != "reference_image" for role in roles
+            ):
+                issues.append(
+                    f"{prefix}.reference_mode: 多参考模式只能使用普通参考图"
                 )
 
         if task_type == "image_to_image":
