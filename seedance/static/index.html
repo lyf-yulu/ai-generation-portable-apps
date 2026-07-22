@@ -39,12 +39,15 @@
             <p class="hint">供应商：豆包官方 / 火山方舟（公司统一 Key，服务端配置）</p>
             <label>Base URL<input name="base_url" v-model="baseUrl"></label>
             <p class="hint">{{ providerHint }}</p>
-            <label>输出目录<input name="output_dir" v-model="outputDir" placeholder="留空则保存到 outputs 文件夹"></label>
+            <!-- 输出目录选择仅在独立本地模式(直连 :8787)显示。Portal(远程)模式
+                 下隐藏:结果统一存服务机 outputs/<用户名>/<日期>/,自定义路径对远程
+                 用户无意义(浏览器写不到访问者电脑)且会导致产出散落、无法同步飞书。 -->
+            <label v-if="!inPortal">输出目录<input name="output_dir" v-model="outputDir" placeholder="留空则保存到 outputs 文件夹"></label>
             <div class="rowButtons outputDirBtns">
-              <button type="button" @click="chooseOutputDir()">选择目录</button>
-              <button type="button" @click="outputDir=''">程序 outputs</button>
-              <button type="button" @click="desktopOutput()">桌面 outputs</button>
-              <button type="button" @click="openOutputDir()">打开目录</button>
+              <button type="button" v-if="!inPortal" @click="chooseOutputDir()">选择目录</button>
+              <button type="button" v-if="!inPortal" @click="outputDir=''">程序 outputs</button>
+              <button type="button" v-if="!inPortal" @click="desktopOutput()">桌面 outputs</button>
+              <button type="button" v-if="!inPortal" @click="openOutputDir()">打开目录</button>
               <button type="button" @click="cleanCache()">清理缓存</button>
             </div>
           </section>
