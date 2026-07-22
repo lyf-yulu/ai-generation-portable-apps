@@ -403,20 +403,22 @@
     }
   }
 
-  function requireCleanDraftForReferenceMutation() {
-    if (!ReviewState.hasDirty(state.review)) return true;
-    showError(new Error("请先提交或放弃本地任务编辑，再增添、替换或删除参考图片"));
+  async function prepareReferenceMutation(task) {
+    const directive = ReviewState.referenceMutationDirective(state.review, task.task_id);
+    if (directive === "proceed") return true;
+    if (directive === "save_then_proceed") return patchReferences(task);
+    showError(new Error("请先提交或放弃提示词、任务选择等本地编辑，再增添、替换或删除参考图片"));
     return false;
   }
 
   async function patchReferences(task) {
     if (!ReviewState.canSaveReferences(state.review, task.task_id)) {
       showError(new Error("请先处理其他本地任务编辑，再保存参考图片用途与顺序"));
-      return;
+      return false;
     }
     const current = currentTask(task.task_id);
     const references = current?.reference_images || [];
-    await mutate(`/api/runs/${state.runId}/tasks/${encodeURIComponent(task.task_id)}/references`, {
+    return mutate(`/api/runs/${state.runId}/tasks/${encodeURIComponent(task.task_id)}/references`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -427,7 +429,7 @@
   }
 
   async function uploadReference(task, fileInput, role, order, replacesAssetId = null) {
-    if (!requireCleanDraftForReferenceMutation()) return;
+    if (!await prepareReferenceMutation(task)) return;
     const file = fileInput.files[0];
     if (!file) {
       showError(new Error("请选择图片文件"));
@@ -447,8 +449,8 @@
   }
 
   async function unlinkReference(task, assetId) {
-    if (!requireCleanDraftForReferenceMutation()) return;
-    await mutate(
+    if (!await prepareReferenceMutation(task)) return;
+    return mutate(
       `/api/runs/${state.runId}/tasks/${encodeURIComponent(task.task_id)}/references/${encodeURIComponent(assetId)}`,
       { method: "DELETE" },
       true,
@@ -456,14 +458,16 @@
   }
 
   async function mutate(url, options, resetDraft = false) {
-    if (state.busy) return;
+    if (state.busy) return false;
     setBusy(true);
     clearError();
     try {
       await api(url, options);
       await poll(true, resetDraft);
+      return true;
     } catch (error) {
       showError(error);
+      return false;
     } finally {
       setBusy(false);
     }

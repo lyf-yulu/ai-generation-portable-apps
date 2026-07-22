@@ -252,3 +252,19 @@ test("switching to frame mode requires exactly two images and assigns endpoints"
     ["first_frame", "last_frame"],
   );
 });
+
+test("reference-only draft changes are saved before adding or replacing an image", () => {
+  let state = ReviewState.mergeServerView(ReviewState.createReviewState(), view());
+  state = ReviewState.patchTask(state, "task-1", {
+    reference_mode: "multi_reference",
+    reference_images: [{ asset_id: "asset-1", role: "reference_image", order: 2 }],
+  });
+
+  assert.equal(
+    ReviewState.referenceMutationDirective(state, "task-1"),
+    "save_then_proceed",
+  );
+
+  state = ReviewState.patchTask(state, "task-1", { prompt: "unsaved prompt" });
+  assert.equal(ReviewState.referenceMutationDirective(state, "task-1"), "blocked");
+});

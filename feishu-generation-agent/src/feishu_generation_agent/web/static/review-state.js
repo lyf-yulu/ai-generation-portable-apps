@@ -266,6 +266,11 @@
     ));
   }
 
+  function referenceMutationDirective(state, taskId) {
+    if (!hasDirty(state)) return "proceed";
+    return canSaveReferences(state, taskId) ? "save_then_proceed" : "blocked";
+  }
+
   return {
     CONFLICT_MESSAGE,
     beginApprovalSubmit,
@@ -282,6 +287,7 @@
     isSubmitting,
     mergeServerView,
     patchTask,
+    referenceMutationDirective,
     selectedTaskIds,
     setReferenceMode,
     setTaskSelected,
