@@ -38,6 +38,7 @@ from feishu_generation_agent.integrations.bitable_delivery import (
 )
 from feishu_generation_agent.integrations.feishu_bitable import BitableSchemaError
 from feishu_generation_agent.storage.bitable_tasks import TaskAlreadyClaimed
+from feishu_generation_agent.storage.production_tasks import ProductionTaskAlreadyClaimed
 from feishu_generation_agent.storage.checkpoints import open_checkpointer
 from feishu_generation_agent.web.schemas import (
     BitableClaimResponse,
@@ -311,7 +312,7 @@ def create_app(
                 status_code=409,
                 detail="结果列已有附件，已停止回写",
             ) from None
-        if isinstance(exc, (TaskAlreadyClaimed, RunConflict)):
+        if isinstance(exc, (TaskAlreadyClaimed, ProductionTaskAlreadyClaimed, RunConflict)):
             raise HTTPException(
                 status_code=409,
                 detail="该任务已被领取或当前不可处理",

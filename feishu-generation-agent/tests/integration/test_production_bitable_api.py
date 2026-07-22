@@ -9,6 +9,7 @@ from feishu_generation_agent.domain.production_bitable import (
     ProductionTaskSummary,
 )
 from feishu_generation_agent.graph.runtime import RunValidationError
+from feishu_generation_agent.storage.production_tasks import ProductionTaskAlreadyClaimed
 from feishu_generation_agent.web.app import create_app
 
 
@@ -34,6 +35,7 @@ class _Runtime:
 class _ProductionService:
     def __init__(self) -> None:
         self.rerun_calls: list[str] = []
+        self.rerun_error: Exception | None = None
 
     async def scan(self):
         return [
@@ -69,6 +71,8 @@ class _ProductionService:
 
     async def rerun(self, run_id: str) -> str:
         self.rerun_calls.append(run_id)
+        if self.rerun_error is not None:
+            raise self.rerun_error
         return "run-new"
 
     async def result_table_url(self, run_id: str) -> str | None:
@@ -122,3 +126,19 @@ async def test_recent_runs_and_rerun_endpoints(tmp_path) -> None:
     assert rerun.status_code == 202
     assert rerun.json() == {"run_id": "run-new"}
     assert production.rerun_calls == ["run-old"]
+
+
+async def test_rerun_of_locked_production_task_returns_a_conflict(tmp_path) -> None:
+    runtime = _Runtime(tmp_path)
+    production = _ProductionService()
+    production.rerun_error = ProductionTaskAlreadyClaimed("生产表任务已被领取")
+    app = create_app(runtime=runtime, bitable_service=production)
+    transport = httpx.ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app), httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        response = await client.post("/api/bitable/runs/run-old/rerun")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "该任务已被领取或当前不可处理"
