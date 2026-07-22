@@ -79,6 +79,21 @@ cp feishu-output-sync/config.example.json feishu-output-sync/config.json
 2026-07-22 起不再用软链）。如需把数据放到别处，设 `DATA_DIR` 环境变量即可
 （`_DATA_BASE = os.environ.get("DATA_DIR", ROOT)`），outputs/state 会跟着走。
 
+## 7. 输出路径锁死（预期行为，非 bug）
+
+Portal（远程）模式下，所有生成结果**强制**落在 `<app>/outputs/<用户名>/<日期>/`。
+子应用后端以 `CORS=1` 环境变量（portal 拉起子应用时设）判定 Portal 模式，
+**忽略**客户端提交的任何 `output_dir`。
+
+- 因此你可能在请求体 / 历史记录里看到 `"output_dir": "7222"` 之类的自定义值——
+  这是前端提交的原始字段，**后端不采纳**，文件实际仍落在 `outputs/<用户名>/<日期>/`。
+  这是正常现象，不是 bug（可查该任务 `result.local_path` 确认真实落点）。
+- 原因：远程用户填的自定义路径只会写到**服务机**文件系统（浏览器访问不了访问者
+  电脑），会导致产出散落在 `outputs/` 之外、无法被飞书搬运器同步。锁死后统一归位。
+- **独立本地模式**（直连子应用端口、无 CORS）仍保留自定义输出目录能力。
+- 前端「选择/打开输出目录」按钮在 Portal 模式已隐藏（`v-if inPortal/isStandalone`），
+  仅独立本地模式显示。
+
 ## 端口表
 
 | App | 端口 |
