@@ -184,6 +184,13 @@ def create_app(
 
     app = FastAPI(title="本地飞书生成任务 Agent", lifespan=lifespan)
 
+    @app.middleware("http")
+    async def prevent_static_asset_caching(request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return response
+
     @app.get("/api/health")
     async def health() -> dict:
         active_settings = (

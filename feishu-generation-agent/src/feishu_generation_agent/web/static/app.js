@@ -5,6 +5,8 @@
   if (!ReviewState) throw new Error("审批草稿状态模块加载失败");
   const BitableState = globalThis.BitableState;
   if (!BitableState) throw new Error("多维表格状态模块加载失败");
+  const ReferenceUploadState = globalThis.ReferenceUploadState;
+  if (!ReferenceUploadState) throw new Error("参考图片上传状态模块加载失败");
 
   const state = {
     runId: null,
@@ -15,6 +17,7 @@
     modes: { bitable: false, legacy_delivery: false },
     bitable: BitableState.createState(),
     review: ReviewState.createReviewState(),
+    referenceUploads: ReferenceUploadState.createState(),
   };
   const byId = (id) => document.getElementById(id);
   const runForm = byId("run-form");
@@ -236,6 +239,7 @@
       state.runId = created.run_id;
       state.runMode = "bitable";
       state.review = ReviewState.createReviewState();
+      state.referenceUploads = ReferenceUploadState.createState();
       await poll(true);
       startPolling();
       document.querySelector(".workspace")?.scrollIntoView({ behavior: "smooth" });
@@ -404,7 +408,13 @@
   }
 
   async function prepareReferenceMutation(task) {
-    const directive = ReviewState.referenceMutationDirective(state.review, task.task_id);
+    const directive = typeof ReviewState.referenceMutationDirective === "function"
+      ? ReviewState.referenceMutationDirective(state.review, task.task_id)
+      : !ReviewState.hasDirty(state.review)
+        ? "proceed"
+        : ReviewState.canSaveReferences(state.review, task.task_id)
+          ? "save_then_proceed"
+          : "blocked";
     if (directive === "proceed") return true;
     if (directive === "save_then_proceed") return patchReferences(task);
     showError(new Error("请先提交或放弃提示词、任务选择等本地编辑，再增添、替换或删除参考图片"));
@@ -428,16 +438,15 @@
     }, true);
   }
 
-  async function uploadReference(task, fileInput, role, order, replacesAssetId = null) {
+  async function uploadReference(task, file, role, order, replacesAssetId = null) {
     if (!await prepareReferenceMutation(task)) return;
-    const file = fileInput.files[0];
     if (!file) {
       showError(new Error("请选择图片文件"));
-      return;
+      return false;
     }
     if (task.reference_mode === "first_last_frame" && !replacesAssetId) {
       showError(new Error("首尾帧模式只能保留两张图片；请先切换到多参考模式再增添图片"));
-      return;
+      return false;
     }
     const body = new FormData();
     body.append("file", file);
@@ -445,7 +454,7 @@
     body.append("role", role);
     body.append("order", String(order));
     if (replacesAssetId) body.append("replaces_asset_id", replacesAssetId);
-    await mutate(`/api/runs/${state.runId}/references`, { method: "POST", body }, true);
+    return mutate(`/api/runs/${state.runId}/references`, { method: "POST", body }, true);
   }
 
   async function unlinkReference(task, assetId) {
@@ -519,7 +528,13 @@
     replace.type = "button";
     replace.addEventListener("click", () => replaceInput.click());
     replaceInput.addEventListener("change", () => {
-      uploadReference(task, replaceInput, reference.role, Number(order.value), reference.asset_id);
+      uploadReference(
+        task,
+        replaceInput.files[0],
+        reference.role,
+        Number(order.value),
+        reference.asset_id,
+      );
     });
     const remove = element("button", "quiet-button", "删除");
     remove.type = "button";
@@ -569,16 +584,68 @@
       const fileInput = document.createElement("input");
       fileInput.type = "file";
       fileInput.accept = "image/*";
+      const feedback = ReferenceUploadState.feedback(state.referenceUploads, task.task_id);
+      const uploadFeedback = element(
+        "p",
+        `upload-feedback${feedback ? ` is-${feedback.phase}` : ""}`,
+        feedback?.message || "请选择一张图片后再上传。",
+      );
+      uploadFeedback.setAttribute("aria-live", "polite");
       const order = document.createElement("input");
       order.type = "number";
       order.min = "1";
       order.value = String(task.reference_images.length + 1);
       const add = element("button", "secondary", "增添图片");
       add.type = "button";
-      add.addEventListener("click", () => {
-        uploadReference(task, fileInput, "reference_image", Number(order.value));
+      fileInput.addEventListener("change", () => {
+        const file = fileInput.files[0];
+        if (!file) return;
+        state.referenceUploads = ReferenceUploadState.fileSelected(
+          state.referenceUploads,
+          task.task_id,
+          file,
+        );
+        uploadFeedback.className = "upload-feedback is-selected";
+        uploadFeedback.textContent = ReferenceUploadState.feedback(
+          state.referenceUploads,
+          task.task_id,
+        ).message;
       });
-      upload.append(fileInput, order, add);
+      add.addEventListener("click", async () => {
+        const file = ReferenceUploadState.pendingFile(state.referenceUploads, task.task_id);
+        if (!file) {
+          const message = "请先选择图片文件";
+          state.referenceUploads = ReferenceUploadState.uploadFailed(
+            state.referenceUploads, task.task_id, message,
+          );
+          uploadFeedback.className = "upload-feedback is-error";
+          uploadFeedback.textContent = message;
+          showError(new Error(message));
+          return;
+        }
+        state.referenceUploads = ReferenceUploadState.uploadStarted(state.referenceUploads, task.task_id);
+        uploadFeedback.className = "upload-feedback is-uploading";
+        uploadFeedback.textContent = ReferenceUploadState.feedback(
+          state.referenceUploads, task.task_id,
+        ).message;
+        add.disabled = true;
+        add.textContent = "正在添加…";
+        let succeeded = false;
+        try {
+          succeeded = await uploadReference(task, file, "reference_image", Number(order.value));
+        } catch (error) {
+          showError(error);
+        }
+        state.referenceUploads = succeeded
+          ? ReferenceUploadState.uploadSucceeded(state.referenceUploads, task.task_id)
+          : ReferenceUploadState.uploadFailed(
+            state.referenceUploads,
+            task.task_id,
+            errorMessage.textContent || "图片添加失败，请重试",
+          );
+        render(ReviewState.draftView(state.review));
+      });
+      upload.append(fileInput, order, add, uploadFeedback);
       section.append(upload);
     }
     return section;
@@ -745,6 +812,7 @@
     state.runMode = null;
     state.view = null;
     state.review = ReviewState.createReviewState();
+    state.referenceUploads = ReferenceUploadState.createState();
     state.bitable = BitableState.resetRunContext(state.bitable);
     byId("status-badge").textContent = "尚未创建";
     byId("run-status").textContent = "—";
@@ -773,6 +841,7 @@
       state.runId = created.run_id;
       state.runMode = "bitable";
       state.review = ReviewState.createReviewState();
+      state.referenceUploads = ReferenceUploadState.createState();
       await poll(true);
       startPolling();
       document.querySelector(".workspace")?.scrollIntoView({ behavior: "smooth" });
@@ -833,6 +902,7 @@
       state.runId = created.run_id;
       state.runMode = "legacy";
       state.review = ReviewState.createReviewState();
+      state.referenceUploads = ReferenceUploadState.createState();
       await poll(true);
     } catch (error) {
       showError(error);

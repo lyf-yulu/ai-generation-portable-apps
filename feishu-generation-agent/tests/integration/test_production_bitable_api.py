@@ -142,3 +142,17 @@ async def test_rerun_of_locked_production_task_returns_a_conflict(tmp_path) -> N
 
     assert response.status_code == 409
     assert response.json()["detail"] == "该任务已被领取或当前不可处理"
+
+
+async def test_static_assets_are_not_cached_between_local_updates(tmp_path) -> None:
+    runtime = _Runtime(tmp_path)
+    app = create_app(runtime=runtime, bitable_service=_ProductionService())
+    transport = httpx.ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app), httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        response = await client.get("/static/review-state.js")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-cache, no-store, must-revalidate"

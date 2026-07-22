@@ -192,6 +192,11 @@ button {
 .reference-actions { display: flex; flex-wrap: wrap; gap: .35rem; }
 .reference-role { color: var(--muted); font-size: .82rem; font-weight: 700; }
 .upload-row { display: grid; grid-template-columns: minmax(160px, 1fr) 80px auto; gap: .55rem; margin-top: .7rem; }
+.upload-feedback { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: .78rem; }
+.upload-feedback.is-selected { color: var(--brand-dark); }
+.upload-feedback.is-uploading { color: var(--warning); font-weight: 700; }
+.upload-feedback.is-success { color: var(--brand-dark); font-weight: 700; }
+.upload-feedback.is-error { color: var(--danger); font-weight: 700; }
 .feedback-box { margin-top: 1.25rem; }
 
 .action-bar {
