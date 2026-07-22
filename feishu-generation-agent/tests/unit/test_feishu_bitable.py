@@ -269,12 +269,20 @@ async def test_creates_result_fields_and_record() -> None:
 
     client = FeishuClient.__new__(FeishuClient)
     client.request_json = FakeClient().request_json
+    async def fields(path: str, *, params=None):
+        return [{"field_id": "fld-primary", "field_name": "Name", "type": 1}]
+    client.iter_items = fields
+    assert await client.list_bitable_fields("app", "tbl") == [
+        {"field_id": "fld-primary", "field_name": "Name", "type": 1}
+    ]
+    await client.update_bitable_field("app", "tbl", "fld-primary", "需求名称", 1)
     field_id = await client.create_bitable_field("app", "tbl", "结果", 17)
     record_id = await client.create_bitable_record("app", "tbl", {"需求名称": "需求 A"})
 
     assert field_id == "fld-result"
     assert record_id == "rec-result"
     assert requests == [
+        ("PUT", "/open-apis/bitable/v1/apps/app/tables/tbl/fields/fld-primary", {"field_name": "需求名称", "type": 1}),
         ("POST", "/open-apis/bitable/v1/apps/app/tables/tbl/fields", {"field_name": "结果", "type": 17}),
         ("POST", "/open-apis/bitable/v1/apps/app/tables/tbl/records", {"fields": {"需求名称": "需求 A"}}),
     ]

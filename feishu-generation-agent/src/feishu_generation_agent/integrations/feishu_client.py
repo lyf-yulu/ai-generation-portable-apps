@@ -233,6 +233,25 @@ class FeishuClient:
             )
         return field_id
 
+    async def list_bitable_fields(self, app_token: str, table_id: str) -> list[dict[str, object]]:
+        return await self.iter_items(
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields"
+        )
+
+    async def update_bitable_field(
+        self,
+        app_token: str,
+        table_id: str,
+        field_id: str,
+        field_name: str,
+        field_type: int,
+    ) -> None:
+        await self.request_json(
+            "PUT",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields/{field_id}",
+            json_body={"field_name": field_name, "type": field_type},
+        )
+
     async def create_bitable_record(
         self, app_token: str, table_id: str, fields: dict[str, object]
     ) -> str:

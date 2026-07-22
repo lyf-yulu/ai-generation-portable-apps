@@ -75,12 +75,13 @@ class Artifact(BaseModel):
 
 class DeliveryRecord(BaseModel):
     status: str
-    target_type: Literal["docx", "bitable_record"] = "docx"
+    target_type: Literal["docx", "bitable_record", "production_result_record"] = "docx"
     document_id: str | None = None
     document_url: str | None = None
     app_token: str | None = None
     table_id: str | None = None
     record_id: str | None = None
+    result_table_url: str | None = None
     uploaded_artifact_ids: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -90,4 +91,9 @@ class DeliveryRecord(BaseModel):
                 raise ValueError("docx delivery requires document identity")
         elif not self.app_token or not self.table_id or not self.record_id:
             raise ValueError("bitable delivery requires app/table/record identity")
+        elif (
+            self.target_type == "production_result_record"
+            and not self.result_table_url
+        ):
+            raise ValueError("production result delivery requires result table URL")
         return self
