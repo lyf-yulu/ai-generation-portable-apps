@@ -1885,12 +1885,21 @@ def run_one(job_id: str, index: int, form_values: dict[str, Any], form_files: di
         video_url = extract_video_url(status_result)
         if not video_url:
             raise RuntimeError(f"Task {task_id} succeeded but no video URL was found")
-        raw_output_dir = form_values.get("output_dir")
-        if not raw_output_dir:
-            with JOBS_LOCK:
-                username = JOBS.get(job_id, {}).get("username", "")
-            form_values["output_dir"] = str(_user_day_subdir(OUTPUT_DIR, username))
-        out_dir = resolve_output_dir(form_values.get("output_dir"))
+        # In Portal mode (CORS=1, i.e. served to remote colleagues), IGNORE any
+        # client-supplied output_dir and force outputs/<user>/<date>/. Remote
+        # users' custom paths only ever wrote to the server's filesystem anyway
+        # (browsers can't reach the client FS), which scattered results outside
+        # outputs/ and made them invisible to the Feishu sync. Standalone local
+        # mode (direct :8787, no CORS) keeps the custom-path ability.
+        with JOBS_LOCK:
+            username = JOBS.get(job_id, {}).get("username", "")
+        if os.environ.get("CORS") == "1":
+            out_dir = _user_day_subdir(OUTPUT_DIR, username)
+        else:
+            raw_output_dir = form_values.get("output_dir")
+            if not raw_output_dir:
+                form_values["output_dir"] = str(_user_day_subdir(OUTPUT_DIR, username))
+            out_dir = resolve_output_dir(form_values.get("output_dir"))
         custom_name = form_values.get("output_name", "").strip()
         if custom_name:
             total = max(1, int(form_values.get("repeat_count") or 1), int(form_values.get("concurrency") or 1))

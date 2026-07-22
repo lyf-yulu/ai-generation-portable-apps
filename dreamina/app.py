@@ -1319,11 +1319,15 @@ def cleanup_cache(media_days: int = 30, log_days: int = 14) -> dict[str, Any]:
 def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str, output_name: str = "", output_dir: str = "", sub_index: int = 1, total: int = 1, env_override: dict | None = None, on_cli_log=None) -> dict | None:
     if not submit_id:
         return None
-    if output_dir:
+    # Portal mode (CORS=1, served to remote colleagues): ignore any client
+    # output_dir and force outputs/<user>/<date>/. Remote custom paths only
+    # wrote to the server FS anyway and scattered results outside outputs/,
+    # hiding them from the Feishu sync. Standalone local mode keeps custom paths.
+    with LOCK:
+        username = JOBS.get(job_id, {}).get("username", "")
+    if output_dir and os.environ.get("CORS") != "1":
         base_dir = resolve_output_dir(output_dir)
     else:
-        with LOCK:
-            username = JOBS.get(job_id, {}).get("username", "")
         base_dir = _user_day_subdir(OUTPUT_DIR, username)
     ts = time.strftime("%Y%m%d_%H%M%S")
     short_id = job_id[:8]

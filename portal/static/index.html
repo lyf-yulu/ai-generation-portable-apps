@@ -102,12 +102,10 @@
           <button type="button" @click="updateCli()">更新 CLI</button>
         </div>
         <section style="margin-bottom:14px">
-          <label style="font-size:12px;font-weight:650;color:#4b5565">输出目录<input type="text" name="output_dir" v-model="outputDir" placeholder="留空则保存到 outputs 文件夹"></label>
+          <!-- 输出目录选择在 Portal(远程)模式下已移除:结果统一保存到服务机
+               outputs/<用户名>/<日期>/,自定义路径对远程用户无意义(浏览器写不到
+               访问者电脑),且会导致产出散落、无法同步到飞书。保留清理缓存。 -->
           <div class="rowButtons outputDirBtns">
-            <button type="button" @click="chooseOutputDir()">选择目录</button>
-            <button type="button" @click="outputDir=''">程序 outputs</button>
-            <button type="button" @click="desktopOutput()">桌面 outputs</button>
-            <button type="button" @click="openOutputDir()">打开目录</button>
             <button type="button" @click="cleanCache()">清理缓存</button>
           </div>
         </section>
@@ -448,15 +446,11 @@
             </div>
             <div style="margin-top:12px;padding-top:10px;border-top:1px solid #e2e8f0;font-size:12px;color:#64748b">
               <div class="row" style="align-items:center">
-                <span>保存位置: <code style="font-size:11px;color:#334155;background:#f1f5f9;padding:2px 6px;border-radius:3px">{{ outputDir || '加载中...' }}</code></span>
-                <button @click="showOutputDirInput = !showOutputDirInput" style="font-size:11px;padding:3px 10px">{{ showOutputDirInput ? '取消' : '修改' }}</button>
-                <button @click="chooseOutputDir()" :disabled="savingOutputDir" style="font-size:11px;padding:3px 10px">选择目录</button>
+                <!-- 输出目录改为只读展示:Portal 模式下结果统一存服务机
+                     outputs/<用户名>/<日期>/,不再允许远程用户改路径(改了也
+                     只落服务机、导致散落)。保留只读显示让用户知道存在哪。 -->
+                <span>保存位置: <code style="font-size:11px;color:#334155;background:#f1f5f9;padding:2px 6px;border-radius:3px">服务器 outputs/{{ '{用户名}/{日期}' }}</code></span>
               </div>
-              <div v-if="showOutputDirInput" class="row" style="margin-top:6px">
-                <input v-model="outputDirInput" placeholder="输入新的保存路径，如 /Users/xxx/Videos" style="flex:1;font-size:12px">
-                <button @click="setOutputDir()" :disabled="savingOutputDir" style="font-size:11px;padding:3px 10px;background:#2563eb;color:#fff;border-color:#2563eb">{{ savingOutputDir ? '保存中...' : '保存' }}</button>
-              </div>
-              <p v-if="outputDirMsg" :style="{fontSize:'11px',marginTop:'4px',color:outputDirOk?'#16a34a':'#dc2626'}">{{ outputDirMsg }}</p>
             </div>
           </section>
         </div>

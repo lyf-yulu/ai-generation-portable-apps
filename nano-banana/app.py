@@ -144,12 +144,20 @@ def _user_day_subdir(base: Path, username: str | None, day: str | None = None) -
 
 
 def _ensure_output_dir(values: dict, job_id: str) -> None:
-    """Fill values['output_dir'] with a <user>/<date>/ subdir when the caller
-    left it empty. Reads username from the JOBS registry under the module lock."""
-    if values.get("output_dir"):
-        return
+    """Set values['output_dir'] to outputs/<user>/<date>/.
+
+    In Portal mode (CORS=1, served to remote colleagues) this OVERRIDES any
+    client-supplied output_dir: remote custom paths only wrote to the server FS
+    anyway (browsers can't reach the client FS), scattering results outside
+    outputs/ and hiding them from the Feishu sync. Standalone local mode (direct
+    :8797, no CORS) keeps a user-provided output_dir if present."""
     with LOCK:
         username = JOBS.get(job_id, {}).get("username", "")
+    if os.environ.get("CORS") == "1":
+        values["output_dir"] = str(_user_day_subdir(OUTPUT_DIR, username))
+        return
+    if values.get("output_dir"):
+        return
     values["output_dir"] = str(_user_day_subdir(OUTPUT_DIR, username))
 
 
