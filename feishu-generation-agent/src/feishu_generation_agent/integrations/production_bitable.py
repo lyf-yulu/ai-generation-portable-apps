@@ -14,7 +14,7 @@ from feishu_generation_agent.integrations.feishu_bitable import BitableSchemaErr
 _REQUIRED_FIELDS: dict[str, frozenset[int]] = {
     "需求名称": frozenset({1}),
     "需求类型": frozenset({3}),
-    "需求附件": frozenset({1}),
+    "需求附件": frozenset({1, 15}),
     "项目名称": frozenset({4}),
     "发起人": frozenset({11}),
     "需求制作人": frozenset({11}),

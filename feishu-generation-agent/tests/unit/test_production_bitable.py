@@ -52,7 +52,8 @@ async def test_lists_readable_production_tasks_and_filters_completed() -> None:
     fields = [
         {"field_id": "fld_name", "field_name": "需求名称", "type": 1},
         {"field_id": "fld_type", "field_name": "需求类型", "type": 3},
-        {"field_id": "fld_attachment", "field_name": "需求附件", "type": 1},
+        # 生产表的需求附件是飞书超链接字段，而不是纯文本字段。
+        {"field_id": "fld_attachment", "field_name": "需求附件", "type": 15},
         {"field_id": "fld_project", "field_name": "项目名称", "type": 4},
         {"field_id": "fld_requester", "field_name": "发起人", "type": 11},
         {"field_id": "fld_maker", "field_name": "需求制作人", "type": 11},
