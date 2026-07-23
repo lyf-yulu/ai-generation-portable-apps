@@ -219,3 +219,80 @@ async def test_portrait_client_reports_public_host_failure_as_transient(
 
     assert caught.value.detail.category is ErrorCategory.TRANSIENT
     assert caught.value.detail.retryable is True
+
+
+async def test_portrait_client_reports_asset_http_400_as_terminal(
+    tmp_path: Path,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        action = request.url.params["Action"]
+        if action == "CreateAssetGroup":
+            return httpx.Response(200, json={"Result": {"Id": "group-1"}})
+        if action == "CreateAsset":
+            return httpx.Response(
+                400,
+                json={
+                    "ResponseMetadata": {
+                        "Error": {
+                            "Code": "InvalidParameter.WidthTooSmall",
+                            "Message": "Width must be between 300px and 6000px.",
+                        }
+                    }
+                },
+            )
+        raise AssertionError(f"unexpected action: {action}")
+
+    store = await PortraitAssetStore.open(tmp_path / "portrait.sqlite3")
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http:
+            client = VolcengineAssetClient(
+                http,
+                access_key="ak-test",
+                secret_key="sk-test",
+                project_name="Seedance2.0",
+                public_media_host=_PublicMediaHost(),
+                store=store,
+            )
+            with pytest.raises(AgentError) as caught:
+                await client.ensure_image_asset("run-1", _image_asset(tmp_path))
+    finally:
+        await store.close()
+
+    assert caught.value.detail.category is ErrorCategory.PROVIDER_TERMINAL
+    assert caught.value.detail.retryable is False
+    assert "InvalidParameter.WidthTooSmall" in caught.value.detail.technical_detail
+    assert (
+        "Width must be between 300px and 6000px."
+        in caught.value.detail.technical_detail
+    )
+
+
+async def test_portrait_client_reports_asset_http_503_as_transient(
+    tmp_path: Path,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["Action"] == "CreateAssetGroup"
+        return httpx.Response(503, json={"ResponseMetadata": {}})
+
+    store = await PortraitAssetStore.open(tmp_path / "portrait.sqlite3")
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http:
+            client = VolcengineAssetClient(
+                http,
+                access_key="ak-test",
+                secret_key="sk-test",
+                project_name="Seedance2.0",
+                public_media_host=_PublicMediaHost(),
+                store=store,
+            )
+            with pytest.raises(AgentError) as caught:
+                await client.ensure_image_asset("run-1", _image_asset(tmp_path))
+    finally:
+        await store.close()
+
+    assert caught.value.detail.category is ErrorCategory.TRANSIENT
+    assert caught.value.detail.retryable is True

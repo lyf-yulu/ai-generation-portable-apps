@@ -172,13 +172,55 @@ class VolcengineAssetClient:
                 headers=headers,
                 timeout=httpx.Timeout(120, connect=10),
             )
-            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise self._transient_error("火山真人资产服务暂时不可用") from exc
+        try:
             data = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
+        except ValueError as exc:
+            if 400 <= response.status_code < 500:
+                raise self._rejection_error(
+                    action, response.status_code, {}
+                ) from exc
+            raise self._transient_error("火山真人资产服务暂时不可用") from exc
+        if 400 <= response.status_code < 500:
+            raise self._rejection_error(action, response.status_code, data)
+        if response.status_code >= 500:
+            raise self._transient_error("火山真人资产服务暂时不可用")
+        try:
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
             raise self._transient_error("火山真人资产服务暂时不可用") from exc
         if not isinstance(data, dict):
             raise self._terminal_error("火山真人资产响应无效")
         return data
+
+    @staticmethod
+    def _rejection_error(
+        action: str, status_code: int, payload: object
+    ) -> AgentError:
+        metadata = payload.get("ResponseMetadata") if isinstance(payload, dict) else None
+        error = metadata.get("Error") if isinstance(metadata, dict) else None
+        code = error.get("Code") if isinstance(error, dict) else None
+        message = error.get("Message") if isinstance(error, dict) else None
+        parts = [f"{action} HTTP {status_code}"]
+        if isinstance(code, str) and code:
+            parts.append(code)
+        if isinstance(message, str) and message:
+            parts.append(message)
+        technical_detail = ": ".join(parts)
+        user_reason = (
+            message
+            if isinstance(message, str) and message
+            else "请求参数不符合要求"
+        )
+        return AgentError(
+            ErrorDetail(
+                category=ErrorCategory.PROVIDER_TERMINAL,
+                message=f"火山真人资产请求被拒绝：{user_reason}",
+                technical_detail=technical_detail,
+                retryable=False,
+            )
+        )
 
     def _signed_headers(self, action: str, payload: str, now: datetime) -> dict[str, str]:
         date_time = now.strftime("%Y%m%dT%H%M%SZ")
