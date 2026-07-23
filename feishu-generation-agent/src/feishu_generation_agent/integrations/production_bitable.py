@@ -13,14 +13,14 @@ from feishu_generation_agent.integrations.feishu_bitable import BitableSchemaErr
 
 _REQUIRED_FIELDS: dict[str, frozenset[int]] = {
     "需求名称": frozenset({1}),
+    "需求类型": frozenset({3}),
     "需求附件": frozenset({1}),
     "项目名称": frozenset({4}),
     "发起人": frozenset({11}),
     "需求制作人": frozenset({11}),
     "当前进度": frozenset({3}),
 }
-_ACTIVE_PROGRESS = frozenset({"未开始", "制作中", "待修改"})
-_TEST_PROGRESS = _ACTIVE_PROGRESS | {"已确认完成"}
+_COMPLETED_PROGRESS = "已确认完成"
 
 
 class ProductionBitableClient:
@@ -64,6 +64,7 @@ class ProductionBitableClient:
             field_ids[name] = field_id
         return ProductionSchema(
             requirement_name_field_id=field_ids["需求名称"],
+            task_type_field_id=field_ids["需求类型"],
             requirement_attachment_field_id=field_ids["需求附件"],
             project_name_field_id=field_ids["项目名称"],
             requester_field_id=field_ids["发起人"],
@@ -78,15 +79,14 @@ class ProductionBitableClient:
         *,
         include_completed: bool,
     ) -> list[ProductionTaskSummary]:
-        del schema
-        allowed_progress = _TEST_PROGRESS if include_completed else _ACTIVE_PROGRESS
+        del schema, include_completed
         records = await self._client.iter_items(
             self._records_path(location), params={"view_id": location.view_id}
         )
         tasks: list[ProductionTaskSummary] = []
         for record in records:
             task = _to_task(record)
-            if task is not None and task.progress in allowed_progress:
+            if task is not None and task.progress != _COMPLETED_PROGRESS:
                 tasks.append(task)
         return tasks
 
@@ -109,6 +109,7 @@ def _to_task(record: Mapping[str, Any]) -> ProductionTaskSummary | None:
     except (TypeError, ValueError):
         return None
     progress = _text(fields.get("当前进度"))
+    task_type = _text(fields.get("需求类型"))
     requirement_name = _text(fields.get("需求名称"))
     if not progress or not requirement_name:
         return None
@@ -116,6 +117,7 @@ def _to_task(record: Mapping[str, Any]) -> ProductionTaskSummary | None:
     maker_ids, maker_names = _people(fields.get("需求制作人"))
     snapshot = ProductionSourceSnapshot(
         requirement_name=requirement_name,
+        task_type=task_type,
         requirement_attachment=source_url,
         project_names=_texts(fields.get("项目名称")),
         requester_open_ids=requester_ids,
@@ -128,6 +130,7 @@ def _to_task(record: Mapping[str, Any]) -> ProductionTaskSummary | None:
         display_text=requirement_name,
         source_url=source_url,
         progress=progress,
+        task_type=task_type,
         maker_open_id=maker_ids[0] if len(maker_ids) == 1 else None,
         maker_name=maker_names[0] if len(maker_names) == 1 else None,
         snapshot=snapshot,

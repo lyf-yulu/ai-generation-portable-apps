@@ -29,26 +29,29 @@ def test_exports_production_task_models() -> None:
     assert hasattr(domain, "ProductionTaskSummary")
 
 
-def test_production_task_without_maker_is_readable_but_not_deliverable() -> None:
+def test_production_task_without_maker_is_deliverable_when_animated() -> None:
     task = ProductionTaskSummary(
         record_id="rec1",
         display_text="需求 A",
         source_url="https://tenant.feishu.cn/docx/doc1",
         progress="未开始",
+        task_type="动画类",
         snapshot=ProductionSourceSnapshot(
             requirement_name="需求 A",
             requirement_attachment="https://tenant.feishu.cn/docx/doc1",
+            task_type="动画类",
         ),
     )
 
     payload = task.model_dump()
-    assert payload.get("deliverable") is False
-    assert payload.get("delivery_block_reason") == "缺少需求制作人"
+    assert payload.get("deliverable") is True
+    assert payload.get("delivery_block_reason") is None
 
 
 async def test_lists_readable_production_tasks_and_filters_completed() -> None:
     fields = [
         {"field_id": "fld_name", "field_name": "需求名称", "type": 1},
+        {"field_id": "fld_type", "field_name": "需求类型", "type": 3},
         {"field_id": "fld_attachment", "field_name": "需求附件", "type": 1},
         {"field_id": "fld_project", "field_name": "项目名称", "type": 4},
         {"field_id": "fld_requester", "field_name": "发起人", "type": 11},
@@ -60,6 +63,7 @@ async def test_lists_readable_production_tasks_and_filters_completed() -> None:
             "record_id": "rec-new",
             "fields": {
                 "需求名称": "需求 A",
+                "需求类型": "动画类",
                 "需求附件": "https://tenant.feishu.cn/docx/docA",
                 "项目名称": ["项目 A"],
                 "发起人": [{"id": "ou-request", "name": "发起人"}],
@@ -71,6 +75,7 @@ async def test_lists_readable_production_tasks_and_filters_completed() -> None:
             "record_id": "rec-done",
             "fields": {
                 "需求名称": "已完成需求",
+                "需求类型": "动画类",
                 "需求附件": "https://tenant.feishu.cn/wiki/wikiDone",
                 "项目名称": [],
                 "发起人": [],
@@ -82,6 +87,7 @@ async def test_lists_readable_production_tasks_and_filters_completed() -> None:
             "record_id": "rec-invalid",
             "fields": {
                 "需求名称": "不可读需求",
+                "需求类型": "真人类",
                 "需求附件": "仅文字说明",
                 "项目名称": [],
                 "发起人": [],
@@ -109,6 +115,7 @@ async def test_lists_readable_production_tasks_and_filters_completed() -> None:
     test_mode = await client.list_tasks(location, schema, include_completed=True)
 
     assert [task.record_id for task in normal] == ["rec-new"]
-    assert [task.record_id for task in test_mode] == ["rec-new", "rec-done"]
+    assert [task.record_id for task in test_mode] == ["rec-new"]
     assert normal[0].maker_open_id == "ou-maker"
     assert normal[0].snapshot.project_names == ["项目 A"]
+    assert normal[0].task_type == "动画类"

@@ -17,7 +17,7 @@ from feishu_generation_agent.storage.production_tasks import ProductionTaskStore
 from feishu_generation_agent.storage.repository import Repository
 
 
-async def test_delivery_creates_one_maker_table_and_updates_same_result_row(tmp_path) -> None:
+async def test_delivery_creates_one_shared_table_and_updates_same_result_row(tmp_path) -> None:
     content = b"video"
     artifact_path = tmp_path / "result.mp4"
     artifact_path.write_bytes(content)
@@ -30,7 +30,7 @@ async def test_delivery_creates_one_maker_table_and_updates_same_result_row(tmp_
     await repository.create_run("run-1", "thread-1", "https://tenant.feishu.cn/docx/docA")
     await repository.save_artifact("run-1", artifact)
     location = BitableLocation(wiki_token="wiki", app_token="app-source", table_id="tbl-source", view_id="vew", source_url="https://tenant.feishu.cn/wiki/wiki?table=tbl-source&view=vew")
-    task = ProductionTaskSummary(record_id="rec-source", display_text="需求 A", source_url="https://tenant.feishu.cn/docx/docA", progress="未开始", maker_open_id="ou-maker", maker_name="制作人", snapshot=ProductionSourceSnapshot(requirement_name="需求 A", requirement_attachment="https://tenant.feishu.cn/docx/docA", project_names=["项目"], requester_open_ids=["ou-request"], requester_names=["发起人"], maker_open_ids=["ou-maker"], maker_names=["制作人"]))
+    task = ProductionTaskSummary(record_id="rec-source", display_text="需求 A", source_url="https://tenant.feishu.cn/docx/docA", progress="未开始", task_type="动画类", maker_open_id="ou-maker", maker_name="制作人", snapshot=ProductionSourceSnapshot(requirement_name="需求 A", task_type="动画类", requirement_attachment="https://tenant.feishu.cn/docx/docA", project_names=["项目"], requester_open_ids=["ou-request"], requester_names=["发起人"], maker_open_ids=["ou-maker"], maker_names=["制作人"]))
     await store.claim(location, task, run_id="run-1", thread_id="thread-1")
 
     class Client:
@@ -47,7 +47,7 @@ async def test_delivery_creates_one_maker_table_and_updates_same_result_row(tmp_
         async def upload_media_all(self, filename, content, mime_type, *, parent_type, parent_node): return "file-result"
         async def create_bitable_record(self, app_token, table_id, fields):
             self.created_records += 1
-            assert list(fields) == ["需求名称", "需求附件", "项目名称", "发起人", "需求制作人", "结果"]
+            assert list(fields) == ["需求名称", "需求类型", "需求附件", "项目名称", "发起人", "需求制作人", "结果"]
             return "rec-result"
         async def update_bitable_record(self, app_token, table_id, record_id, fields): self.updated_records += 1
 

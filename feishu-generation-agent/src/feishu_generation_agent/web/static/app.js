@@ -128,6 +128,7 @@
       if (Object.hasOwn(task, "progress")) {
         identity.append(
           element("p", "bitable-task-meta", `进度：${task.progress || "—"}`),
+          element("p", "bitable-task-meta", `类型：${task.task_type || "未分类"}`),
           element("p", "bitable-task-meta", `制作人：${task.maker_name || "未填写"}`),
         );
         if (!task.deliverable && task.delivery_block_reason) {
@@ -147,7 +148,7 @@
       link.rel = "noreferrer";
       const claim = element("button", "primary", "开始分析");
       claim.type = "button";
-      claim.disabled = state.busy || state.bitable.claim.phase === "loading";
+      claim.disabled = state.busy || state.bitable.claim.phase === "loading" || task.deliverable === false;
       claim.addEventListener("click", () => claimBitableTask(task.record_id));
       card.append(identity, link, claim);
       return card;

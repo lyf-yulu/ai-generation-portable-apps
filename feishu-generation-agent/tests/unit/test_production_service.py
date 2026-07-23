@@ -20,14 +20,14 @@ def _location() -> BitableLocation:
 def _task() -> ProductionTaskSummary:
     return ProductionTaskSummary(
         record_id="rec-no-maker", display_text="需求 A",
-        source_url="https://tenant.feishu.cn/docx/docA", progress="未开始",
+        source_url="https://tenant.feishu.cn/docx/docA", progress="未开始", task_type="动画类",
         snapshot=ProductionSourceSnapshot(
-            requirement_name="需求 A", requirement_attachment="https://tenant.feishu.cn/docx/docA"
+            requirement_name="需求 A", task_type="动画类", requirement_attachment="https://tenant.feishu.cn/docx/docA"
         ),
     )
 
 
-async def test_service_allows_planning_but_blocks_approval_without_maker(tmp_path) -> None:
+async def test_service_allows_approval_without_maker_for_animation(tmp_path) -> None:
     from feishu_generation_agent.storage.production_tasks import ProductionTaskStore
 
     class Bitable:
@@ -45,8 +45,7 @@ async def test_service_allows_planning_but_blocks_approval_without_maker(tmp_pat
     )
     try:
         run_id = await service.claim("rec-no-maker")
-        with pytest.raises(RunValidationError, match="缺少需求制作人"):
-            await service.validate_approval(run_id)
+        await service.validate_approval(run_id)
     finally:
         await store.close()
 

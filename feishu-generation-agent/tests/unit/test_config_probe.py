@@ -183,7 +183,7 @@ async def test_production_probe_reads_only_and_marks_result_writes_unverified(
         async def ensure_schema(self, location):
             calls.append("GET schema")
             return ProductionSchema(
-                requirement_name_field_id="name", requirement_attachment_field_id="attachment",
+                requirement_name_field_id="name", task_type_field_id="type", requirement_attachment_field_id="attachment",
                 project_name_field_id="project", requester_field_id="requester",
                 maker_field_id="maker", progress_field_id="progress",
             )

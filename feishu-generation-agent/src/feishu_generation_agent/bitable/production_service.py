@@ -23,6 +23,7 @@ _ACTIVE_STATUSES = {
     "delivering": TableTaskStatus.WRITING_BACK,
     "delivery_failed": TableTaskStatus.WRITEBACK_FAILED,
 }
+_SHARED_RESULT_TARGET = "__shared_production_result__"
 
 
 class ProductionBitableService:
@@ -63,6 +64,8 @@ class ProductionBitableService:
         task = next((item for item in await self.scan() if item.record_id == record_id), None)
         if task is None:
             raise RunConflict("该生产表记录当前不可领取")
+        if task.task_type != "动画类":
+            raise RunConflict(f"{task.task_type or '未分类'}任务暂未启用")
         binding = await self._store.claim(
             self._location,
             task,
@@ -85,9 +88,9 @@ class ProductionBitableService:
 
     async def result_table_url(self, run_id: str) -> str | None:
         binding = await self._store.get_by_run(run_id)
-        if binding is None or binding.maker_open_id is None:
+        if binding is None:
             return None
-        target = await self._store.get_result_target(binding.maker_open_id)
+        target = await self._store.get_result_target(_SHARED_RESULT_TARGET)
         return target.url if target is not None else None
 
     async def rerun(self, run_id: str) -> str:
@@ -184,8 +187,8 @@ class ProductionBitableService:
 
     async def validate_approval(self, run_id: str) -> None:
         binding = await self._store.get_by_run(run_id)
-        if binding is not None and binding.maker_open_id is None:
-            raise RunValidationError("缺少需求制作人；请先在生产表补齐后再批准")
+        if binding is not None and binding.snapshot.task_type != "动画类":
+            raise RunValidationError(f"{binding.snapshot.task_type or '未分类'}任务暂未启用")
 
     async def _prepared_schema(self):
         if self._closed:

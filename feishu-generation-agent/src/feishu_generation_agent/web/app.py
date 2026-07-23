@@ -347,6 +347,7 @@ def create_app(
                 "display_text": task.display_text,
                 "source_url": task.source_url,
                 "progress": task.progress,
+                "task_type": task.task_type,
                 "maker_name": task.maker_name,
                 "deliverable": task.deliverable,
                 "delivery_block_reason": task.delivery_block_reason,

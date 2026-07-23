@@ -10,12 +10,15 @@ from feishu_generation_agent.storage.repository import Repository
 
 
 _RESULT_FIELDS = (
+    ("需求类型", 3),
     ("需求附件", 1),
     ("项目名称", 4),
     ("发起人", 11),
     ("需求制作人", 11),
     ("结果", 17),
 )
+_SHARED_RESULT_TARGET = "__shared_production_result__"
+_SHARED_RESULT_NAME = "统一结果表"
 _DELIVERY_TASK_ID = "__production_delivery__"
 _CONTEXT_OPERATION = "production_delivery_context"
 
@@ -40,10 +43,8 @@ class ProductionResultWriter:
         binding = await self._store.get_by_run(run_id)
         if binding is None:
             raise ValueError("生产表运行不存在")
-        if not binding.maker_open_id or not binding.maker_name:
-            raise ValueError("缺少需求制作人；不能交付")
         await self._save_context_if_absent(run_id, document, plan)
-        target = await self._ensure_target(binding.maker_open_id, binding.maker_name)
+        target = await self._ensure_target()
         tokens = [
             await self._upload(run_id, target.app_token, artifact)
             for artifact in artifacts
@@ -98,11 +99,11 @@ class ProductionResultWriter:
             },
         )
 
-    async def _ensure_target(self, maker_open_id: str, maker_name: str) -> ResultTableTarget:
-        existing = await self._store.get_result_target(maker_open_id)
+    async def _ensure_target(self) -> ResultTableTarget:
+        existing = await self._store.get_result_target(_SHARED_RESULT_TARGET)
         if existing is not None:
             return existing
-        created = await self._client.create_bitable_app(f"AI生成结果－{maker_name}", self._result_folder_token)
+        created = await self._client.create_bitable_app(_SHARED_RESULT_NAME, self._result_folder_token)
         fields = await self._client.list_bitable_fields(created.app_token, created.table_id)
         primary = next((item for item in fields if item.get("type") == 1), None)
         if not isinstance(primary, dict) or not isinstance(primary.get("field_id"), str):
@@ -110,8 +111,7 @@ class ProductionResultWriter:
         await self._client.update_bitable_field(created.app_token, created.table_id, primary["field_id"], "需求名称", 1)
         for name, field_type in _RESULT_FIELDS:
             await self._client.create_bitable_field(created.app_token, created.table_id, name, field_type)
-        await self._client.grant_bitable_editor(created.app_token, maker_open_id)
-        target = ResultTableTarget(maker_open_id=maker_open_id, maker_name=maker_name, app_token=created.app_token, table_id=created.table_id, url=created.url)
+        target = ResultTableTarget(maker_open_id=_SHARED_RESULT_TARGET, maker_name=_SHARED_RESULT_NAME, app_token=created.app_token, table_id=created.table_id, url=created.url)
         await self._store.upsert_result_target(target)
         return target
 
@@ -134,6 +134,7 @@ class ProductionResultWriter:
 def _result_fields(snapshot, file_tokens: list[str]) -> dict[str, object]:
     return {
         "需求名称": snapshot.requirement_name,
+        "需求类型": snapshot.task_type,
         "需求附件": snapshot.requirement_attachment,
         "项目名称": snapshot.project_names,
         "发起人": [{"id": value} for value in snapshot.requester_open_ids],
