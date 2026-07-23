@@ -34,10 +34,15 @@ from feishu_generation_agent.integrations.safe_download import (
 )
 from feishu_generation_agent.integrations.seedance import SeedanceVideoGenerator
 from feishu_generation_agent.integrations.public_media import UguuPublicMediaHost
+from feishu_generation_agent.integrations.volcengine_portrait import (
+    VolcengineAssetClient,
+    VolcenginePortraitVideoGenerator,
+)
 from feishu_generation_agent.integrations.vision import ClaudeVisionAnalyzer
 from feishu_generation_agent.storage.files import FileStore
 from feishu_generation_agent.storage.bitable_tasks import BitableTaskStore
 from feishu_generation_agent.storage.production_tasks import ProductionTaskStore
+from feishu_generation_agent.storage.portrait_assets import PortraitAssetStore
 from feishu_generation_agent.storage.provider_results import ProviderResultStore
 from feishu_generation_agent.storage.repository import Repository
 
@@ -126,6 +131,7 @@ class ProductionBitableServiceFactory:
     store: ProductionTaskStore
     location: BitableLocation
     include_completed_for_test: bool
+    enabled_task_types: frozenset[str] = frozenset({"动画类"})
     _claimed: bool = False
 
     def create(self, runtime) -> ProductionBitableService:
@@ -138,6 +144,7 @@ class ProductionBitableServiceFactory:
             runtime=runtime,
             location=self.location,
             include_completed_for_test=self.include_completed_for_test,
+            enabled_task_types=self.enabled_task_types,
         )
 
     async def close_unclaimed(self) -> None:
@@ -197,11 +204,33 @@ async def _open_application_services(
     feishu = FeishuClient(settings)
     file_store: FileStore | None = None
     bitable_factory: BitableServiceFactory | ProductionBitableServiceFactory | None = None
+    portrait_store: PortraitAssetStore | None = None
     try:
         provider_results = ProviderResultStore(
             settings.data_dir / "provider-results",
             max_item_bytes=settings.max_download_bytes,
         )
+        portrait_generator = None
+        if capability_is_configured(settings, "portrait_generation"):
+            portrait_store = await PortraitAssetStore.open(
+                settings.data_dir / "portrait-assets.sqlite3"
+            )
+            portrait_client = VolcengineAssetClient(
+                provider_http,
+                access_key=settings.volcengine_access_key,
+                secret_key=settings.volcengine_secret_key,
+                project_name=settings.volcengine_project_name,
+                public_media_host=UguuPublicMediaHost(provider_http),
+                store=portrait_store,
+            )
+            portrait_generator = VolcenginePortraitVideoGenerator(
+                provider_http,
+                asset_client=portrait_client,
+                base_url=settings.ark_base_url,
+                api_key=settings.ark_api_key,
+                model=settings.seedance_model,
+                public_media_host=UguuPublicMediaHost(provider_http),
+            )
         file_store = FileStore(
             settings.data_dir,
             settings.outputs_dir,
@@ -277,6 +306,10 @@ async def _open_application_services(
                 store=production_store,
                 location=production_location,
                 include_completed_for_test=settings.lark_include_completed_for_test,
+                enabled_task_types=(
+                    frozenset({"动画类", "真人类"})
+                    if portrait_generator is not None else frozenset({"动画类"})
+                ),
             )
             production_writer = ProductionResultWriter(
                 client=feishu,
@@ -319,6 +352,8 @@ async def _open_application_services(
                 model=settings.seedance_model,
                 public_media_host=UguuPublicMediaHost(provider_http),
             ),
+            portrait_video_generator=portrait_generator,
+            production_task_store=production_store if production_bitable_configured else None,
             delivery_writer=delivery_writer,
             repository=repository,
             file_store=file_store,
@@ -334,6 +369,8 @@ async def _open_application_services(
             await bitable_factory.close_unclaimed()
         if file_store is not None:
             file_store.close()
+        if portrait_store is not None:
+            await portrait_store.close()
         await feishu.close()
         await downloader.aclose()
         await provider_http.aclose()

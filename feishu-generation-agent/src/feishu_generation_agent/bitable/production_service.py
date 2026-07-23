@@ -35,12 +35,14 @@ class ProductionBitableService:
         runtime: Any,
         location: BitableLocation,
         include_completed_for_test: bool,
+        enabled_task_types: frozenset[str] = frozenset({"动画类"}),
     ) -> None:
         self._bitable = bitable
         self._store = store
         self._runtime = runtime
         self._location = location
         self._include_completed_for_test = include_completed_for_test
+        self._enabled_task_types = enabled_task_types
         self._schema: Any | None = None
         self._closed = False
 
@@ -64,7 +66,7 @@ class ProductionBitableService:
         task = next((item for item in await self.scan() if item.record_id == record_id), None)
         if task is None:
             raise RunConflict("该生产表记录当前不可领取")
-        if task.task_type != "动画类":
+        if task.task_type not in self._enabled_task_types:
             raise RunConflict(f"{task.task_type or '未分类'}任务暂未启用")
         binding = await self._store.claim(
             self._location,
@@ -100,7 +102,7 @@ class ProductionBitableService:
             TableTaskStatus.FAILED,
         }:
             raise RunConflict("只有已经结束的多维表格任务可以重跑")
-        if source.snapshot.task_type != "动画类":
+        if source.snapshot.task_type not in self._enabled_task_types:
             raise RunConflict(f"{source.snapshot.task_type or '未分类'}任务暂未启用")
         task = ProductionTaskSummary(
             record_id=source.record_id,
@@ -190,7 +192,7 @@ class ProductionBitableService:
 
     async def validate_approval(self, run_id: str) -> None:
         binding = await self._store.get_by_run(run_id)
-        if binding is not None and binding.snapshot.task_type != "动画类":
+        if binding is not None and binding.snapshot.task_type not in self._enabled_task_types:
             raise RunValidationError(f"{binding.snapshot.task_type or '未分类'}任务暂未启用")
 
     async def _prepared_schema(self):

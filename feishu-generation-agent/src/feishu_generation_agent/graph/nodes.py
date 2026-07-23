@@ -62,6 +62,8 @@ class GraphServices:
     repository: Repository
     file_store: FileStore
     settings: Settings
+    portrait_video_generator: Any | None = None
+    production_task_store: Any | None = None
 
 
 _Result = TypeVar("_Result")
@@ -646,10 +648,6 @@ def _task_assets(
         raise _validation_error("The approved plan is not valid") from None
 
 
-def _provider_for_task(task: GenerationTask) -> str:
-    return "chiyun" if task.task_type is TaskType.IMAGE_TO_IMAGE else "seedance"
-
-
 def _task_fingerprint(task: GenerationTask) -> str:
     canonical = json.dumps(
         task.model_dump(mode="json"),
@@ -694,10 +692,14 @@ async def _keep_submission_intent_alive(
             return
 
 
-def _generator_for_task(task: GenerationTask, services: GraphServices):
+async def _generator_for_task(run_id: str, task: GenerationTask, services: GraphServices):
     if task.task_type is TaskType.IMAGE_TO_IMAGE:
-        return services.image_generator
-    return services.video_generator
+        return "chiyun", services.image_generator
+    if services.portrait_video_generator is not None and services.production_task_store is not None:
+        binding = await services.production_task_store.get_by_run(run_id)
+        if binding is not None and binding.snapshot.task_type == "真人类":
+            return "volcengine_portrait", services.portrait_video_generator.for_run(run_id)
+    return "seedance", services.video_generator
 
 
 async def _transition_operation(
@@ -972,9 +974,8 @@ async def _execute_one_task(
     task: GenerationTask,
     assets: list[MediaAsset],
 ) -> tuple[ExecutionRecord, list[Artifact]]:
-    provider = _provider_for_task(task)
     task_fingerprint = _task_fingerprint(task)
-    generator = _generator_for_task(task, services)
+    provider, generator = await _generator_for_task(run_id, task, services)
     existing_artifacts = await _existing_valid_artifacts(
         services, run_id, task
     )

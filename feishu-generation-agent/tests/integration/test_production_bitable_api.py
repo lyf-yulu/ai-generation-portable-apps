@@ -130,8 +130,8 @@ async def test_scan_marks_live_action_as_unavailable_and_rejects_claim(tmp_path)
 
     assert scanned.status_code == 200
     assert scanned.json()[0]["task_type"] == "真人类"
-    assert scanned.json()[0]["deliverable"] is False
-    assert scanned.json()[0]["delivery_block_reason"] == "真人类任务暂未启用"
+    assert scanned.json()[0]["deliverable"] is True
+    assert scanned.json()[0]["delivery_block_reason"] is None
     assert rejected.status_code == 409
     assert rejected.json()["detail"] == "真人类任务暂未启用"
 
