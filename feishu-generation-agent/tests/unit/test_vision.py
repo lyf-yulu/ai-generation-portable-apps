@@ -68,6 +68,19 @@ class FakeVisionModel:
         return self.result
 
 
+class FlakyStructuredVisionModel(FakeVisionModel):
+    def __init__(self, results: list[object | Exception | None]) -> None:
+        super().__init__()
+        self.results = list(results)
+
+    async def ainvoke(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> object:
+        self.result = self.results.pop(0)
+        return await super().ainvoke(messages)
+
+
 class ModelRefusalError(RuntimeError):
     pass
 
@@ -368,6 +381,21 @@ async def test_missing_structured_fields_are_non_retryable_validation_errors(
     assert detail.retryable is False
     assert webp_asset.asset_id in f"{detail.message} {detail.technical_detail}"
     assert webp_asset.local_path.exists()
+
+
+async def test_invalid_structured_result_is_retried_before_failing_run(
+    repository: Repository,
+    webp_asset: MediaAsset,
+):
+    invalid = description_payload()
+    del invalid["scene"]
+    model = FlakyStructuredVisionModel([invalid, description_payload()])
+    analyzer = ClaudeVisionAnalyzer(model, repository, prompt_version="vision-v1")
+
+    result = await analyzer.analyze(webp_asset)
+
+    assert result.scene == "木质抽屉前"
+    assert model.calls == 2
 
 
 async def test_none_structured_result_is_non_retryable_provider_refusal(

@@ -32,6 +32,7 @@ _MAX_VISION_EDGE = 1568
 _MAX_VISION_PIXELS = 1_150_000
 _MAX_VISION_SOURCE_BYTES = 1_500_000
 _VISION_JPEG_QUALITY = 90
+_VISION_STRUCTURE_ATTEMPTS = 3
 
 
 class _ModelRefusal(RuntimeError):
@@ -196,12 +197,25 @@ class ClaudeVisionAnalyzer:
         structured_model = self._model.with_structured_output(
             VisionDescription
         )
-        result = await structured_model.ainvoke(messages)
-        if result is None or (isinstance(result, dict) and result.get("refusal")):
+        description: VisionDescription | None = None
+        validation_error: ValidationError | ValueError | TypeError | None = None
+        for _ in range(_VISION_STRUCTURE_ATTEMPTS):
+            try:
+                result = await structured_model.ainvoke(messages)
+                if result is None or (
+                    isinstance(result, dict) and result.get("refusal")
+                ):
+                    raise _ModelRefusal
+                description = VisionDescription.model_validate(result).model_copy(
+                    update={"asset_id": ""}
+                )
+                break
+            except (ValidationError, ValueError, TypeError) as exc:
+                validation_error = exc
+        if description is None:
+            if validation_error is not None:
+                raise validation_error
             raise _ModelRefusal
-        description = VisionDescription.model_validate(result).model_copy(
-            update={"asset_id": ""}
-        )
         await self._repository.save_vision_cache(cache_key, description)
         return description
 
