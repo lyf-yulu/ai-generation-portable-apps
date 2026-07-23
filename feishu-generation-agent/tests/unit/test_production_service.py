@@ -7,7 +7,7 @@ from feishu_generation_agent.domain.production_bitable import (
     ProductionSourceSnapshot,
     ProductionTaskSummary,
 )
-from feishu_generation_agent.graph.runtime import RunValidationError
+from feishu_generation_agent.graph.runtime import RunConflict, RunValidationError
 
 
 def _location() -> BitableLocation:
@@ -123,3 +123,36 @@ async def test_service_rerun_archives_original_binding_and_lists_it_as_recent(tm
     assert cloned_from == original_run_id
     assert cloned_run_id == rerun_id
     assert cloned_thread_id != original.thread_id
+
+
+async def test_service_rejects_rerun_of_non_animation_task(tmp_path) -> None:
+    from feishu_generation_agent.domain.bitable import TableTaskStatus
+    from feishu_generation_agent.storage.production_tasks import ProductionTaskStore
+
+    class Bitable:
+        async def ensure_schema(self, location): return object()
+        async def list_tasks(self, location, schema, *, include_completed): return [_task()]
+
+    class Runtime:
+        async def start_run(self, request, *, run_id=None, thread_id=None): return run_id
+
+    task = _task().model_copy(
+        update={
+            "task_type": "真人类",
+            "snapshot": _task().snapshot.model_copy(update={"task_type": "真人类"}),
+        }
+    )
+    store = await ProductionTaskStore.open(tmp_path / "production.sqlite3")
+    service = ProductionBitableService(
+        bitable=Bitable(), store=store, runtime=Runtime(), location=_location(),
+        include_completed_for_test=False,
+    )
+    try:
+        binding = await store.claim(
+            _location(), task, run_id="run-live-action", thread_id="thread-live-action"
+        )
+        await store.release(binding.run_id, status=TableTaskStatus.COMPLETED)
+        with pytest.raises(RunConflict, match="真人类任务暂未启用"):
+            await service.rerun(binding.run_id)
+    finally:
+        await store.close()

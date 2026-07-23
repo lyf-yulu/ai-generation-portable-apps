@@ -100,11 +100,14 @@ class ProductionBitableService:
             TableTaskStatus.FAILED,
         }:
             raise RunConflict("只有已经结束的多维表格任务可以重跑")
+        if source.snapshot.task_type != "动画类":
+            raise RunConflict(f"{source.snapshot.task_type or '未分类'}任务暂未启用")
         task = ProductionTaskSummary(
             record_id=source.record_id,
             display_text=source.display_text,
             source_url=source.source_url,
             progress=source.progress,
+            task_type=source.snapshot.task_type,
             maker_open_id=source.maker_open_id,
             maker_name=source.maker_name,
             snapshot=source.snapshot,

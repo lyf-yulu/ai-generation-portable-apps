@@ -319,6 +319,8 @@ def create_app(
                 status_code=409,
                 detail="结果列已有附件，已停止回写",
             ) from None
+        if isinstance(exc, RunConflict) and str(exc).endswith("任务暂未启用"):
+            raise HTTPException(status_code=409, detail=str(exc)) from None
         if isinstance(exc, (TaskAlreadyClaimed, ProductionTaskAlreadyClaimed, RunConflict)):
             raise HTTPException(
                 status_code=409,
