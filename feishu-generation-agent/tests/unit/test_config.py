@@ -30,6 +30,21 @@ def test_settings_can_explicitly_enable_benchmark_fake_ips():
     assert settings.allow_benchmark_fake_ips is True
 
 
+def test_production_portrait_view_is_separately_configurable() -> None:
+    settings = Settings(
+        _env_file=None,
+        lark_production_portrait_view_id="vewPortrait",
+    )
+
+    assert settings.lark_production_portrait_view_id == "vewPortrait"
+
+
+def test_env_example_documents_production_requirement_type_field() -> None:
+    example = (Path(__file__).parents[2] / ".env.example").read_text()
+
+    assert "生产表模式只读「需求名称、需求类型、需求附件" in example
+
+
 def test_provider_polling_defaults_to_fifteen_minutes(monkeypatch):
     monkeypatch.delenv("PROVIDER_POLL_INTERVAL_SECONDS", raising=False)
     monkeypatch.delenv("PROVIDER_POLL_MAX_ATTEMPTS", raising=False)

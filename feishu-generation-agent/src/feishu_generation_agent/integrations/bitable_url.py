@@ -1,6 +1,6 @@
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
 from feishu_generation_agent.domain.bitable import BitableLocation
 from feishu_generation_agent.domain.document import SourceType
@@ -21,6 +21,24 @@ def parse_bitable_url(url: str, table_id: str, view_id: str) -> BitableLocation:
         table_id=table_id,
         view_id=view_id,
         source_url=url,
+    )
+
+
+def with_bitable_view(location: BitableLocation, view_id: str) -> BitableLocation:
+    if not isinstance(view_id, str) or not view_id.strip():
+        raise ValueError("多维表格 view_id 不能为空")
+    parsed = urlsplit(location.source_url)
+    query = [
+        (name, value)
+        for name, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if name not in {"table", "view"}
+    ]
+    query.extend((("table", location.table_id), ("view", view_id.strip())))
+    source_url = urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
+    )
+    return location.model_copy(
+        update={"view_id": view_id.strip(), "source_url": source_url}
     )
 
 

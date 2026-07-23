@@ -74,12 +74,14 @@ class _BitableService:
         self.scan_error: Exception | None = None
         self.retry_error: Exception | None = None
 
-    async def scan(self) -> list[BitableTaskSummary]:
+    async def scan(self, category: str = "animation") -> list[BitableTaskSummary]:
+        del category
         if self.scan_error:
             raise self.scan_error
         return self.tasks
 
-    async def claim(self, record_id: str) -> str:
+    async def claim(self, record_id: str, category: str = "animation") -> str:
+        del category
         if record_id in self.claimed:
             raise RunConflict("already claimed rec-1")
         if record_id != "rec-1":
@@ -119,7 +121,8 @@ class _ApprovalSmokeService:
         self.claimed: list[str] = []
         self.synced: list[str] = []
 
-    async def scan(self) -> list[BitableTaskSummary]:
+    async def scan(self, category: str = "animation") -> list[BitableTaskSummary]:
+        del category
         return [
             BitableTaskSummary(
                 record_id="rec-1",
@@ -128,7 +131,8 @@ class _ApprovalSmokeService:
             )
         ]
 
-    async def claim(self, record_id: str) -> str:
+    async def claim(self, record_id: str, category: str = "animation") -> str:
+        del category
         self.claimed.append(record_id)
         return "run-approval-gate"
 

@@ -8,14 +8,20 @@ from langchain_openai import ChatOpenAI
 
 from feishu_generation_agent.config import Settings
 from feishu_generation_agent.bitable.mvp_service import BitableMvpService
-from feishu_generation_agent.bitable.production_service import ProductionBitableService
+from feishu_generation_agent.bitable.production_service import (
+    ProductionBitableService,
+    ProductionTaskSource,
+)
 from feishu_generation_agent.domain import BitableLocation
 from feishu_generation_agent.graph.nodes import GraphServices
 from feishu_generation_agent.integrations.chiyun import ChiyunImageGenerator
 from feishu_generation_agent.integrations.feishu_client import FeishuClient
 from feishu_generation_agent.integrations.feishu_bitable import FeishuBitableClient
 from feishu_generation_agent.integrations.bitable_delivery import BitableResultWriter
-from feishu_generation_agent.integrations.bitable_url import parse_bitable_url
+from feishu_generation_agent.integrations.bitable_url import (
+    parse_bitable_url,
+    with_bitable_view,
+)
 from feishu_generation_agent.integrations.feishu_delivery import (
     FeishuDeliveryWriter,
 )
@@ -129,7 +135,7 @@ class BitableServiceFactory:
 class ProductionBitableServiceFactory:
     bitable: ProductionBitableClient
     store: ProductionTaskStore
-    location: BitableLocation
+    sources: dict[str, ProductionTaskSource]
     include_completed_for_test: bool
     enabled_task_types: frozenset[str] = frozenset({"动画类"})
     _claimed: bool = False
@@ -142,7 +148,7 @@ class ProductionBitableServiceFactory:
             bitable=self.bitable,
             store=self.store,
             runtime=runtime,
-            location=self.location,
+            sources=self.sources,
             include_completed_for_test=self.include_completed_for_test,
             enabled_task_types=self.enabled_task_types,
         )
@@ -301,10 +307,24 @@ async def _open_application_services(
             production_store = await ProductionTaskStore.open(
                 settings.data_dir / "production-bitable.sqlite3"
             )
+            production_sources = {
+                "animation": ProductionTaskSource(
+                    production_location,
+                    expected_task_type="动画类",
+                )
+            }
+            if settings.lark_production_portrait_view_id:
+                production_sources["portrait"] = ProductionTaskSource(
+                    with_bitable_view(
+                        production_location,
+                        settings.lark_production_portrait_view_id,
+                    ),
+                    expected_task_type="真人类",
+                )
             production_factory = ProductionBitableServiceFactory(
                 bitable=ProductionBitableClient(feishu),
                 store=production_store,
-                location=production_location,
+                sources=production_sources,
                 include_completed_for_test=settings.lark_include_completed_for_test,
                 enabled_task_types=(
                     frozenset({"动画类", "真人类"})

@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
@@ -26,6 +28,12 @@ _ACTIVE_STATUSES = {
 _SHARED_RESULT_TARGET = "__shared_production_result__"
 
 
+@dataclass(frozen=True, slots=True)
+class ProductionTaskSource:
+    location: BitableLocation
+    expected_task_type: str
+
+
 class ProductionBitableService:
     def __init__(
         self,
@@ -33,43 +41,57 @@ class ProductionBitableService:
         bitable: Any,
         store: ProductionTaskStore,
         runtime: Any,
-        location: BitableLocation,
+        sources: Mapping[str, ProductionTaskSource],
         include_completed_for_test: bool,
         enabled_task_types: frozenset[str] = frozenset({"动画类"}),
     ) -> None:
         self._bitable = bitable
         self._store = store
         self._runtime = runtime
-        self._location = location
+        self._sources = dict(sources)
         self._include_completed_for_test = include_completed_for_test
         self._enabled_task_types = enabled_task_types
-        self._schema: Any | None = None
+        self._schemas: dict[tuple[str, str], Any] = {}
         self._closed = False
 
-    async def scan(self):
-        schema = await self._prepared_schema()
+    async def scan(self, category: str = "animation"):
+        source = await self._prepared_source(category)
+        schema_key = (
+            source.location.app_token or "",
+            source.location.table_id,
+        )
+        schema = self._schemas.get(schema_key)
+        if schema is None:
+            schema = await self._bitable.ensure_schema(source.location)
+            self._schemas[schema_key] = schema
         tasks = await self._bitable.list_tasks(
-            self._location,
+            source.location,
             schema,
             include_completed=self._include_completed_for_test,
         )
-        location = await self._prepared_location()
         active_record_ids = {
             binding.record_id
-            for binding in await self._store.list_active(
-                location.app_token or "", location.table_id
-            )
+            for binding in await self._store.list_active(*schema_key)
         }
-        return [task for task in tasks if task.record_id not in active_record_ids]
+        return [
+            task
+            for task in tasks
+            if task.task_type == source.expected_task_type
+            and task.record_id not in active_record_ids
+        ]
 
-    async def claim(self, record_id: str) -> str:
-        task = next((item for item in await self.scan() if item.record_id == record_id), None)
+    async def claim(self, record_id: str, category: str = "animation") -> str:
+        source = await self._prepared_source(category)
+        task = next(
+            (item for item in await self.scan(category) if item.record_id == record_id),
+            None,
+        )
         if task is None:
             raise RunConflict("该生产表记录当前不可领取")
         if task.task_type not in self._enabled_task_types:
             raise RunConflict(f"{task.task_type or '未分类'}任务暂未启用")
         binding = await self._store.claim(
-            self._location,
+            source.location,
             task,
             run_id=str(uuid4()),
             thread_id=str(uuid4()),
@@ -81,11 +103,11 @@ class ProductionBitableService:
         )
 
     async def active_runs(self):
-        location = await self._prepared_location()
+        location = await self._table_location()
         return await self._store.list_active(location.app_token or "", location.table_id)
 
     async def recent_runs(self):
-        location = await self._prepared_location()
+        location = await self._table_location()
         return await self._store.list_recent(location.app_token or "", location.table_id)
 
     async def result_table_url(self, run_id: str) -> str | None:
@@ -115,7 +137,7 @@ class ProductionBitableService:
             snapshot=source.snapshot,
         )
         rerun = await self._store.claim(
-            self._location,
+            source.source_location,
             task,
             run_id=str(uuid4()),
             thread_id=str(uuid4()),
@@ -195,15 +217,18 @@ class ProductionBitableService:
         if binding is not None and binding.snapshot.task_type not in self._enabled_task_types:
             raise RunValidationError(f"{binding.snapshot.task_type or '未分类'}任务暂未启用")
 
-    async def _prepared_schema(self):
+    async def _prepared_source(self, category: str) -> ProductionTaskSource:
         if self._closed:
             raise RunConflict("多维表格服务正在关闭")
-        await self._prepared_location()
-        if self._schema is None:
-            self._schema = await self._bitable.ensure_schema(self._location)
-        return self._schema
+        source = self._sources.get(category)
+        if source is None:
+            label = "真人类" if category == "portrait" else "动画类"
+            raise RunValidationError(f"{label}视图尚未配置")
+        if source.location.app_token is None:
+            resolved = await self._bitable.resolve_location(source.location)
+            source = ProductionTaskSource(resolved, source.expected_task_type)
+            self._sources[category] = source
+        return source
 
-    async def _prepared_location(self) -> BitableLocation:
-        if self._location.app_token is None:
-            self._location = await self._bitable.resolve_location(self._location)
-        return self._location
+    async def _table_location(self) -> BitableLocation:
+        return (await self._prepared_source("animation")).location

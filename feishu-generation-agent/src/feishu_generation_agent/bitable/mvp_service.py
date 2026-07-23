@@ -95,7 +95,8 @@ class BitableMvpService:
         assert self._location is not None
         return self._location
 
-    async def scan(self) -> list[BitableTaskSummary]:
+    async def scan(self, category: str = "animation") -> list[BitableTaskSummary]:
+        del category
         for attempt in range(2):
             try:
                 return await self._scan_once()
@@ -132,7 +133,8 @@ class BitableMvpService:
             location.table_id,
         )
 
-    async def claim(self, record_id: str) -> str:
+    async def claim(self, record_id: str, category: str = "animation") -> str:
+        del category
         location, schema = await self._prepared()
         tasks = await self._bitable.list_tasks(location, schema)
         task = next(

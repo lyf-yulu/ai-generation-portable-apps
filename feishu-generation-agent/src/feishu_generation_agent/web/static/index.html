@@ -22,9 +22,25 @@
           <p class="eyebrow">BITABLE TASKS</p>
           <h2>多维表格任务</h2>
         </div>
-        <button id="scan-bitable-button" type="button" class="secondary">
-          扫描任务
-        </button>
+        <button id="scan-bitable-button" type="button" class="secondary">刷新任务</button>
+      </div>
+      <div class="task-category-tabs" role="tablist" aria-label="任务类别">
+        <button
+          id="animation-category-tab"
+          class="task-category-tab is-active"
+          type="button"
+          role="tab"
+          aria-selected="true"
+          data-category="animation"
+        >动画类</button>
+        <button
+          id="portrait-category-tab"
+          class="task-category-tab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          data-category="portrait"
+        >真人类</button>
       </div>
       <p id="bitable-status" class="mode-message">
         点击扫描，读取需求附件可访问且进度符合扫描规则的记录。

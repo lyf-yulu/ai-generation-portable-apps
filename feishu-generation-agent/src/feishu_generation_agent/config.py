@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     lark_production_bitable_url: str | None = None
     lark_production_table_id: str | None = None
     lark_production_view_id: str | None = None
+    lark_production_portrait_view_id: str | None = None
     lark_result_folder_token: str | None = None
     lark_include_completed_for_test: bool = False
     lark_local_operator_open_id: str | None = None
