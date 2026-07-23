@@ -253,7 +253,7 @@ class SeedanceVideoGenerator:
         status = self._status(body.get("status"), "poll")
         if status in _NONTERMINAL_STATUSES:
             return ProviderSubmission(
-                provider="seedance",
+                provider=self._provider_name,
                 provider_task_id=provider_task_id,
                 status=status,
             )
@@ -267,7 +267,7 @@ class SeedanceVideoGenerator:
 
         result = self._video_result(body, operation="poll")
         return ProviderSubmission(
-            provider="seedance",
+            provider=self._provider_name,
             provider_task_id=provider_task_id,
             status="succeeded",
             result_items=[result],

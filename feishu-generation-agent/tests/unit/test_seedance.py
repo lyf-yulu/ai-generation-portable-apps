@@ -1083,6 +1083,35 @@ async def test_poll_nonterminal_status_performs_exactly_one_get(
 
 
 @pytest.mark.asyncio
+async def test_poll_preserves_custom_provider_identity_while_running() -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={"id": "task-portrait-running", "status": "running"},
+            )
+        )
+    )
+    generator = SeedanceVideoGenerator(
+        client,
+        base_url="https://ark.fictional.test/api/v3",
+        api_key="fictional-key",
+        model="fictional-model",
+        provider_name="volcengine_portrait",
+    )
+    async with client:
+        result = await generator.poll(
+            _submission(
+                provider="volcengine_portrait",
+                provider_task_id="task-portrait-running",
+            )
+        )
+
+    assert result.provider == "volcengine_portrait"
+    assert result.status == "running"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["failed", "cancelled", "canceled", "expired"])
 async def test_poll_terminal_status_is_non_retryable_and_redacted(
     status: str,
