@@ -275,12 +275,15 @@ class FeishuClient:
             f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records"
         )
 
-    async def delete_bitable_record(
-        self, app_token: str, table_id: str, record_id: str
+    async def delete_bitable_records(
+        self, app_token: str, table_id: str, record_ids: list[str]
     ) -> None:
+        if not record_ids:
+            return
         await self.request_json(
-            "DELETE",
-            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}",
+            "POST",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_delete",
+            json_body={"records": record_ids},
         )
 
     async def update_bitable_record(

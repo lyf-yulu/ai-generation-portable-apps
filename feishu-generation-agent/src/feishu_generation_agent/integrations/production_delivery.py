@@ -152,7 +152,7 @@ class ProductionResultWriter:
         records = await self._client.list_bitable_records(
             target.app_token, target.table_id
         )
-        deleted = 0
+        empty_record_ids: list[str] = []
         for record in records:
             record_id = record.get("record_id")
             if (
@@ -160,11 +160,11 @@ class ProductionResultWriter:
                 and record_id
                 and record.get("fields") == {}
             ):
-                await self._client.delete_bitable_record(
-                    target.app_token, target.table_id, record_id
-                )
-                deleted += 1
-        return deleted
+                empty_record_ids.append(record_id)
+        await self._client.delete_bitable_records(
+            target.app_token, target.table_id, empty_record_ids
+        )
+        return len(empty_record_ids)
 
     async def _upload(self, run_id: str, app_token: str, artifact: Artifact) -> str:
         if artifact.feishu_file_token:
