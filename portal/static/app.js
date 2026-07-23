@@ -399,10 +399,18 @@ function DreaminaApp() {
     },
 
     async _blobDownload(url, filename) {
+      // We deliberately fetch → blob → <a download> (instead of a plain
+      // <a href download>) to dodge the self-signed-cert trap: Chrome's
+      // download manager re-validates the request out of page context and
+      // rejects our LAN self-signed cert ("检查网络连接"). The blob path keeps
+      // it inside the page's TLS context. Cost: the whole file streams into
+      // browser memory first with no native progress UI — so we render our own
+      // progress bar by reading the response as a stream.
+      const bar = window._dlProgress ? window._dlProgress.start(filename) : null;
       try {
         const resp = await fetch(url);
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        const blob = await resp.blob();
+        const blob = bar ? await bar.readBlob(resp) : await resp.blob();
         const blobUrl = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = blobUrl;
@@ -412,7 +420,9 @@ function DreaminaApp() {
         a.click();
         document.body.removeChild(a);
         setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+        if (bar) bar.done();
       } catch (e) {
+        if (bar) bar.fail();
         const a = document.createElement('a');
         a.href = url;
         a.download = filename;
@@ -860,6 +870,92 @@ function DreaminaApp() {
 // Global bridge for onclick in innerHTML
 window._dmRestore = null;
 window.openPreview = openPreview;
+
+// === Download progress bar (shared, self-contained) ===================
+// blob-download reads the whole file into browser memory with no native
+// progress UI. This overlay reads the response as a stream and shows a
+// bottom-of-screen bar ("已下载 42.0 / 180.0 MB") so users don't think it hung.
+// Injects its own DOM+CSS on first use; concurrent downloads each get a row.
+(function () {
+  if (window._dlProgress) return;
+  const MB = 1024 * 1024;
+  let container = null;
+  function ensureContainer() {
+    if (container) return container;
+    const style = document.createElement('style');
+    style.textContent = `
+      #_dlProgWrap{position:fixed;left:16px;bottom:16px;z-index:99999;display:flex;flex-direction:column;gap:8px;pointer-events:none}
+      #_dlProgWrap .dlp{background:#17191f;color:#e2e8f0;border-radius:8px;padding:10px 12px;min-width:240px;max-width:340px;box-shadow:0 4px 16px rgba(0,0,0,.35);font-size:12px;pointer-events:auto}
+      #_dlProgWrap .dlp .name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:6px}
+      #_dlProgWrap .dlp .track{height:6px;background:#2d3340;border-radius:3px;overflow:hidden}
+      #_dlProgWrap .dlp .fill{height:100%;width:0;background:#3b82f6;transition:width .15s ease}
+      #_dlProgWrap .dlp .txt{margin-top:5px;color:#94a3b8;font-size:11px}
+      #_dlProgWrap .dlp.done .fill{background:#22c55e}
+      #_dlProgWrap .dlp.fail .fill{background:#ef4444}
+    `;
+    document.head.appendChild(style);
+    container = document.createElement('div');
+    container.id = '_dlProgWrap';
+    document.body.appendChild(container);
+    return container;
+  }
+  function fmt(bytes) { return (bytes / MB).toFixed(1); }
+  window._dlProgress = {
+    start(filename) {
+      const wrap = ensureContainer();
+      const row = document.createElement('div');
+      row.className = 'dlp';
+      row.innerHTML =
+        '<div class="name">⬇ ' + (filename || '下载中') + '</div>' +
+        '<div class="track"><div class="fill"></div></div>' +
+        '<div class="txt">准备中…</div>';
+      wrap.appendChild(row);
+      const fill = row.querySelector('.fill');
+      const txt = row.querySelector('.txt');
+      let removed = false;
+      function remove(delay) {
+        if (removed) return; removed = true;
+        setTimeout(() => { if (row.parentNode) row.parentNode.removeChild(row); }, delay);
+      }
+      return {
+        // Read a fetch Response as a stream, updating the bar, return a Blob.
+        // Falls back to resp.blob() if the body isn't streamable.
+        async readBlob(resp) {
+          const total = Number(resp.headers.get('Content-Length')) || 0;
+          if (!resp.body || !resp.body.getReader) { txt.textContent = '下载中…'; return await resp.blob(); }
+          const reader = resp.body.getReader();
+          const chunks = [];
+          let received = 0;
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+            received += value.length;
+            if (total) {
+              const pct = Math.min(100, received / total * 100);
+              fill.style.width = pct.toFixed(1) + '%';
+              txt.textContent = '已下载 ' + fmt(received) + ' / ' + fmt(total) + ' MB (' + pct.toFixed(0) + '%)';
+            } else {
+              txt.textContent = '已下载 ' + fmt(received) + ' MB';
+            }
+          }
+          return new Blob(chunks);
+        },
+        done() {
+          row.classList.add('done');
+          fill.style.width = '100%';
+          txt.textContent = '完成';
+          remove(1200);
+        },
+        fail() {
+          row.classList.add('fail');
+          txt.textContent = '下载出错，已尝试直接下载';
+          remove(2500);
+        },
+      };
+    },
+  };
+})();
 
 // === Stats App ===
 function StatsApp() {

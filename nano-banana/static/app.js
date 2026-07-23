@@ -734,10 +734,15 @@ function NanoBananaApp() {
     },
 
     async _blobDownload(url, filename) {
+      // fetch → blob → <a download> dodges the self-signed-cert trap (Chrome's
+      // download manager re-validates out of page context and rejects our LAN
+      // cert). Cost: whole file into memory, no native progress — so we stream
+      // the response and render our own progress bar (window._dlProgress).
+      var bar = window._dlProgress ? window._dlProgress.start(filename) : null;
       try {
         var resp = await fetch(url);
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        var blob = await resp.blob();
+        var blob = bar ? await bar.readBlob(resp) : await resp.blob();
         var blobUrl = URL.createObjectURL(blob);
         var a = document.createElement('a');
         a.href = blobUrl;
@@ -747,7 +752,9 @@ function NanoBananaApp() {
         a.click();
         document.body.removeChild(a);
         setTimeout(function() { URL.revokeObjectURL(blobUrl); }, 1000);
+        if (bar) bar.done();
       } catch (e) {
+        if (bar) bar.fail();
         var a2 = document.createElement('a');
         a2.href = url;
         a2.download = filename;
@@ -1235,3 +1242,86 @@ document.addEventListener('DOMContentLoaded', function () {
     }
   });
 });
+
+// === Download progress bar (shared, self-contained) ===================
+// blob-download reads the whole file into browser memory with no native
+// progress UI. This overlay reads the response as a stream and shows a
+// bottom-of-screen bar ("已下载 42.0 / 180.0 MB") so users don't think it hung.
+// Injects its own DOM+CSS on first use; concurrent downloads each get a row.
+(function () {
+  if (window._dlProgress) return;
+  var MB = 1024 * 1024;
+  var container = null;
+  function ensureContainer() {
+    if (container) return container;
+    var style = document.createElement('style');
+    style.textContent =
+      '#_dlProgWrap{position:fixed;left:16px;bottom:16px;z-index:99999;display:flex;flex-direction:column;gap:8px;pointer-events:none}' +
+      '#_dlProgWrap .dlp{background:#17191f;color:#e2e8f0;border-radius:8px;padding:10px 12px;min-width:240px;max-width:340px;box-shadow:0 4px 16px rgba(0,0,0,.35);font-size:12px;pointer-events:auto}' +
+      '#_dlProgWrap .dlp .name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:6px}' +
+      '#_dlProgWrap .dlp .track{height:6px;background:#2d3340;border-radius:3px;overflow:hidden}' +
+      '#_dlProgWrap .dlp .fill{height:100%;width:0;background:#3b82f6;transition:width .15s ease}' +
+      '#_dlProgWrap .dlp .txt{margin-top:5px;color:#94a3b8;font-size:11px}' +
+      '#_dlProgWrap .dlp.done .fill{background:#22c55e}' +
+      '#_dlProgWrap .dlp.fail .fill{background:#ef4444}';
+    document.head.appendChild(style);
+    container = document.createElement('div');
+    container.id = '_dlProgWrap';
+    document.body.appendChild(container);
+    return container;
+  }
+  function fmt(bytes) { return (bytes / MB).toFixed(1); }
+  window._dlProgress = {
+    start: function (filename) {
+      var wrap = ensureContainer();
+      var row = document.createElement('div');
+      row.className = 'dlp';
+      row.innerHTML =
+        '<div class="name">⬇ ' + (filename || '下载中') + '</div>' +
+        '<div class="track"><div class="fill"></div></div>' +
+        '<div class="txt">准备中…</div>';
+      wrap.appendChild(row);
+      var fill = row.querySelector('.fill');
+      var txt = row.querySelector('.txt');
+      var removed = false;
+      function remove(delay) {
+        if (removed) return; removed = true;
+        setTimeout(function () { if (row.parentNode) row.parentNode.removeChild(row); }, delay);
+      }
+      return {
+        readBlob: async function (resp) {
+          var total = Number(resp.headers.get('Content-Length')) || 0;
+          if (!resp.body || !resp.body.getReader) { txt.textContent = '下载中…'; return await resp.blob(); }
+          var reader = resp.body.getReader();
+          var chunks = [];
+          var received = 0;
+          for (;;) {
+            var r = await reader.read();
+            if (r.done) break;
+            chunks.push(r.value);
+            received += r.value.length;
+            if (total) {
+              var pct = Math.min(100, received / total * 100);
+              fill.style.width = pct.toFixed(1) + '%';
+              txt.textContent = '已下载 ' + fmt(received) + ' / ' + fmt(total) + ' MB (' + pct.toFixed(0) + '%)';
+            } else {
+              txt.textContent = '已下载 ' + fmt(received) + ' MB';
+            }
+          }
+          return new Blob(chunks);
+        },
+        done: function () {
+          row.classList.add('done');
+          fill.style.width = '100%';
+          txt.textContent = '完成';
+          remove(1200);
+        },
+        fail: function () {
+          row.classList.add('fail');
+          txt.textContent = '下载出错，已尝试直接下载';
+          remove(2500);
+        },
+      };
+    },
+  };
+})();
