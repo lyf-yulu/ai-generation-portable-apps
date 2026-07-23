@@ -355,6 +355,11 @@
   function formatDuration(value) {
     if (typeof value !== "number") return "—";
     if (value < 1000) return `${value} ms`;
+    if (value >= 60_000) {
+      const minutes = Math.floor(value / 60_000);
+      const seconds = Math.floor((value % 60_000) / 1000);
+      return `${minutes} 分 ${String(seconds).padStart(2, "0")} 秒`;
+    }
     return `${(value / 1000).toFixed(1)} s`;
   }
 
@@ -782,9 +787,8 @@
     byId("run-status").textContent = view.status;
     byId("thread-id").textContent = view.thread_id;
     const latestEvent = (view.events || []).at(-1);
-    byId("current-node").textContent = latestEvent?.node || "—";
-    const durations = (view.events || []).map((item) => item.duration_ms).filter((item) => typeof item === "number");
-    byId("run-duration").textContent = formatDuration(durations.reduce((sum, value) => sum + value, 0));
+    byId("current-node").textContent = BitableState.runStage(view) || latestEvent?.node || "—";
+    byId("run-duration").textContent = formatDuration(BitableState.runElapsedMs(view));
     byId("document-title").textContent = view.approval.document_title || "未命名文档";
     byId("source-link").href = view.source_url;
     byId("document-revision").textContent = view.approval.revision ?? "—";
@@ -815,7 +819,6 @@
 
   async function poll(force = false, resetDraft = false) {
     if (!state.runId || (state.busy && !force)) return;
-    if (!force && document.activeElement?.closest(".task-card")) return;
     try {
       const serverView = await api(`/api/runs/${state.runId}`);
       state.review = resetDraft

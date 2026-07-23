@@ -11,6 +11,13 @@
   "use strict";
 
   const CATEGORY_NAMES = new Set(["animation", "portrait"]);
+  const TERMINAL_RUN_STATUSES = new Set([
+    "succeeded",
+    "completed_with_errors",
+    "failed",
+    "cancelled",
+    "delivery_failed",
+  ]);
 
   function createCategoryState() {
     return {
@@ -168,6 +175,39 @@
     };
   }
 
+  function runStage(view) {
+    if (!view || typeof view !== "object") return null;
+    if (view.status === "delivering") return "正在写入结果表";
+    const operations = Array.isArray(view.operations) ? view.operations : [];
+    const latest = operations.at(-1);
+    if (
+      view.status === "waiting_provider"
+      || latest?.phase === "submitted"
+      || latest?.provider_task_id
+    ) {
+      return "Seedance 正在生成";
+    }
+    if (
+      ["running", "resuming"].includes(view.status)
+      && ["intent_created", "submission_uncertain"].includes(latest?.phase)
+      && !latest?.provider_task_id
+    ) {
+      return "正在准备参考素材并提交";
+    }
+    return null;
+  }
+
+  function runElapsedMs(view, now = Date.now()) {
+    if (!view || typeof view !== "object") return null;
+    const started = Date.parse(view.created_at);
+    const finished = Date.parse(view.updated_at);
+    if (!Number.isFinite(started)) return null;
+    const end = TERMINAL_RUN_STATUSES.has(view.status) && Number.isFinite(finished)
+      ? finished
+      : now;
+    return Math.max(0, end - started);
+  }
+
   return {
     createState,
     selectCategory,
@@ -183,5 +223,7 @@
     retryFailed,
     recentSucceeded,
     resetRunContext,
+    runStage,
+    runElapsedMs,
   };
 });

@@ -176,3 +176,37 @@ test("a portrait scan failure does not clear animation results", () => {
     "真人视图读取失败",
   );
 });
+
+test("run stage exposes asset preparation, provider generation and delivery", () => {
+  assert.equal(BitableState.runStage({
+    status: "running",
+    operations: [{ phase: "intent_created", provider_task_id: null }],
+  }), "正在准备参考素材并提交");
+
+  assert.equal(BitableState.runStage({
+    status: "waiting_provider",
+    operations: [{ phase: "submitted", provider_task_id: "task-1" }],
+  }), "Seedance 正在生成");
+
+  assert.equal(BitableState.runStage({
+    status: "delivering",
+    operations: [{ phase: "succeeded", provider_task_id: "task-1" }],
+  }), "正在写入结果表");
+});
+
+test("run elapsed time keeps increasing until a terminal status", () => {
+  const createdAt = "2026-07-23T10:00:00+00:00";
+  const updatedAt = "2026-07-23T10:00:08+00:00";
+
+  assert.equal(BitableState.runElapsedMs({
+    status: "waiting_provider",
+    created_at: createdAt,
+    updated_at: updatedAt,
+  }, Date.parse("2026-07-23T10:00:20+00:00")), 20_000);
+
+  assert.equal(BitableState.runElapsedMs({
+    status: "succeeded",
+    created_at: createdAt,
+    updated_at: updatedAt,
+  }, Date.parse("2026-07-23T10:00:20+00:00")), 8_000);
+});

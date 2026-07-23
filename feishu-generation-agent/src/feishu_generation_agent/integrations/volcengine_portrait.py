@@ -92,6 +92,8 @@ class VolcengineAssetClient:
         store: PortraitAssetStore,
         poll_interval_seconds: float = 1.0,
         max_poll_attempts: int = 300,
+        public_upload_attempts: int = 3,
+        public_upload_retry_delay_seconds: float = 1.0,
     ) -> None:
         access_key = _secret(access_key).strip()
         secret_key = _secret(secret_key).strip()
@@ -105,6 +107,10 @@ class VolcengineAssetClient:
         self._store = store
         self._poll_interval_seconds = poll_interval_seconds
         self._max_poll_attempts = max_poll_attempts
+        self._public_upload_attempts = max(1, public_upload_attempts)
+        self._public_upload_retry_delay_seconds = max(
+            0.0, public_upload_retry_delay_seconds
+        )
 
     async def ensure_image_asset(self, run_id: str, asset: MediaAsset) -> str:
         if not run_id or not asset.mime_type.startswith("image/"):
@@ -118,14 +124,7 @@ class VolcengineAssetClient:
 
         group_id = await self._ensure_group(run_id)
         asset_name = _portrait_asset_name(asset)
-        try:
-            source_url = await self._public_media_host.upload(
-                _portrait_upload_content(asset),
-                asset_name,
-                asset.mime_type,
-            )
-        except (OSError, PublicMediaUploadError) as exc:
-            raise self._transient_error("真人素材临时托管失败") from exc
+        source_url = await self._upload_public_copy(asset, asset_name)
         result = await self._call(
             "CreateAsset",
             {
@@ -140,6 +139,28 @@ class VolcengineAssetClient:
         await self._store.save_asset(run_id, asset.asset_id, asset_id, "Processing")
         await self._wait_for_active(run_id, asset.asset_id, asset_id)
         return f"asset://{asset_id}"
+
+    async def _upload_public_copy(
+        self,
+        asset: MediaAsset,
+        asset_name: str,
+    ) -> str:
+        content = _portrait_upload_content(asset)
+        last_error: OSError | PublicMediaUploadError | None = None
+        for attempt in range(self._public_upload_attempts):
+            try:
+                return await self._public_media_host.upload(
+                    content,
+                    asset_name,
+                    asset.mime_type,
+                )
+            except (OSError, PublicMediaUploadError) as exc:
+                last_error = exc
+                if attempt + 1 < self._public_upload_attempts:
+                    await asyncio.sleep(
+                        self._public_upload_retry_delay_seconds * (attempt + 1)
+                    )
+        raise self._transient_error("真人素材临时托管失败") from last_error
 
     async def _ensure_group(self, run_id: str) -> str:
         existing = await self._store.get_group_id(run_id)

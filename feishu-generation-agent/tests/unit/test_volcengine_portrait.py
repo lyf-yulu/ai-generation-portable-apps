@@ -26,9 +26,26 @@ class _PublicMediaHost:
 
 
 class _FailingPublicMediaHost:
+    def __init__(self) -> None:
+        self.attempts = 0
+
     async def upload(self, content: bytes, filename: str, mime_type: str) -> str:
         del content, filename, mime_type
+        self.attempts += 1
         raise PublicMediaUploadError("temporary host unavailable")
+
+
+class _FlakyPublicMediaHost:
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+        self.attempts = 0
+
+    async def upload(self, content: bytes, filename: str, mime_type: str) -> str:
+        del content, filename, mime_type
+        self.attempts += 1
+        if self.attempts <= self.failures:
+            raise PublicMediaUploadError("temporary host unavailable")
+        return "https://public.example/portrait.png"
 
 
 class _CapturingPublicMediaHost:
@@ -256,6 +273,7 @@ async def test_portrait_client_reports_public_host_failure_as_transient(
         assert request.url.params["Action"] == "CreateAssetGroup"
         return httpx.Response(200, json={"Result": {"Id": "group-1"}})
 
+    host = _FailingPublicMediaHost()
     store = await PortraitAssetStore.open(tmp_path / "portrait.sqlite3")
     try:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
@@ -264,8 +282,9 @@ async def test_portrait_client_reports_public_host_failure_as_transient(
                 access_key="ak-test",
                 secret_key="sk-test",
                 project_name="Seedance2.0",
-                public_media_host=_FailingPublicMediaHost(),
+                public_media_host=host,
                 store=store,
+                public_upload_retry_delay_seconds=0,
             )
             with pytest.raises(AgentError) as caught:
                 await client.ensure_image_asset("run-1", _image_asset(tmp_path))
@@ -274,6 +293,40 @@ async def test_portrait_client_reports_public_host_failure_as_transient(
 
     assert caught.value.detail.category is ErrorCategory.TRANSIENT
     assert caught.value.detail.retryable is True
+    assert host.attempts == 3
+
+
+async def test_portrait_client_retries_public_host_before_creating_asset(
+    tmp_path: Path,
+) -> None:
+    actions: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        actions.append(request.url.params["Action"])
+        return _active_asset_handler(request)
+
+    host = _FlakyPublicMediaHost(failures=2)
+    store = await PortraitAssetStore.open(tmp_path / "portrait.sqlite3")
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = VolcengineAssetClient(
+                http,
+                access_key="ak-test",
+                secret_key="sk-test",
+                project_name="Seedance2.0",
+                public_media_host=host,
+                store=store,
+                poll_interval_seconds=0,
+                max_poll_attempts=1,
+                public_upload_retry_delay_seconds=0,
+            )
+            result = await client.ensure_image_asset("run-retry", _image_asset(tmp_path))
+    finally:
+        await store.close()
+
+    assert result == "asset://asset-1"
+    assert host.attempts == 3
+    assert actions == ["CreateAssetGroup", "CreateAsset", "GetAsset"]
 
 
 async def test_portrait_client_reports_asset_http_400_as_terminal(
