@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 import os
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 from fastapi import (
     FastAPI,
@@ -47,6 +47,8 @@ from feishu_generation_agent.web.schemas import (
     DecisionRequest,
     ReferenceListRequest,
 )
+
+ProductionCategory = Literal["animation", "portrait"]
 
 
 def create_app(
@@ -314,6 +316,8 @@ def create_app(
                 status_code=422,
                 detail="多维表格字段配置不兼容，请检查文本、需求来源、执行人和结果列",
             ) from None
+        if isinstance(exc, RunValidationError):
+            raise HTTPException(status_code=422, detail=str(exc)) from None
         if isinstance(exc, BitableResultConflict):
             raise HTTPException(
                 status_code=409,
@@ -334,10 +338,13 @@ def create_app(
         ) from None
 
     @app.get("/api/bitable/tasks")
-    async def scan_bitable_tasks(request: Request) -> list[dict]:
+    async def scan_bitable_tasks(
+        request: Request,
+        category: ProductionCategory = "animation",
+    ) -> list[dict]:
         active = get_bitable_service(request)
         try:
-            tasks = await active.scan()
+            tasks = await active.scan(category)
         except Exception as exc:
             raise_bitable_error(exc)
         return [_task_payload(task) for task in tasks]
@@ -405,11 +412,13 @@ def create_app(
         status_code=status.HTTP_202_ACCEPTED,
     )
     async def claim_bitable_task(
-        record_id: str, request: Request
+        record_id: str,
+        request: Request,
+        category: ProductionCategory = "animation",
     ) -> BitableClaimResponse:
         active = get_bitable_service(request)
         try:
-            run_id = await active.claim(record_id)
+            run_id = await active.claim(record_id, category)
         except Exception as exc:
             raise_bitable_error(exc)
         return BitableClaimResponse(run_id=run_id)
