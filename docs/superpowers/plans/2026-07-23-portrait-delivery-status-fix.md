@@ -124,7 +124,7 @@ Expected: 882 个基线测试加新增测试全部通过。
 
 - [ ] **Step 2: Run frontend suite**
 
-Run: `node --test tests/frontend/*.test.mjs`
+Run: `node --test tests/frontend/*.test.cjs`
 
 Expected: 全部通过。
 
