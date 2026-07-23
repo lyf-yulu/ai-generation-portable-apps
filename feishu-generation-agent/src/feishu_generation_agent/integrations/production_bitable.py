@@ -111,7 +111,7 @@ def _to_task(record: Mapping[str, Any]) -> ProductionTaskSummary | None:
     progress = _text(fields.get("当前进度"))
     task_type = _text(fields.get("需求类型"))
     requirement_name = _text(fields.get("需求名称"))
-    if not progress or not requirement_name:
+    if not requirement_name:
         return None
     requester_ids, requester_names = _people(fields.get("发起人"))
     maker_ids, maker_names = _people(fields.get("需求制作人"))

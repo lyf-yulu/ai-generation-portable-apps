@@ -61,6 +61,18 @@ async def test_lists_readable_production_tasks_and_filters_completed() -> None:
     ]
     records = [
         {
+            "record_id": "rec-empty-progress",
+            "fields": {
+                "需求名称": "进度为空需求",
+                "需求类型": "动画类",
+                "需求附件": "https://tenant.feishu.cn/docx/docEmpty",
+                "项目名称": [],
+                "发起人": [],
+                "需求制作人": [],
+                "当前进度": "",
+            },
+        },
+        {
             "record_id": "rec-new",
             "fields": {
                 "需求名称": "需求 A",
@@ -115,8 +127,9 @@ async def test_lists_readable_production_tasks_and_filters_completed() -> None:
     normal = await client.list_tasks(location, schema, include_completed=False)
     test_mode = await client.list_tasks(location, schema, include_completed=True)
 
-    assert [task.record_id for task in normal] == ["rec-new"]
-    assert [task.record_id for task in test_mode] == ["rec-new"]
-    assert normal[0].maker_open_id == "ou-maker"
-    assert normal[0].snapshot.project_names == ["项目 A"]
-    assert normal[0].task_type == "动画类"
+    assert [task.record_id for task in normal] == ["rec-empty-progress", "rec-new"]
+    assert [task.record_id for task in test_mode] == ["rec-empty-progress", "rec-new"]
+    assert normal[0].progress == ""
+    assert normal[1].maker_open_id == "ou-maker"
+    assert normal[1].snapshot.project_names == ["项目 A"]
+    assert normal[1].task_type == "动画类"
