@@ -16,6 +16,7 @@ from feishu_generation_agent.integrations.public_media import (
     PublicMediaUploadError,
 )
 from feishu_generation_agent.storage.portrait_assets import PortraitAssetStore
+from feishu_generation_agent.integrations.seedance import SeedanceVideoGenerator
 
 
 _OPENAPI_URL = "https://ark.cn-beijing.volcengineapi.com/"
@@ -200,3 +201,37 @@ class VolcengineAssetClient:
     @staticmethod
     def _transient_error(message: str) -> AgentError:
         return AgentError(ErrorDetail(ErrorCategory.PROVIDER_TRANSIENT, message, message, True))
+
+
+class VolcenginePortraitVideoGenerator:
+    def __init__(
+        self,
+        http_client: httpx.AsyncClient,
+        *,
+        asset_client: VolcengineAssetClient,
+        base_url: str,
+        api_key: str | SecretStr,
+        model: str,
+        public_media_host: PublicMediaHost,
+    ) -> None:
+        self._http = http_client
+        self._asset_client = asset_client
+        self._base_url = base_url
+        self._api_key = api_key
+        self._model = model
+        self._public_media_host = public_media_host
+
+    def for_run(self, run_id: str) -> SeedanceVideoGenerator:
+        async def resolve_image(task: Any, reference: Any, asset: MediaAsset, content: bytes) -> str:
+            del task, reference, content
+            return await self._asset_client.ensure_image_asset(run_id, asset)
+
+        return SeedanceVideoGenerator(
+            self._http,
+            base_url=self._base_url,
+            api_key=self._api_key,
+            model=self._model,
+            public_media_host=self._public_media_host,
+            provider_name="volcengine_portrait",
+            image_url_resolver=resolve_image,
+        )

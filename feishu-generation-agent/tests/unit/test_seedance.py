@@ -107,6 +107,34 @@ async def test_submit_uses_public_urls_for_video_and_audio_references(tmp_path: 
     assert content[3] == {"type": "audio_url", "audio_url": {"url": "https://public.example/reference.mp3"}, "role": "reference_audio"}
 
 
+@pytest.mark.asyncio
+async def test_submit_can_use_official_asset_urls_for_image_references(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    async def asset_url(task, reference, asset, content) -> str:
+        del task, reference, asset, content
+        return "asset://portrait-image-1"
+
+    def create(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "task-portrait", "status": "queued"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(create)) as client:
+        generator = SeedanceVideoGenerator(
+            client,
+            base_url="https://ark.fictional.test/api/v3",
+            api_key="fictional-key",
+            model="fictional-model",
+            provider_name="volcengine_portrait",
+            image_url_resolver=asset_url,
+        )
+        submission = await generator.submit(_video_task(), _assets(tmp_path))
+
+    content = json.loads(requests[0].content)["content"]
+    assert content[1]["image_url"]["url"] == "asset://portrait-image-1"
+    assert submission.provider == "volcengine_portrait"
+
+
 def _video_task(
     *,
     references: list[dict] | None = None,

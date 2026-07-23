@@ -5,6 +5,7 @@ from io import BytesIO
 import json
 import os
 import stat
+from collections.abc import Awaitable, Callable
 from typing import Any
 import unicodedata
 from urllib.parse import quote, urlsplit
@@ -76,6 +77,8 @@ class SeedanceVideoGenerator:
         max_input_bytes: int = _DEFAULT_MAX_INPUT_BYTES,
         max_total_input_bytes: int = _DEFAULT_MAX_TOTAL_INPUT_BYTES,
         public_media_host: PublicMediaHost | None = None,
+        provider_name: str = "seedance",
+        image_url_resolver: Callable[[GenerationTask, Any, MediaAsset, bytes], Awaitable[str]] | None = None,
     ) -> None:
         if not isinstance(base_url, str):
             raise self._configuration_error("base_url", "expected=https_origin_or_api_v3")
@@ -134,6 +137,8 @@ class SeedanceVideoGenerator:
         self._max_total_input_bytes = max_total_input_bytes
         self._timeout = httpx.Timeout(120, connect=10)
         self._public_media_host = public_media_host
+        self._provider_name = provider_name
+        self._image_url_resolver = image_url_resolver
 
     async def submit(
         self,
@@ -153,8 +158,14 @@ class SeedanceVideoGenerator:
             references, ordered_assets, contents, strict=True
         ):
             if asset.mime_type.startswith("image/"):
-                encoded = base64.b64encode(content).decode("ascii")
-                request_content.append({"type": "image_url", "image_url": {"url": f"data:{asset.mime_type};base64,{encoded}"}, "role": reference.role})
+                if self._image_url_resolver is None:
+                    encoded = base64.b64encode(content).decode("ascii")
+                    url = f"data:{asset.mime_type};base64,{encoded}"
+                else:
+                    url = await self._image_url_resolver(task, reference, asset, content)
+                    if not isinstance(url, str) or not url.startswith("asset://"):
+                        raise self._validation_error(task.task_id, "真人资产引用无效", "cause=invalid_asset_url")
+                request_content.append({"type": "image_url", "image_url": {"url": url}, "role": reference.role})
                 continue
             if self._public_media_host is None:
                 raise self._validation_error(task.task_id, "未配置参考音视频临时托管", "cause=missing_public_media_host")
@@ -192,7 +203,7 @@ class SeedanceVideoGenerator:
             else []
         )
         return ProviderSubmission(
-            provider="seedance",
+            provider=self._provider_name,
             provider_task_id=provider_task_id,
             status="succeeded" if status == "success" else status,
             result_items=result_items,
@@ -202,7 +213,7 @@ class SeedanceVideoGenerator:
         self,
         submission: ProviderSubmission,
     ) -> ProviderSubmission:
-        if submission.provider != "seedance":
+        if submission.provider != self._provider_name:
             raise self._error(
                 ErrorCategory.VALIDATION,
                 "只能轮询 Seedance 提交",
