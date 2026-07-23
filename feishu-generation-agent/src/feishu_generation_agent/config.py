@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     ark_api_key: SecretStr | None = None
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     seedance_model: str = "doubao-seedance-2-0-260128"
+    volcengine_access_key: SecretStr | None = None
+    volcengine_secret_key: SecretStr | None = None
+    volcengine_project_name: str = "Seedance2.0"
     langsmith_tracing: bool = False
     langsmith_api_key: SecretStr | None = None
     langsmith_project: str = "feishu-generation-agent-local"

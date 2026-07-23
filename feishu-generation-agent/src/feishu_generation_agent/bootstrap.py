@@ -51,6 +51,9 @@ CAPABILITY_FIELDS: dict[str, tuple[str, ...]] = {
         "chiyun_api_key", "chiyun_model", "ark_api_key",
         "seedance_model",
     ),
+    "portrait_generation": (
+        "ark_api_key", "volcengine_access_key", "volcengine_secret_key",
+    ),
     "bitable": (
         "lark_app_id", "lark_app_secret", "lark_bitable_url",
         "lark_bitable_table_id", "lark_bitable_view_id",

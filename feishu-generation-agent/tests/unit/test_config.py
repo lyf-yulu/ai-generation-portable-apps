@@ -40,6 +40,21 @@ def test_provider_polling_defaults_to_fifteen_minutes(monkeypatch):
     assert settings.provider_poll_max_attempts == 900
 
 
+def test_portrait_generation_requires_ak_sk_and_ark_key() -> None:
+    settings = Settings(_env_file=None, ark_api_key="ark")
+    assert not capability_is_configured(settings, "portrait_generation")
+
+    configured = Settings(
+        _env_file=None,
+        ark_api_key="ark",
+        volcengine_access_key="ak",
+        volcengine_secret_key="sk",
+    )
+
+    assert capability_is_configured(configured, "portrait_generation")
+    assert configured.volcengine_project_name == "Seedance2.0"
+
+
 def test_runtime_accepts_complete_production_bitable_configuration() -> None:
     settings = Settings(
         _env_file=None,
