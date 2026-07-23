@@ -136,6 +136,34 @@ def test_video_task_keeps_exact_first_and_last_frames():
     ]
 
 
+def test_multi_reference_accepts_video_and_audio_roles():
+    task = video_task(
+        reference_images=[
+            {"asset_id": "image-1", "role": "reference_image", "order": 1},
+            {"asset_id": "video-1", "role": "reference_video", "order": 2},
+            {"asset_id": "audio-1", "role": "reference_audio", "order": 3},
+        ]
+    )
+
+    assert task.reference_mode == "multi_reference"
+    assert [reference.role for reference in task.reference_images] == [
+        "reference_image",
+        "reference_video",
+        "reference_audio",
+    ]
+
+
+def test_first_last_frame_rejects_media_reference_roles():
+    with pytest.raises(ValidationError, match="first_last_frame"):
+        video_task(
+            reference_mode="first_last_frame",
+            reference_images=[
+                {"asset_id": "first", "role": "first_frame", "order": 1},
+                {"asset_id": "audio", "role": "reference_audio", "order": 2},
+            ],
+        )
+
+
 def test_reference_role_rejects_unknown_values():
     payload = task_payload("image_to_video")
     payload.update(duration=10, resolution="720p")

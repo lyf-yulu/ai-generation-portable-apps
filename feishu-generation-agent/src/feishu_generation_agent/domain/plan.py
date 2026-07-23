@@ -14,7 +14,13 @@ ReferenceMode = Literal["multi_reference", "first_last_frame"]
 
 class ImageReference(BaseModel):
     asset_id: str
-    role: Literal["reference_image", "first_frame", "last_frame"]
+    role: Literal[
+        "reference_image",
+        "first_frame",
+        "last_frame",
+        "reference_video",
+        "reference_audio",
+    ]
     order: int = Field(ge=1)
 
     @field_validator("role", mode="before")
@@ -72,6 +78,11 @@ class GenerationTask(BaseModel):
                     )
             if self.reference_mode not in {None, "multi_reference"}:
                 raise ValueError("image_to_image only supports multi_reference")
+            if any(
+                reference.role != "reference_image"
+                for reference in self.reference_images
+            ):
+                raise ValueError("image_to_image only accepts reference_image")
             self.reference_mode = "multi_reference"
             return self
 
@@ -95,8 +106,8 @@ class GenerationTask(BaseModel):
                 )
             return
         if self.reference_mode == "multi_reference":
-            if any(role != "reference_image" for role in roles):
-                raise ValueError("multi_reference only accepts reference_image")
+            if any(role in {"first_frame", "last_frame"} for role in roles):
+                raise ValueError("multi_reference does not accept first_frame or last_frame")
             return
         if is_exact_frame_pair:
             self.reference_mode = "first_last_frame"
@@ -121,7 +132,11 @@ class GenerationTask(BaseModel):
             self.reference_images = [
                 ImageReference(
                     asset_id=reference.asset_id,
-                    role="reference_image",
+                    role=(
+                        "reference_image"
+                        if reference.role in {"first_frame", "last_frame"}
+                        else reference.role
+                    ),
                     order=reference.order,
                 )
                 for reference in self.reference_images
