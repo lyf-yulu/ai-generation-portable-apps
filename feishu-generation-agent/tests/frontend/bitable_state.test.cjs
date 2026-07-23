@@ -1,11 +1,24 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const { readFileSync } = require("node:fs");
+const { join } = require("node:path");
 const test = require("node:test");
 
 const BitableState = require(
   "../../src/feishu_generation_agent/web/static/bitable-state.js"
 );
+
+test("production-only page has no legacy document form", () => {
+  const html = readFileSync(
+    join(__dirname, "../../src/feishu_generation_agent/web/static/index.html"),
+    "utf8",
+  );
+
+  assert.equal(html.includes('id="run-form"'), false);
+  assert.equal(html.includes('id="source-url"'), false);
+  assert.equal(html.includes('id="scan-bitable-button"'), true);
+});
 
 const tasks = [
   {

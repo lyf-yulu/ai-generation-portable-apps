@@ -20,7 +20,6 @@
     referenceUploads: ReferenceUploadState.createState(),
   };
   const byId = (id) => document.getElementById(id);
-  const runForm = byId("run-form");
   const errorMessage = byId("error-message");
   const taskList = byId("task-list");
   const rejectButton = byId("reject-button");
@@ -88,9 +87,6 @@
 
   function setBusy(value) {
     state.busy = value;
-    runForm.querySelectorAll("input, button").forEach((control) => {
-      control.disabled = value || !state.modes.legacy_delivery;
-    });
     scanBitableButton.disabled = value || !state.modes.bitable;
     bitableTaskList.querySelectorAll("button").forEach((control) => {
       control.disabled = value;
@@ -265,14 +261,6 @@
     scanBitableButton.disabled = !state.modes.bitable;
     if (!state.modes.bitable) {
       bitableStatus.textContent = "多维表格尚未配置，请先补全表格链接、数据表和视图。";
-    }
-    if (!state.modes.legacy_delivery) {
-      runForm.querySelectorAll("input, button").forEach((control) => {
-        control.disabled = true;
-      });
-      const message = byId("legacy-mode-message");
-      message.textContent = "当前未配置旧版文档交付，请从下方多维表格任务开始。";
-      message.hidden = false;
     }
     if (state.modes.bitable && !state.runId) {
       await loadRecentRuns();
@@ -901,29 +889,6 @@
       setBusy(false);
     }
   }
-
-  runForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    if (state.busy) return;
-    setBusy(true);
-    clearError();
-    try {
-      const created = await api("/api/runs", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ source_url: byId("source-url").value }),
-      });
-      state.runId = created.run_id;
-      state.runMode = "legacy";
-      state.review = ReviewState.createReviewState();
-      state.referenceUploads = ReferenceUploadState.createState();
-      await poll(true);
-    } catch (error) {
-      showError(error);
-    } finally {
-      setBusy(false);
-    }
-  });
 
   byId("reject-button").addEventListener("click", () => submitDecision("reject"));
   byId("cancel-button").addEventListener("click", () => submitDecision("cancel"));
