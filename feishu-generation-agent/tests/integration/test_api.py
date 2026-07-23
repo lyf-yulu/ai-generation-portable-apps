@@ -699,6 +699,34 @@ async def test_add_reference_uses_verified_image_and_invalidates_approval(
         assert view["approval"]["revision"] == 8
 
 
+async def test_add_reference_accepts_verified_video_and_audio(tmp_path: Path):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime, graph, repository
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/add-media-ref"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        video = await client.post(
+            f"/api/runs/{run_id}/references",
+            data={"task_id": "task-1", "role": "reference_video", "order": "2"},
+            files={"file": ("clip.mp4", b"\x00\x00\x00\x18ftypisom", "video/mp4")},
+        )
+        audio = await client.post(
+            f"/api/runs/{run_id}/references",
+            data={"task_id": "task-1", "role": "reference_audio", "order": "3"},
+            files={"file": ("music.mp3", b"ID3\x04\x00\x00\x00\x00\x00\x00", "audio/mpeg")},
+        )
+
+        assert video.status_code == 201
+        assert audio.status_code == 201
+        audio_id = audio.json()["asset_id"]
+        content = await client.get(f"/api/runs/{run_id}/references/{audio_id}/content")
+        assert content.headers["content-type"].startswith("audio/mpeg")
+
+
 async def test_replace_and_unlink_reference_keep_content_file(tmp_path: Path):
     async with _environment(tmp_path) as (client, runtime, graph, repository):
         del runtime, graph, repository

@@ -564,13 +564,22 @@ class GraphRuntime:
             try:
                 verified = self.file_store.validate(content)
             except (TypeError, ValueError):
-                raise RunValidationError("上传内容不是有效图片") from None
-            if not verified.mime_type.startswith("image/"):
-                raise RunValidationError("只允许上传真实图片")
+                raise RunValidationError("上传内容不是有效图片或音视频参考素材") from None
+            allowed_roles = (
+                {"reference_image", "first_frame", "last_frame"}
+                if verified.mime_type.startswith("image/")
+                else {"reference_video"}
+                if verified.mime_type.startswith("video/")
+                else {"reference_audio"}
+                if verified.mime_type.startswith("audio/")
+                else set()
+            )
+            if role not in allowed_roles:
+                raise RunValidationError("参考素材类型与用途不匹配")
             try:
                 stored = self.file_store.save_input(run_id, filename, content)
             except (TypeError, ValueError):
-                raise RunValidationError("图片保存失败") from None
+                raise RunValidationError("参考素材保存失败") from None
             asset_id = f"upload-{uuid4().hex}"
             asset = MediaAsset(
                 asset_id=asset_id,
@@ -687,13 +696,13 @@ class GraphRuntime:
             resolved_path = asset.local_path.resolve()
             data_root = self.settings.data_dir.resolve()
             if (
-                not asset.mime_type.startswith("image/")
+                not asset.mime_type.startswith(("image/", "video/", "audio/"))
                 or not resolved_path.is_relative_to(data_root)
                 or not resolved_path.is_file()
             ):
                 break
             return resolved_path, asset.mime_type
-        raise RunNotFound("图片素材不存在")
+        raise RunNotFound("参考素材不存在")
 
     async def _waiting_state(
         self,
@@ -748,7 +757,7 @@ class GraphRuntime:
             self._validate_references(
                 updated.task_type.value,
                 updated.reference_images,
-                {asset.asset_id for asset in assets},
+                {asset.asset_id: asset.mime_type for asset in assets},
                 updated.reference_mode,
             )
             return updated
@@ -852,9 +861,13 @@ class GraphRuntime:
             if any(task.task_id not in original_ids for task in candidate.tasks):
                 raise ValueError("编辑结果包含未知任务")
             assets = {
-                item.get("asset_id")
+                item["asset_id"]: item["mime_type"]
                 for item in state.get("media_assets", [])
-                if isinstance(item, dict) and isinstance(item.get("asset_id"), str)
+                if (
+                    isinstance(item, dict)
+                    and isinstance(item.get("asset_id"), str)
+                    and isinstance(item.get("mime_type"), str)
+                )
             }
             for task in candidate.tasks:
                 self._validate_references(
@@ -882,7 +895,7 @@ class GraphRuntime:
     def _validate_references(
         task_type: str,
         references: Any,
-        known_assets: set[str],
+        known_assets: dict[str, str],
         reference_mode: str | None = None,
     ) -> None:
         asset_ids = [reference.asset_id for reference in references]
@@ -894,9 +907,24 @@ class GraphRuntime:
         if len(orders) != len(set(orders)):
             raise RunValidationError("同一任务的图片顺序不能重复")
         roles = [reference.role for reference in references]
-        allowed_roles = {"reference_image", "first_frame", "last_frame"}
+        allowed_roles = {
+            "reference_image",
+            "first_frame",
+            "last_frame",
+            "reference_video",
+            "reference_audio",
+        }
         if any(role not in allowed_roles for role in roles):
-            raise RunValidationError("图片用途无效")
+            raise RunValidationError("参考素材用途无效")
+        for reference in references:
+            mime_type = known_assets[reference.asset_id]
+            valid = (
+                (mime_type.startswith("image/") and reference.role in {"reference_image", "first_frame", "last_frame"})
+                or (mime_type.startswith("video/") and reference.role == "reference_video")
+                or (mime_type.startswith("audio/") and reference.role == "reference_audio")
+            )
+            if not valid:
+                raise RunValidationError("参考素材类型与用途不匹配")
         ordered_roles = [
             reference.role
             for reference in sorted(references, key=lambda reference: reference.order)
@@ -914,8 +942,8 @@ class GraphRuntime:
                 )
             return
         if reference_mode == "multi_reference":
-            if any(role != "reference_image" for role in roles):
-                raise RunValidationError("多参考模式只能使用普通参考图")
+            if any(role in {"first_frame", "last_frame"} for role in roles):
+                raise RunValidationError("多参考模式不能使用首帧或尾帧")
             return
         if roles.count("first_frame") > 1 or roles.count("last_frame") > 1:
             raise RunValidationError("首帧或尾帧用途不能重复")

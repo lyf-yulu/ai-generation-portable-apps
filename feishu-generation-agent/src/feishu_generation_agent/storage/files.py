@@ -402,10 +402,10 @@ class FileStore:
                 raise ValueError("unsupported or invalid media content")
             mime_type, extension = _IMAGE_FORMATS[image_format]
         except (OSError, SyntaxError, UnidentifiedImageError):
-            video_type = self._identify_video(content)
-            if video_type is None:
+            media_type = self._identify_non_image_media(content)
+            if media_type is None:
                 raise ValueError("unsupported or invalid media content") from None
-            mime_type, extension = video_type
+            mime_type, extension = media_type
 
         self._validate_content_type(mime_type, declared_content_type)
 
@@ -569,10 +569,10 @@ class FileStore:
                 raise ValueError("unsupported or invalid media content")
             mime_type, extension = _IMAGE_FORMATS[image_format]
         except (OSError, SyntaxError, UnidentifiedImageError):
-            video_type = self._identify_video(header)
-            if video_type is None:
+            media_type = self._identify_non_image_media(header)
+            if media_type is None:
                 raise ValueError("unsupported or invalid media content") from None
-            mime_type, extension = video_type
+            mime_type, extension = media_type
 
         self._validate_content_type(mime_type, declared_content_type)
         return _VerifiedMedia(
@@ -660,11 +660,31 @@ class FileStore:
             yield chunk
 
     @staticmethod
-    def _identify_video(content: bytes) -> tuple[str, str] | None:
+    def _identify_non_image_media(content: bytes) -> tuple[str, str] | None:
         if len(content) >= 12 and content[4:8] == b"ftyp":
             return "video/mp4", "mp4"
         if content.startswith(b"\x1aE\xdf\xa3") and b"webm" in content[:128].lower():
             return "video/webm", "webm"
+        if content.startswith(b"ID3") or (
+            len(content) >= 2
+            and content[0] == 0xFF
+            and content[1] & 0xE0 == 0xE0
+        ):
+            return "audio/mpeg", "mp3"
+        if (
+            len(content) >= 12
+            and content[:4] == b"RIFF"
+            and content[8:12] == b"WAVE"
+        ):
+            return "audio/wav", "wav"
+        if content.startswith(b"OggS"):
+            return "audio/ogg", "ogg"
+        if (
+            len(content) >= 2
+            and content[0] == 0xFF
+            and content[1] & 0xF6 == 0xF0
+        ):
+            return "audio/aac", "aac"
         return None
 
     @staticmethod
