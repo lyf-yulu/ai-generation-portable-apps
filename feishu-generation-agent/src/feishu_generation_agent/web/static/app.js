@@ -235,7 +235,6 @@
       state.bitable = BitableState.scanSucceeded(state.bitable, category, tasks);
     } catch (error) {
       state.bitable = BitableState.scanFailed(state.bitable, category, error.message);
-      showError(error);
     } finally {
       setBusy(false);
       renderBitableTasks();
@@ -267,7 +266,6 @@
       state.bitable = error.status === 409
         ? BitableState.claimConflict(state.bitable, error.message)
         : BitableState.claimConflict(state.bitable, error.message);
-      showError(error);
     } finally {
       setBusy(false);
       renderBitableTasks();

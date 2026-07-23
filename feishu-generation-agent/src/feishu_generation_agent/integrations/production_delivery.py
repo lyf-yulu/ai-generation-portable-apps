@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 from feishu_generation_agent.domain.artifact import Artifact, DeliveryRecord
@@ -36,6 +37,7 @@ class ProductionResultWriter:
         self._store = store
         self._repository = repository
         self._result_folder_token = result_folder_token
+        self._target_creation_lock = asyncio.Lock()
 
     async def deliver(self, run_id: str, document: NormalizedDocument, plan: TaskPlan, artifacts: list[Artifact]) -> DeliveryRecord:
         if not artifacts:
@@ -103,17 +105,41 @@ class ProductionResultWriter:
         existing = await self._store.get_result_target(_SHARED_RESULT_TARGET)
         if existing is not None:
             return existing
-        created = await self._client.create_bitable_app(_SHARED_RESULT_NAME, self._result_folder_token)
-        fields = await self._client.list_bitable_fields(created.app_token, created.table_id)
-        primary = next((item for item in fields if item.get("type") == 1), None)
-        if not isinstance(primary, dict) or not isinstance(primary.get("field_id"), str):
-            raise ValueError("结果表缺少可重命名的主字段")
-        await self._client.update_bitable_field(created.app_token, created.table_id, primary["field_id"], "需求名称", 1)
-        for name, field_type in _RESULT_FIELDS:
-            await self._client.create_bitable_field(created.app_token, created.table_id, name, field_type)
-        target = ResultTableTarget(maker_open_id=_SHARED_RESULT_TARGET, maker_name=_SHARED_RESULT_NAME, app_token=created.app_token, table_id=created.table_id, url=created.url)
-        await self._store.upsert_result_target(target)
-        return target
+        async with self._target_creation_lock:
+            existing = await self._store.get_result_target(_SHARED_RESULT_TARGET)
+            if existing is not None:
+                return existing
+            created = await self._client.create_bitable_app(
+                _SHARED_RESULT_NAME, self._result_folder_token
+            )
+            fields = await self._client.list_bitable_fields(
+                created.app_token, created.table_id
+            )
+            primary = next((item for item in fields if item.get("type") == 1), None)
+            if not isinstance(primary, dict) or not isinstance(
+                primary.get("field_id"), str
+            ):
+                raise ValueError("结果表缺少可重命名的主字段")
+            await self._client.update_bitable_field(
+                created.app_token,
+                created.table_id,
+                primary["field_id"],
+                "需求名称",
+                1,
+            )
+            for name, field_type in _RESULT_FIELDS:
+                await self._client.create_bitable_field(
+                    created.app_token, created.table_id, name, field_type
+                )
+            target = ResultTableTarget(
+                maker_open_id=_SHARED_RESULT_TARGET,
+                maker_name=_SHARED_RESULT_NAME,
+                app_token=created.app_token,
+                table_id=created.table_id,
+                url=created.url,
+            )
+            await self._store.upsert_result_target(target)
+            return target
 
     async def _upload(self, run_id: str, app_token: str, artifact: Artifact) -> str:
         if artifact.feishu_file_token:

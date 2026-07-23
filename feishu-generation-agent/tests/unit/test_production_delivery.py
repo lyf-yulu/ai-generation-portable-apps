@@ -1,3 +1,4 @@
+import asyncio
 from hashlib import sha256
 
 from feishu_generation_agent.domain.artifact import Artifact
@@ -15,6 +16,59 @@ from feishu_generation_agent.integrations.production_routing import (
 )
 from feishu_generation_agent.storage.production_tasks import ProductionTaskStore
 from feishu_generation_agent.storage.repository import Repository
+
+
+async def test_concurrent_first_target_creation_creates_one_shared_table(
+    tmp_path,
+) -> None:
+    store = await ProductionTaskStore.open(tmp_path / "production.sqlite3")
+    repository = await Repository.open(tmp_path / "repository.sqlite3")
+
+    class Client:
+        def __init__(self) -> None:
+            self.created_apps = 0
+
+        async def create_bitable_app(self, name, folder_token):
+            self.created_apps += 1
+            sequence = self.created_apps
+            await asyncio.sleep(0)
+            return CreatedBitableApp(
+                f"app-result-{sequence}",
+                f"tbl-result-{sequence}",
+                f"https://tenant.feishu.cn/base/app-result-{sequence}",
+            )
+
+        async def list_bitable_fields(self, app_token, table_id):
+            return [{"field_id": "fld-primary", "field_name": "Name", "type": 1}]
+
+        async def update_bitable_field(
+            self, app_token, table_id, field_id, field_name, field_type
+        ):
+            return None
+
+        async def create_bitable_field(
+            self, app_token, table_id, field_name, field_type
+        ):
+            return f"fld-{field_name}"
+
+    client = Client()
+    writer = ProductionResultWriter(
+        client=client,
+        store=store,
+        repository=repository,
+        result_folder_token="fld-results",
+    )
+    try:
+        first, second = await asyncio.gather(
+            writer._ensure_target(),
+            writer._ensure_target(),
+        )
+    finally:
+        await store.close()
+        await repository.close()
+
+    assert client.created_apps == 1
+    assert first == second
 
 
 async def test_delivery_creates_one_shared_table_and_updates_same_result_row(tmp_path) -> None:

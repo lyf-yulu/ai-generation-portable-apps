@@ -28,9 +28,12 @@ def with_bitable_view(location: BitableLocation, view_id: str) -> BitableLocatio
     if not isinstance(view_id, str) or not view_id.strip():
         raise ValueError("多维表格 view_id 不能为空")
     parsed = urlsplit(location.source_url)
-    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    query["table"] = location.table_id
-    query["view"] = view_id.strip()
+    query = [
+        (name, value)
+        for name, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if name not in {"table", "view"}
+    ]
+    query.extend((("table", location.table_id), ("view", view_id.strip())))
     source_url = urlunsplit(
         (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
     )

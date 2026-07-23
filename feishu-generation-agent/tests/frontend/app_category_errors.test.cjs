@@ -1,0 +1,192 @@
+"use strict";
+
+const assert = require("node:assert/strict");
+const { readFileSync } = require("node:fs");
+const { join } = require("node:path");
+const test = require("node:test");
+const vm = require("node:vm");
+
+const BitableState = require(
+  "../../src/feishu_generation_agent/web/static/bitable-state.js"
+);
+const ReferenceUploadState = require(
+  "../../src/feishu_generation_agent/web/static/reference-upload-state.js"
+);
+const ReviewState = require(
+  "../../src/feishu_generation_agent/web/static/review-state.js"
+);
+
+class FakeNode {
+  constructor(tagName = "div", id = "") {
+    this.tagName = tagName.toUpperCase();
+    this.id = id;
+    this.children = [];
+    this.dataset = {};
+    this.disabled = false;
+    this.hidden = id === "error-message";
+    this.textContent = "";
+    this.value = "";
+    this.listeners = new Map();
+    this.classList = { toggle() {} };
+  }
+
+  addEventListener(name, listener) {
+    const listeners = this.listeners.get(name) || [];
+    listeners.push(listener);
+    this.listeners.set(name, listeners);
+  }
+
+  async dispatch(name) {
+    await Promise.all(
+      (this.listeners.get(name) || []).map((listener) =>
+        listener({ target: this })
+      ),
+    );
+  }
+
+  append(...children) {
+    this.children.push(...children);
+  }
+
+  replaceChildren(...children) {
+    this.children = children;
+  }
+
+  querySelectorAll(selector) {
+    const tags = new Set(
+      selector.split(",").map((value) => value.trim().toUpperCase()),
+    );
+    const matches = [];
+    const visit = (node) => {
+      if (tags.has(node.tagName)) matches.push(node);
+      node.children.forEach(visit);
+    };
+    this.children.forEach(visit);
+    return matches;
+  }
+
+  setAttribute() {}
+  scrollIntoView() {}
+}
+
+function jsonResponse(status, payload) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: () => "application/json" },
+    async json() {
+      return payload;
+    },
+  };
+}
+
+async function settle() {
+  for (let index = 0; index < 8; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+async function loadApp(fetch) {
+  const nodes = new Map();
+  const getNode = (id) => {
+    if (!nodes.has(id)) nodes.set(id, new FakeNode("div", id));
+    return nodes.get(id);
+  };
+  getNode("animation-category-tab").dataset.category = "animation";
+  getNode("portrait-category-tab").dataset.category = "portrait";
+  const document = {
+    createElement: (tagName) => new FakeNode(tagName),
+    getElementById: getNode,
+    querySelector: () => new FakeNode("main"),
+  };
+  const context = {
+    BitableState,
+    ReferenceUploadState,
+    ReviewState,
+    document,
+    fetch,
+    confirm: () => true,
+    location: { reload() {} },
+    setInterval: () => 1,
+    clearInterval() {},
+    console,
+  };
+  const source = readFileSync(
+    join(__dirname, "../../src/feishu_generation_agent/web/static/app.js"),
+    "utf8",
+  );
+  vm.runInNewContext(source, context);
+  await settle();
+  return { getNode };
+}
+
+function baseFetch(categoryResponse) {
+  return async (url, options = {}) => {
+    if (url === "/api/health") {
+      return jsonResponse(200, { modes: { bitable: true } });
+    }
+    if (url === "/api/bitable/recent-runs") return jsonResponse(200, []);
+    if (url === "/api/bitable/active-runs") return jsonResponse(200, []);
+    if (url.startsWith("/api/bitable/tasks?")) {
+      const category = new URL(url, "https://local.invalid").searchParams.get(
+        "category",
+      );
+      return categoryResponse(category);
+    }
+    if (options.method === "POST" && url.includes("/claim")) {
+      return jsonResponse(409, { detail: "该任务已被领取" });
+    }
+    throw new Error(`unexpected request: ${url}`);
+  };
+}
+
+test("scan errors stay with their category instead of the global error box", async () => {
+  const app = await loadApp(
+    baseFetch((category) =>
+      category === "portrait"
+        ? jsonResponse(503, { detail: "真人视图读取失败" })
+        : jsonResponse(200, []),
+    ),
+  );
+
+  await app.getNode("portrait-category-tab").dispatch("click");
+  await app.getNode("animation-category-tab").dispatch("click");
+
+  assert.equal(app.getNode("error-message").hidden, true);
+  assert.equal(
+    app.getNode("error-message").textContent.includes("真人视图读取失败"),
+    false,
+  );
+
+  await app.getNode("portrait-category-tab").dispatch("click");
+
+  assert.equal(app.getNode("bitable-status").textContent, "真人视图读取失败");
+  assert.equal(app.getNode("error-message").hidden, true);
+});
+
+test("claim errors do not remain in the global box after a cached category switch", async () => {
+  const app = await loadApp(
+    baseFetch((category) =>
+      jsonResponse(
+        200,
+        category === "animation"
+          ? [{ record_id: "rec-animation", display_text: "动画需求" }]
+          : [],
+      ),
+    ),
+  );
+  await app.getNode("portrait-category-tab").dispatch("click");
+  await app.getNode("animation-category-tab").dispatch("click");
+  const claimButton = app
+    .getNode("bitable-task-list")
+    .querySelectorAll("button")[0];
+
+  await claimButton.dispatch("click");
+  await app.getNode("portrait-category-tab").dispatch("click");
+
+  assert.equal(app.getNode("error-message").hidden, true);
+  assert.equal(
+    app.getNode("error-message").textContent.includes("该任务已被领取"),
+    false,
+  );
+});
