@@ -3,10 +3,13 @@ import hashlib
 import hmac
 import json
 from datetime import UTC, datetime
+from io import BytesIO
+from math import ceil
 from typing import Any
 from urllib.parse import urlencode
 
 import httpx
+from PIL import Image, UnidentifiedImageError
 from pydantic import SecretStr
 
 from feishu_generation_agent.domain.document import MediaAsset
@@ -23,6 +26,8 @@ _OPENAPI_URL = "https://ark.cn-beijing.volcengineapi.com/"
 _OPENAPI_HOST = "ark.cn-beijing.volcengineapi.com"
 _REGION = "cn-beijing"
 _SERVICE = "ark"
+_MIN_ASSET_DIMENSION = 300
+_RESIZABLE_IMAGE_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
 
 
 def _secret(value: str | SecretStr) -> str:
@@ -35,6 +40,32 @@ def _hash(value: str) -> str:
 
 def _sign(key: bytes, message: str) -> bytes:
     return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
+
+
+def _portrait_upload_content(asset: MediaAsset) -> bytes:
+    content = asset.local_path.read_bytes()
+    try:
+        with Image.open(BytesIO(content)) as image:
+            width, height = image.size
+            if width >= _MIN_ASSET_DIMENSION and height >= _MIN_ASSET_DIMENSION:
+                return content
+            if image.format not in _RESIZABLE_IMAGE_FORMATS:
+                raise VolcengineAssetClient._validation_error(
+                    "真人参考图格式不支持自动放大"
+                )
+            scale = max(
+                _MIN_ASSET_DIMENSION / width,
+                _MIN_ASSET_DIMENSION / height,
+            )
+            target_size = (ceil(width * scale), ceil(height * scale))
+            resized = image.resize(target_size, Image.Resampling.LANCZOS)
+            output = BytesIO()
+            resized.save(output, format=image.format)
+            return output.getvalue()
+    except (OSError, UnidentifiedImageError) as exc:
+        raise VolcengineAssetClient._validation_error(
+            "真人参考图无法读取"
+        ) from exc
 
 
 class VolcengineAssetClient:
@@ -76,7 +107,9 @@ class VolcengineAssetClient:
         group_id = await self._ensure_group(run_id)
         try:
             source_url = await self._public_media_host.upload(
-                asset.local_path.read_bytes(), asset.local_path.name, asset.mime_type
+                _portrait_upload_content(asset),
+                asset.local_path.name,
+                asset.mime_type,
             )
         except (OSError, PublicMediaUploadError) as exc:
             raise self._transient_error("真人素材临时托管失败") from exc
