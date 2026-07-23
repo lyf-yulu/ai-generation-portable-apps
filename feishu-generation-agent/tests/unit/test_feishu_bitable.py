@@ -278,6 +278,7 @@ async def test_creates_result_fields_and_record() -> None:
     await client.update_bitable_field("app", "tbl", "fld-primary", "需求名称", 1)
     field_id = await client.create_bitable_field("app", "tbl", "结果", 17)
     record_id = await client.create_bitable_record("app", "tbl", {"需求名称": "需求 A"})
+    await client.delete_bitable_records("app", "tbl", ["rec-empty-1", "rec-empty-2"])
 
     assert field_id == "fld-result"
     assert record_id == "rec-result"
@@ -285,6 +286,11 @@ async def test_creates_result_fields_and_record() -> None:
         ("PUT", "/open-apis/bitable/v1/apps/app/tables/tbl/fields/fld-primary", {"field_name": "需求名称", "type": 1}),
         ("POST", "/open-apis/bitable/v1/apps/app/tables/tbl/fields", {"field_name": "结果", "type": 17}),
         ("POST", "/open-apis/bitable/v1/apps/app/tables/tbl/records", {"fields": {"需求名称": "需求 A"}}),
+        (
+            "POST",
+            "/open-apis/bitable/v1/apps/app/tables/tbl/records/batch_delete",
+            {"records": ["rec-empty-1", "rec-empty-2"]},
+        ),
     ]
 
 

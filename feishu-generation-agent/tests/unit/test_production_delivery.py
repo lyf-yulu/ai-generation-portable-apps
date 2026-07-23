@@ -55,7 +55,7 @@ async def test_concurrent_first_target_creation_creates_one_shared_table(
         async def list_bitable_records(self, app_token, table_id):
             return []
 
-        async def delete_bitable_record(self, app_token, table_id, record_id):
+        async def delete_bitable_records(self, app_token, table_id, record_ids):
             return None
 
     client = Client()
@@ -86,7 +86,7 @@ async def test_target_creation_removes_only_completely_empty_default_records(
 
     class Client:
         def __init__(self) -> None:
-            self.deleted_records: list[str] = []
+            self.deleted_batches: list[list[str]] = []
 
         async def create_bitable_app(self, name, folder_token):
             return CreatedBitableApp(
@@ -116,8 +116,8 @@ async def test_target_creation_removes_only_completely_empty_default_records(
                 {"record_id": "", "fields": {}},
             ]
 
-        async def delete_bitable_record(self, app_token, table_id, record_id):
-            self.deleted_records.append(record_id)
+        async def delete_bitable_records(self, app_token, table_id, record_ids):
+            self.deleted_batches.append(record_ids)
 
     client = Client()
     writer = ProductionResultWriter(
@@ -132,7 +132,7 @@ async def test_target_creation_removes_only_completely_empty_default_records(
         await store.close()
         await repository.close()
 
-    assert client.deleted_records == ["rec-empty-1"]
+    assert client.deleted_batches == [["rec-empty-1"]]
 
 
 async def test_cleanup_empty_records_supports_existing_shared_result_table(
@@ -152,7 +152,7 @@ async def test_cleanup_empty_records_supports_existing_shared_result_table(
 
     class Client:
         def __init__(self) -> None:
-            self.deleted_records: list[str] = []
+            self.deleted_batches: list[list[str]] = []
 
         async def list_bitable_records(self, app_token, table_id):
             return [
@@ -161,8 +161,8 @@ async def test_cleanup_empty_records_supports_existing_shared_result_table(
                 {"record_id": "rec-used", "fields": {"结果": [{"file_token": "file-1"}]}},
             ]
 
-        async def delete_bitable_record(self, app_token, table_id, record_id):
-            self.deleted_records.append(record_id)
+        async def delete_bitable_records(self, app_token, table_id, record_ids):
+            self.deleted_batches.append(record_ids)
 
     client = Client()
     writer = ProductionResultWriter(
@@ -178,7 +178,7 @@ async def test_cleanup_empty_records_supports_existing_shared_result_table(
         await repository.close()
 
     assert deleted == 2
-    assert client.deleted_records == ["rec-empty-1", "rec-empty-2"]
+    assert client.deleted_batches == [["rec-empty-1", "rec-empty-2"]]
 
 
 async def test_delivery_creates_one_shared_table_and_updates_same_result_row(tmp_path) -> None:
@@ -208,7 +208,7 @@ async def test_delivery_creates_one_shared_table_and_updates_same_result_row(tmp
         async def update_bitable_field(self, app_token, table_id, field_id, field_name, field_type): return None
         async def create_bitable_field(self, app_token, table_id, field_name, field_type): return f"fld-{field_name}"
         async def list_bitable_records(self, app_token, table_id): return []
-        async def delete_bitable_record(self, app_token, table_id, record_id): return None
+        async def delete_bitable_records(self, app_token, table_id, record_ids): return None
         async def grant_bitable_editor(self, app_token, open_id): return None
         async def upload_media_all(self, filename, content, mime_type, *, parent_type, parent_node): return "file-result"
         async def create_bitable_record(self, app_token, table_id, fields):
