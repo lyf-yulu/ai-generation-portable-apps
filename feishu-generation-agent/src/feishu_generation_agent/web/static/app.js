@@ -31,6 +31,9 @@
   const conflictText = byId("review-conflict-text");
   const discardButton = byId("discard-review-draft");
   const scanBitableButton = byId("scan-bitable-button");
+  const animationCategoryTab = byId("animation-category-tab");
+  const portraitCategoryTab = byId("portrait-category-tab");
+  const categoryTabs = [animationCategoryTab, portraitCategoryTab];
   const bitableTaskList = byId("bitable-task-list");
   const bitableStatus = byId("bitable-status");
   const recentRunList = byId("recent-run-list");
@@ -88,6 +91,9 @@
   function setBusy(value) {
     state.busy = value;
     scanBitableButton.disabled = value || !state.modes.bitable;
+    categoryTabs.forEach((tab) => {
+      tab.disabled = value || !state.modes.bitable;
+    });
     bitableTaskList.querySelectorAll("button").forEach((control) => {
       control.disabled = value;
     });
@@ -106,18 +112,30 @@
   }
 
   function renderBitableTasks() {
-    const scan = state.bitable.scan;
+    const categoryState = BitableState.activeCategoryState(state.bitable);
+    const scan = categoryState.scan;
+    const tasks = categoryState.tasks;
+    const activeCategory = state.bitable.activeCategory;
+    categoryTabs.forEach((tab) => {
+      const isActive = tab.dataset.category === activeCategory;
+      tab.classList.toggle("is-active", isActive);
+      tab.setAttribute("aria-selected", String(isActive));
+      tab.disabled = state.busy || !state.modes.bitable;
+    });
     if (scan.phase === "loading") bitableStatus.textContent = "正在读取多维表格…";
     else if (scan.phase === "error") bitableStatus.textContent = scan.error;
-    else if (state.bitable.claim.phase === "conflict") {
+    else if (
+      state.bitable.claim.phase === "conflict"
+      && state.bitable.claim.category === activeCategory
+    ) {
       bitableStatus.textContent = state.bitable.claim.error;
     } else if (scan.phase === "ready") {
-      bitableStatus.textContent = state.bitable.tasks.length
-        ? `发现 ${state.bitable.tasks.length} 条可处理任务，请手动选择一条。`
+      bitableStatus.textContent = tasks.length
+        ? `发现 ${tasks.length} 条可处理任务，请手动选择一条。`
         : "当前没有需求附件可读且进度符合规则的可处理任务。";
     }
 
-    const nodes = state.bitable.tasks.map((task) => {
+    const nodes = tasks.map((task) => {
       const card = element("article", "bitable-task");
       const identity = element("div", "");
       identity.append(element("h3", "", task.display_text || task.record_id));
@@ -205,15 +223,18 @@
 
   async function scanBitableTasks() {
     if (state.busy || !state.modes.bitable) return;
-    state.bitable = BitableState.scanStarted(state.bitable);
+    const category = state.bitable.activeCategory;
+    state.bitable = BitableState.scanStarted(state.bitable, category);
     renderBitableTasks();
     setBusy(true);
     clearError();
     try {
-      const tasks = await api("/api/bitable/tasks");
-      state.bitable = BitableState.scanSucceeded(state.bitable, tasks);
+      const tasks = await api(
+        `/api/bitable/tasks?category=${encodeURIComponent(category)}`,
+      );
+      state.bitable = BitableState.scanSucceeded(state.bitable, category, tasks);
     } catch (error) {
-      state.bitable = BitableState.scanFailed(state.bitable, error.message);
+      state.bitable = BitableState.scanFailed(state.bitable, category, error.message);
       showError(error);
     } finally {
       setBusy(false);
@@ -223,13 +244,15 @@
 
   async function claimBitableTask(recordId) {
     if (state.busy) return;
-    state.bitable = BitableState.claimStarted(state.bitable, recordId);
+    const category = state.bitable.activeCategory;
+    state.bitable = BitableState.claimStarted(state.bitable, recordId, category);
     renderBitableTasks();
     setBusy(true);
     clearError();
     try {
       const created = await api(
-        `/api/bitable/tasks/${encodeURIComponent(recordId)}/claim`,
+        `/api/bitable/tasks/${encodeURIComponent(recordId)}/claim`
+          + `?category=${encodeURIComponent(category)}`,
         { method: "POST" },
       );
       state.bitable = BitableState.claimSucceeded(state.bitable, created.run_id);
@@ -251,6 +274,19 @@
     }
   }
 
+  async function selectBitableCategory(category) {
+    if (
+      state.busy
+      || !state.modes.bitable
+      || category === state.bitable.activeCategory
+    ) return;
+    state.bitable = BitableState.selectCategory(state.bitable, category);
+    renderBitableTasks();
+    if (BitableState.activeCategoryState(state.bitable).scan.phase === "idle") {
+      await scanBitableTasks();
+    }
+  }
+
   async function configureModes() {
     try {
       const health = await api("/api/health");
@@ -259,6 +295,9 @@
       showError(error);
     }
     scanBitableButton.disabled = !state.modes.bitable;
+    categoryTabs.forEach((tab) => {
+      tab.disabled = !state.modes.bitable;
+    });
     if (!state.modes.bitable) {
       bitableStatus.textContent = "多维表格尚未配置，请先补全表格链接、数据表和视图。";
     }
@@ -279,6 +318,13 @@
       } catch (error) {
         showError(error);
       }
+    }
+    if (
+      state.modes.bitable
+      && state.bitable.activeCategory === "animation"
+      && BitableState.activeCategoryState(state.bitable).scan.phase === "idle"
+    ) {
+      await scanBitableTasks();
     }
   }
 
@@ -940,6 +986,9 @@
     render(ReviewState.draftView(state.review));
   });
   scanBitableButton.addEventListener("click", scanBitableTasks);
+  categoryTabs.forEach((tab) => {
+    tab.addEventListener("click", () => selectBitableCategory(tab.dataset.category));
+  });
   updateActionAvailability();
   configureModes();
 })();
