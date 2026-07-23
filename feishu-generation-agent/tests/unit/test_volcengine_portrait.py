@@ -20,7 +20,7 @@ class _PublicMediaHost:
     async def upload(self, content: bytes, filename: str, mime_type: str) -> str:
         with Image.open(BytesIO(content)) as image:
             assert image.size == (300, 300)
-        assert filename == "portrait.png"
+        assert filename == "source-image-1.png"
         assert mime_type == "image/png"
         return "https://public.example/portrait.png"
 
@@ -86,6 +86,61 @@ def _active_asset_handler(request: httpx.Request) -> httpx.Response:
     raise AssertionError(f"unexpected action: {action}")
 
 
+async def test_portrait_client_uses_short_name_in_host_and_asset_request(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / f"{'a' * 64}.png"
+    Image.new("RGB", (720, 1280), color=(20, 120, 60)).save(path, format="PNG")
+    content = path.read_bytes()
+    asset = MediaAsset(
+        asset_id="image-1",
+        source_block_id="block-1",
+        origin="fixture",
+        local_path=path,
+        mime_type="image/png",
+        size=len(content),
+        sha256=sha256(content).hexdigest(),
+        width=720,
+        height=1280,
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return _active_asset_handler(request)
+
+    host = _CapturingPublicMediaHost()
+    store = await PortraitAssetStore.open(tmp_path / "portrait.sqlite3")
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http:
+            client = VolcengineAssetClient(
+                http,
+                access_key="ak-test",
+                secret_key="sk-test",
+                project_name="Seedance2.0",
+                public_media_host=host,
+                store=store,
+                poll_interval_seconds=0,
+                max_poll_attempts=1,
+            )
+            await client.ensure_image_asset("run-short-name", asset)
+    finally:
+        await store.close()
+
+    _uploaded, host_filename, _mime_type = host.uploaded[0]
+    create_asset = next(
+        request
+        for request in requests
+        if request.url.params["Action"] == "CreateAsset"
+    )
+    asset_name = json.loads(create_asset.content)["Name"]
+    assert host_filename == "image-1.png"
+    assert asset_name == host_filename
+    assert len(asset_name) <= 64
+
+
 async def test_portrait_client_resizes_only_upload_copy_for_small_image(
     tmp_path: Path,
 ) -> None:
@@ -114,7 +169,7 @@ async def test_portrait_client_resizes_only_upload_copy_for_small_image(
     uploaded, filename, mime_type = host.uploaded[0]
     with Image.open(BytesIO(uploaded)) as image:
         assert image.size == (300, 534)
-    assert filename == asset.local_path.name
+    assert filename == f"{asset.asset_id}.png"
     assert mime_type == "image/png"
     assert asset.local_path.read_bytes() == source_before
     assert sha256(asset.local_path.read_bytes()).hexdigest() == asset.sha256

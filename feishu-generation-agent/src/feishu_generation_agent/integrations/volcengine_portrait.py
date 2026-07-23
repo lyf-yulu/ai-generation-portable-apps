@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import re
 from datetime import UTC, datetime
 from io import BytesIO
 from math import ceil
@@ -28,6 +29,8 @@ _REGION = "cn-beijing"
 _SERVICE = "ark"
 _MIN_ASSET_DIMENSION = 300
 _RESIZABLE_IMAGE_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
+_UNSAFE_ASSET_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+_SAFE_ASSET_SUFFIX = re.compile(r"\.[a-z0-9]{1,10}")
 
 
 def _secret(value: str | SecretStr) -> str:
@@ -68,6 +71,15 @@ def _portrait_upload_content(asset: MediaAsset) -> bytes:
         ) from exc
 
 
+def _portrait_asset_name(asset: MediaAsset) -> str:
+    suffix = asset.local_path.suffix.lower()
+    if _SAFE_ASSET_SUFFIX.fullmatch(suffix) is None:
+        suffix = ""
+    stem = _UNSAFE_ASSET_NAME.sub("-", asset.asset_id).strip("._-") or "image"
+    max_stem_length = 64 - len(suffix)
+    return f"{stem[:max_stem_length]}{suffix}"
+
+
 class VolcengineAssetClient:
     def __init__(
         self,
@@ -105,10 +117,11 @@ class VolcengineAssetClient:
             return f"asset://{asset_id}"
 
         group_id = await self._ensure_group(run_id)
+        asset_name = _portrait_asset_name(asset)
         try:
             source_url = await self._public_media_host.upload(
                 _portrait_upload_content(asset),
-                asset.local_path.name,
+                asset_name,
                 asset.mime_type,
             )
         except (OSError, PublicMediaUploadError) as exc:
@@ -120,7 +133,7 @@ class VolcengineAssetClient:
                 "URL": source_url,
                 "AssetType": "Image",
                 "ProjectName": self._project_name,
-                "Name": asset.local_path.name,
+                "Name": asset_name,
             },
         )
         asset_id = self._result_id(result, "CreateAsset")
