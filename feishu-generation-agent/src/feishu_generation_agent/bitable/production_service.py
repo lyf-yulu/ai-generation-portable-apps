@@ -12,7 +12,7 @@ from feishu_generation_agent.storage.production_tasks import ProductionTaskStore
 
 _RELEASED_STATUSES = {
     "succeeded": TableTaskStatus.COMPLETED,
-    "completed_with_errors": TableTaskStatus.COMPLETED,
+    "completed_with_errors": TableTaskStatus.FAILED,
     "failed": TableTaskStatus.FAILED,
     "cancelled": TableTaskStatus.FAILED,
 }
