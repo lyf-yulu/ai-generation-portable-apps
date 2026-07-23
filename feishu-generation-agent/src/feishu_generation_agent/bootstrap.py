@@ -33,6 +33,7 @@ from feishu_generation_agent.integrations.safe_download import (
     SafeResultDownloader,
 )
 from feishu_generation_agent.integrations.seedance import SeedanceVideoGenerator
+from feishu_generation_agent.integrations.public_media import UguuPublicMediaHost
 from feishu_generation_agent.integrations.vision import ClaudeVisionAnalyzer
 from feishu_generation_agent.storage.files import FileStore
 from feishu_generation_agent.storage.bitable_tasks import BitableTaskStore
@@ -313,6 +314,7 @@ async def _open_application_services(
                 base_url=settings.ark_base_url,
                 api_key=settings.ark_api_key,
                 model=settings.seedance_model,
+                public_media_host=UguuPublicMediaHost(provider_http),
             ),
             delivery_writer=delivery_writer,
             repository=repository,

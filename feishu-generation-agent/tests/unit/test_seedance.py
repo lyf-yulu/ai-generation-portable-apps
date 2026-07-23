@@ -19,6 +19,12 @@ from feishu_generation_agent.domain.plan import GenerationTask, ImageReference
 from feishu_generation_agent.integrations.seedance import SeedanceVideoGenerator
 
 
+class _FakePublicMediaHost:
+    async def upload(self, content: bytes, filename: str, mime_type: str) -> str:
+        del content, filename
+        return f"https://public.example/reference.{ 'mp4' if mime_type.startswith('video/') else 'mp3' }"
+
+
 def _image_bytes(image_format: str, color: str) -> bytes:
     buffer = BytesIO()
     Image.new("RGB", (2, 2), color).save(buffer, format=image_format)
@@ -69,6 +75,36 @@ def _assets(tmp_path: Path) -> list[MediaAsset]:
             mime_type="image/jpeg",
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_submit_uses_public_urls_for_video_and_audio_references(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def create(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "task-ark-multimodal", "status": "queued"})
+
+    task = _video_task(references=[
+        {"asset_id": "asset-blue", "role": "reference_image", "order": 1},
+        {"asset_id": "asset-video", "role": "reference_video", "order": 2},
+        {"asset_id": "asset-audio", "role": "reference_audio", "order": 3},
+    ])
+    assets = [
+        _assets(tmp_path)[0],
+        _asset(tmp_path, "asset-video", content=b"\x00\x00\x00\x18ftypisom", mime_type="video/mp4"),
+        _asset(tmp_path, "asset-audio", content=b"ID3\x04\x00\x00\x00\x00\x00\x00", mime_type="audio/mpeg"),
+    ]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(create)) as client:
+        generator = SeedanceVideoGenerator(
+            client, base_url="https://ark.fictional.test/api/v3", api_key="fictional-key", model="fictional-model", public_media_host=_FakePublicMediaHost(),
+        )
+        await generator.submit(task, assets)
+
+    content = json.loads(requests[0].content)["content"]
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert content[2] == {"type": "video_url", "video_url": {"url": "https://public.example/reference.mp4"}, "role": "reference_video"}
+    assert content[3] == {"type": "audio_url", "audio_url": {"url": "https://public.example/reference.mp3"}, "role": "reference_audio"}
 
 
 def _video_task(

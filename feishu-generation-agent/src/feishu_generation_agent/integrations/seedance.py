@@ -24,6 +24,10 @@ from feishu_generation_agent.domain.errors import (
     ErrorDetail,
 )
 from feishu_generation_agent.domain.plan import GenerationTask
+from feishu_generation_agent.integrations.public_media import (
+    PublicMediaHost,
+    PublicMediaUploadError,
+)
 
 
 _IMAGE_MIME_TYPES = frozenset(
@@ -36,7 +40,13 @@ _IMAGE_FORMAT_MIME_TYPES = {
     "WEBP": "image/webp",
 }
 _REFERENCE_ROLES = frozenset(
-    {"reference_image", "first_frame", "last_frame"}
+    {
+        "reference_image",
+        "first_frame",
+        "last_frame",
+        "reference_video",
+        "reference_audio",
+    }
 )
 _ASPECT_RATIOS = frozenset(
     {"16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "9:21", "adaptive"}
@@ -65,6 +75,7 @@ class SeedanceVideoGenerator:
         max_response_bytes: int = _DEFAULT_MAX_RESPONSE_BYTES,
         max_input_bytes: int = _DEFAULT_MAX_INPUT_BYTES,
         max_total_input_bytes: int = _DEFAULT_MAX_TOTAL_INPUT_BYTES,
+        public_media_host: PublicMediaHost | None = None,
     ) -> None:
         if not isinstance(base_url, str):
             raise self._configuration_error("base_url", "expected=https_origin_or_api_v3")
@@ -122,6 +133,7 @@ class SeedanceVideoGenerator:
         self._max_input_bytes = max_input_bytes
         self._max_total_input_bytes = max_total_input_bytes
         self._timeout = httpx.Timeout(120, connect=10)
+        self._public_media_host = public_media_host
 
     async def submit(
         self,
@@ -140,16 +152,21 @@ class SeedanceVideoGenerator:
         for reference, asset, content in zip(
             references, ordered_assets, contents, strict=True
         ):
-            encoded = base64.b64encode(content).decode("ascii")
-            request_content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{asset.mime_type};base64,{encoded}"
-                    },
-                    "role": reference.role,
-                }
-            )
+            if asset.mime_type.startswith("image/"):
+                encoded = base64.b64encode(content).decode("ascii")
+                request_content.append({"type": "image_url", "image_url": {"url": f"data:{asset.mime_type};base64,{encoded}"}, "role": reference.role})
+                continue
+            if self._public_media_host is None:
+                raise self._validation_error(task.task_id, "未配置参考音视频临时托管", "cause=missing_public_media_host")
+            try:
+                url = await self._public_media_host.upload(content, asset.local_path.name, asset.mime_type)
+            except PublicMediaUploadError as exc:
+                raise self._error(ErrorCategory.PROVIDER_TRANSIENT, str(exc), "operation=public_media_upload") from None
+            request_content.append({
+                "type": "video_url" if reference.role == "reference_video" else "audio_url",
+                "video_url" if reference.role == "reference_video" else "audio_url": {"url": url},
+                "role": reference.role,
+            })
         payload = {
             "model": self._model,
             "content": request_content,
@@ -533,12 +550,17 @@ class SeedanceVideoGenerator:
 
         expected_stats: list[os.stat_result] = []
         total_size = 0
-        for asset in ordered_assets:
-            if asset.mime_type not in _IMAGE_MIME_TYPES:
+        for reference, asset in zip(references, ordered_assets, strict=True):
+            valid_role = (
+                (asset.mime_type in _IMAGE_MIME_TYPES and reference.role in {"reference_image", "first_frame", "last_frame"})
+                or (asset.mime_type.startswith("video/") and reference.role == "reference_video")
+                or (asset.mime_type.startswith("audio/") and reference.role == "reference_audio")
+            )
+            if not valid_role:
                 raise self._validation_error(
                     task.task_id,
-                    "参考素材不是支持的图片格式",
-                    f"asset_id={asset.asset_id}; cause=invalid_mime",
+                    "参考素材类型与用途不匹配",
+                    f"asset_id={asset.asset_id}; cause=invalid_mime_or_role",
                 )
             if asset.download_error is not None:
                 raise self._document_error(
@@ -596,7 +618,8 @@ class SeedanceVideoGenerator:
             ordered_assets, expected_stats, strict=True
         ):
             content = self._read_verified_asset(asset, expected_stat)
-            self._validate_image_content(asset, content)
+            if asset.mime_type.startswith("image/"):
+                self._validate_image_content(asset, content)
             contents.append(content)
         return references, ordered_assets, contents
 
@@ -647,10 +670,10 @@ class SeedanceVideoGenerator:
                 )
             return
         if task.reference_mode == "multi_reference":
-            if any(role != "reference_image" for role in roles):
+            if any(role in {"first_frame", "last_frame"} for role in roles):
                 raise self._validation_error(
                     task.task_id,
-                    "多参考模式只能使用普通参考图",
+                    "多参考模式不能使用首帧或尾帧",
                     "cause=invalid_multi_reference_mode",
                 )
             return
