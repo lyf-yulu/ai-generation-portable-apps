@@ -81,6 +81,12 @@ class ProductionResultWriter:
         artifacts = await self._repository.list_artifacts(run_id)
         return await self.deliver(run_id, document, plan, artifacts)
 
+    async def cleanup_empty_records(self) -> int:
+        target = await self._store.get_result_target(_SHARED_RESULT_TARGET)
+        if target is None:
+            return 0
+        return await self._delete_empty_records(target)
+
     async def _save_context_if_absent(
         self, run_id: str, document: NormalizedDocument, plan: TaskPlan
     ) -> None:
@@ -138,8 +144,27 @@ class ProductionResultWriter:
                 table_id=created.table_id,
                 url=created.url,
             )
+            await self._delete_empty_records(target)
             await self._store.upsert_result_target(target)
             return target
+
+    async def _delete_empty_records(self, target: ResultTableTarget) -> int:
+        records = await self._client.list_bitable_records(
+            target.app_token, target.table_id
+        )
+        deleted = 0
+        for record in records:
+            record_id = record.get("record_id")
+            if (
+                isinstance(record_id, str)
+                and record_id
+                and record.get("fields") == {}
+            ):
+                await self._client.delete_bitable_record(
+                    target.app_token, target.table_id, record_id
+                )
+                deleted += 1
+        return deleted
 
     async def _upload(self, run_id: str, app_token: str, artifact: Artifact) -> str:
         if artifact.feishu_file_token:

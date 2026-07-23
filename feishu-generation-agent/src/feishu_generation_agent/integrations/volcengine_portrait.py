@@ -192,15 +192,36 @@ class VolcengineAssetClient:
 
     @staticmethod
     def _validation_error(message: str) -> AgentError:
-        return AgentError(ErrorDetail(ErrorCategory.VALIDATION, message, message, False))
+        return AgentError(
+            ErrorDetail(
+                category=ErrorCategory.VALIDATION,
+                message=message,
+                technical_detail=message,
+                retryable=False,
+            )
+        )
 
     @staticmethod
     def _terminal_error(message: str) -> AgentError:
-        return AgentError(ErrorDetail(ErrorCategory.PROVIDER_TERMINAL, message, message, False))
+        return AgentError(
+            ErrorDetail(
+                category=ErrorCategory.PROVIDER_TERMINAL,
+                message=message,
+                technical_detail=message,
+                retryable=False,
+            )
+        )
 
     @staticmethod
     def _transient_error(message: str) -> AgentError:
-        return AgentError(ErrorDetail(ErrorCategory.PROVIDER_TRANSIENT, message, message, True))
+        return AgentError(
+            ErrorDetail(
+                category=ErrorCategory.TRANSIENT,
+                message=message,
+                technical_detail=message,
+                retryable=True,
+            )
+        )
 
 
 class VolcenginePortraitVideoGenerator:

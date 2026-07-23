@@ -4,7 +4,7 @@ from feishu_generation_agent.bitable.production_service import (
     ProductionBitableService,
     ProductionTaskSource,
 )
-from feishu_generation_agent.domain.bitable import BitableLocation
+from feishu_generation_agent.domain.bitable import BitableLocation, TableTaskStatus
 from feishu_generation_agent.domain.document import RequirementRequest
 from feishu_generation_agent.domain.production_bitable import (
     ProductionSourceSnapshot,
@@ -113,6 +113,38 @@ async def test_service_scans_only_the_requested_category_and_exact_type(
     assert [task.task_type for task in animation_tasks] == ["动画类"]
     assert [task.task_type for task in portrait_tasks] == ["真人类"]
     assert bitable.calls == ["vewAnimation", "vewPortrait"]
+
+
+async def test_completed_with_errors_releases_production_task_as_failed(
+    tmp_path,
+) -> None:
+    class Runtime:
+        async def get_run_view(self, run_id):
+            return {"run_id": run_id, "status": "completed_with_errors"}
+
+    store = await ProductionTaskStore.open(tmp_path / "production.sqlite3")
+    service = ProductionBitableService(
+        bitable=_MixedCategoryBitable(),
+        store=store,
+        runtime=Runtime(),
+        sources=_category_sources(),
+        include_completed_for_test=False,
+        enabled_task_types=frozenset({"动画类", "真人类"}),
+    )
+    try:
+        binding = await store.claim(
+            _category_sources()["portrait"].location,
+            _portrait_task(),
+            run_id="run-with-errors",
+            thread_id="thread-with-errors",
+        )
+        released = await service.sync_once(binding.run_id)
+        active = await service.active_runs()
+    finally:
+        await store.close()
+
+    assert released.status is TableTaskStatus.FAILED
+    assert active == []
 
 
 async def test_portrait_claim_uses_the_portrait_source_location(tmp_path) -> None:
