@@ -16,6 +16,7 @@ from feishu_generation_agent.domain.artifact import ProviderSubmission
 from feishu_generation_agent.domain.document import MediaAsset
 from feishu_generation_agent.domain.errors import AgentError, ErrorCategory
 from feishu_generation_agent.domain.plan import GenerationTask, ImageReference
+from feishu_generation_agent.integrations.public_media import PublicMediaUploadError
 from feishu_generation_agent.integrations.seedance import SeedanceVideoGenerator
 
 
@@ -23,6 +24,12 @@ class _FakePublicMediaHost:
     async def upload(self, content: bytes, filename: str, mime_type: str) -> str:
         del content, filename
         return f"https://public.example/reference.{ 'mp4' if mime_type.startswith('video/') else 'mp3' }"
+
+
+class _FailingPublicMediaHost:
+    async def upload(self, content: bytes, filename: str, mime_type: str) -> str:
+        del content, filename, mime_type
+        raise PublicMediaUploadError("temporary host unavailable")
 
 
 def _image_bytes(image_format: str, color: str) -> bytes:
@@ -105,6 +112,44 @@ async def test_submit_uses_public_urls_for_video_and_audio_references(tmp_path: 
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
     assert content[2] == {"type": "video_url", "video_url": {"url": "https://public.example/reference.mp4"}, "role": "reference_video"}
     assert content[3] == {"type": "audio_url", "audio_url": {"url": "https://public.example/reference.mp3"}, "role": "reference_audio"}
+
+
+@pytest.mark.asyncio
+async def test_submit_reports_public_media_failure_as_transient(
+    tmp_path: Path,
+) -> None:
+    task = _video_task(
+        references=[
+            {"asset_id": "asset-video", "role": "reference_video", "order": 1}
+        ]
+    )
+    assets = [
+        _asset(
+            tmp_path,
+            "asset-video",
+            content=b"\x00\x00\x00\x18ftypisom",
+            mime_type="video/mp4",
+        )
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                500, request=request, json={"error": "must not submit"}
+            )
+        )
+    ) as client:
+        generator = SeedanceVideoGenerator(
+            client,
+            base_url="https://ark.fictional.test/api/v3",
+            api_key="fictional-key",
+            model="fictional-model",
+            public_media_host=_FailingPublicMediaHost(),
+        )
+        with pytest.raises(AgentError) as caught:
+            await generator.submit(task, assets)
+
+    assert caught.value.detail.category is ErrorCategory.TRANSIENT
+    assert caught.value.detail.retryable is True
 
 
 @pytest.mark.asyncio

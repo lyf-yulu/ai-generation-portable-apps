@@ -172,7 +172,12 @@ class SeedanceVideoGenerator:
             try:
                 url = await self._public_media_host.upload(content, asset.local_path.name, asset.mime_type)
             except PublicMediaUploadError as exc:
-                raise self._error(ErrorCategory.PROVIDER_TRANSIENT, str(exc), "operation=public_media_upload") from None
+                raise self._error(
+                    ErrorCategory.TRANSIENT,
+                    str(exc),
+                    "operation=public_media_upload",
+                    retryable=True,
+                ) from None
             request_content.append({
                 "type": "video_url" if reference.role == "reference_video" else "audio_url",
                 "video_url" if reference.role == "reference_video" else "audio_url": {"url": url},
@@ -839,13 +844,15 @@ class SeedanceVideoGenerator:
         category: ErrorCategory,
         message: str,
         technical_detail: str,
+        *,
+        retryable: bool = False,
     ) -> AgentError:
         return AgentError(
             ErrorDetail(
                 category=category,
                 message=message,
                 technical_detail=technical_detail,
-                retryable=False,
+                retryable=retryable,
             )
         )
 

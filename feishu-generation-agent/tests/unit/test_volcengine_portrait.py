@@ -3,8 +3,11 @@ from hashlib import sha256
 from pathlib import Path
 
 import httpx
+import pytest
 
 from feishu_generation_agent.domain.document import MediaAsset
+from feishu_generation_agent.domain.errors import AgentError, ErrorCategory
+from feishu_generation_agent.integrations.public_media import PublicMediaUploadError
 from feishu_generation_agent.integrations.volcengine_portrait import (
     VolcengineAssetClient,
 )
@@ -17,6 +20,12 @@ class _PublicMediaHost:
         assert filename == "portrait.png"
         assert mime_type == "image/png"
         return "https://public.example/portrait.png"
+
+
+class _FailingPublicMediaHost:
+    async def upload(self, content: bytes, filename: str, mime_type: str) -> str:
+        del content, filename, mime_type
+        raise PublicMediaUploadError("temporary host unavailable")
 
 
 def _image_asset(tmp_path: Path) -> MediaAsset:
@@ -80,3 +89,30 @@ async def test_portrait_client_creates_group_activates_image_and_reuses_asset(
     )
     assert "sk-test" not in requests[0].headers["authorization"]
     assert json.loads(requests[1].content)["URL"] == "https://public.example/portrait.png"
+
+
+async def test_portrait_client_reports_public_host_failure_as_transient(
+    tmp_path: Path,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["Action"] == "CreateAssetGroup"
+        return httpx.Response(200, json={"Result": {"Id": "group-1"}})
+
+    store = await PortraitAssetStore.open(tmp_path / "portrait.sqlite3")
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = VolcengineAssetClient(
+                http,
+                access_key="ak-test",
+                secret_key="sk-test",
+                project_name="Seedance2.0",
+                public_media_host=_FailingPublicMediaHost(),
+                store=store,
+            )
+            with pytest.raises(AgentError) as caught:
+                await client.ensure_image_asset("run-1", _image_asset(tmp_path))
+    finally:
+        await store.close()
+
+    assert caught.value.detail.category is ErrorCategory.TRANSIENT
+    assert caught.value.detail.retryable is True
