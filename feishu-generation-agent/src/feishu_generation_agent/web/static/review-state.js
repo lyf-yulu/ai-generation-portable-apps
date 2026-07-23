@@ -158,6 +158,9 @@
       if (references.length !== 2) {
         throw new Error('首尾帧模式需要恰好两张图片');
       }
+      if (references.some((reference) => reference.role === 'reference_video' || reference.role === 'reference_audio')) {
+        throw new Error('首尾帧模式不支持参考视频或参考音频');
+      }
       return patchTask(state, taskId, {
         reference_mode: referenceMode,
         reference_images: references.map((reference, index) => ({
@@ -170,7 +173,9 @@
       reference_mode: referenceMode,
       reference_images: references.map((reference) => ({
         ...reference,
-        role: 'reference_image',
+        role: reference.role === 'reference_video' || reference.role === 'reference_audio'
+          ? reference.role
+          : 'reference_image',
       })),
     });
   }

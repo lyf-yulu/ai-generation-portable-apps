@@ -28,28 +28,30 @@
   }
 
   function fileSelected(state, taskId, file) {
+    const mimeType = typeof file.type === "string" ? file.type : "";
+    const category = mimeType.startsWith("video/") ? "视频" : mimeType.startsWith("audio/") ? "音频" : "图片";
     return withTask(state, taskId, {
       file,
-      feedback: createFeedback("selected", `已选择：${file.name}，点击“增添图片”上传`),
+      feedback: createFeedback("selected", `已选择${category}：${file.name}，点击“增添素材”上传`),
     });
   }
 
   function uploadStarted(state, taskId) {
     return withTask(state, taskId, {
-      feedback: createFeedback("uploading", "正在上传图片…"),
+      feedback: createFeedback("uploading", "正在上传参考素材…"),
     });
   }
 
   function uploadSucceeded(state, taskId) {
     return withTask(state, taskId, {
       file: null,
-      feedback: createFeedback("success", "图片已加入参考列表"),
+      feedback: createFeedback("success", "参考素材已加入列表"),
     });
   }
 
   function uploadFailed(state, taskId, message) {
     return withTask(state, taskId, {
-      feedback: createFeedback("error", message || "图片添加失败，请重试"),
+      feedback: createFeedback("error", message || "参考素材添加失败，请重试"),
     });
   }
 

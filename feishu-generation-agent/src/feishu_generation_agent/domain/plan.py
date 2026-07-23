@@ -78,11 +78,6 @@ class GenerationTask(BaseModel):
                     )
             if self.reference_mode not in {None, "multi_reference"}:
                 raise ValueError("image_to_image only supports multi_reference")
-            if any(
-                reference.role != "reference_image"
-                for reference in self.reference_images
-            ):
-                raise ValueError("image_to_image only accepts reference_image")
             self.reference_mode = "multi_reference"
             return self
 

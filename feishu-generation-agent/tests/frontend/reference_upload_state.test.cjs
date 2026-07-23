@@ -16,14 +16,14 @@ test("selected reference file survives status updates until upload succeeds", ()
   assert.equal(ReferenceUploadState.pendingFile(state, "task-1"), file);
   assert.deepEqual(ReferenceUploadState.feedback(state, "task-1"), {
     phase: "uploading",
-    message: "正在上传图片…",
+    message: "正在上传参考素材…",
   });
 
   state = ReferenceUploadState.uploadSucceeded(state, "task-1");
   assert.equal(ReferenceUploadState.pendingFile(state, "task-1"), null);
   assert.deepEqual(ReferenceUploadState.feedback(state, "task-1"), {
     phase: "success",
-    message: "图片已加入参考列表",
+    message: "参考素材已加入列表",
   });
 });
 

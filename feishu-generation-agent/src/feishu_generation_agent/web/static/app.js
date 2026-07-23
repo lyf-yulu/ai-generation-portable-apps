@@ -489,8 +489,20 @@
     row.dataset.referenceTask = task.task_id;
     row.dataset.assetId = reference.asset_id;
 
-    const image = document.createElement("img");
-    image.alt = `参考图片 ${reference.order}`;
+    const isVideo = reference.role === "reference_video";
+    const isAudio = reference.role === "reference_audio";
+    const image = document.createElement(isVideo ? "video" : isAudio ? "audio" : "img");
+    image.alt = `参考素材 ${reference.order}`;
+    if (isVideo) {
+      image.muted = true;
+      image.controls = true;
+      image.preload = "metadata";
+      image.playsInline = true;
+    }
+    if (isAudio) {
+      image.controls = true;
+      image.preload = "metadata";
+    }
     if (asset?.preview_url) image.src = asset.preview_url;
 
     const descriptionText = description
@@ -507,7 +519,7 @@
         ? "首帧"
         : reference.role === "last_frame"
           ? "尾帧"
-          : "普通参考图",
+          : isVideo ? "参考视频" : isAudio ? "参考音频" : "普通参考图",
     );
 
     const order = document.createElement("input");
@@ -522,7 +534,7 @@
     const actions = element("div", "reference-actions");
     const replaceInput = document.createElement("input");
     replaceInput.type = "file";
-    replaceInput.accept = "image/*";
+    replaceInput.accept = "image/*,video/mp4,video/webm,audio/mpeg,audio/wav,audio/ogg,audio/aac";
     replaceInput.hidden = true;
     const replace = element("button", "quiet-button", "替换");
     replace.type = "button";
@@ -547,7 +559,7 @@
   function referenceSection(task) {
     const section = element("section", "reference-section");
     const heading = element("div", "panel-heading");
-    heading.append(element("h3", "", "参考图片"));
+    heading.append(element("h3", "", "参考素材"));
     const referenceMode = task.reference_mode || "multi_reference";
     const mode = document.createElement("select");
     mode.setAttribute("aria-label", "参考模式");
@@ -576,26 +588,26 @@
       "mode-message",
       referenceMode === "first_last_frame"
         ? "首尾帧模式仅提交两张图片：首帧和尾帧。"
-        : "多参考模式会把所有图片作为普通参考图；首尾效果请在提示词中描述。",
+        : "多参考模式支持图片、视频和音频；首尾效果请在提示词中描述。",
     );
     section.append(heading, modeHint, list);
     if (referenceMode === "multi_reference") {
       const upload = element("div", "upload-row");
       const fileInput = document.createElement("input");
       fileInput.type = "file";
-      fileInput.accept = "image/*";
+      fileInput.accept = "image/*,video/mp4,video/webm,audio/mpeg,audio/wav,audio/ogg,audio/aac";
       const feedback = ReferenceUploadState.feedback(state.referenceUploads, task.task_id);
       const uploadFeedback = element(
         "p",
         `upload-feedback${feedback ? ` is-${feedback.phase}` : ""}`,
-        feedback?.message || "请选择一张图片后再上传。",
+        feedback?.message || "请选择图片、视频或音频后再上传。",
       );
       uploadFeedback.setAttribute("aria-live", "polite");
       const order = document.createElement("input");
       order.type = "number";
       order.min = "1";
       order.value = String(task.reference_images.length + 1);
-      const add = element("button", "secondary", "增添图片");
+      const add = element("button", "secondary", "增添素材");
       add.type = "button";
       fileInput.addEventListener("change", () => {
         const file = fileInput.files[0];
@@ -614,7 +626,7 @@
       add.addEventListener("click", async () => {
         const file = ReferenceUploadState.pendingFile(state.referenceUploads, task.task_id);
         if (!file) {
-          const message = "请先选择图片文件";
+          const message = "请先选择图片、视频或音频文件";
           state.referenceUploads = ReferenceUploadState.uploadFailed(
             state.referenceUploads, task.task_id, message,
           );
@@ -632,7 +644,8 @@
         add.textContent = "正在添加…";
         let succeeded = false;
         try {
-          succeeded = await uploadReference(task, file, "reference_image", Number(order.value));
+          const role = file.type.startsWith("video/") ? "reference_video" : file.type.startsWith("audio/") ? "reference_audio" : "reference_image";
+          succeeded = await uploadReference(task, file, role, Number(order.value));
         } catch (error) {
           showError(error);
         }

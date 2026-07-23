@@ -187,7 +187,8 @@ button {
 .reference-section { margin-top: 1rem; border-top: 1px solid var(--line); padding-top: .9rem; }
 .reference-list { display: grid; gap: .7rem; }
 .reference-row { display: grid; grid-template-columns: 84px minmax(130px, 1fr) 120px 76px auto; gap: .65rem; align-items: center; padding: .65rem; border: 1px solid var(--line); border-radius: .65rem; background: #fff; }
-.reference-row img { width: 84px; height: 64px; object-fit: cover; border-radius: .4rem; background: #edf1ee; }
+.reference-row img, .reference-row video { width: 84px; height: 64px; object-fit: cover; border-radius: .4rem; background: #edf1ee; }
+.reference-row audio { width: 130px; max-width: 100%; }
 .reference-description { color: var(--muted); font-size: .76rem; line-height: 1.4; }
 .reference-actions { display: flex; flex-wrap: wrap; gap: .35rem; }
 .reference-role { color: var(--muted); font-size: .82rem; font-weight: 700; }
