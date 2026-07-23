@@ -177,3 +177,75 @@ Run the normalization helper against the cached first reference and assert:
 - upload copy is `300×534`;
 - the task remains available as rerunnable.
 
+### Task 4: Use short deterministic Asset names
+
+**Files:**
+- Modify: `feishu-generation-agent/src/feishu_generation_agent/integrations/volcengine_portrait.py`
+- Test: `feishu-generation-agent/tests/unit/test_volcengine_portrait.py`
+
+**Interfaces:**
+- Consumes: `MediaAsset.asset_id` and `MediaAsset.local_path.suffix`.
+- Produces: `_portrait_asset_name(asset: MediaAsset) -> str`, containing only ASCII letters, numbers, dot, underscore, and hyphen, with a maximum length of 64 characters.
+
+- [ ] **Step 1: Write the failing test**
+
+Create a PNG whose local filename is a 64-character SHA-256 string plus `.png`,
+set its asset ID to `image-1`, and run `ensure_image_asset`. Capture both the
+temporary host filename and the `CreateAsset` JSON body. Assert both names are
+`image-1.png` and have length at most 64.
+
+- [ ] **Step 2: Run the test and verify RED**
+
+Run:
+
+```bash
+uv run pytest tests/unit/test_volcengine_portrait.py -q
+```
+
+Expected: the host and `CreateAsset.Name` still receive the 68-character local
+cache filename.
+
+- [ ] **Step 3: Implement the short-name helper**
+
+Generate the name from the asset ID, replacing characters outside
+`[A-Za-z0-9._-]` with `-`. Preserve the lowercase source extension, reserve its
+length before truncating the stem, and fall back to `image` when the sanitized
+stem is empty.
+
+Use the generated name for both:
+
+```python
+source_url = await self._public_media_host.upload(
+    upload_content,
+    asset_name,
+    asset.mime_type,
+)
+```
+
+and:
+
+```python
+{
+    "Name": asset_name,
+}
+```
+
+- [ ] **Step 4: Run targeted and full verification**
+
+Run:
+
+```bash
+uv run pytest tests/unit/test_volcengine_portrait.py tests/graph/test_execution_graph.py -q
+uv run pytest -q
+node --test tests/frontend/*.test.cjs
+```
+
+Expected: targeted tests, the full backend suite, and all 23 frontend tests
+pass.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add feishu-generation-agent/src/feishu_generation_agent/integrations/volcengine_portrait.py feishu-generation-agent/tests/unit/test_volcengine_portrait.py
+git commit -m "fix(agent): shorten portrait asset names"
+```
