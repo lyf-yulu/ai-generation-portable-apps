@@ -268,6 +268,21 @@ class FeishuClient:
             )
         return record_id
 
+    async def list_bitable_records(
+        self, app_token: str, table_id: str
+    ) -> list[dict[str, object]]:
+        return await self.iter_items(
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records"
+        )
+
+    async def delete_bitable_record(
+        self, app_token: str, table_id: str, record_id: str
+    ) -> None:
+        await self.request_json(
+            "DELETE",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}",
+        )
+
     async def update_bitable_record(
         self, app_token: str, table_id: str, record_id: str, fields: dict[str, object]
     ) -> None:

@@ -8,6 +8,7 @@ from feishu_generation_agent.domain.plan import TaskPlan
 from feishu_generation_agent.domain.production_bitable import (
     ProductionSourceSnapshot,
     ProductionTaskSummary,
+    ResultTableTarget,
 )
 from feishu_generation_agent.integrations.feishu_client import CreatedBitableApp
 from feishu_generation_agent.integrations.production_delivery import ProductionResultWriter
@@ -51,6 +52,12 @@ async def test_concurrent_first_target_creation_creates_one_shared_table(
         ):
             return f"fld-{field_name}"
 
+        async def list_bitable_records(self, app_token, table_id):
+            return []
+
+        async def delete_bitable_record(self, app_token, table_id, record_id):
+            return None
+
     client = Client()
     writer = ProductionResultWriter(
         client=client,
@@ -69,6 +76,109 @@ async def test_concurrent_first_target_creation_creates_one_shared_table(
 
     assert client.created_apps == 1
     assert first == second
+
+
+async def test_target_creation_removes_only_completely_empty_default_records(
+    tmp_path,
+) -> None:
+    store = await ProductionTaskStore.open(tmp_path / "production.sqlite3")
+    repository = await Repository.open(tmp_path / "repository.sqlite3")
+
+    class Client:
+        def __init__(self) -> None:
+            self.deleted_records: list[str] = []
+
+        async def create_bitable_app(self, name, folder_token):
+            return CreatedBitableApp(
+                "app-result",
+                "tbl-result",
+                "https://tenant.feishu.cn/base/app-result",
+            )
+
+        async def list_bitable_fields(self, app_token, table_id):
+            return [{"field_id": "fld-primary", "field_name": "Name", "type": 1}]
+
+        async def update_bitable_field(
+            self, app_token, table_id, field_id, field_name, field_type
+        ):
+            return None
+
+        async def create_bitable_field(
+            self, app_token, table_id, field_name, field_type
+        ):
+            return f"fld-{field_name}"
+
+        async def list_bitable_records(self, app_token, table_id):
+            return [
+                {"record_id": "rec-empty-1", "fields": {}},
+                {"record_id": "rec-used", "fields": {"需求名称": "已有结果"}},
+                {"record_id": "rec-missing-fields"},
+                {"record_id": "", "fields": {}},
+            ]
+
+        async def delete_bitable_record(self, app_token, table_id, record_id):
+            self.deleted_records.append(record_id)
+
+    client = Client()
+    writer = ProductionResultWriter(
+        client=client,
+        store=store,
+        repository=repository,
+        result_folder_token="fld-results",
+    )
+    try:
+        await writer._ensure_target()
+    finally:
+        await store.close()
+        await repository.close()
+
+    assert client.deleted_records == ["rec-empty-1"]
+
+
+async def test_cleanup_empty_records_supports_existing_shared_result_table(
+    tmp_path,
+) -> None:
+    store = await ProductionTaskStore.open(tmp_path / "production.sqlite3")
+    repository = await Repository.open(tmp_path / "repository.sqlite3")
+    await store.upsert_result_target(
+        ResultTableTarget(
+            maker_open_id="__shared_production_result__",
+            maker_name="统一结果表",
+            app_token="app-result",
+            table_id="tbl-result",
+            url="https://tenant.feishu.cn/base/app-result",
+        )
+    )
+
+    class Client:
+        def __init__(self) -> None:
+            self.deleted_records: list[str] = []
+
+        async def list_bitable_records(self, app_token, table_id):
+            return [
+                {"record_id": "rec-empty-1", "fields": {}},
+                {"record_id": "rec-empty-2", "fields": {}},
+                {"record_id": "rec-used", "fields": {"结果": [{"file_token": "file-1"}]}},
+            ]
+
+        async def delete_bitable_record(self, app_token, table_id, record_id):
+            self.deleted_records.append(record_id)
+
+    client = Client()
+    writer = ProductionResultWriter(
+        client=client,
+        store=store,
+        repository=repository,
+        result_folder_token="fld-results",
+    )
+    try:
+        deleted = await writer.cleanup_empty_records()
+    finally:
+        await store.close()
+        await repository.close()
+
+    assert deleted == 2
+    assert client.deleted_records == ["rec-empty-1", "rec-empty-2"]
 
 
 async def test_delivery_creates_one_shared_table_and_updates_same_result_row(tmp_path) -> None:
@@ -97,6 +207,8 @@ async def test_delivery_creates_one_shared_table_and_updates_same_result_row(tmp
         async def list_bitable_fields(self, app_token, table_id): return [{"field_id": "fld-primary", "field_name": "Name", "type": 1}]
         async def update_bitable_field(self, app_token, table_id, field_id, field_name, field_type): return None
         async def create_bitable_field(self, app_token, table_id, field_name, field_type): return f"fld-{field_name}"
+        async def list_bitable_records(self, app_token, table_id): return []
+        async def delete_bitable_record(self, app_token, table_id, record_id): return None
         async def grant_bitable_editor(self, app_token, open_id): return None
         async def upload_media_all(self, filename, content, mime_type, *, parent_type, parent_node): return "file-result"
         async def create_bitable_record(self, app_token, table_id, fields):
