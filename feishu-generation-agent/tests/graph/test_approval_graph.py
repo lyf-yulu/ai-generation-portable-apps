@@ -158,10 +158,12 @@ def test_agent_state_and_graph_services_contracts_are_stable():
         "image_generator",
         "video_generator",
         "delivery_writer",
-        "repository",
-        "file_store",
-        "settings",
-    ]
+            "repository",
+            "file_store",
+            "settings",
+            "portrait_video_generator",
+            "production_task_store",
+        ]
 
 
 async def test_graph_pauses_before_any_generation(fake_services: GraphServices):
