@@ -32,6 +32,7 @@ _AUDIT_SYSTEM_PROMPT = """你是独立审查员，与需求规划角色相互独
 只指出计划中的遗漏、冲突、虚构内容和供应商限制，不得改写计划或生成替代任务。
 严格输出 AuditReport JSON，不要输出思维过程、推理原文、Markdown 或额外说明。
 """
+_STRUCTURED_OUTPUT_ATTEMPTS = 3
 
 
 def _compact_json(value: Any) -> str:
@@ -571,7 +572,7 @@ class DeepSeekPlanner:
     ) -> Any:
         repair_message: dict[str, str] | None = None
         last_errors: list[str] = []
-        for attempt in range(2):
+        for attempt in range(_STRUCTURED_OUTPUT_ATTEMPTS):
             request_messages = list(messages)
             if repair_message is not None:
                 request_messages.append(repair_message)
@@ -594,7 +595,7 @@ class DeepSeekPlanner:
             if parsed is not None:
                 return parsed
 
-            if attempt == 0:
+            if attempt + 1 < _STRUCTURED_OUTPUT_ATTEMPTS:
                 repair_message = {
                     "role": "user",
                     "content": self._repair_prompt(raw_content, last_errors),
@@ -731,12 +732,13 @@ class DeepSeekPlanner:
             ErrorDetail(
                 category=ErrorCategory.VALIDATION,
                 message=(
-                    "模型两次返回的 JSON 均未通过校验"
+                    "模型三次返回的 JSON 均未通过校验"
                     f"（document_id={document_id}）"
                 ),
                 technical_detail=(
                     f"document_id={document_id}; operation={operation}; "
-                    f"attempts=2; error_count={error_count}"
+                    f"attempts={_STRUCTURED_OUTPUT_ATTEMPTS}; "
+                    f"error_count={error_count}"
                 ),
                 retryable=False,
             )

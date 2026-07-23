@@ -605,13 +605,15 @@ async def test_second_invalid_response_raises_safe_error_without_third_call(
     narrative_document: NormalizedDocument,
     vision_descriptions: list[VisionDescription],
 ):
-    model = FakeDeepSeekModel(["not-json-first", "not-json-second"])
+    model = FakeDeepSeekModel(
+        ["not-json-first", "not-json-second", "not-json-third"]
+    )
     planner = DeepSeekPlanner(model, max_output_count=4)
 
     with pytest.raises(AgentError) as raised:
         await planner.plan(narrative_document, vision_descriptions)
 
-    assert model.calls == 2
+    assert model.calls == 3
     detail = raised.value.detail
     serialized = json.dumps(detail.model_dump(mode="json"))
     assert detail.category == ErrorCategory.VALIDATION
@@ -649,10 +651,13 @@ async def test_two_non_string_task_types_raise_safe_validation_error(
     first["tasks"][0]["task_type"] = []
     second = json.loads(_plan_json(_video_task()))
     second["tasks"][0]["task_type"] = {}
+    third = json.loads(_plan_json(_video_task()))
+    third["tasks"][0]["task_type"] = None
     model = FakeDeepSeekModel(
         [
             json.dumps(first, ensure_ascii=False),
             json.dumps(second, ensure_ascii=False),
+            json.dumps(third, ensure_ascii=False),
         ]
     )
     planner = DeepSeekPlanner(model, max_output_count=4)
@@ -660,7 +665,7 @@ async def test_two_non_string_task_types_raise_safe_validation_error(
     with pytest.raises(AgentError) as raised:
         await planner.plan(narrative_document, vision_descriptions)
 
-    assert model.calls == 2
+    assert model.calls == 3
     detail = raised.value.detail
     serialized = json.dumps(detail.model_dump(mode="json"))
     assert detail.category == ErrorCategory.VALIDATION
@@ -689,13 +694,13 @@ async def test_two_empty_plans_raise_safe_validation_error(
     narrative_document: NormalizedDocument,
     vision_descriptions: list[VisionDescription],
 ):
-    model = FakeDeepSeekModel([_plan_json(), _plan_json()])
+    model = FakeDeepSeekModel([_plan_json(), _plan_json(), _plan_json()])
     planner = DeepSeekPlanner(model, max_output_count=4)
 
     with pytest.raises(AgentError) as raised:
         await planner.plan(narrative_document, vision_descriptions)
 
-    assert model.calls == 2
+    assert model.calls == 3
     detail = raised.value.detail
     serialized = json.dumps(detail.model_dump(mode="json"))
     assert detail.category == ErrorCategory.VALIDATION

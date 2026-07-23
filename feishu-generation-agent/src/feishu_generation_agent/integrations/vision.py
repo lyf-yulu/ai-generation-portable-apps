@@ -214,7 +214,19 @@ class ClaudeVisionAnalyzer:
                 validation_error = exc
         if description is None:
             if validation_error is not None:
-                raise validation_error
+                return VisionDescription(
+                    asset_id="",
+                    subjects=[],
+                    scene="未能稳定解析参考素材，需结合需求文本使用原图",
+                    style="未确认",
+                    composition="未确认",
+                    characters=[],
+                    actions=[],
+                    visible_text=[],
+                    colors=[],
+                    probable_role="视觉参考素材",
+                    uncertainties=["视觉模型连续返回不完整结构，未对画面内容作猜测"],
+                )
             raise _ModelRefusal
         await self._repository.save_vision_cache(cache_key, description)
         return description

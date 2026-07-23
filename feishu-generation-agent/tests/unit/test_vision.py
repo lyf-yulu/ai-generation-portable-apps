@@ -364,7 +364,7 @@ async def test_cache_connection_error_is_retryable_and_safe(
     assert model.calls == 0
 
 
-async def test_missing_structured_fields_are_non_retryable_validation_errors(
+async def test_persistently_invalid_structure_uses_conservative_fallback(
     repository: Repository,
     webp_asset: MediaAsset,
 ):
@@ -373,13 +373,13 @@ async def test_missing_structured_fields_are_non_retryable_validation_errors(
     model = FakeVisionModel(result)
     analyzer = ClaudeVisionAnalyzer(model, repository, prompt_version="vision-v1")
 
-    with pytest.raises(AgentError) as raised:
-        await analyzer.analyze(webp_asset)
+    result = await analyzer.analyze(webp_asset)
 
-    detail = raised.value.detail
-    assert detail.category == ErrorCategory.VALIDATION
-    assert detail.retryable is False
-    assert webp_asset.asset_id in f"{detail.message} {detail.technical_detail}"
+    assert result.asset_id == webp_asset.asset_id
+    assert result.subjects == []
+    assert result.visible_text == []
+    assert result.uncertainties
+    assert model.calls == 3
     assert webp_asset.local_path.exists()
 
 
