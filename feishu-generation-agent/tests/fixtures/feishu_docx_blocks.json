@@ -4,7 +4,7 @@
     {
       "block_id": "fiction-page",
       "block_type": 1,
-      "children": ["fiction-paragraph", "fiction-image"],
+      "children": ["fiction-paragraph", "fiction-sheet", "fiction-image"],
       "page": {
         "elements": [
           {"text_run": {"content": "虚构产品需求"}}
@@ -19,6 +19,14 @@
         "elements": [
           {"text_run": {"content": "制作一张虚构的蓝色纸船插画。"}}
         ]
+      }
+    },
+    {
+      "block_id": "fiction-sheet",
+      "parent_id": "fiction-page",
+      "block_type": 30,
+      "sheet": {
+        "token": "C7tUs3k3fhoiybtWxzvcqN7Nn3b_NuBUx5"
       }
     },
     {

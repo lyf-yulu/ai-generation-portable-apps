@@ -1,11 +1,14 @@
 import asyncio
 import base64
+import hashlib
+from io import BytesIO
 import json
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+from PIL import Image
 
 from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain.document import RequirementRequest, SourceType
@@ -14,6 +17,12 @@ from feishu_generation_agent.integrations.feishu_client import FeishuClient
 from feishu_generation_agent.integrations.feishu_source import (
     FeishuDocumentSource,
     parse_feishu_url,
+)
+from feishu_generation_agent.integrations.feishu_sheet_export import (
+    EmbeddedSheetRef,
+    ExtractedSheet,
+    ExtractedSheetImage,
+    SheetImageAnchor,
 )
 from feishu_generation_agent.storage.files import FileStore
 
@@ -77,6 +86,56 @@ class FakeFeishuClient:
         if self.download_error is not None:
             raise self.download_error
         return self.media, "image/png"
+
+
+class FakeFeishuSheetExporter:
+    def __init__(
+        self,
+        extracted: ExtractedSheet | None = None,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.extracted = extracted
+        self.error = error
+        self.refs: list[EmbeddedSheetRef] = []
+
+    async def export(self, ref: EmbeddedSheetRef) -> ExtractedSheet:
+        self.refs.append(ref)
+        if self.error is not None:
+            raise self.error
+        assert self.extracted is not None
+        return self.extracted
+
+
+def _png_bytes(color: str) -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (2, 3), color).save(output, format="PNG")
+    return output.getvalue()
+
+
+def _sheet_image(
+    content: bytes,
+    *,
+    media_name: str,
+    anchors: tuple[tuple[str, int, int], ...],
+) -> ExtractedSheetImage:
+    digest = hashlib.sha256(content).hexdigest()
+    return ExtractedSheetImage(
+        media_name=media_name,
+        content=content,
+        sha256=digest,
+        anchors=tuple(
+            SheetImageAnchor(
+                row=row,
+                column=column,
+                media_name=media_name,
+                sha256=digest,
+                worksheet_name=worksheet_name,
+                source_sheet_id="NuBUx5",
+            )
+            for worksheet_name, row, column in anchors
+        ),
+    )
 
 
 @pytest.fixture
@@ -492,15 +551,193 @@ async def test_ingest_docx_preserves_hierarchy_and_stable_references(
     assert [block.block_id for block in document.blocks] == [
         "fiction-page",
         "fiction-paragraph",
+        "fiction-sheet",
         "fiction-image",
     ]
     assert document.blocks[1].path == ["fiction-page", "fiction-paragraph"]
     assert "[block:fiction-paragraph]" in document.text_view
     assert "[image:image-1]" in document.text_view
-    assert document.blocks[2].image_asset_id == "image-1"
+    assert document.blocks[3].image_asset_id == "image-1"
     assert document.media_assets[0].local_path.parts[-3:-1] == (
         "doccn123",
         "inputs",
+    )
+
+
+async def test_ingest_merges_full_embedded_workbook_at_sheet_block_order(
+    file_store: FileStore,
+):
+    fixture = _fixture("feishu_docx_blocks.json")
+    normal_image = base64.b64decode(fixture["media_base64"])
+    hero = _png_bytes("blue")
+    reference = _png_bytes("red")
+    exporter = FakeFeishuSheetExporter(
+        ExtractedSheet(
+            text_lines=(
+                "[sheet:NuBUx5 worksheet:分镜 cell:B2] 镜头一",
+                "[sheet:NuBUx5 worksheet:角色 cell:C4] 人物保持一致",
+            ),
+            images=(
+                _sheet_image(
+                    hero,
+                    media_name="hero.png",
+                    anchors=(("分镜", 1, 2), ("角色", 7, 4)),
+                ),
+                _sheet_image(
+                    reference,
+                    media_name="reference.png",
+                    anchors=(("角色", 9, 6),),
+                ),
+            ),
+        )
+    )
+    source = FeishuDocumentSource(
+        FakeFeishuClient(fixture["items"], normal_image),
+        file_store,
+        sheet_exporter=exporter,
+    )
+
+    first = await source.ingest(
+        RequirementRequest(source_url="https://fiction.feishu.cn/docx/doccn123")
+    )
+    second = await source.ingest(
+        RequirementRequest(source_url="https://fiction.feishu.cn/docx/doccn123")
+    )
+
+    sheet_block = next(
+        block for block in first.blocks if block.block_id == "fiction-sheet"
+    )
+    assert sheet_block.block_type == "sheet"
+    assert "[sheet:NuBUx5 worksheet:角色 cell:C4]" in sheet_block.text
+    assert first.text_view.index("cell:B2") < first.text_view.index(
+        "[image:image-1]"
+    )
+    assert "worksheet:分镜 anchor:R2C3" in first.text_view
+    assert "worksheet:角色 anchor:R8C5" in first.text_view
+    assert "worksheet:角色 anchor:R10C7" in first.text_view
+    assert exporter.refs == [
+        EmbeddedSheetRef(
+            spreadsheet_token="C7tUs3k3fhoiybtWxzvcqN7Nn3b",
+            sheet_id="NuBUx5",
+        ),
+        EmbeddedSheetRef(
+            spreadsheet_token="C7tUs3k3fhoiybtWxzvcqN7Nn3b",
+            sheet_id="NuBUx5",
+        ),
+    ]
+
+    sheet_assets = [
+        asset
+        for asset in first.media_assets
+        if asset.origin == "feishu_embedded_sheet"
+    ]
+    assert len(sheet_assets) == 2
+    assert all(
+        asset.source_block_id == "fiction-sheet" for asset in sheet_assets
+    )
+    assert all(asset.download_error is None for asset in sheet_assets)
+    metadata = [
+        (asset.mime_type, asset.size, asset.width, asset.height)
+        for asset in sheet_assets
+    ]
+    assert metadata == [
+        ("image/png", len(hero), 2, 3),
+        ("image/png", len(reference), 2, 3),
+    ]
+    assert [asset.asset_id for asset in sheet_assets] == [
+        asset.asset_id
+        for asset in second.media_assets
+        if asset.origin == "feishu_embedded_sheet"
+    ]
+    assert all("doccn123" in asset.asset_id for asset in sheet_assets)
+    assert all("NuBUx5" in asset.asset_id for asset in sheet_assets)
+    assert "-r1-c2-" in sheet_assets[0].asset_id
+    assert sheet_assets[0].asset_id.endswith(
+        hashlib.sha256(hero).hexdigest()
+    )
+    assert hero.hex() not in first.text_view
+    assert len(first.media_assets) == 3
+    assert first.media_assets[-1].origin == "feishu"
+
+
+async def test_embedded_sheet_export_failure_is_a_blocking_ingest_issue(
+    file_store: FileStore,
+):
+    fixture = _fixture("feishu_docx_blocks.json")
+    exporter = FakeFeishuSheetExporter(
+        error=RuntimeError("fictional export failure")
+    )
+    source = FeishuDocumentSource(
+        FakeFeishuClient(
+            fixture["items"], base64.b64decode(fixture["media_base64"])
+        ),
+        file_store,
+        sheet_exporter=exporter,
+    )
+
+    document = await source.ingest(
+        RequirementRequest(source_url="https://fiction.feishu.cn/docx/doccn123")
+    )
+
+    assert any(
+        "阻塞" in issue
+        and "fiction-sheet" in issue
+        and "NuBUx5" in issue
+        and "fictional export failure" in issue
+        for issue in document.ingest_issues
+    )
+    assert any(block.block_type == "sheet" for block in document.blocks)
+    assert len(document.media_assets) == 1
+
+
+async def test_malformed_sheet_image_keeps_others_and_reports_issue(
+    file_store: FileStore,
+):
+    fixture = _fixture("feishu_docx_blocks.json")
+    valid = _png_bytes("green")
+    exporter = FakeFeishuSheetExporter(
+        ExtractedSheet(
+            text_lines=(),
+            images=(
+                _sheet_image(
+                    b"not-an-image",
+                    media_name="broken.bin",
+                    anchors=(("分镜", 0, 0),),
+                ),
+                _sheet_image(
+                    valid,
+                    media_name="valid.png",
+                    anchors=(("分镜", 2, 3),),
+                ),
+            ),
+        )
+    )
+    source = FeishuDocumentSource(
+        FakeFeishuClient(
+            fixture["items"], base64.b64decode(fixture["media_base64"])
+        ),
+        file_store,
+        sheet_exporter=exporter,
+    )
+
+    document = await source.ingest(
+        RequirementRequest(source_url="https://fiction.feishu.cn/docx/doccn123")
+    )
+
+    sheet_assets = [
+        asset
+        for asset in document.media_assets
+        if asset.origin == "feishu_embedded_sheet"
+    ]
+    assert len(sheet_assets) == 2
+    assert sheet_assets[0].download_error is not None
+    assert sheet_assets[1].download_error is None
+    assert sheet_assets[1].local_path.is_file()
+    assert any(
+        "阻塞" in issue
+        and "fiction-sheet" in issue
+        and sheet_assets[0].asset_id in issue
+        for issue in document.ingest_issues
     )
 
 

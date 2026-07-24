@@ -10,10 +10,17 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.types import Command
 from pydantic import ValidationError
 
-from feishu_generation_agent.domain.errors import AgentError, ErrorCategory
-from feishu_generation_agent.domain.document import PlanningPromptSnapshot
+from feishu_generation_agent.domain.errors import (
+    AgentError,
+    ErrorCategory,
+    ErrorDetail,
+)
+from feishu_generation_agent.domain.document import (
+    PlanningPromptSnapshot,
+    VisionDescription,
+)
 from feishu_generation_agent.graph.builder import build_graph
-from feishu_generation_agent.graph.nodes import GraphServices
+from feishu_generation_agent.graph.nodes import GraphServices, analyze_images
 from feishu_generation_agent.graph.state import AgentState
 from feishu_generation_agent.integrations.planner import DeepSeekPlanner
 from feishu_generation_agent.storage.checkpoints import open_checkpointer
@@ -75,6 +82,37 @@ class _NeverCalledVisionAnalyzer:
         del asset
         self.calls += 1
         raise AssertionError("resume must not analyze images again")
+
+
+class _PartiallyFailingVisionAnalyzer:
+    def __init__(self, failed_asset_id: str) -> None:
+        self.failed_asset_id = failed_asset_id
+        self.calls: list[str] = []
+
+    async def analyze(self, asset: Any) -> VisionDescription:
+        self.calls.append(asset.asset_id)
+        if asset.asset_id == self.failed_asset_id:
+            raise AgentError(
+                ErrorDetail(
+                    category=ErrorCategory.DOCUMENT,
+                    message="该图片无法识别",
+                    technical_detail="fictional-secret-image-detail",
+                    retryable=False,
+                )
+            )
+        return VisionDescription(
+            asset_id=asset.asset_id,
+            subjects=["虚构纸船"],
+            scene="虚构河面",
+            style="插画",
+            composition="居中",
+            characters=[],
+            actions=[],
+            visible_text=[],
+            colors=["蓝色"],
+            probable_role="参考图",
+            uncertainties=[],
+        )
 
 
 class _NeverCalledPlanner:
@@ -207,6 +245,41 @@ def _assert_no_paid_side_effects(services: GraphServices) -> None:
         assert services.portrait_video_generator.submit_calls == 0
         assert services.portrait_video_generator.poll_calls == 0
     assert services.delivery_writer.deliver_calls == 0
+
+
+async def test_image_analysis_keeps_other_assets_and_reports_single_failure(
+    fake_services: GraphServices,
+) -> None:
+    document = fake_services.document_source.document
+    first = document.media_assets[0].model_copy(
+        update={"asset_id": "sheet-failed"}
+    )
+    second = document.media_assets[0].model_copy(
+        update={"asset_id": "sheet-success"}
+    )
+    document = document.model_copy(update={"media_assets": [first, second]})
+    analyzer = _PartiallyFailingVisionAnalyzer("sheet-failed")
+    services = replace(fake_services, vision_analyzer=analyzer)
+    state: AgentState = {
+        "run_id": "run-partial-vision",
+        "thread_id": "thread-partial-vision",
+        "normalized_document": document.model_dump(mode="json"),
+    }
+
+    result = await analyze_images(
+        state,
+        _config("thread-partial-vision"),
+        services=services,
+    )
+
+    assert analyzer.calls == ["sheet-failed", "sheet-success"]
+    assert [
+        item["asset_id"] for item in result["vision_descriptions"]
+    ] == ["sheet-success"]
+    assert len(result["vision_issues"]) == 1
+    assert "sheet-failed" in result["vision_issues"][0]
+    assert "该图片无法识别" in result["vision_issues"][0]
+    assert "fictional-secret-image-detail" not in result["vision_issues"][0]
 
 
 def test_agent_state_and_graph_services_contracts_are_stable():

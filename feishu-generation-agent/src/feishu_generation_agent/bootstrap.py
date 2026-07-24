@@ -28,6 +28,9 @@ from feishu_generation_agent.integrations.feishu_delivery import (
 from feishu_generation_agent.integrations.feishu_source import (
     FeishuDocumentSource,
 )
+from feishu_generation_agent.integrations.feishu_sheet_export import (
+    FeishuSheetExporter,
+)
 from feishu_generation_agent.integrations.planner import DeepSeekPlanner
 from feishu_generation_agent.integrations.routing_delivery import RoutingDeliveryWriter
 from feishu_generation_agent.integrations.production_bitable import ProductionBitableClient
@@ -353,7 +356,11 @@ async def _open_application_services(
             bitable_factory = production_factory
         assert delivery_writer is not None
         services = GraphServices(
-            document_source=FeishuDocumentSource(feishu, file_store),
+            document_source=FeishuDocumentSource(
+                feishu,
+                file_store,
+                sheet_exporter=FeishuSheetExporter(feishu),
+            ),
             vision_analyzer=ClaudeVisionAnalyzer(
                 vision_model,
                 repository,

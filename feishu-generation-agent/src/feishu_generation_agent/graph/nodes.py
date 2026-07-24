@@ -338,15 +338,27 @@ async def analyze_images(
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
-        descriptions = [
-            await services.vision_analyzer.analyze(asset)
-            for asset in document.media_assets
-        ]
+        descriptions: list[VisionDescription] = []
+        issues: list[str] = []
+        for asset in document.media_assets:
+            try:
+                descriptions.append(
+                    await services.vision_analyzer.analyze(asset)
+                )
+            except Exception as exc:
+                reason = (
+                    exc.detail.message
+                    if isinstance(exc, AgentError)
+                    else "图片无法完成视觉分析"
+                )
+                issues.append(
+                    f"素材 {asset.asset_id} 视觉分析失败：{reason}"
+                )
         return {
             "vision_descriptions": [
                 _json_model(description) for description in descriptions
             ],
-            "vision_issues": [],
+            "vision_issues": issues,
         }
 
     return await _run_node(state, "analyze_images", services, operation)
