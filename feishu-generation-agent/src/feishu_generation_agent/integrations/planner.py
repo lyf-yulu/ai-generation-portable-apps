@@ -25,6 +25,7 @@ _STORYBOARD_ROW_MARKER = re.compile(
 _STORYBOARD_HEADER = re.compile(r"^\s*(?:镜头|镜号|镜头号)\s*[：:]?\s*$")
 _STORYBOARD_ROW_NUMBER = re.compile(r"^\s*([0-9]{1,3})\s*[、.．]?\s*$")
 _CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+_CJK_ISSUE_SUFFIX = "必须包含中文主体说明"
 _PLAN_SYSTEM_PROMPT = """你是 AI 图片与视频生成需求规划器。
 只根据给定文档、稳定引用和视觉描述输出 TaskPlan JSON，不得虚构素材或需求。
 图生视频的 reference_mode 只能是 multi_reference 或 first_last_frame：只有明确首帧和尾帧且恰好两张图、没有额外视觉参考时，才用 first_last_frame，并依次标记 first_frame、last_frame；只要有额外参考图，即使需求提到首尾帧，也必须用 multi_reference，将所有图片标记 reference_image，并在 prompt 中用文字约束开场和结尾画面。
@@ -53,6 +54,17 @@ def planner_system_prompt() -> str:
 
 def _contains_cjk(value: str) -> bool:
     return bool(_CJK.search(value))
+
+
+def language_validation_message(issues: list[str]) -> str | None:
+    fields = [
+        issue.partition(":")[0]
+        for issue in issues
+        if _CJK_ISSUE_SUFFIX in issue
+    ]
+    if not fields:
+        return None
+    return f"以下字段{_CJK_ISSUE_SUFFIX}：{'、'.join(dict.fromkeys(fields))}"
 
 
 def _compact_json(value: Any) -> str:
@@ -195,13 +207,8 @@ def validate_plan(
     plan: TaskPlan | dict[str, Any],
     document: NormalizedDocument,
     max_output_count: int,
-    *,
-    require_chinese_task_fields: bool | None = None,
 ) -> list[str]:
     payload: Any
-    is_structured_output = isinstance(plan, dict)
-    if require_chinese_task_fields is None:
-        require_chinese_task_fields = is_structured_output
     if isinstance(plan, TaskPlan):
         payload = plan.model_dump(mode="json")
     else:
@@ -211,12 +218,10 @@ def validate_plan(
     if not isinstance(payload, dict):
         return ["plan: must be a JSON object"]
     document_summary = payload.get("document_summary")
-    if (
-        is_structured_output
-        and isinstance(document_summary, str)
-        and not _contains_cjk(document_summary)
+    if not isinstance(document_summary, str) or not _contains_cjk(
+        document_summary
     ):
-        issues.append("plan.document_summary: 必须包含中文主体说明")
+        issues.append(f"plan.document_summary: {_CJK_ISSUE_SUFFIX}")
     tasks = payload.get("tasks")
     if not isinstance(tasks, list):
         return ["plan.tasks: must be a list"]
@@ -245,13 +250,10 @@ def validate_plan(
         else:
             task_ids.add(task_id)
 
-        if require_chinese_task_fields:
-            for field_name in ("user_intent", "prompt"):
-                value = task.get(field_name)
-                if isinstance(value, str) and not _contains_cjk(value):
-                    issues.append(
-                        f"{prefix}.{field_name}: 必须包含中文主体说明"
-                    )
+        for field_name in ("user_intent", "prompt"):
+            value = task.get(field_name)
+            if not isinstance(value, str) or not _contains_cjk(value):
+                issues.append(f"{prefix}.{field_name}: {_CJK_ISSUE_SUFFIX}")
 
         task_type = task.get("task_type")
         if (
@@ -715,7 +717,7 @@ class DeepSeekPlanner:
         instructions = [
             "仅返回修复后的 JSON 对象，不要解释或输出推理过程。",
         ]
-        if any("必须包含中文主体说明" in error for error in errors):
+        if language_validation_message(errors) is not None:
             instructions.insert(
                 0,
                 (
@@ -790,11 +792,10 @@ class DeepSeekPlanner:
         operation: str,
         errors: list[str],
     ) -> AgentError:
-        language_failure = any(
-            "必须包含中文主体说明" in error for error in errors
-        )
+        language_failure = language_validation_message(errors)
         message_prefix = (
-            "模型三次返回的 JSON 均未通过中文规划校验"
+            "模型三次返回的 JSON 均未通过中文规划校验："
+            f"{language_failure}"
             if language_failure
             else "模型三次返回的 JSON 均未通过校验"
         )

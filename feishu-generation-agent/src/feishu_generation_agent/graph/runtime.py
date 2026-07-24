@@ -441,6 +441,15 @@ class GraphRuntime:
             await self.repository.update_run_status(run_id, status)
         except asyncio.CancelledError:
             raise
+        except AgentError as exc:
+            await self._record_last_error(run_id, thread_id, exc)
+            await self.repository.append_event(
+                run_id,
+                "runtime",
+                "failed",
+                "Workflow background execution failed",
+            )
+            await self.repository.update_run_status(run_id, "failed")
         except Exception:
             await self.repository.append_event(
                 run_id,
@@ -548,6 +557,7 @@ class GraphRuntime:
                 for artifact in artifacts
             ],
             "delivery": state.get("delivery_record"),
+            "last_error": state.get("last_error"),
             "privacy": {
                 "langsmith_tracing": self.settings.langsmith_tracing,
             },
@@ -604,6 +614,7 @@ class GraphRuntime:
                     config=self._config(run["thread_id"]),
                 )
             except AgentError as exc:
+                await self._record_last_error(run_id, run["thread_id"], exc)
                 await self.repository.update_run_status(run_id, "failed")
                 raise RunValidationError(exc.detail.message) from None
             except Exception:
@@ -621,6 +632,19 @@ class GraphRuntime:
                 else self._safe_status(result.get("status"), "completed")
             )
             await self.repository.update_run_status(run_id, status)
+
+    async def _record_last_error(
+        self,
+        run_id: str,
+        thread_id: str,
+        exc: AgentError,
+    ) -> None:
+        del run_id
+        await self._graph_aupdate_state(
+            self._config(thread_id),
+            {"last_error": exc.detail.model_dump(mode="json")},
+            as_node="revalidate_approval",
+        )
 
     async def add_reference(
         self,

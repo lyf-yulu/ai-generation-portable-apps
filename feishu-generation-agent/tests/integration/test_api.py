@@ -22,6 +22,11 @@ from feishu_generation_agent.domain.document import (
     RequirementRequest,
     build_planning_prompt_snapshot,
 )
+from feishu_generation_agent.domain.errors import (
+    AgentError,
+    ErrorCategory,
+    ErrorDetail,
+)
 from feishu_generation_agent.graph.builder import build_graph
 from feishu_generation_agent.graph.nodes import GraphServices
 from feishu_generation_agent.graph.runtime import (
@@ -83,6 +88,7 @@ class FakeApprovalGraph:
         self.states: dict[str, dict[str, Any]] = {}
         self.resume_calls = 0
         self.fail_initial = False
+        self.resume_error: AgentError | None = None
         self.resume_started = asyncio.Event()
         self.resume_release: asyncio.Event | None = None
 
@@ -183,6 +189,8 @@ class FakeApprovalGraph:
         self.resume_started.set()
         if self.resume_release is not None:
             await self.resume_release.wait()
+        if self.resume_error is not None:
+            raise self.resume_error
         decision = value.resume
         if decision["action"] == "cancel":
             state.update(status="cancelled", approval_decision=decision)
@@ -498,6 +506,42 @@ async def _wait_for_status(
             return response.json()
         await asyncio.sleep(0.01)
     raise AssertionError(f"run did not reach {expected}")
+
+
+async def test_run_view_exposes_safe_chinese_validation_field_paths(
+    tmp_path: Path,
+) -> None:
+    raw_prompt = "English prompt that must not be exposed"
+    message = "以下字段必须包含中文主体说明：tasks[0].prompt"
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime, repository
+        created = await client.post(
+            "/api/runs",
+            json={"source_url": "https://tenant.feishu.cn/docx/chinese"},
+        )
+        run_id = created.json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        graph.resume_error = AgentError(
+            ErrorDetail(
+                category=ErrorCategory.VALIDATION,
+                message=message,
+                technical_detail="safe validation error",
+                retryable=False,
+            )
+        )
+
+        response = await client.post(
+            f"/api/runs/{run_id}/decision",
+            json={"action": "approve", "selected_task_ids": ["task-1"]},
+        )
+        view = await client.get(f"/api/runs/{run_id}")
+
+    assert response.status_code == 422
+    assert "tasks[0].prompt" in response.text
+    assert raw_prompt not in response.text
+    assert view.status_code == 200
+    assert view.json()["last_error"]["message"] == message
+    assert raw_prompt not in view.text
 
 
 async def test_run_and_reference_routes_hide_user_a_run_from_user_b(

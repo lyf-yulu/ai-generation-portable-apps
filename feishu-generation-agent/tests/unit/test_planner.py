@@ -917,6 +917,37 @@ def test_validator_rejects_english_only_required_planning_fields(
     assert any(expected_issue in issue and "中文" in issue for issue in issues)
 
 
+@pytest.mark.parametrize("summary", [None, "", "English summary only"])
+def test_validator_requires_cjk_document_summary_for_raw_json(
+    narrative_document: NormalizedDocument,
+    summary: str | None,
+):
+    raw_plan = json.loads(_plan_json(_video_task()))
+    if summary is None:
+        raw_plan.pop("document_summary")
+    else:
+        raw_plan["document_summary"] = summary
+
+    issues = validate_plan(raw_plan, narrative_document, 4)
+
+    assert "plan.document_summary: 必须包含中文主体说明" in issues
+
+
+def test_validator_requires_cjk_document_summary_for_task_plan(
+    narrative_document: NormalizedDocument,
+):
+    typed_plan = TaskPlan.model_validate(
+        {
+            "tasks": [_video_task()],
+            "document_summary": "English summary only",
+        }
+    )
+
+    issues = validate_plan(typed_plan, narrative_document, 4)
+
+    assert "plan.document_summary: 必须包含中文主体说明" in issues
+
+
 def test_validator_accepts_chinese_prompt_with_requested_english_dialogue_brand_and_ui(
     narrative_document: NormalizedDocument,
 ):

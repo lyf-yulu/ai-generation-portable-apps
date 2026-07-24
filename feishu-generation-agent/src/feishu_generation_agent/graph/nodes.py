@@ -40,6 +40,7 @@ from feishu_generation_agent.domain.artifact import (
     ProviderSubmission,
 )
 from feishu_generation_agent.integrations.planner import (
+    language_validation_message,
     planner_system_prompt,
     validate_plan,
 )
@@ -116,7 +117,9 @@ def _safe_error(exc: BaseException) -> AgentError:
         if category is ErrorCategory.VALIDATION:
             message = (
                 exc.detail.message
-                if exc.detail.message.startswith("模型三次返回的 JSON 均未通过")
+                if exc.detail.message.startswith(
+                    ("模型三次返回的 JSON 均未通过", "以下字段必须包含中文主体说明")
+                )
                 else "The request is invalid"
             )
         else:
@@ -602,11 +605,13 @@ async def revalidate_approval(
                 selected_plan,
                 document,
                 max_output_count=services.settings.max_output_count,
-                require_chinese_task_fields=True,
             )
         )
         if issues:
-            raise _validation_error("The approved plan is not valid")
+            raise _validation_error(
+                language_validation_message(issues)
+                or "The approved plan is not valid"
+            )
         return {"validation_issues": [], "status": "approved"}
 
     return await _run_node(
@@ -1338,10 +1343,12 @@ async def execute_selected_tasks(
             plan,
             document,
             max_output_count=services.settings.max_output_count,
-            require_chinese_task_fields=True,
         )
         if issues:
-            raise _validation_error("The approved plan is not valid")
+            raise _validation_error(
+                language_validation_message(issues)
+                or "The approved plan is not valid"
+            )
         task_assets = [(task, _task_assets(task, document)) for task in plan.tasks]
 
         records: list[ExecutionRecord] = []

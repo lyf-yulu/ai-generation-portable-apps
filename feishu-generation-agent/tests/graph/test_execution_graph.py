@@ -421,7 +421,7 @@ class _TwoTaskPlanner:
         exact_system_prompt=None,
     ):
         del document, descriptions, feedback, exact_system_prompt
-        return TaskPlan(tasks=self.tasks, document_summary="two selectable tasks")
+        return TaskPlan(tasks=self.tasks, document_summary="两个可选择任务")
 
     async def audit(self, document, plan):
         del document, plan
@@ -852,7 +852,7 @@ async def test_tasks_execute_serially_and_later_task_survives_partial_failure(
     state["approved_tasks"] = [image_task, video_task]
     state["draft_plan"] = {
         "tasks": [image_task, video_task],
-        "document_summary": "two serial tasks",
+        "document_summary": "两个串行任务",
     }
     call_order: list[str] = []
     image = _ScriptedGenerator(
@@ -1414,7 +1414,7 @@ async def test_chiyun_local_result_materializes_with_single_client_id(
     state["approved_tasks"] = [image_task]
     state["draft_plan"] = {
         "tasks": [image_task],
-        "document_summary": "image task",
+        "document_summary": "图片任务",
     }
 
     result = await execute_selected_tasks(state, config, services=services)
@@ -1447,7 +1447,7 @@ async def test_chiyun_submitted_staging_tamper_fails_without_resubmit(
     state["approved_tasks"] = [image_task]
     state["draft_plan"] = {
         "tasks": [image_task],
-        "document_summary": "image recovery",
+        "document_summary": "图片恢复任务",
     }
     client_id = "5" * 32
     provider_store = ProviderResultStore(
@@ -1560,7 +1560,7 @@ async def test_chiyun_mismatched_official_id_becomes_uncertain(
     state["approved_tasks"] = [image_task]
     state["draft_plan"] = {
         "tasks": [image_task],
-        "document_summary": "identity mismatch",
+        "document_summary": "身份不匹配",
     }
 
     result = await execute_selected_tasks(state, config, services=services)

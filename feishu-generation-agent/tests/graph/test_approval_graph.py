@@ -164,6 +164,16 @@ class _StructuredOutputModel:
         return SimpleNamespace(content=self.responses.pop(0))
 
 
+class _PortraitGeneratorProbe:
+    def __init__(self) -> None:
+        self.submit_calls = 0
+        self.poll_calls = 0
+
+    def for_run(self, run_id: str) -> "_PortraitGeneratorProbe":
+        del run_id
+        return self
+
+
 def _input(
     run_id: str,
     thread_id: str,
@@ -193,6 +203,9 @@ def _assert_no_paid_side_effects(services: GraphServices) -> None:
     assert services.image_generator.poll_calls == 0
     assert services.video_generator.submit_calls == 0
     assert services.video_generator.poll_calls == 0
+    if services.portrait_video_generator is not None:
+        assert services.portrait_video_generator.submit_calls == 0
+        assert services.portrait_video_generator.poll_calls == 0
     assert services.delivery_writer.deliver_calls == 0
 
 
@@ -485,6 +498,7 @@ async def test_three_english_only_plans_fail_before_any_paid_generator_call(
     services = replace(
         fake_services,
         planner=DeepSeekPlanner(model, max_output_count=4),
+        portrait_video_generator=_PortraitGeneratorProbe(),
     )
     graph = build_graph(services, InMemorySaver())
 
@@ -497,6 +511,9 @@ async def test_three_english_only_plans_fail_before_any_paid_generator_call(
     assert model.calls == 3
     assert raised.value.detail.category == ErrorCategory.VALIDATION
     assert "中文" in raised.value.detail.message
+    assert "plan.document_summary" in raised.value.detail.message
+    assert "tasks[0].user_intent" in raised.value.detail.message
+    assert "Generate a paper boat video" not in raised.value.detail.message
     _assert_no_paid_side_effects(services)
     assert await services.repository.count_operations() == 0
 
@@ -529,6 +546,9 @@ async def test_approval_edit_with_english_only_prompt_fails_before_generator(
         )
 
     assert raised.value.detail.category == ErrorCategory.VALIDATION
+    assert "tasks[0].user_intent" in raised.value.detail.message
+    assert "tasks[0].prompt" in raised.value.detail.message
+    assert "Generate a paper boat video" not in raised.value.detail.message
     _assert_no_paid_side_effects(fake_services)
     assert await fake_services.repository.count_operations() == 0
 
