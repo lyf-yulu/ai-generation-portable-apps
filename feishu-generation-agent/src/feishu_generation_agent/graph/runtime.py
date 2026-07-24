@@ -215,6 +215,7 @@ class GraphRuntime:
                 approval_decision=None,
                 approval_revision=None,
                 approved_tasks=deepcopy(approved_tasks),
+                approved_plan=None,
                 execution_records=[],
                 artifacts=[],
                 delivery_record=None,
@@ -894,7 +895,7 @@ class GraphRuntime:
             self._validate_references(
                 updated.task_type.value,
                 updated.reference_images,
-                {asset.asset_id: asset.mime_type for asset in assets},
+                {asset.asset_id: asset for asset in assets},
                 updated.reference_mode,
             )
             return updated
@@ -947,6 +948,7 @@ class GraphRuntime:
             "draft_revision": revision + 1,
             "approval_decision": None,
             "approved_tasks": [],
+            "approved_plan": None,
             "validation_issues": validation_issues,
             "status": "waiting_approval",
         }
@@ -994,16 +996,13 @@ class GraphRuntime:
             original_ids = {task.task_id for task in original.tasks}
             if any(task.task_id not in original_ids for task in candidate.tasks):
                 raise ValueError("编辑结果包含未知任务")
-            assets = {
-                item["asset_id"]: item["mime_type"]
-                for item in state.get("media_assets", [])
-                if (
-                    isinstance(item, dict)
-                    and isinstance(item.get("asset_id"), str)
-                    and isinstance(item.get("mime_type"), str)
-                    and item.get("download_error") is None
-                )
-            }
+            assets: dict[str, MediaAsset] = {}
+            for item in state.get("media_assets", []):
+                try:
+                    asset = MediaAsset.model_validate(item)
+                except Exception:
+                    continue
+                assets[asset.asset_id] = asset
             for task in candidate.tasks:
                 self._validate_references(
                     task.task_type.value,
@@ -1044,12 +1043,17 @@ class GraphRuntime:
     def _validate_references(
         task_type: str,
         references: Any,
-        known_assets: dict[str, str],
+        known_assets: dict[str, MediaAsset],
         reference_mode: str | None = None,
     ) -> None:
         asset_ids = [reference.asset_id for reference in references]
         if any(asset_id not in known_assets for asset_id in asset_ids):
             raise RunValidationError("编辑结果引用了未知素材")
+        if any(
+            known_assets[asset_id].download_error is not None
+            for asset_id in asset_ids
+        ):
+            raise RunValidationError("编辑结果引用了下载失败素材")
         if len(asset_ids) != len(set(asset_ids)):
             raise RunValidationError("同一任务不能重复引用同一图片")
         orders = [reference.order for reference in references]
@@ -1066,7 +1070,7 @@ class GraphRuntime:
         if any(role not in allowed_roles for role in roles):
             raise RunValidationError("参考素材用途无效")
         for reference in references:
-            mime_type = known_assets[reference.asset_id]
+            mime_type = known_assets[reference.asset_id].mime_type
             valid = (
                 (mime_type.startswith("image/") and reference.role in {"reference_image", "first_frame", "last_frame"})
                 or (mime_type.startswith("video/") and reference.role == "reference_video")

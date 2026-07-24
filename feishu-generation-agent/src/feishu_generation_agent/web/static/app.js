@@ -819,15 +819,38 @@
     byId("coverage-detail").textContent = details.join(" · ");
     const rows = ReviewState.excludedAssetRows(view).map((item) => {
       const row = element("div", "excluded-asset-row");
-      const image = document.createElement("img");
-      image.alt = `排除素材 ${item.asset_id}`;
-      if (item.preview_url) image.src = agentUrl(item.preview_url);
+      let preview;
+      if (item.media_kind === "image") {
+        preview = document.createElement("img");
+        preview.alt = `排除素材 ${item.asset_id}`;
+      } else if (item.media_kind === "video") {
+        preview = document.createElement("video");
+        preview.controls = true;
+        preview.preload = "metadata";
+        preview.muted = true;
+        preview.playsInline = true;
+        preview.setAttribute("aria-label", `排除视频 ${item.asset_id}`);
+      } else if (item.media_kind === "audio") {
+        preview = document.createElement("audio");
+        preview.controls = true;
+        preview.preload = "metadata";
+        preview.setAttribute("aria-label", `排除音频 ${item.asset_id}`);
+      } else {
+        preview = element(
+          "div",
+          "excluded-asset-placeholder",
+          item.mime_type || "附件",
+        );
+      }
+      if (item.preview_url && item.media_kind !== "file") {
+        preview.src = agentUrl(item.preview_url);
+      }
       const content = element("div", "excluded-asset-copy");
       content.append(
         element("strong", "", item.asset_id),
         element("p", "", item.reason),
       );
-      row.append(image, content);
+      row.append(preview, content);
       return row;
     });
     if (!rows.length) {

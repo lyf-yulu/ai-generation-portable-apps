@@ -245,6 +245,14 @@
     return `已使用 ${coverage.referenced_count} / 共 ${coverage.successful_total} 张`;
   }
 
+  function mediaKind(mimeType) {
+    if (typeof mimeType !== "string") return "file";
+    if (mimeType.startsWith("image/")) return "image";
+    if (mimeType.startsWith("video/")) return "video";
+    if (mimeType.startsWith("audio/")) return "audio";
+    return "file";
+  }
+
   function excludedAssetRows(view) {
     const approval = view?.approval || {};
     const referencedIds = new Set(
@@ -257,11 +265,17 @@
     );
     return (approval.excluded_assets || [])
       .filter((item) => !referencedIds.has(item?.asset_id))
-      .map((item) => ({
-        asset_id: item.asset_id,
-        reason: item.reason,
-        preview_url: assets.get(item.asset_id)?.preview_url || null,
-      }));
+      .map((item) => {
+        const asset = assets.get(item.asset_id);
+        const mimeType = asset?.mime_type || "";
+        return {
+          asset_id: item.asset_id,
+          reason: item.reason,
+          preview_url: asset?.preview_url || null,
+          mime_type: mimeType,
+          media_kind: mediaKind(mimeType),
+        };
+      });
   }
 
   function canApprove(state) {

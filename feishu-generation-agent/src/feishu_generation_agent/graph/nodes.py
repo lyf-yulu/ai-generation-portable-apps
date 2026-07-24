@@ -211,6 +211,31 @@ def _draft_plan(state: AgentState) -> Any:
     return plan if plan is not None else state.get("task_plan")
 
 
+def _approved_plan(
+    state: AgentState,
+    *,
+    max_output_count: int,
+) -> TaskPlan:
+    saved = state.get("approved_plan")
+    if isinstance(saved, dict):
+        return TaskPlan.model_validate(saved)
+
+    draft = TaskPlan.model_validate(_draft_plan(state))
+    approved_tasks = [
+        GenerationTask.model_validate(task)
+        for task in state.get("approved_tasks", [])
+    ]
+    selected_ids = [
+        task.task_id
+        for task in approved_tasks
+    ]
+    reconciled = reconcile_task_asset_coverage(draft, approved_tasks)
+    return reconciled.approved_subset(
+        selected_ids,
+        max_output_count,
+    )
+
+
 def _document_revision(state: AgentState) -> Any:
     revision = state.get("document_revision")
     return revision if revision is not None else state.get("source_revision")
@@ -295,6 +320,7 @@ async def ingest_source(
             "media_assets": document_json["media_assets"],
             "approval_decision": None,
             "approved_tasks": [],
+            "approved_plan": None,
             "execution_records": [],
             "artifacts": [],
             "delivery_record": None,
@@ -514,6 +540,7 @@ async def human_approval(
                     "approval_decision": decision_json,
                     "planner_feedback": decision.feedback.strip(),
                     "approved_tasks": [],
+                    "approved_plan": None,
                     "status": "running",
                 },
                 goto="plan_requirements",
@@ -523,6 +550,7 @@ async def human_approval(
                 update={
                     "approval_decision": decision_json,
                     "approved_tasks": [],
+                    "approved_plan": None,
                     "status": "cancelled",
                 },
                 goto=END,
@@ -553,6 +581,7 @@ async def human_approval(
                 "approved_tasks": [
                     _json_model(task) for task in approved.tasks
                 ],
+                "approved_plan": _json_model(approved),
                 "status": "approval_pending_validation",
             },
             goto="revalidate_approval",
@@ -595,10 +624,9 @@ async def revalidate_approval(
             decision.selected_task_ids,
             services.settings.max_output_count,
         )
-        checkpoint_plan = TaskPlan(
-            tasks=state.get("approved_tasks", []),
-            document_summary=draft.document_summary,
-            excluded_assets=selected_plan.excluded_assets,
+        checkpoint_plan = _approved_plan(
+            state,
+            max_output_count=services.settings.max_output_count,
         )
         if checkpoint_plan.model_dump(mode="json") != selected_plan.model_dump(
             mode="json"
@@ -658,6 +686,7 @@ async def check_source_revision(
                     "approval_decision": None,
                     "approval_revision": None,
                     "approved_tasks": [],
+                    "approved_plan": None,
                     "status": "running",
                 },
                 goto="ingest_source",
@@ -1341,20 +1370,9 @@ async def execute_selected_tasks(
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
-        draft = TaskPlan.model_validate(_draft_plan(state))
-        selected_ids = [
-            task.get("task_id")
-            for task in state.get("approved_tasks", [])
-            if isinstance(task, dict) and isinstance(task.get("task_id"), str)
-        ]
-        selected_exclusions = draft.approved_subset(
-            selected_ids,
-            services.settings.max_output_count,
-        ).excluded_assets
-        plan = TaskPlan(
-            tasks=state.get("approved_tasks", []),
-            document_summary=draft.document_summary,
-            excluded_assets=selected_exclusions,
+        plan = _approved_plan(
+            state,
+            max_output_count=services.settings.max_output_count,
         )
         issues = validate_plan(
             plan,
@@ -1471,19 +1489,9 @@ async def deliver_to_feishu(
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
-        draft = TaskPlan.model_validate(_draft_plan(state))
-        plan = TaskPlan(
-            tasks=state.get("approved_tasks", []),
-            document_summary=draft.document_summary,
-            excluded_assets=draft.approved_subset(
-                [
-                    task.get("task_id")
-                    for task in state.get("approved_tasks", [])
-                    if isinstance(task, dict)
-                    and isinstance(task.get("task_id"), str)
-                ],
-                services.settings.max_output_count,
-            ).excluded_assets,
+        plan = _approved_plan(
+            state,
+            max_output_count=services.settings.max_output_count,
         )
         artifacts = [
             Artifact.model_validate(item) for item in state.get("artifacts", [])

@@ -1641,6 +1641,53 @@ async def test_reference_patch_rejects_unknown_asset_duplicate_order_and_role(
             assert response.json()["detail"]
 
 
+async def test_reference_patch_rejects_failed_asset_atomically(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/failed-ref"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        failed = copy.deepcopy(state["media_assets"][0])
+        failed.update(
+            asset_id="asset-failed",
+            source_block_id="image-failed",
+            download_error="fictional download failure",
+        )
+        state["media_assets"].append(failed)
+        before_plan = copy.deepcopy(state["draft_plan"])
+        before_revision = state.get("draft_revision")
+
+        response = await client.patch(
+            f"/api/runs/{run_id}/tasks/task-1/references",
+            json={
+                "references": [
+                    {"asset_id": "asset-1", "role": "reference_image", "order": 1},
+                    {
+                        "asset_id": "asset-failed",
+                        "role": "reference_image",
+                        "order": 2,
+                    },
+                ],
+                "reference_mode": "multi_reference",
+            },
+        )
+
+        assert response.status_code == 422
+        assert "下载失败" in response.text
+        assert state["draft_plan"] == before_plan
+        assert state.get("draft_revision") == before_revision
+        assert state["approved_tasks"] == []
+
+
 async def test_reference_add_persists_in_real_graph_checkpoint(
     fake_services: GraphServices,
 ):

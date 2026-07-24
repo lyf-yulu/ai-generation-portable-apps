@@ -16,11 +16,18 @@ from feishu_generation_agent.domain.errors import (
     ErrorDetail,
 )
 from feishu_generation_agent.domain.document import (
+    DocumentBlock,
+    MediaAsset,
     PlanningPromptSnapshot,
     VisionDescription,
 )
+from feishu_generation_agent.domain.plan import AuditReport, TaskPlan
 from feishu_generation_agent.graph.builder import build_graph
-from feishu_generation_agent.graph.nodes import GraphServices, analyze_images
+from feishu_generation_agent.graph.nodes import (
+    GraphServices,
+    _approved_plan,
+    analyze_images,
+)
 from feishu_generation_agent.graph.state import AgentState
 from feishu_generation_agent.integrations.planner import DeepSeekPlanner
 from feishu_generation_agent.storage.checkpoints import open_checkpointer
@@ -44,6 +51,7 @@ _FORMAL_STATE_KEYS = {
     "validation_issues",
     "approval_decision",
     "approved_tasks",
+    "approved_plan",
     "execution_records",
     "artifacts",
     "delivery_record",
@@ -758,6 +766,164 @@ async def test_approve_revalidates_then_executes_generation(
     assert ("revalidate_approval", "completed") in [
         (event["node"], event["status"]) for event in events
     ]
+
+
+async def test_reincluded_excluded_asset_survives_real_graph_execution(
+    fake_services: GraphServices,
+    tmp_path,
+):
+    second_path = tmp_path / "data" / "second-reference.png"
+    second_path.write_bytes(b"fictional-second-reference")
+    second_asset = MediaAsset(
+        asset_id="asset-2",
+        source_block_id="image-2",
+        origin="feishu",
+        file_token="fictional-second-token",
+        local_path=second_path,
+        mime_type="image/png",
+        size=second_path.stat().st_size,
+        sha256="graph-sha-asset-2",
+        width=640,
+        height=480,
+    )
+    document = fake_services.document_source.document
+    fake_services.document_source.document = document.model_copy(
+        update={
+            "blocks": [
+                *document.blocks,
+                DocumentBlock(
+                    block_id="image-2",
+                    parent_id="page-1",
+                    block_type="image",
+                    order=3,
+                    path=["page-1", "image-2"],
+                    image_asset_id="asset-2",
+                ),
+            ],
+            "media_assets": [*document.media_assets, second_asset],
+        }
+    )
+
+    class Planner:
+        async def plan(
+            self,
+            document,
+            descriptions,
+            feedback,
+            system_prompt=None,
+            exact_system_prompt=None,
+        ):
+            del (
+                document,
+                descriptions,
+                feedback,
+                system_prompt,
+                exact_system_prompt,
+            )
+            return TaskPlan(
+                tasks=[fake_services.planner.task],
+                document_summary="纸船连续漂流视频",
+                excluded_assets=[
+                    {
+                        "asset_id": "asset-2",
+                        "reason": "初次规划只保留主体参考图。",
+                    }
+                ],
+            )
+
+        async def audit(self, document, plan):
+            del document, plan
+            return AuditReport()
+
+    services = replace(fake_services, planner=Planner())
+    graph = build_graph(services, InMemorySaver())
+    config = _config("thread-reinclude-excluded")
+    first = await graph.ainvoke(
+        _input("run-reinclude-excluded", "thread-reinclude-excluded"),
+        config=config,
+    )
+    plan = _interrupt_payload(first)["task_plan"]
+    edited = dict(plan["tasks"][0])
+    edited["reference_images"] = [
+        *edited["reference_images"],
+        {"asset_id": "asset-2", "role": "reference_image", "order": 2},
+    ]
+
+    result = await graph.ainvoke(
+        Command(
+            resume={
+                "action": "approve",
+                "selected_task_ids": ["task-video"],
+                "tasks": [edited],
+            }
+        ),
+        config=config,
+    )
+
+    assert result["status"] == "succeeded"
+    assert services.video_generator.submit_calls == 1
+    assert services.delivery_writer.deliver_calls == 1
+    assert result["approved_plan"]["excluded_assets"] == []
+    assert [
+        item["asset_id"]
+        for item in result["approved_plan"]["tasks"][0]["reference_images"]
+    ] == ["asset-1", "asset-2"]
+
+
+def test_legacy_approved_checkpoint_reconciles_stale_exclusions():
+    draft = TaskPlan.model_validate(
+        {
+            "tasks": [
+                {
+                    "task_id": "task-video",
+                    "task_type": "image_to_video",
+                    "title": "纸船漂流",
+                    "source_block_ids": ["paragraph-1"],
+                    "user_intent": "生成纸船漂流视频",
+                    "prompt": "纸船向前漂流。",
+                    "aspect_ratio": "16:9",
+                    "resolution": "720p",
+                    "duration": 5,
+                    "reference_mode": "multi_reference",
+                    "reference_images": [
+                        {
+                            "asset_id": "asset-1",
+                            "role": "reference_image",
+                            "order": 1,
+                        }
+                    ],
+                }
+            ],
+            "document_summary": "纸船连续漂流视频",
+            "excluded_assets": [
+                {
+                    "asset_id": "asset-2",
+                    "reason": "初次规划只保留主体参考图。",
+                }
+            ],
+        }
+    )
+    approved_task = draft.tasks[0].model_dump(mode="json")
+    approved_task["reference_images"].append(
+        {
+            "asset_id": "asset-2",
+            "role": "reference_image",
+            "order": 2,
+        }
+    )
+
+    restored = _approved_plan(
+        {
+            "draft_plan": draft.model_dump(mode="json"),
+            "approved_tasks": [approved_task],
+        },
+        max_output_count=3,
+    )
+
+    assert restored.excluded_assets == []
+    assert [
+        item.asset_id for item in restored.tasks[0].reference_images
+    ] == ["asset-1", "asset-2"]
 
 
 async def test_delivery_failure_is_terminal_without_discarding_artifacts(

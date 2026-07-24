@@ -281,7 +281,12 @@ test("coverage summarizes referenced, excluded, uncovered, and failed assets", (
   serverView.approval.media_assets = [
     { asset_id: "asset-1", preview_url: "/asset-1", download_failed: false },
     { asset_id: "asset-2", preview_url: "/asset-2", download_failed: false },
-    { asset_id: "asset-3", preview_url: "/asset-3", download_failed: false },
+    {
+      asset_id: "asset-3",
+      preview_url: "/asset-3",
+      download_failed: false,
+      mime_type: "image/png",
+    },
     { asset_id: "asset-failed", preview_url: null, download_failed: true },
   ];
   serverView.approval.excluded_assets = [
@@ -306,7 +311,41 @@ test("coverage summarizes referenced, excluded, uncovered, and failed assets", (
       asset_id: "asset-3",
       reason: "供应商最多支持两张参考图，保留主体与场景图。",
       preview_url: "/asset-3",
+      mime_type: "image/png",
+      media_kind: "image",
     }],
+  );
+});
+
+test("excluded asset rows classify image video audio and unknown media safely", () => {
+  const serverView = view();
+  serverView.approval.media_assets = [
+    { asset_id: "image-1", preview_url: "/image", mime_type: "image/png" },
+    { asset_id: "video-1", preview_url: "/video", mime_type: "video/mp4" },
+    { asset_id: "audio-1", preview_url: "/audio", mime_type: "audio/mpeg" },
+    { asset_id: "file-1", preview_url: "/file", mime_type: "application/pdf" },
+  ];
+  serverView.approval.tasks[0].reference_images = [
+    { asset_id: "image-1", role: "reference_image", order: 1 },
+  ];
+  serverView.approval.tasks[1].reference_images = [
+    { asset_id: "image-1", role: "reference_image", order: 1 },
+  ];
+  serverView.approval.excluded_assets = [
+    { asset_id: "video-1", reason: "本次不使用参考视频。" },
+    { asset_id: "audio-1", reason: "本次不使用参考音频。" },
+    { asset_id: "file-1", reason: "该格式仅作为其他附件保留。" },
+  ];
+
+  const rows = ReviewState.excludedAssetRows(serverView);
+
+  assert.deepEqual(
+    rows.map((item) => item.media_kind),
+    ["video", "audio", "file"],
+  );
+  assert.deepEqual(
+    rows.map((item) => item.mime_type),
+    ["video/mp4", "audio/mpeg", "application/pdf"],
   );
 });
 

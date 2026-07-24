@@ -31,6 +31,7 @@ class AgentState(TypedDict, total=False):
     approval_decision: dict[str, Any] | None
     approval_revision: int | None
     approved_tasks: list[dict[str, Any]]
+    approved_plan: dict[str, Any] | None
     execution_records: list[dict[str, Any]]
     artifacts: list[dict[str, Any]]
     delivery_record: dict[str, Any] | None
