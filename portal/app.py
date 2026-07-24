@@ -1491,6 +1491,8 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(404, {"ok": False, "error": "not found"})
 
     def do_DELETE(self):
+        if self._reject_oversized_upload():
+            return
         path = urllib.parse.urlparse(self.path).path
         user = self._require_auth(path)
         if not user:
@@ -1950,7 +1952,7 @@ class Handler(SimpleHTTPRequestHandler):
 
         try:
             body = None
-            if method in {"POST", "PUT", "PATCH"}:
+            if method in {"POST", "PUT", "PATCH", "DELETE"}:
                 length = int(self.headers.get("Content-Length") or "0")
                 if length > 0:
                     body = self.rfile.read(length)

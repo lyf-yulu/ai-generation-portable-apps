@@ -173,7 +173,7 @@ class ProxyIdentityHeadersTests(unittest.TestCase):
             self.mod._sign_admin_header(upstream_headers["X-Username"], False, ts),
         )
 
-    def test_proxy_forwards_put_and_patch_request_bodies(self):
+    def test_proxy_forwards_mutation_request_bodies_and_content_length(self):
         payload = b'{"prompt_text":"Chinese plan"}'
         forwarded = []
 
@@ -204,7 +204,7 @@ class ProxyIdentityHeadersTests(unittest.TestCase):
             "username": "测试用户",
             "role": "user",
         }
-        for method in ("PUT", "PATCH"):
+        for method in ("PUT", "PATCH", "DELETE"):
             with self.subTest(method=method):
                 handler = self.mod.Handler.__new__(self.mod.Handler)
                 handler.client_address = ("127.0.0.1", 12345)
@@ -233,9 +233,76 @@ class ProxyIdentityHeadersTests(unittest.TestCase):
                     )
 
         self.assertEqual(
-            [(method, body) for method, body, _ in forwarded],
-            [("PUT", payload), ("PATCH", payload)],
+            [
+                (method, body, headers.get("Content-Length"))
+                for method, body, headers in forwarded
+            ],
+            [
+                ("PUT", payload, str(len(payload))),
+                ("PATCH", payload, str(len(payload))),
+                ("DELETE", payload, str(len(payload))),
+            ],
         )
+
+    def test_proxy_keeps_bodyless_delete_compatible(self):
+        forwarded = []
+
+        class FakeResponse(io.BytesIO):
+            status = 204
+
+            def getheader(self, name, default=None):
+                return default
+
+            def getheaders(self):
+                return []
+
+        class FakeConnection:
+            def __init__(self, host, port, timeout):
+                self.response = FakeResponse()
+
+            def request(self, method, path, body=None, headers=None):
+                forwarded.append((method, body, headers))
+
+            def getresponse(self):
+                return self.response
+
+            def close(self):
+                pass
+
+        handler = self.mod.Handler.__new__(self.mod.Handler)
+        handler.client_address = ("127.0.0.1", 12345)
+        handler.headers = Message()
+        handler.rfile = io.BytesIO()
+        handler.wfile = io.BytesIO()
+        handler._is_https = lambda: False
+        handler.send_response = lambda status: None
+        handler.send_header = lambda key, value: None
+        handler._cors_headers = lambda: None
+        handler.end_headers = lambda: None
+        user = {
+            "user_id": "user-a-immutable",
+            "username": "测试用户",
+            "role": "user",
+        }
+
+        with patch.object(
+            self.mod.http.client,
+            "HTTPConnection",
+            FakeConnection,
+        ):
+            handler._proxy(
+                "feishu-generation-agent",
+                8765,
+                "DELETE",
+                "/api/runs/run-1",
+                user,
+            )
+
+        self.assertEqual(len(forwarded), 1)
+        method, body, headers = forwarded[0]
+        self.assertEqual(method, "DELETE")
+        self.assertIsNone(body)
+        self.assertNotIn("Content-Length", headers)
 
 
 class ProxyHttpMethodDispatchTests(unittest.TestCase):
@@ -289,6 +356,19 @@ class ProxyHttpMethodDispatchTests(unittest.TestCase):
                         )
                     ],
                 )
+
+    def test_delete_rejects_oversized_body_before_auth_or_proxy(self):
+        handler = self.mod.Handler.__new__(self.mod.Handler)
+        handler.path = "/feishu-generation-agent/api/runs/run-1"
+        handler._reject_oversized_upload = lambda: True
+        handler._require_auth = lambda path: self.fail(
+            "oversized DELETE must be rejected before authentication"
+        )
+        handler._try_proxy = lambda path, method, user: self.fail(
+            "oversized DELETE must not be proxied"
+        )
+
+        handler.do_DELETE()
 
 
 class FeishuAgentNavigationTests(unittest.TestCase):
