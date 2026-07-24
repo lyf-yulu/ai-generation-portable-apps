@@ -1232,7 +1232,9 @@ async def test_run_view_exposes_blocking_and_nonblocking_ingest_issues(
             **state["media_assets"][0],
             "asset_id": "asset-failed",
             "source_block_id": "image-failed",
-            "local_path": None,
+            "local_path": str(
+                tmp_path / "__missing__" / "asset-failed.missing"
+            ),
             "size": 0,
             "sha256": "",
             "download_error": "图片保存失败",
@@ -1337,30 +1339,102 @@ async def test_run_view_rebuilds_validation_ingest_issues_without_raw_alignment(
         state["source_document"] = copy.deepcopy(state["normalized_document"])
         state["validation_issues"] = [
             raw_extra,
-            "任务 task-1 缺少输出尺寸",
             raw_path,
-            "供应商失败：Bearer sk-live-abcdefgh",
             raw_bearer,
-            "缓存文件位于 /Volumes/private/customer.png",
+            "供应商失败：sk_live_abcdefgh",
+            "供应商失败：ark_live_abcdefgh",
+            "缓存文件 file:///Users/alice/private/customer.png",
+            "缓存文件位于中文/Volumes/private/customer.png",
+            "任何未登记的原始校验文本",
         ]
 
         response = await client.get(f"/api/runs/{run_id}")
         view = response.json()
 
         assert view["approval"]["validation_issues"] == [
-            "任务 task-1 缺少输出尺寸",
-            "任务校验出现未知问题，请检查后重试",
-            "任务校验出现未知问题，请检查后重试",
             "飞书电子表格导出超时，请稍后重试",
         ]
         for secret in (
             raw_path,
             raw_bearer,
             raw_extra,
-            "sk-live-abcdefgh",
-            "/Volumes/private/customer.png",
+            "sk_live_abcdefgh",
+            "ark_live_abcdefgh",
+            "file:///Users/alice/private/customer.png",
+            "中文/Volumes/private/customer.png",
+            "任何未登记的原始校验文本",
         ):
             assert secret not in response.text
+
+
+async def test_run_view_recomputes_real_plan_and_audit_validation_issues(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/rebuilt-validation"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+        state["source_document"] = copy.deepcopy(state["normalized_document"])
+        state["draft_plan"]["tasks"][0]["source_block_ids"] = ["missing-block"]
+        state["task_plan"] = copy.deepcopy(state["draft_plan"])
+        state["audit_report"] = {
+            "issues": [
+                "镜头动作缺少可执行细节",
+                "镜头动作缺少可执行细节",
+            ],
+            "corrections_required": True,
+        }
+        state["validation_issues"] = ["任意旧原文绝不能回传"]
+
+        response = await client.get(f"/api/runs/{run_id}")
+        validation_issues = response.json()["approval"]["validation_issues"]
+
+        assert validation_issues == [
+            "tasks[0].source_block_ids: unknown block_id 'missing-block'",
+            "audit: 镜头动作缺少可执行细节",
+        ]
+        assert "任意旧原文绝不能回传" not in response.text
+
+
+async def test_run_view_validation_rebuild_fails_closed_for_invalid_typed_state(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/invalid-validation"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+        state["normalized_document"]["blocks"] = "invalid-block-state"
+        state["source_document"] = copy.deepcopy(state["normalized_document"])
+        state["validation_issues"] = [
+            "Bearer sk_live_abcdefgh file:///Users/alice/private/customer.png"
+        ]
+
+        response = await client.get(f"/api/runs/{run_id}")
+        view = response.json()
+
+        assert view["approval"]["validation_issues"] == [
+            "审批校验状态无效，请重新读取后再审批"
+        ]
+        assert "sk_live_abcdefgh" not in response.text
+        assert "file:///Users/alice/private/customer.png" not in response.text
 
 
 async def test_run_view_fails_closed_for_forged_structured_ingest_record(

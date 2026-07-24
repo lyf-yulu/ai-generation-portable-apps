@@ -1,5 +1,4 @@
 import asyncio
-import re
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +27,7 @@ from feishu_generation_agent.domain.errors import AgentError
 from feishu_generation_agent.ports import DeliveryWriter
 from feishu_generation_agent.domain.plan import (
     ApprovalDecision,
+    AuditReport,
     GenerationTask,
     ImageReference,
     TaskPlan,
@@ -638,8 +638,9 @@ class GraphRuntime:
                     for record in ingest_issue_records
                     if record.severity is IngestIssueSeverity.ASSET
                 ],
-                "validation_issues": self._safe_validation_issues(
+                "validation_issues": self._rebuild_validation_issues(
                     state,
+                    plan_model,
                     ingest_issue_records,
                 ),
                 "selected_task_ids": [
@@ -669,57 +670,42 @@ class GraphRuntime:
                 ]
         return []
 
-    @staticmethod
-    def _safe_validation_issues(
+    def _rebuild_validation_issues(
+        self,
         state: dict[str, Any],
+        plan: TaskPlan | None,
         records: list[IngestIssueRecord],
     ) -> list[str]:
-        validation_issues = state.get("validation_issues")
-        if not isinstance(validation_issues, list):
-            return []
-        raw_ingest_issues: set[str] = set()
-        for key in ("normalized_document", "source_document"):
-            document = state.get(key)
-            if isinstance(document, dict) and isinstance(
-                document.get("ingest_issues"), list
-            ):
-                raw_ingest_issues.update(
-                    issue
-                    for issue in document["ingest_issues"]
-                    if isinstance(issue, str)
-                )
-        safe_issues = [
-            (
-                "任务校验出现未知问题，请检查后重试"
-                if GraphRuntime._validation_issue_is_sensitive(issue)
-                else issue
+        try:
+            if plan is None:
+                raise ValueError("approval plan is invalid")
+            document = self._typed_document_for_view(state)
+            issues = validate_plan(
+                plan,
+                document,
+                max_output_count=self.settings.max_output_count,
             )
-            for issue in validation_issues
-            if isinstance(issue, str) and issue not in raw_ingest_issues
-        ]
-        for record in records:
-            if (
-                record.severity is IngestIssueSeverity.BLOCKING
-                and record.display_message not in safe_issues
-            ):
-                safe_issues.append(record.display_message)
-        return safe_issues
+            audit = AuditReport.model_validate(state.get("audit_report", {}))
+            if audit.corrections_required:
+                issues.extend(f"audit: {issue}" for issue in audit.issues)
+            issues.extend(
+                record.display_message
+                for record in records
+                if record.severity is IngestIssueSeverity.BLOCKING
+            )
+        except Exception:
+            return ["审批校验状态无效，请重新读取后再审批"]
+        return list(dict.fromkeys(issues))
 
     @staticmethod
-    def _validation_issue_is_sensitive(issue: str) -> bool:
-        return re.search(
-            r"(?i)(?:"
-            r"\bbearer\b|"
-            r"\btoken\b|"
-            r"\bsecret\b|"
-            r"(?:^|[^a-z0-9])sk-[a-z0-9_-]{8,}|"
-            r"(?:^|[^a-z0-9])ark-[a-z0-9_-]+|"
-            r"\baklt[a-z0-9_-]+|"
-            r"(?:^|[\s：:=（(])/(?:[^/\s]+/)+[^/\s]+|"
-            r"[a-z]:\\"
-            r")",
-            issue,
-        ) is not None
+    def _typed_document_for_view(
+        state: dict[str, Any],
+    ) -> NormalizedDocument:
+        for key in ("normalized_document", "source_document"):
+            document = state.get(key)
+            if document is not None:
+                return NormalizedDocument.model_validate(document)
+        raise ValueError("approval document is missing")
 
     async def resume_run(
         self,
