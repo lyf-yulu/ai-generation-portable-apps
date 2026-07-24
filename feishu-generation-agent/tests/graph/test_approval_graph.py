@@ -561,6 +561,96 @@ async def test_graph_pauses_before_any_generation(fake_services: GraphServices):
     assert await fake_services.repository.count_operations() == 0
 
 
+async def test_blocking_ingest_issue_is_visible_and_blocks_edited_approval(
+    fake_services: GraphServices,
+):
+    issue = "阻塞：内嵌电子表格 NuBUx5 读取失败（Block fiction-sheet）"
+    document = fake_services.document_source.document
+    fake_services.document_source.document = document.model_copy(
+        update={"ingest_issues": [issue]}
+    )
+    graph = build_graph(fake_services, InMemorySaver())
+    config = _config("thread-blocking-ingest")
+
+    first = await graph.ainvoke(
+        _input("run-blocking-ingest", "thread-blocking-ingest"),
+        config=config,
+    )
+
+    payload = _interrupt_payload(first)
+    assert payload["validation_issues"] == [issue]
+    edited_tasks = payload["draft_plan"]["tasks"]
+    edited_tasks[0]["prompt"] += "，保持构图不变"
+    with pytest.raises(AgentError) as raised:
+        await graph.ainvoke(
+            Command(
+                resume={
+                    "action": "approve",
+                    "selected_task_ids": ["task-video"],
+                    "tasks": edited_tasks,
+                }
+            ),
+            config=config,
+        )
+
+    assert raised.value.detail.category == ErrorCategory.VALIDATION
+    _assert_no_paid_side_effects(fake_services)
+    assert await fake_services.repository.count_operations() == 0
+
+
+async def test_single_asset_and_vision_failures_do_not_block_other_asset(
+    fake_services: GraphServices,
+):
+    document = fake_services.document_source.document
+    failed = document.media_assets[0].model_copy(
+        update={
+            "asset_id": "sheet-failed",
+            "source_block_id": "fiction-sheet",
+            "local_path": document.media_assets[0].local_path.parent
+            / "sheet-failed.missing",
+            "size": 0,
+            "sha256": "",
+            "download_error": "虚构图片保存失败",
+        }
+    )
+    fake_services.document_source.document = document.model_copy(
+        update={
+            "media_assets": [document.media_assets[0], failed],
+            "ingest_issues": [
+                "素材失败：内嵌电子表格素材 sheet-failed 保存失败"
+            ],
+        }
+    )
+    services = replace(
+        fake_services,
+        vision_analyzer=_PartiallyFailingVisionAnalyzer("sheet-failed"),
+    )
+    graph = build_graph(services, InMemorySaver())
+    config = _config("thread-nonblocking-ingest")
+
+    first = await graph.ainvoke(
+        _input("run-nonblocking-ingest", "thread-nonblocking-ingest"),
+        config=config,
+    )
+
+    payload = _interrupt_payload(first)
+    assert payload["validation_issues"] == []
+    result = await graph.ainvoke(
+        Command(
+            resume={
+                "action": "approve",
+                "selected_task_ids": ["task-video"],
+                "tasks": payload["draft_plan"]["tasks"],
+            }
+        ),
+        config=config,
+    )
+
+    assert result["status"] == "succeeded"
+    assert services.video_generator.submit_calls == 1
+    assert services.delivery_writer.deliver_calls == 1
+
+
 async def test_three_english_only_plans_fail_before_any_paid_generator_call(
     fake_services: GraphServices,
 ):

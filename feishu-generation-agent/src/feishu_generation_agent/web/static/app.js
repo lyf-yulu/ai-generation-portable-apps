@@ -966,10 +966,29 @@
     byId("langsmith-warning").hidden = !view.privacy?.langsmith_tracing;
     renderEvents(view.events);
 
-    const issues = view.approval.validation_issues || [];
+    const blockingIngestIssues = view.approval.blocking_ingest_issues || [];
+    const issues = (view.approval.validation_issues || [])
+      .filter((issue) => !blockingIngestIssues.includes(issue));
     const issueBox = byId("validation-issues");
     issueBox.textContent = issues.join("；");
     issueBox.hidden = issues.length === 0;
+    const blockingIngestBox = byId("blocking-ingest-issues");
+    blockingIngestBox.textContent = blockingIngestIssues.length
+      ? `文档读取阻塞：${blockingIngestIssues.join("；")}`
+      : "";
+    blockingIngestBox.hidden = blockingIngestIssues.length === 0;
+    const assetIngestIssues = view.approval.asset_ingest_issues || [];
+    const assetIngestBox = byId("asset-ingest-issues");
+    assetIngestBox.textContent = assetIngestIssues.length
+      ? `素材读取失败（不影响其他素材）：${assetIngestIssues.join("；")}`
+      : "";
+    assetIngestBox.hidden = assetIngestIssues.length === 0;
+    const visionIssues = view.approval.vision_issues || [];
+    const visionIssueBox = byId("vision-issues");
+    visionIssueBox.textContent = visionIssues.length
+      ? `素材识别失败（不影响其他素材）：${visionIssues.join("；")}`
+      : "";
+    visionIssueBox.hidden = visionIssues.length === 0;
     renderCoverage(view);
     taskList.replaceChildren(...(view.approval.tasks || []).map(renderTask));
     updateActionAvailability();
@@ -1029,6 +1048,15 @@
     byId("document-title").textContent = "等待选择多维表格任务";
     byId("document-summary").textContent = "";
     byId("delivery-target").hidden = true;
+    [
+      "validation-issues",
+      "blocking-ingest-issues",
+      "asset-ingest-issues",
+      "vision-issues",
+    ].forEach((id) => {
+      byId(id).textContent = "";
+      byId(id).hidden = true;
+    });
     byId("event-list").replaceChildren();
     taskList.replaceChildren();
     pollingNote.textContent = "请选择下一条任务开始分析";

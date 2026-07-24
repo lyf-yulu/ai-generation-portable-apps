@@ -16,7 +16,9 @@ from feishu_generation_agent.domain.document import (
     NormalizedDocument,
     PlanningPromptSnapshot,
     RequirementRequest,
+    blocking_ingest_issues,
     build_planning_prompt_snapshot,
+    non_blocking_ingest_issues,
 )
 from feishu_generation_agent.domain.errors import AgentError
 from feishu_generation_agent.ports import DeliveryWriter
@@ -550,6 +552,7 @@ class GraphRuntime:
             plan_model,
             state.get("media_assets", []),
         )
+        ingest_issues = self._document_ingest_issues(state)
         view = {
             "run_id": run_id,
             "thread_id": run["thread_id"],
@@ -605,6 +608,10 @@ class GraphRuntime:
                 "excluded_assets": plan.get("excluded_assets", []),
                 "coverage": coverage,
                 "vision_descriptions": state.get("vision_descriptions", []),
+                "vision_issues": state.get("vision_issues", []),
+                "ingest_issues": ingest_issues,
+                "blocking_ingest_issues": blocking_ingest_issues(ingest_issues),
+                "asset_ingest_issues": non_blocking_ingest_issues(ingest_issues),
                 "validation_issues": state.get("validation_issues", []),
                 "selected_task_ids": [
                     task.get("task_id")
@@ -614,6 +621,21 @@ class GraphRuntime:
             },
         }
         return view
+
+    @staticmethod
+    def _document_ingest_issues(state: dict[str, Any]) -> list[str]:
+        for key in ("normalized_document", "source_document"):
+            document = state.get(key)
+            if not isinstance(document, dict):
+                continue
+            issues = document.get("ingest_issues")
+            if isinstance(issues, list):
+                return [
+                    issue
+                    for issue in issues
+                    if isinstance(issue, str) and issue
+                ]
+        return []
 
     async def resume_run(
         self,
@@ -943,10 +965,14 @@ class GraphRuntime:
         validation_issues: list[str] = []
         if normalized is not None:
             try:
-                validation_issues = validate_plan(
-                    plan,
-                    NormalizedDocument.model_validate(normalized),
-                    max_output_count=self.settings.max_output_count,
+                document = NormalizedDocument.model_validate(normalized)
+                validation_issues = blocking_ingest_issues(document.ingest_issues)
+                validation_issues.extend(
+                    validate_plan(
+                        plan,
+                        document,
+                        max_output_count=self.settings.max_output_count,
+                    )
                 )
             except Exception:
                 raise RunValidationError("更新后的任务计划无法验证") from None
@@ -1030,9 +1056,13 @@ class GraphRuntime:
                 raise ValueError("没有可批准的任务")
             normalized = state.get("normalized_document")
             if isinstance(normalized, dict):
+                document = NormalizedDocument.model_validate(normalized)
+                ingest_issues = blocking_ingest_issues(document.ingest_issues)
+                if ingest_issues:
+                    raise RunValidationError(ingest_issues[0])
                 issues = validate_plan(
                     approved,
-                    NormalizedDocument.model_validate(normalized),
+                    document,
                     max_output_count=self.settings.max_output_count,
                 )
                 if issues:

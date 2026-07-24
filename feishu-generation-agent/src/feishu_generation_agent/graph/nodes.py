@@ -20,6 +20,7 @@ from feishu_generation_agent.domain.document import (
     PlanningPromptSnapshot,
     RequirementRequest,
     VisionDescription,
+    blocking_ingest_issues,
     build_planning_prompt_snapshot,
 )
 from feishu_generation_agent.domain.errors import (
@@ -449,7 +450,7 @@ async def validate_planned_tasks(
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
-        issues = list(state.get("vision_issues", []))
+        issues = blocking_ingest_issues(document.ingest_issues)
         issues.extend(
             validate_plan(
                 plan,
@@ -635,7 +636,7 @@ async def revalidate_approval(
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
-        issues = list(state.get("vision_issues", []))
+        issues = blocking_ingest_issues(document.ingest_issues)
         issues.extend(
             validate_plan(
                 selected_plan,
@@ -1374,10 +1375,13 @@ async def execute_selected_tasks(
             state,
             max_output_count=services.settings.max_output_count,
         )
-        issues = validate_plan(
-            plan,
-            document,
-            max_output_count=services.settings.max_output_count,
+        issues = blocking_ingest_issues(document.ingest_issues)
+        issues.extend(
+            validate_plan(
+                plan,
+                document,
+                max_output_count=services.settings.max_output_count,
+            )
         )
         if issues:
             raise _validation_error(

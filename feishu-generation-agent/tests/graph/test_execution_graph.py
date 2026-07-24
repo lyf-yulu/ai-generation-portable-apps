@@ -1543,6 +1543,28 @@ async def test_local_validation_failure_creates_no_intent(
 
 
 @pytest.mark.asyncio
+async def test_old_approved_checkpoint_with_blocking_ingest_issue_never_executes(
+    fake_services: GraphServices,
+) -> None:
+    state, config = await _waiting_state(
+        fake_services,
+        "run-old-blocking-ingest",
+        "thread-old-blocking-ingest",
+    )
+    state["approved_tasks"] = state["draft_plan"]["tasks"]
+    state["normalized_document"]["ingest_issues"] = [
+        "阻塞：旧 checkpoint 的内嵌电子表格读取失败"
+    ]
+
+    with pytest.raises(AgentError) as caught:
+        await execute_selected_tasks(state, config, services=fake_services)
+
+    assert caught.value.detail.category == ErrorCategory.VALIDATION
+    assert await fake_services.repository.count_operations() == 0
+    _assert_zero_generation(fake_services)
+
+
+@pytest.mark.asyncio
 async def test_chiyun_mismatched_official_id_becomes_uncertain(
     fake_services: GraphServices,
 ) -> None:

@@ -5,6 +5,8 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from feishu_generation_agent.domain.document import (
+    BLOCKING_INGEST_ISSUE_PREFIX,
+    NON_BLOCKING_INGEST_ISSUE_PREFIX,
     DocumentBlock,
     MediaAsset,
     NormalizedDocument,
@@ -184,7 +186,8 @@ class FeishuDocumentSource:
         token = sheet.get("token") if isinstance(sheet, Mapping) else None
         if not isinstance(token, str) or not token:
             issue = (
-                f"阻塞：内嵌电子表格读取失败（Block {block_id}）："
+                f"{BLOCKING_INGEST_ISSUE_PREFIX}"
+                f"内嵌电子表格读取失败（Block {block_id}）："
                 "Sheet Block 缺少 token"
             )
             return "", [], [], [issue]
@@ -192,13 +195,15 @@ class FeishuDocumentSource:
             ref = parse_sheet_block_token(token)
         except (TypeError, ValueError) as exc:
             issue = (
-                f"阻塞：内嵌电子表格读取失败（Block {block_id}）：{exc}"
+                f"{BLOCKING_INGEST_ISSUE_PREFIX}"
+                f"内嵌电子表格读取失败（Block {block_id}）：{exc}"
             )
             return "", [], [], [issue]
 
         if self._sheet_exporter is None:
             issue = (
-                f"阻塞：内嵌电子表格 {ref.sheet_id} 读取失败"
+                f"{BLOCKING_INGEST_ISSUE_PREFIX}"
+                f"内嵌电子表格 {ref.sheet_id} 读取失败"
                 f"（Block {block_id}）：未配置电子表格导出器"
             )
             return "", [], [], [issue]
@@ -207,7 +212,8 @@ class FeishuDocumentSource:
             extracted = await self._sheet_exporter.export(ref)
         except Exception as exc:
             issue = (
-                f"阻塞：内嵌电子表格 {ref.sheet_id} 读取失败"
+                f"{BLOCKING_INGEST_ISSUE_PREFIX}"
+                f"内嵌电子表格 {ref.sheet_id} 读取失败"
                 f"（Block {block_id}）：{exc}"
             )
             return "", [], [], [issue]
@@ -311,7 +317,8 @@ class FeishuDocumentSource:
                 download_error=str(exc),
             )
             issue = (
-                f"阻塞：内嵌电子表格素材 {asset_id} 保存失败"
+                f"{NON_BLOCKING_INGEST_ISSUE_PREFIX}"
+                f"内嵌电子表格素材 {asset_id} 保存失败"
                 f"（Block {block_id}，Sheet {sheet_id}）：{exc}"
             )
             return asset, anchor_lines, issue
@@ -691,7 +698,8 @@ class FeishuDocumentSource:
                 sha256="",
                 download_error=error,
             ),
-            f"阻塞：素材 {asset_id} 下载失败（Block {block_id}）：{error}",
+            f"{NON_BLOCKING_INGEST_ISSUE_PREFIX}"
+            f"素材 {asset_id} 下载失败（Block {block_id}）：{error}",
         )
 
     @staticmethod

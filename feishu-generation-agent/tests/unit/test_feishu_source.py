@@ -734,7 +734,7 @@ async def test_malformed_sheet_image_keeps_others_and_reports_issue(
     assert sheet_assets[1].download_error is None
     assert sheet_assets[1].local_path.is_file()
     assert any(
-        "阻塞" in issue
+        issue.startswith("素材失败：")
         and "fiction-sheet" in issue
         and sheet_assets[0].asset_id in issue
         for issue in document.ingest_issues
@@ -966,10 +966,16 @@ async def test_ingest_rejects_inconsistent_table_references(
     assert raised.value.detail.retryable is False
 
 
-async def test_image_download_failure_is_blocking_and_never_silently_skipped(
+async def test_image_download_failure_is_nonblocking_and_visible(
     file_store: FileStore,
 ):
     fixture = _fixture("feishu_docx_blocks.json")
+    fixture["items"][0]["children"].remove("fiction-sheet")
+    fixture["items"] = [
+        item
+        for item in fixture["items"]
+        if item["block_id"] != "fiction-sheet"
+    ]
     client = FakeFeishuClient(
         fixture["items"], base64.b64decode(fixture["media_base64"])
     )
@@ -990,4 +996,10 @@ async def test_image_download_failure_is_blocking_and_never_silently_skipped(
     assert asset.download_error == "fictional download failure"
     assert asset.local_path == Path("__missing__") / "doccn123" / "image-1.missing"
     assert not asset.local_path.exists()
-    assert any("阻塞" in issue and "image-1" in issue for issue in document.ingest_issues)
+    assert any(
+        issue.startswith("素材失败：") and "image-1" in issue
+        for issue in document.ingest_issues
+    )
+    assert not any(
+        issue.startswith("阻塞：") for issue in document.ingest_issues
+    )

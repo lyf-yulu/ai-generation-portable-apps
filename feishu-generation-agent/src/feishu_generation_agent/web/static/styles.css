@@ -199,6 +199,8 @@ button {
 
 .document-meta, .document-summary { color: var(--muted); font-size: .86rem; }
 .validation-issues { margin-bottom: 1rem; padding: .75rem; border-left: 3px solid var(--warning); color: #68420d; background: #fff8e9; }
+.blocking-ingest-issues { margin-bottom: .65rem; padding: .75rem; border-left: 3px solid var(--danger); color: #7d241e; background: #fff0ee; }
+.asset-issue-message { margin: 0 0 .65rem; padding: .65rem .75rem; border-left: 3px solid var(--warning); color: #68420d; background: #fff8e9; font-size: .82rem; }
 .review-conflict { display: flex; justify-content: space-between; gap: .75rem; align-items: center; margin-bottom: 1rem; padding: .75rem; border-left: 3px solid var(--danger); color: #7d241e; background: #fff0ee; }
 .review-conflict[hidden] { display: none; }
 .coverage-summary {

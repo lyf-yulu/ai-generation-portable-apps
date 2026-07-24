@@ -1213,6 +1213,96 @@ async def test_create_run_and_read_waiting_approval(tmp_path: Path):
         }
 
 
+async def test_run_view_exposes_blocking_and_nonblocking_ingest_issues(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/ingest-view"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        failed_asset = {
+            **state["media_assets"][0],
+            "asset_id": "asset-failed",
+            "source_block_id": "image-failed",
+            "local_path": None,
+            "size": 0,
+            "sha256": "",
+            "download_error": "图片保存失败",
+        }
+        state["media_assets"].append(failed_asset)
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+        state["normalized_document"]["ingest_issues"] = [
+            "阻塞：内嵌电子表格 NuBUx5 读取失败",
+            "素材失败：图片 asset-failed 保存失败",
+        ]
+        state["source_document"] = copy.deepcopy(state["normalized_document"])
+        state["vision_issues"] = [
+            "素材 asset-failed 视觉分析失败：图片无法识别"
+        ]
+
+        view = (await client.get(f"/api/runs/{run_id}")).json()
+
+        assert view["approval"]["ingest_issues"] == [
+            "阻塞：内嵌电子表格 NuBUx5 读取失败",
+            "素材失败：图片 asset-failed 保存失败",
+        ]
+        assert view["approval"]["blocking_ingest_issues"] == [
+            "阻塞：内嵌电子表格 NuBUx5 读取失败"
+        ]
+        assert view["approval"]["asset_ingest_issues"] == [
+            "素材失败：图片 asset-failed 保存失败"
+        ]
+        assert view["approval"]["vision_issues"] == [
+            "素材 asset-failed 视觉分析失败：图片无法识别"
+        ]
+        assert view["approval"]["coverage"]["failed_count"] == 1
+
+
+async def test_blocking_ingest_issue_returns_422_before_edited_approval_resume(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/ingest-blocked"},
+            )
+        ).json()["run_id"]
+        view = await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+        state["normalized_document"]["ingest_issues"] = [
+            "阻塞：内嵌电子表格 NuBUx5 读取失败"
+        ]
+        state["source_document"] = copy.deepcopy(state["normalized_document"])
+        edited = copy.deepcopy(view["approval"]["tasks"][0])
+        edited["prompt"] = "用户编辑后的提示词"
+
+        response = await client.post(
+            f"/api/runs/{run_id}/decision",
+            json={
+                "action": "approve",
+                "selected_task_ids": ["task-1"],
+                "tasks": [edited],
+            },
+        )
+
+        assert response.status_code == 422
+        assert "内嵌电子表格" in response.text
+        assert graph.resume_calls == 0
+
+
 async def test_delete_waiting_run_removes_api_view(tmp_path: Path):
     async with _environment(tmp_path) as (client, runtime, graph, repository):
         del runtime, graph, repository

@@ -7,6 +7,26 @@ from typing import Any, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+BLOCKING_INGEST_ISSUE_PREFIX = "阻塞："
+NON_BLOCKING_INGEST_ISSUE_PREFIX = "素材失败："
+
+
+def blocking_ingest_issues(issues: list[str]) -> list[str]:
+    return [
+        issue
+        for issue in issues
+        if issue.startswith(BLOCKING_INGEST_ISSUE_PREFIX)
+    ]
+
+
+def non_blocking_ingest_issues(issues: list[str]) -> list[str]:
+    return [
+        issue
+        for issue in issues
+        if not issue.startswith(BLOCKING_INGEST_ISSUE_PREFIX)
+    ]
+
+
 class SourceType(StrEnum):
     DOCX = "docx"
     WIKI = "wiki"
