@@ -966,6 +966,8 @@
     byId("langsmith-warning").hidden = !view.privacy?.langsmith_tracing;
     renderEvents(view.events);
 
+    const displayIssue = (issue) => String(issue || "")
+      .replace(/^(?:阻塞：|素材失败：)/, "");
     const blockingIngestIssues = view.approval.blocking_ingest_issues || [];
     const issues = (view.approval.validation_issues || [])
       .filter((issue) => !blockingIngestIssues.includes(issue));
@@ -974,13 +976,13 @@
     issueBox.hidden = issues.length === 0;
     const blockingIngestBox = byId("blocking-ingest-issues");
     blockingIngestBox.textContent = blockingIngestIssues.length
-      ? `文档读取阻塞：${blockingIngestIssues.join("；")}`
+      ? `文档读取阻塞：${blockingIngestIssues.map(displayIssue).join("；")}`
       : "";
     blockingIngestBox.hidden = blockingIngestIssues.length === 0;
     const assetIngestIssues = view.approval.asset_ingest_issues || [];
     const assetIngestBox = byId("asset-ingest-issues");
     assetIngestBox.textContent = assetIngestIssues.length
-      ? `素材读取失败（不影响其他素材）：${assetIngestIssues.join("；")}`
+      ? `素材读取失败（不影响其他素材）：${assetIngestIssues.map(displayIssue).join("；")}`
       : "";
     assetIngestBox.hidden = assetIngestIssues.length === 0;
     const visionIssues = view.approval.vision_issues || [];

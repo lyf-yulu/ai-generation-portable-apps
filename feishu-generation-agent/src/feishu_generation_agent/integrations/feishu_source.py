@@ -193,10 +193,11 @@ class FeishuDocumentSource:
             return "", [], [], [issue]
         try:
             ref = parse_sheet_block_token(token)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError):
             issue = (
                 f"{BLOCKING_INGEST_ISSUE_PREFIX}"
-                f"内嵌电子表格读取失败（Block {block_id}）：{exc}"
+                f"内嵌电子表格读取失败（Block {block_id}）："
+                "电子表格引用无效"
             )
             return "", [], [], [issue]
 
@@ -211,10 +212,21 @@ class FeishuDocumentSource:
         try:
             extracted = await self._sheet_exporter.export(ref)
         except Exception as exc:
+            message = self._safe_exception_message(
+                exc,
+                "电子表格导出失败，请稍后重试",
+            )
             issue = (
                 f"{BLOCKING_INGEST_ISSUE_PREFIX}"
                 f"内嵌电子表格 {ref.sheet_id} 读取失败"
-                f"（Block {block_id}）：{exc}"
+                f"（Block {block_id}）：{message}"
+            )
+            return "", [], [], [issue]
+        if not extracted.text_lines and not extracted.images:
+            issue = (
+                f"{BLOCKING_INGEST_ISSUE_PREFIX}"
+                f"内嵌电子表格 {ref.sheet_id} 读取失败"
+                f"（Block {block_id}）：导出结果为空"
             )
             return "", [], [], [issue]
 
@@ -304,6 +316,10 @@ class FeishuDocumentSource:
                 image.content,
             )
         except Exception as exc:
+            message = self._safe_exception_message(
+                exc,
+                "图片保存失败，请稍后重试",
+            )
             asset = MediaAsset(
                 asset_id=asset_id,
                 source_block_id=block_id,
@@ -314,12 +330,12 @@ class FeishuDocumentSource:
                 mime_type="application/octet-stream",
                 size=0,
                 sha256="",
-                download_error=str(exc),
+                download_error=message,
             )
             issue = (
                 f"{NON_BLOCKING_INGEST_ISSUE_PREFIX}"
                 f"内嵌电子表格素材 {asset_id} 保存失败"
-                f"（Block {block_id}，Sheet {sheet_id}）：{exc}"
+                f"（Block {block_id}，Sheet {sheet_id}）：{message}"
             )
             return asset, anchor_lines, issue
 
@@ -654,8 +670,12 @@ class FeishuDocumentSource:
             cache[file_token] = cached
 
         if isinstance(cached, Exception):
+            message = self._safe_exception_message(
+                cached,
+                "图片下载或保存失败，请稍后重试",
+            )
             return self._failed_media_asset(
-                document_id, asset_id, block_id, file_token, str(cached)
+                document_id, asset_id, block_id, file_token, message
             )
 
         width = image.get("width") if isinstance(image, Mapping) else None
@@ -712,6 +732,12 @@ class FeishuDocumentSource:
                 return None
             current = current.get(key)
         return current if isinstance(current, Mapping) else None
+
+    @staticmethod
+    def _safe_exception_message(exc: Exception, fallback: str) -> str:
+        if isinstance(exc, AgentError) and exc.detail.message:
+            return exc.detail.message
+        return fallback
 
     @staticmethod
     def _string_or_none(value: Any) -> str | None:

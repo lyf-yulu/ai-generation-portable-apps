@@ -12,7 +12,11 @@ from PIL import Image
 
 from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain.document import RequirementRequest, SourceType
-from feishu_generation_agent.domain.errors import AgentError, ErrorCategory
+from feishu_generation_agent.domain.errors import (
+    AgentError,
+    ErrorCategory,
+    ErrorDetail,
+)
 from feishu_generation_agent.integrations.feishu_client import FeishuClient
 from feishu_generation_agent.integrations.feishu_source import (
     FeishuDocumentSource,
@@ -664,8 +668,9 @@ async def test_embedded_sheet_export_failure_is_a_blocking_ingest_issue(
     file_store: FileStore,
 ):
     fixture = _fixture("feishu_docx_blocks.json")
+    secret = "/Users/alice/private/secret-token.xlsx"
     exporter = FakeFeishuSheetExporter(
-        error=RuntimeError("fictional export failure")
+        error=RuntimeError(secret)
     )
     source = FeishuDocumentSource(
         FakeFeishuClient(
@@ -679,15 +684,90 @@ async def test_embedded_sheet_export_failure_is_a_blocking_ingest_issue(
         RequirementRequest(source_url="https://fiction.feishu.cn/docx/doccn123")
     )
 
-    assert any(
-        "阻塞" in issue
-        and "fiction-sheet" in issue
-        and "NuBUx5" in issue
-        and "fictional export failure" in issue
-        for issue in document.ingest_issues
-    )
+    issue = next(issue for issue in document.ingest_issues if "阻塞" in issue)
+    assert "fiction-sheet" in issue
+    assert "NuBUx5" in issue
+    assert "读取失败" in issue
+    assert secret not in issue
     assert any(block.block_type == "sheet" for block in document.blocks)
     assert len(document.media_assets) == 1
+
+
+async def test_embedded_sheet_agent_error_uses_only_safe_user_message(
+    file_store: FileStore,
+):
+    fixture = _fixture("feishu_docx_blocks.json")
+    exporter = FakeFeishuSheetExporter(
+        error=AgentError(
+            ErrorDetail(
+                category=ErrorCategory.DOCUMENT,
+                message="电子表格暂时无法读取",
+                technical_detail="/Users/alice/private/secret-token.xlsx",
+                retryable=True,
+            )
+        )
+    )
+    source = FeishuDocumentSource(
+        FakeFeishuClient(
+            fixture["items"], base64.b64decode(fixture["media_base64"])
+        ),
+        file_store,
+        sheet_exporter=exporter,
+    )
+
+    document = await source.ingest(
+        RequirementRequest(source_url="https://fiction.feishu.cn/docx/doccn123")
+    )
+
+    joined = "；".join(document.ingest_issues)
+    assert "电子表格暂时无法读取" in joined
+    assert "secret-token" not in joined
+
+
+@pytest.mark.parametrize(
+    ("text_lines", "images", "blocked"),
+    [
+        ((), (), True),
+        (("[sheet:NuBUx5 worksheet:分镜 cell:A1] 只有文字",), (), False),
+        (
+            (),
+            (
+                _sheet_image(
+                    _png_bytes("purple"),
+                    media_name="image-only.png",
+                    anchors=(("分镜", 0, 0),),
+                ),
+            ),
+            False,
+        ),
+    ],
+)
+async def test_embedded_sheet_blocks_only_when_export_is_completely_empty(
+    file_store: FileStore,
+    text_lines: tuple[str, ...],
+    images: tuple[ExtractedSheetImage, ...],
+    blocked: bool,
+):
+    fixture = _fixture("feishu_docx_blocks.json")
+    source = FeishuDocumentSource(
+        FakeFeishuClient(
+            fixture["items"], base64.b64decode(fixture["media_base64"])
+        ),
+        file_store,
+        sheet_exporter=FakeFeishuSheetExporter(
+            ExtractedSheet(text_lines=text_lines, images=images)
+        ),
+    )
+
+    document = await source.ingest(
+        RequirementRequest(source_url="https://fiction.feishu.cn/docx/doccn123")
+    )
+
+    sheet_issues = [
+        issue for issue in document.ingest_issues if "内嵌电子表格" in issue
+    ]
+    assert any("导出结果为空" in issue for issue in sheet_issues) is blocked
+    assert any(issue.startswith("阻塞：") for issue in sheet_issues) is blocked
 
 
 async def test_malformed_sheet_image_keeps_others_and_reports_issue(
@@ -739,6 +819,51 @@ async def test_malformed_sheet_image_keeps_others_and_reports_issue(
         and sheet_assets[0].asset_id in issue
         for issue in document.ingest_issues
     )
+
+
+async def test_sheet_file_store_oserror_path_is_not_exposed(
+    file_store: FileStore,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fixture = _fixture("feishu_docx_blocks.json")
+    secret = "/Volumes/private/customer-secret/sheet-image.png"
+
+    def fail_save(*args: Any, **kwargs: Any):
+        del args, kwargs
+        raise OSError(secret)
+
+    monkeypatch.setattr(file_store, "save_input", fail_save)
+    source = FeishuDocumentSource(
+        FakeFeishuClient(
+            fixture["items"], base64.b64decode(fixture["media_base64"])
+        ),
+        file_store,
+        sheet_exporter=FakeFeishuSheetExporter(
+            ExtractedSheet(
+                text_lines=(),
+                images=(
+                    _sheet_image(
+                        _png_bytes("green"),
+                        media_name="sheet-image.png",
+                        anchors=(("分镜", 0, 0),),
+                    ),
+                ),
+            )
+        ),
+    )
+
+    document = await source.ingest(
+        RequirementRequest(source_url="https://fiction.feishu.cn/docx/doccn123")
+    )
+
+    sheet_asset = next(
+        asset
+        for asset in document.media_assets
+        if asset.origin == "feishu_embedded_sheet"
+    )
+    assert sheet_asset.download_error == "图片保存失败，请稍后重试"
+    assert secret not in sheet_asset.download_error
+    assert secret not in "；".join(document.ingest_issues)
 
 
 async def test_ingest_accepts_feishu_empty_root_parent_and_null_leaf_children(
@@ -979,7 +1104,8 @@ async def test_image_download_failure_is_nonblocking_and_visible(
     client = FakeFeishuClient(
         fixture["items"], base64.b64decode(fixture["media_base64"])
     )
-    client.download_error = RuntimeError("fictional download failure")
+    secret = "/Users/alice/private/secret-token.png"
+    client.download_error = RuntimeError(secret)
     source = FeishuDocumentSource(client, file_store)
 
     document = await source.ingest(
@@ -993,7 +1119,8 @@ async def test_image_download_failure_is_nonblocking_and_visible(
     assert asset.size == 0
     assert asset.sha256 == ""
     assert asset.mime_type == "application/octet-stream"
-    assert asset.download_error == "fictional download failure"
+    assert asset.download_error == "图片下载或保存失败，请稍后重试"
+    assert secret not in asset.download_error
     assert asset.local_path == Path("__missing__") / "doccn123" / "image-1.missing"
     assert not asset.local_path.exists()
     assert any(
@@ -1003,3 +1130,40 @@ async def test_image_download_failure_is_nonblocking_and_visible(
     assert not any(
         issue.startswith("阻塞：") for issue in document.ingest_issues
     )
+    assert secret not in "；".join(document.ingest_issues)
+
+
+async def test_file_store_oserror_path_is_not_exposed_in_asset_or_issue(
+    file_store: FileStore,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fixture = _fixture("feishu_docx_blocks.json")
+    fixture["items"][0]["children"].remove("fiction-sheet")
+    fixture["items"] = [
+        item
+        for item in fixture["items"]
+        if item["block_id"] != "fiction-sheet"
+    ]
+    secret = "/Volumes/private/customer-secret/image.png"
+
+    def fail_save(*args: Any, **kwargs: Any):
+        del args, kwargs
+        raise OSError(secret)
+
+    monkeypatch.setattr(file_store, "save_input", fail_save)
+    source = FeishuDocumentSource(
+        FakeFeishuClient(
+            fixture["items"], base64.b64decode(fixture["media_base64"])
+        ),
+        file_store,
+    )
+
+    document = await source.ingest(
+        RequirementRequest(source_url="https://fiction.feishu.cn/docx/doccn123")
+    )
+
+    assert document.media_assets[0].download_error == (
+        "图片下载或保存失败，请稍后重试"
+    )
+    assert secret not in document.media_assets[0].download_error
+    assert secret not in "；".join(document.ingest_issues)

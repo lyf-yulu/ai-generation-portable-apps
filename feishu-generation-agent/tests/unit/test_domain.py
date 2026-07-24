@@ -5,7 +5,12 @@ import pytest
 from pydantic import ValidationError
 
 from feishu_generation_agent.domain.artifact import Artifact, ProviderResult
-from feishu_generation_agent.domain.document import MediaAsset, SourceType
+from feishu_generation_agent.domain.document import (
+    MediaAsset,
+    SourceType,
+    blocking_ingest_issues,
+    non_blocking_ingest_issues,
+)
 from feishu_generation_agent.domain.errors import AgentError, ErrorCategory, ErrorDetail
 from feishu_generation_agent.domain.plan import (
     ExcludedAsset,
@@ -345,6 +350,23 @@ def test_agent_error_exposes_serializable_detail():
 
     assert str(error) == "任务无效"
     assert error.detail.model_dump(mode="json")["category"] == "validation_error"
+
+
+def test_ingest_issue_classification_supports_new_and_legacy_formats():
+    whole_sheet_issues = [
+        "阻塞：内嵌电子表格读取失败（Block sheet-block）：缺少 token",
+        "阻塞：内嵌电子表格 NuBUx5 读取失败（Block sheet-block）：导出失败",
+    ]
+    asset_issues = [
+        "素材失败：内嵌电子表格素材 sheet-1 保存失败",
+        "素材失败：素材 image-1 下载失败",
+        "阻塞：内嵌电子表格素材 sheet-legacy 保存失败",
+        "阻塞：素材 image-legacy 下载失败",
+    ]
+    issues = [*whole_sheet_issues, *asset_issues]
+
+    assert blocking_ingest_issues(issues) == whole_sheet_issues
+    assert non_blocking_ingest_issues(issues) == asset_issues
 
 
 def test_provider_result_url_requires_explicit_untrusted_boundary() -> None:

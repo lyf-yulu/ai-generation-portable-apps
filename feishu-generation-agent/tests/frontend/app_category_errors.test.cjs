@@ -215,7 +215,7 @@ test("approval view distinguishes blocking document and nonblocking asset issues
         failed_count: 1,
       },
       validation_issues: [],
-      blocking_ingest_issues: ["阻塞：整张电子表格读取失败"],
+      blocking_ingest_issues: ["阻塞：内嵌电子表格读取失败，请检查文档后重试"],
       asset_ingest_issues: ["素材失败：图片 asset-2 保存失败"],
       vision_issues: ["素材 asset-2 视觉分析失败：图片无法识别"],
     },
@@ -240,12 +240,12 @@ test("approval view distinguishes blocking document and nonblocking asset issues
 
   assert.equal(
     app.getNode("blocking-ingest-issues").textContent,
-    "文档读取阻塞：阻塞：整张电子表格读取失败",
+    "文档读取阻塞：内嵌电子表格读取失败，请检查文档后重试",
   );
   assert.equal(app.getNode("blocking-ingest-issues").hidden, false);
   assert.equal(
     app.getNode("asset-ingest-issues").textContent,
-    "素材读取失败（不影响其他素材）：素材失败：图片 asset-2 保存失败",
+    "素材读取失败（不影响其他素材）：图片 asset-2 保存失败",
   );
   assert.equal(app.getNode("asset-ingest-issues").hidden, false);
   assert.equal(

@@ -1240,10 +1240,17 @@ async def test_run_view_exposes_blocking_and_nonblocking_ingest_issues(
         state["media_assets"].append(failed_asset)
         state["normalized_document"] = _normalized_document(state["media_assets"])
         state["normalized_document"]["ingest_issues"] = [
-            "阻塞：内嵌电子表格 NuBUx5 读取失败",
+            (
+                "阻塞：内嵌电子表格 NuBUx5 读取失败"
+                "（Block fiction-sheet）：/Users/alice/private/secret-token.xlsx"
+            ),
             "素材失败：图片 asset-failed 保存失败",
+            "阻塞：素材 image-legacy 下载失败：/Volumes/private/token.png",
         ]
         state["source_document"] = copy.deepcopy(state["normalized_document"])
+        state["validation_issues"] = [
+            state["normalized_document"]["ingest_issues"][0]
+        ]
         state["vision_issues"] = [
             "素材 asset-failed 视觉分析失败：图片无法识别"
         ]
@@ -1251,19 +1258,28 @@ async def test_run_view_exposes_blocking_and_nonblocking_ingest_issues(
         view = (await client.get(f"/api/runs/{run_id}")).json()
 
         assert view["approval"]["ingest_issues"] == [
-            "阻塞：内嵌电子表格 NuBUx5 读取失败",
+            "阻塞：内嵌电子表格读取失败，请检查文档后重试",
             "素材失败：图片 asset-failed 保存失败",
+            "素材失败：文档图片下载失败",
         ]
         assert view["approval"]["blocking_ingest_issues"] == [
-            "阻塞：内嵌电子表格 NuBUx5 读取失败"
+            "阻塞：内嵌电子表格读取失败，请检查文档后重试"
         ]
         assert view["approval"]["asset_ingest_issues"] == [
-            "素材失败：图片 asset-failed 保存失败"
+            "素材失败：图片 asset-failed 保存失败",
+            "素材失败：文档图片下载失败",
         ]
         assert view["approval"]["vision_issues"] == [
             "素材 asset-failed 视觉分析失败：图片无法识别"
         ]
         assert view["approval"]["coverage"]["failed_count"] == 1
+        assert view["approval"]["validation_issues"] == [
+            "阻塞：内嵌电子表格读取失败，请检查文档后重试"
+        ]
+        assert "secret-token" not in (await client.get(f"/api/runs/{run_id}")).text
+        assert "/Volumes/private" not in (
+            await client.get(f"/api/runs/{run_id}")
+        ).text
 
 
 async def test_blocking_ingest_issue_returns_422_before_edited_approval_resume(
@@ -1283,7 +1299,10 @@ async def test_blocking_ingest_issue_returns_422_before_edited_approval_resume(
         state = graph.states[run["thread_id"]]
         state["normalized_document"] = _normalized_document(state["media_assets"])
         state["normalized_document"]["ingest_issues"] = [
-            "阻塞：内嵌电子表格 NuBUx5 读取失败"
+            (
+                "阻塞：内嵌电子表格 NuBUx5 读取失败"
+                "（Block fiction-sheet）：/Users/alice/private/secret-token.xlsx"
+            )
         ]
         state["source_document"] = copy.deepcopy(state["normalized_document"])
         edited = copy.deepcopy(view["approval"]["tasks"][0])
@@ -1299,7 +1318,8 @@ async def test_blocking_ingest_issue_returns_422_before_edited_approval_resume(
         )
 
         assert response.status_code == 422
-        assert "内嵌电子表格" in response.text
+        assert "文档存在阻断性读取问题" in response.text
+        assert "secret-token" not in response.text
         assert graph.resume_calls == 0
 
 

@@ -105,7 +105,7 @@ test("new ingest issue state is part of server identity and survives the draft v
   state = ReviewState.patchTask(state, "task-1", { prompt: "本地编辑" });
 
   const updated = view();
-  updated.approval.blocking_ingest_issues = ["阻塞：整张电子表格读取失败"];
+  updated.approval.blocking_ingest_issues = ["阻塞：内嵌电子表格读取失败"];
   updated.approval.asset_ingest_issues = ["素材失败：图片 asset-2 保存失败"];
   updated.approval.vision_issues = ["素材 asset-2 视觉分析失败"];
   state = ReviewState.mergeServerView(state, updated);
@@ -118,7 +118,7 @@ test("new ingest issue state is part of server identity and survives the draft v
   const draft = ReviewState.draftView(state);
   assert.deepEqual(
     draft.approval.blocking_ingest_issues,
-    ["阻塞：整张电子表格读取失败"],
+    ["阻塞：内嵌电子表格读取失败"],
   );
   assert.deepEqual(
     draft.approval.asset_ingest_issues,

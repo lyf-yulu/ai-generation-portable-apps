@@ -1553,7 +1553,7 @@ async def test_old_approved_checkpoint_with_blocking_ingest_issue_never_executes
     )
     state["approved_tasks"] = state["draft_plan"]["tasks"]
     state["normalized_document"]["ingest_issues"] = [
-        "阻塞：旧 checkpoint 的内嵌电子表格读取失败"
+        "阻塞：内嵌电子表格 NuBUx5 读取失败（Block fiction-sheet）：旧错误"
     ]
 
     with pytest.raises(AgentError) as caught:
@@ -1562,6 +1562,31 @@ async def test_old_approved_checkpoint_with_blocking_ingest_issue_never_executes
     assert caught.value.detail.category == ErrorCategory.VALIDATION
     assert await fake_services.repository.count_operations() == 0
     _assert_zero_generation(fake_services)
+
+
+@pytest.mark.asyncio
+async def test_old_asset_failure_checkpoint_remains_nonblocking(
+    fake_services: GraphServices,
+) -> None:
+    state, config = await _waiting_state(
+        fake_services,
+        "run-old-asset-ingest",
+        "thread-old-asset-ingest",
+    )
+    state["approved_tasks"] = state["draft_plan"]["tasks"]
+    state["normalized_document"]["ingest_issues"] = [
+        "阻塞：内嵌电子表格素材 sheet-old 保存失败",
+        "阻塞：素材 image-old 下载失败",
+    ]
+
+    result = await execute_selected_tasks(
+        state,
+        config,
+        services=fake_services,
+    )
+
+    assert result["status"] == "verification_pending"
+    assert fake_services.video_generator.submit_calls == 1
 
 
 @pytest.mark.asyncio

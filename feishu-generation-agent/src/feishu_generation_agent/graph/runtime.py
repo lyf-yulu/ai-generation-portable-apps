@@ -19,6 +19,7 @@ from feishu_generation_agent.domain.document import (
     blocking_ingest_issues,
     build_planning_prompt_snapshot,
     non_blocking_ingest_issues,
+    safe_ingest_issue_for_display,
 )
 from feishu_generation_agent.domain.errors import AgentError
 from feishu_generation_agent.ports import DeliveryWriter
@@ -612,7 +613,11 @@ class GraphRuntime:
                 "ingest_issues": ingest_issues,
                 "blocking_ingest_issues": blocking_ingest_issues(ingest_issues),
                 "asset_ingest_issues": non_blocking_ingest_issues(ingest_issues),
-                "validation_issues": state.get("validation_issues", []),
+                "validation_issues": [
+                    safe_ingest_issue_for_display(issue)
+                    for issue in state.get("validation_issues", [])
+                    if isinstance(issue, str)
+                ],
                 "selected_task_ids": [
                     task.get("task_id")
                     for task in state.get("approved_tasks", [])
@@ -631,7 +636,7 @@ class GraphRuntime:
             issues = document.get("ingest_issues")
             if isinstance(issues, list):
                 return [
-                    issue
+                    safe_ingest_issue_for_display(issue)
                     for issue in issues
                     if isinstance(issue, str) and issue
                 ]
@@ -1059,7 +1064,9 @@ class GraphRuntime:
                 document = NormalizedDocument.model_validate(normalized)
                 ingest_issues = blocking_ingest_issues(document.ingest_issues)
                 if ingest_issues:
-                    raise RunValidationError(ingest_issues[0])
+                    raise RunValidationError(
+                        "文档存在阻断性读取问题，请修复源文档后重试"
+                    )
                 issues = validate_plan(
                     approved,
                     document,

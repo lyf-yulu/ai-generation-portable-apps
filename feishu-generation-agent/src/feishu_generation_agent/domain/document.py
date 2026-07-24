@@ -1,4 +1,5 @@
 import hashlib
+import re
 from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
@@ -9,13 +10,20 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 BLOCKING_INGEST_ISSUE_PREFIX = "阻塞："
 NON_BLOCKING_INGEST_ISSUE_PREFIX = "素材失败："
+_BLOCKING_SHEET_READ_ISSUE = re.compile(
+    r"^阻塞：内嵌电子表格(?:\s+\S+)?\s*读取失败(?:$|[（：，,])"
+)
+
+
+def is_blocking_ingest_issue(issue: str) -> bool:
+    return _BLOCKING_SHEET_READ_ISSUE.match(issue) is not None
 
 
 def blocking_ingest_issues(issues: list[str]) -> list[str]:
     return [
         issue
         for issue in issues
-        if issue.startswith(BLOCKING_INGEST_ISSUE_PREFIX)
+        if is_blocking_ingest_issue(issue)
     ]
 
 
@@ -23,8 +31,26 @@ def non_blocking_ingest_issues(issues: list[str]) -> list[str]:
     return [
         issue
         for issue in issues
-        if not issue.startswith(BLOCKING_INGEST_ISSUE_PREFIX)
+        if not is_blocking_ingest_issue(issue)
     ]
+
+
+def safe_ingest_issue_for_display(issue: str) -> str:
+    if is_blocking_ingest_issue(issue):
+        return "阻塞：内嵌电子表格读取失败，请检查文档后重试"
+    body = issue
+    for prefix in (
+        BLOCKING_INGEST_ISSUE_PREFIX,
+        NON_BLOCKING_INGEST_ISSUE_PREFIX,
+    ):
+        if body.startswith(prefix):
+            body = body[len(prefix):]
+            break
+    if body.startswith("内嵌电子表格素材"):
+        return "素材失败：内嵌电子表格图片保存失败"
+    if body.startswith("素材 ") and "下载失败" in body:
+        return "素材失败：文档图片下载失败"
+    return issue
 
 
 class SourceType(StrEnum):
