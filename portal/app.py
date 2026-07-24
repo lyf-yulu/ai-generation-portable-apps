@@ -1982,6 +1982,9 @@ class Handler(SimpleHTTPRequestHandler):
             # names pass through unchanged.
             username_encoded = urllib.parse.quote(user.get("username", ""), safe="")
             headers["X-Username"] = username_encoded
+            # User identity comes only from the authenticated Portal session.
+            # Never accept a browser-supplied X-Portal-User-Id value.
+            headers["X-Portal-User-Id"] = str(user["user_id"])
             # X-Is-Admin: raised for the admin role and also for any spec that
             # declares an `admin_permission` and the user has that permission
             # (dreamina lets `manage_dreamina_accounts` proxy admin so ops folks

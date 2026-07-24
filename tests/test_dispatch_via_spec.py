@@ -12,11 +12,14 @@ helpers directly. Uses a temp state dir so it doesn't touch prod data.
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
 import sys
 import tempfile
 import unittest
+from email.message import Message
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -109,6 +112,79 @@ class CredentialSchemeSpecTests(unittest.TestCase):
 
     def test_volcengine_portrait_is_ak_sk(self):
         self.assertEqual(self.by_name["volcengine-portrait"].credential_scheme, "ak_sk")
+
+
+class ProxyIdentityHeadersTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod, cls.tmp = _load_portal_with_temp_state()
+
+    @classmethod
+    def tearDownClass(cls):
+        _restore_data_dir_env()
+
+    def test_proxy_uses_session_user_identity_not_forged_browser_header(self):
+        upstream_headers = {}
+
+        class FakeResponse(io.BytesIO):
+            status = 200
+
+            def getheader(self, name, default=None):
+                return default
+
+            def getheaders(self):
+                return []
+
+        class FakeConnection:
+            def __init__(self, host, port, timeout):
+                self.response = FakeResponse()
+
+            def request(self, method, path, body=None, headers=None):
+                upstream_headers.update(headers or {})
+
+            def getresponse(self):
+                return self.response
+
+            def close(self):
+                pass
+
+        handler = self.mod.Handler.__new__(self.mod.Handler)
+        handler.client_address = ("127.0.0.1", 12345)
+        handler.headers = Message()
+        handler.headers["X-Portal-User-Id"] = "attacker"
+        handler.rfile = io.BytesIO()
+        handler.wfile = io.BytesIO()
+        handler._is_https = lambda: False
+        handler.send_response = lambda status: None
+        handler.send_header = lambda key, value: None
+        handler._cors_headers = lambda: None
+        handler.end_headers = lambda: None
+
+        user = {"user_id": "user-a-immutable", "username": "测试用户", "role": "user"}
+        with patch.object(self.mod.http.client, "HTTPConnection", FakeConnection):
+            handler._proxy("feishu-generation-agent", 8765, "GET", "/", user)
+
+        self.assertEqual(upstream_headers["X-Portal-User-Id"], "user-a-immutable")
+        self.assertEqual(upstream_headers["X-Username"], "%E6%B5%8B%E8%AF%95%E7%94%A8%E6%88%B7")
+        self.assertNotEqual(upstream_headers["X-Portal-User-Id"], "attacker")
+        ts = int(upstream_headers["X-Portal-Ts"])
+        self.assertEqual(
+            upstream_headers["X-Portal-Sig"],
+            self.mod._sign_admin_header(upstream_headers["X-Username"], False, ts),
+        )
+
+
+class FeishuAgentNavigationTests(unittest.TestCase):
+    def test_feishu_agent_tab_uses_registered_relative_iframe_url(self):
+        html = (PORTAL / "static" / "index.html").read_text(encoding="utf-8")
+        js = (PORTAL / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('data-tab="feishu-generation-agent"', html)
+        self.assertIn('data-app="feishu-generation-agent"', html)
+        self.assertIn("iframe_url", js)
+        for literal_host in ("192.168.30.5", "localhost:8765", "127.0.0.1:8765"):
+            self.assertNotIn(literal_host, html)
+            self.assertNotIn(literal_host, js)
 
 
 if __name__ == "__main__":
