@@ -40,15 +40,18 @@ class AppSpecLoaderTests(unittest.TestCase):
         expected_head = ["seedance", "nano-banana", "dreamina", "volcengine-portrait"]
         self.assertEqual([s.name for s in self.specs][:4], expected_head)
 
-    def test_golden_set_is_exactly_four(self):
-        # Production apps.json holds only the 4 golden apps. hello-world is a
-        # reference sub-app kept in the repo for the 9190 canary but NOT
-        # registered in production (its stdlib launch tripped port-cleanup's
-        # orphan killer — see portal/app.py _kill_port_squatter).
+    def test_golden_set_includes_externally_managed_agent(self):
         self.assertEqual(
             [s.name for s in self.specs],
-            ["seedance", "nano-banana", "dreamina", "volcengine-portrait"],
+            ["seedance", "nano-banana", "dreamina", "volcengine-portrait", "feishu-generation-agent"],
         )
+
+    def test_feishu_generation_agent_is_externally_managed(self):
+        agent = next(spec for spec in self.specs if spec.name == "feishu-generation-agent")
+        self.assertFalse(agent.managed)
+        self.assertEqual(agent.mount, "iframe")
+        self.assertEqual(agent.iframe_url, "/feishu-generation-agent/")
+        self.assertEqual(agent.port, 8765)
 
     def test_no_duplicate_names(self):
         names = [s.name for s in self.specs]
@@ -131,6 +134,7 @@ class AppSpecLoaderTests(unittest.TestCase):
             self.assertIsNone(s.company_key_endpoint)
             self.assertEqual(s.job_type, "image")
             self.assertEqual(s.extra_headers, {})
+            self.assertTrue(s.managed)
         finally:
             fpath.unlink()
 

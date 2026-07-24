@@ -528,7 +528,14 @@ class AppManager:
 
     def start_all(self):
         for name, config in APPS.items():
-            self.start_app(name, config)
+            if config["spec"].managed:
+                self.start_app(name, config)
+            else:
+                alive = self._tcp_probe(config["port"])
+                self.status[name] = {
+                    "status": "running" if alive else "unavailable",
+                    "port": config["port"],
+                }
         threading.Thread(target=self._health_loop, daemon=True).start()
         threading.Thread(target=self._log_rotation_loop, daemon=True).start()
 
@@ -572,6 +579,14 @@ class AppManager:
             return "", ""
 
     def start_app(self, name: str, config: dict):
+        spec: AppSpec | None = config.get("spec")
+        if spec is not None and not spec.managed:
+            alive = self._tcp_probe(config["port"])
+            self.status[name] = {
+                "status": "running" if alive else "unavailable",
+                "port": config["port"],
+            }
+            return
         app_dir = config["dir"]
         if not (app_dir / "app.py").exists():
             self.status[name] = {"status": "missing", "error": "app.py not found"}
@@ -583,7 +598,6 @@ class AppManager:
         env["CORS"] = "1"
         if "DATA_DIR" in os.environ:
             env["DATA_DIR"] = str(app_dir / "test-data")
-        spec: AppSpec | None = config.get("spec")
         if spec is not None and spec.needs_tos_creds:
             ak, sk = self._read_tos_source_keys()
             if ak and sk:
@@ -650,6 +664,13 @@ class AppManager:
         while not self._stop_event.is_set():
             time.sleep(15)
             for name, config in APPS.items():
+                if not config["spec"].managed:
+                    alive = self._tcp_probe(config["port"])
+                    self.status[name] = {
+                        "status": "running" if alive else "unavailable",
+                        "port": config["port"],
+                    }
+                    continue
                 proc = self.processes.get(name)
                 if proc and proc.poll() is not None:
                     self.status[name] = {"status": "crashed", "exit_code": proc.returncode, "port": config["port"]}
