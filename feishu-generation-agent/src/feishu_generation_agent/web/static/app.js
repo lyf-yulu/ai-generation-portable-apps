@@ -7,6 +7,7 @@
   if (!BitableState) throw new Error("多维表格状态模块加载失败");
   const ReferenceUploadState = globalThis.ReferenceUploadState;
   if (!ReferenceUploadState) throw new Error("参考图片上传状态模块加载失败");
+  const PlannerPromptState = globalThis.PlannerPromptState;
   const ApiPaths = globalThis.ApiPaths;
 
   const state = {
@@ -19,6 +20,7 @@
     bitable: BitableState.createState(),
     review: ReviewState.createReviewState(),
     referenceUploads: ReferenceUploadState.createState(),
+    plannerPrompt: PlannerPromptState?.createPlannerPromptState?.() || null,
   };
   const byId = (id) => document.getElementById(id);
   const errorMessage = byId("error-message");
@@ -41,6 +43,15 @@
   const nextTaskButton = byId("next-task-button");
   const rerunButton = byId("rerun-button");
   const pollingNote = byId("polling-note");
+  const plannerPromptEntry = byId("planner-prompt-entry");
+  const plannerPromptButton = byId("planner-prompt-button");
+  const plannerPromptMode = byId("planner-prompt-mode");
+  const plannerPromptModal = byId("planner-prompt-modal");
+  const plannerPromptModalMode = byId("planner-prompt-modal-mode");
+  const plannerPromptText = byId("planner-prompt-text");
+  const plannerPromptSave = byId("planner-prompt-save");
+  const plannerPromptReset = byId("planner-prompt-reset");
+  const plannerPromptFeedback = byId("planner-prompt-feedback");
   const TERMINAL_RUN_STATUSES = new Set([
     "succeeded", "completed_with_errors", "failed", "cancelled", "delivery_failed",
   ]);
@@ -94,6 +105,93 @@
       throw error;
     }
     return payload;
+  }
+
+  function renderPlannerPrompt() {
+    if (!PlannerPromptState || !state.plannerPrompt) return;
+    const prompt = state.plannerPrompt;
+    plannerPromptEntry.hidden = !prompt.entryVisible;
+    plannerPromptButton.disabled = prompt.entryDisabled;
+    plannerPromptMode.textContent = prompt.modeLabel;
+    plannerPromptModal.hidden = !prompt.editorOpen;
+    plannerPromptModalMode.textContent = prompt.modeLabel;
+    if (plannerPromptText.value !== prompt.promptText) {
+      plannerPromptText.value = prompt.promptText;
+    }
+    plannerPromptText.disabled = !prompt.editable || prompt.saving || prompt.resetting;
+    plannerPromptSave.disabled = prompt.saveDisabled;
+    plannerPromptReset.disabled = prompt.resetDisabled;
+    plannerPromptFeedback.textContent = prompt.statusMessage;
+    plannerPromptFeedback.className = `planner-prompt-feedback${prompt.statusType ? ` is-${prompt.statusType}` : ""}`;
+  }
+
+  async function loadPlannerPrompt() {
+    if (!PlannerPromptState || !state.plannerPrompt) return;
+    try {
+      const payload = await api("/api/planner-prompt");
+      state.plannerPrompt = PlannerPromptState.applyPlannerPromptResponse(
+        state.plannerPrompt, payload,
+      );
+    } catch (error) {
+      state.plannerPrompt = {
+        ...state.plannerPrompt,
+        statusMessage: error.message,
+        statusType: "error",
+      };
+    }
+    renderPlannerPrompt();
+  }
+
+  async function savePlannerPrompt() {
+    if (!PlannerPromptState || !state.plannerPrompt) return;
+    if (state.plannerPrompt.saving || state.plannerPrompt.resetting) return;
+    try {
+      state.plannerPrompt = PlannerPromptState.beginPromptSave(state.plannerPrompt);
+      renderPlannerPrompt();
+      const payload = await api("/api/planner-prompt", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt_text: state.plannerPrompt.promptText }),
+      });
+      state.plannerPrompt = PlannerPromptState.finishPromptSave(state.plannerPrompt, payload);
+    } catch (error) {
+      state.plannerPrompt = PlannerPromptState.failPromptSave(
+        state.plannerPrompt, error.message,
+      );
+    }
+    renderPlannerPrompt();
+  }
+
+  async function resetPlannerPrompt() {
+    if (!PlannerPromptState || !state.plannerPrompt) return;
+    if (state.plannerPrompt.saving || state.plannerPrompt.resetting) return;
+    if (!globalThis.confirm("恢复 Prime 将删除当前个人版本，是否继续？")) return;
+    try {
+      state.plannerPrompt = PlannerPromptState.beginPromptReset(state.plannerPrompt);
+      renderPlannerPrompt();
+      const payload = await api("/api/planner-prompt", { method: "DELETE" });
+      state.plannerPrompt = PlannerPromptState.finishPromptReset(state.plannerPrompt, payload);
+    } catch (error) {
+      state.plannerPrompt = PlannerPromptState.failPromptReset(
+        state.plannerPrompt, error.message,
+      );
+    }
+    renderPlannerPrompt();
+  }
+
+  function closePlannerPromptEditor() {
+    if (!PlannerPromptState || !state.plannerPrompt) return;
+    const next = PlannerPromptState.requestPromptEditorClose(state.plannerPrompt);
+    if (next.closeConfirmationNeeded) {
+      if (!globalThis.confirm("尚有未保存的提示词，确定放弃这些修改吗？")) {
+        state.plannerPrompt = { ...next, closeConfirmationNeeded: false };
+      } else {
+        state.plannerPrompt = PlannerPromptState.discardPromptEditorChanges(next);
+      }
+    } else {
+      state.plannerPrompt = next;
+    }
+    renderPlannerPrompt();
   }
 
   function setBusy(value) {
@@ -994,10 +1092,33 @@
     clearError();
     render(ReviewState.draftView(state.review));
   });
+  if (PlannerPromptState && plannerPromptButton) {
+    plannerPromptButton.addEventListener("click", () => {
+      state.plannerPrompt = PlannerPromptState.openPromptEditor(state.plannerPrompt);
+      renderPlannerPrompt();
+      plannerPromptText.focus();
+    });
+    byId("planner-prompt-close").addEventListener("click", closePlannerPromptEditor);
+    plannerPromptModal.addEventListener("click", (event) => {
+      if (event.target === plannerPromptModal) closePlannerPromptEditor();
+    });
+    plannerPromptText.addEventListener("input", () => {
+      state.plannerPrompt = PlannerPromptState.markPromptDirty(
+        state.plannerPrompt, plannerPromptText.value,
+      );
+      renderPlannerPrompt();
+    });
+    plannerPromptSave.addEventListener("click", savePlannerPrompt);
+    plannerPromptReset.addEventListener("click", resetPlannerPrompt);
+  }
   scanBitableButton.addEventListener("click", scanBitableTasks);
   categoryTabs.forEach((tab) => {
     tab.addEventListener("click", () => selectBitableCategory(tab.dataset.category));
   });
   updateActionAvailability();
+  if (PlannerPromptState) {
+    renderPlannerPrompt();
+    loadPlannerPrompt();
+  }
   configureModes();
 })();

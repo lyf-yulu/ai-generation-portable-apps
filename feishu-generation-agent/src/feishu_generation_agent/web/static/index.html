@@ -12,6 +12,12 @@
         <p class="eyebrow">LOCAL GENERATION AGENT</p>
         <h1>飞书生成任务审批工作区</h1>
       </div>
+      <div id="planner-prompt-entry" class="planner-prompt-entry" hidden>
+        <span id="planner-prompt-mode" class="planner-prompt-mode">使用 Prime</span>
+        <button id="planner-prompt-button" type="button" class="secondary" disabled>
+          计划提示词设置
+        </button>
+      </div>
     </header>
 
     <p id="error-message" class="error-message" role="alert" hidden></p>
@@ -115,10 +121,33 @@
       </div>
     </footer>
 
+    <div id="planner-prompt-modal" class="modal-overlay" hidden>
+      <section class="planner-prompt-modal" role="dialog" aria-modal="true"
+        aria-labelledby="planner-prompt-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">PLANNER PROMPT</p>
+            <h2 id="planner-prompt-title">计划提示词设置</h2>
+          </div>
+          <button id="planner-prompt-close" type="button" class="quiet-button">关闭</button>
+        </div>
+        <p id="planner-prompt-modal-mode" class="mode-message">使用 Prime</p>
+        <label for="planner-prompt-text">计划提示词</label>
+        <textarea id="planner-prompt-text" rows="14" spellcheck="false"></textarea>
+        <p class="planner-prompt-note">修改只影响之后领取的新任务</p>
+        <p id="planner-prompt-feedback" class="planner-prompt-feedback" aria-live="polite"></p>
+        <div class="planner-prompt-actions">
+          <button id="planner-prompt-reset" type="button" class="secondary">恢复 Prime</button>
+          <button id="planner-prompt-save" type="button" class="primary">保存个人版本</button>
+        </div>
+      </section>
+    </div>
+
     <script src="static/review-state.js" defer></script>
     <script src="static/bitable-state.js" defer></script>
     <script src="static/reference-upload-state.js" defer></script>
     <script src="static/api-paths.js" defer></script>
+    <script src="static/planner-prompt-state.js" defer></script>
     <script src="static/app.js" defer></script>
   </body>
 </html>
