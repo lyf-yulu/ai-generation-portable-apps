@@ -175,7 +175,7 @@
             <div v-if="statusText === '空闲'">
               <div class="resultHeader"><h2>生成历史 <button @click="loadJobs()" style="font-size:11px;padding:3px 10px;margin-left:8px;cursor:pointer">刷新</button></h2></div>
               <div v-if="jobs.length===0" style="color:#697386;font-size:12px;padding:12px 0">暂无生成记录，提交任务后自动显示</div>
-              <div v-for="j in jobs" :key="j.job_id" style="border:1px solid #e2e8f0;border-radius:8px;padding:10px;margin-bottom:10px">
+              <div v-for="j in visibleJobs()" :key="j.job_id" style="border:1px solid #e2e8f0;border-radius:8px;padding:10px;margin-bottom:10px">
                 <div style="display:flex;align-items:center;margin-bottom:2px;gap:8px">
                   <span :class="'tag tag-'+(j.status||'queued')">{{ j.status }}</span>
                   <span style="font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ (j.prompt||'').slice(0,60) }}</span>
@@ -185,11 +185,19 @@
                 </div>
                 <div v-if="j.errors && j.errors.length" style="font-size:11px;color:#dc2626;margin-top:4px">{{ j.errors.join('; ') }}</div>
                 <div v-for="r in (j.results||[]).filter(function(x){ return x.download_url; })" style="display:flex;align-items:center;margin-top:6px;padding-top:6px;border-top:1px solid #f1f5f9;gap:8px">
-                  <video :src="appPath + r.download_url" controls style="width:120px;height:68px;border-radius:4px;object-fit:cover;flex-shrink:0"></video>
+                  <!-- Lazy video: render a lightweight click-to-play placeholder instead of a live <video>.
+                       Dozens of live <video controls> in the history list pin decoder/buffer memory and
+                       crash the tab over time. Click swaps in the real element on demand. -->
+                  <div v-if="!r._play" @click="r._play = true" style="width:120px;height:68px;border-radius:4px;background:#0f172a;color:#cbd5e1;flex-shrink:0;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:11px">▶ 播放</div>
+                  <video v-else :src="appPath + r.download_url" controls autoplay muted playsinline style="width:120px;height:68px;border-radius:4px;object-fit:cover;flex-shrink:0"></video>
                   <span style="font-size:11px;color:#697386;flex:1">{{ r.filename || 'video' }}</span>
                   <button @click="_blobDownload(appPath + r.download_url, r.filename || 'video')" style="background:#2563eb;color:#fff;border:1px solid #2563eb;font-size:11px;padding:3px 10px;border-radius:4px;cursor:pointer">下载</button>
                 </div>
               </div>
+              <button v-if="jobs.length > jobsLimit" @click="jobsLimit += 20"
+                      style="width:100%;padding:8px;margin-top:4px;font-size:12px;cursor:pointer;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:6px">
+                加载更多（还有 {{ jobs.length - jobsLimit }} 条）
+              </button>
             </div>
           </div>
           <div v-show="wsTab==='activity'" class="activity-panel-inner">

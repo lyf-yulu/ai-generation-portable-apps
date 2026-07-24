@@ -2076,6 +2076,12 @@ class Handler(SimpleHTTPRequestHandler):
                         "total": j.get("total", 0),
                     })
             items.sort(key=lambda it: (it.get("submitted_at") or 0), reverse=True)
+            # Cap the payload to the most recent N jobs. JOBS grows unbounded in
+            # memory until restart; returning every job every 5s (poll) bloats
+            # both the response and the client DOM (each job renders a <video>),
+            # which crashed long-lived browser tabs. 200 is well past what any
+            # user scrolls; the frontend further paginates to 20.
+            items = items[:200]
             json_response(self, 200, {"ok": True, "jobs": items})
             return
         if self.path == "/api/activity":

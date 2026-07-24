@@ -324,6 +324,7 @@ function SeedanceApp() {
     wsTab: 'jobs',
     activityRecords: [],
     jobs: [],
+    jobsLimit: 20,
     activityCounts: null,
     activityDetail: null,
 
@@ -625,6 +626,13 @@ function SeedanceApp() {
         this.activityCounts = res.counts || null;
       }
       this.activityDetail = null;
+    },
+
+    // Only render the most recent `jobsLimit` jobs. The full history can grow
+    // to hundreds of jobs; rendering them all (each with a <video>) pins DOM
+    // memory and eventually crashes the tab. "加载更多" bumps the limit.
+    visibleJobs() {
+      return (this.jobs || []).slice(0, this.jobsLimit);
     },
 
     async loadJobs() {
