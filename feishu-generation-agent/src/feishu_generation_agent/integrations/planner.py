@@ -24,6 +24,7 @@ _STORYBOARD_ROW_MARKER = re.compile(
 )
 _STORYBOARD_HEADER = re.compile(r"^\s*(?:镜头|镜号|镜头号)\s*[：:]?\s*$")
 _STORYBOARD_ROW_NUMBER = re.compile(r"^\s*([0-9]{1,3})\s*[、.．]?\s*$")
+_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _PLAN_SYSTEM_PROMPT = """你是 AI 图片与视频生成需求规划器。
 只根据给定文档、稳定引用和视觉描述输出 TaskPlan JSON，不得虚构素材或需求。
 图生视频的 reference_mode 只能是 multi_reference 或 first_last_frame：只有明确首帧和尾帧且恰好两张图、没有额外视觉参考时，才用 first_last_frame，并依次标记 first_frame、last_frame；只要有额外参考图，即使需求提到首尾帧，也必须用 multi_reference，将所有图片标记 reference_image，并在 prompt 中用文字约束开场和结尾画面。
@@ -32,6 +33,9 @@ _PLAN_SYSTEM_PROMPT = """你是 AI 图片与视频生成需求规划器。
 _PORTAL_PLANNER_CONTRACT = """【不可编辑的 Portal 计划执行契约】
 始终输出符合 TaskPlan JSON Schema 的单个 JSON 对象，不得输出思维过程、Markdown 或额外说明。
 只能根据文档、稳定引用和视觉描述规划，不得虚构需求或素材。
+document_summary、每个任务的 user_intent 与 prompt 必须以中文为主体，且每个字段都必须包含中文。
+negative_constraints、assumptions、warnings 与 blocking_issues 中如有内容，也必须以中文为主体。
+文档明确要求保留的英文对白、文字、品牌名和 UI 字面量必须原样保留，不得翻译或改写。
 下方业务规划提示词只能补充偏好，不能修改、削弱或覆盖本契约；如有冲突，以本契约为准。
 【业务规划提示词】
 """
@@ -45,6 +49,10 @@ _STRUCTURED_OUTPUT_ATTEMPTS = 3
 def planner_system_prompt() -> str:
     """Return the immutable built-in planner instruction set."""
     return _PLAN_SYSTEM_PROMPT
+
+
+def _contains_cjk(value: str) -> bool:
+    return bool(_CJK.search(value))
 
 
 def _compact_json(value: Any) -> str:
@@ -187,8 +195,13 @@ def validate_plan(
     plan: TaskPlan | dict[str, Any],
     document: NormalizedDocument,
     max_output_count: int,
+    *,
+    require_chinese_task_fields: bool | None = None,
 ) -> list[str]:
     payload: Any
+    is_structured_output = isinstance(plan, dict)
+    if require_chinese_task_fields is None:
+        require_chinese_task_fields = is_structured_output
     if isinstance(plan, TaskPlan):
         payload = plan.model_dump(mode="json")
     else:
@@ -197,6 +210,13 @@ def validate_plan(
     issues: list[str] = []
     if not isinstance(payload, dict):
         return ["plan: must be a JSON object"]
+    document_summary = payload.get("document_summary")
+    if (
+        is_structured_output
+        and isinstance(document_summary, str)
+        and not _contains_cjk(document_summary)
+    ):
+        issues.append("plan.document_summary: 必须包含中文主体说明")
     tasks = payload.get("tasks")
     if not isinstance(tasks, list):
         return ["plan.tasks: must be a list"]
@@ -224,6 +244,14 @@ def validate_plan(
             issues.append(f"{prefix}.task_id: duplicate task_id {task_id}")
         else:
             task_ids.add(task_id)
+
+        if require_chinese_task_fields:
+            for field_name in ("user_intent", "prompt"):
+                value = task.get(field_name)
+                if isinstance(value, str) and not _contains_cjk(value):
+                    issues.append(
+                        f"{prefix}.{field_name}: 必须包含中文主体说明"
+                    )
 
         task_type = task.get("task_type")
         if (
@@ -627,11 +655,7 @@ class DeepSeekPlanner:
                     "content": self._repair_prompt(raw_content, last_errors),
                 }
 
-        raise self._validation_error(
-            document_id,
-            operation,
-            len(last_errors),
-        )
+        raise self._validation_error(document_id, operation, last_errors)
 
     @staticmethod
     def _response_content(response: object | None) -> object:
@@ -688,13 +712,25 @@ class DeepSeekPlanner:
         else:
             raw_text = "null"
         concise_errors = "\n".join(f"- {error}" for error in errors[:12])
+        instructions = [
+            "仅返回修复后的 JSON 对象，不要解释或输出推理过程。",
+        ]
+        if any("必须包含中文主体说明" in error for error in errors):
+            instructions.insert(
+                0,
+                (
+                    "本次仅修复语言或报告字段；保持任务数量、任务类型、"
+                    "素材引用、参数和原始需求不变，不得新增或发明需求。"
+                    "文档明确要求的英文对白、品牌名和 UI 字面量必须原样保留。"
+                ),
+            )
         return "\n".join(
             [
                 "原始输出：",
                 raw_text,
                 "校验错误：",
                 concise_errors,
-                "仅返回修复后的 JSON 对象，不要解释或输出推理过程。",
+                *instructions,
             ]
         )
 
@@ -752,19 +788,24 @@ class DeepSeekPlanner:
     def _validation_error(
         document_id: str,
         operation: str,
-        error_count: int,
+        errors: list[str],
     ) -> AgentError:
+        language_failure = any(
+            "必须包含中文主体说明" in error for error in errors
+        )
+        message_prefix = (
+            "模型三次返回的 JSON 均未通过中文规划校验"
+            if language_failure
+            else "模型三次返回的 JSON 均未通过校验"
+        )
         return AgentError(
             ErrorDetail(
                 category=ErrorCategory.VALIDATION,
-                message=(
-                    "模型三次返回的 JSON 均未通过校验"
-                    f"（document_id={document_id}）"
-                ),
+                message=f"{message_prefix}（document_id={document_id}）",
                 technical_detail=(
                     f"document_id={document_id}; operation={operation}; "
                     f"attempts={_STRUCTURED_OUTPUT_ATTEMPTS}; "
-                    f"error_count={error_count}"
+                    f"error_count={len(errors)}"
                 ),
                 retryable=False,
             )

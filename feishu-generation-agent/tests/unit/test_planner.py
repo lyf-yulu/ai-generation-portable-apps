@@ -892,6 +892,43 @@ def test_validator_accepts_task_plan_and_valid_raw_plan(
     assert validate_plan(typed_plan, narrative_document, 4) == []
 
 
+@pytest.mark.parametrize(
+    ("field_path", "value", "expected_issue"),
+    [
+        ("document_summary", "Generate a paper boat video", "document_summary"),
+        ("user_intent", "Generate a paper boat video", "tasks[0].user_intent"),
+        ("prompt", "A paper boat drifts down a river", "tasks[0].prompt"),
+    ],
+)
+def test_validator_rejects_english_only_required_planning_fields(
+    narrative_document: NormalizedDocument,
+    field_path: str,
+    value: str,
+    expected_issue: str,
+):
+    raw_plan = json.loads(_plan_json(_video_task()))
+    if field_path == "document_summary":
+        raw_plan[field_path] = value
+    else:
+        raw_plan["tasks"][0][field_path] = value
+
+    issues = validate_plan(raw_plan, narrative_document, 4)
+
+    assert any(expected_issue in issue and "中文" in issue for issue in issues)
+
+
+def test_validator_accepts_chinese_prompt_with_requested_english_dialogue_brand_and_ui(
+    narrative_document: NormalizedDocument,
+):
+    raw_plan = json.loads(_plan_json(_video_task()))
+    raw_plan["tasks"][0]["prompt"] = (
+        "近景镜头中，角色说：\"Don't move.\"；画面保留 Coca-Cola 品牌，"
+        "并在 UI 上显示 Start 按钮。"
+    )
+
+    assert validate_plan(raw_plan, narrative_document, 4) == []
+
+
 def test_validator_rejects_frame_mode_without_exactly_two_frame_roles(
     narrative_document: NormalizedDocument,
 ):

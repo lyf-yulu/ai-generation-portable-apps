@@ -1,6 +1,7 @@
 import hashlib
 import json
 from dataclasses import dataclass, fields, replace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -14,6 +15,7 @@ from feishu_generation_agent.domain.document import PlanningPromptSnapshot
 from feishu_generation_agent.graph.builder import build_graph
 from feishu_generation_agent.graph.nodes import GraphServices
 from feishu_generation_agent.graph.state import AgentState
+from feishu_generation_agent.integrations.planner import DeepSeekPlanner
 from feishu_generation_agent.storage.checkpoints import open_checkpointer
 
 
@@ -141,6 +143,25 @@ class _FailingDeliveryWriter:
         del run_id, document, plan, artifacts
         self.deliver_calls += 1
         raise RuntimeError("fictional delivery outage")
+
+
+class _StructuredOutputModel:
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = responses
+        self.calls = 0
+
+    def bind(self, **kwargs: Any) -> "_StructuredOutputModel":
+        del kwargs
+        return self
+
+    async def ainvoke(
+        self,
+        messages: list[dict[str, Any]],
+        config: dict[str, Any] | None = None,
+    ) -> SimpleNamespace:
+        del messages, config
+        self.calls += 1
+        return SimpleNamespace(content=self.responses.pop(0))
 
 
 def _input(
@@ -442,6 +463,72 @@ async def test_graph_pauses_before_any_generation(fake_services: GraphServices):
     assert "fictional-graph-image-bytes" not in serialized
     assert "must-not-persist" not in serialized
     assert "base64" not in serialized.lower()
+    _assert_no_paid_side_effects(fake_services)
+    assert await fake_services.repository.count_operations() == 0
+
+
+async def test_three_english_only_plans_fail_before_any_paid_generator_call(
+    fake_services: GraphServices,
+):
+    invalid_plan = {
+        "tasks": [
+            fake_services.planner.task.model_dump(mode="json") | {
+                "user_intent": "Generate a paper boat video",
+                "prompt": "A paper boat drifts into the distance",
+            }
+        ],
+        "document_summary": "Generate a paper boat video",
+    }
+    model = _StructuredOutputModel(
+        [json.dumps(invalid_plan), json.dumps(invalid_plan), json.dumps(invalid_plan)]
+    )
+    services = replace(
+        fake_services,
+        planner=DeepSeekPlanner(model, max_output_count=4),
+    )
+    graph = build_graph(services, InMemorySaver())
+
+    with pytest.raises(AgentError) as raised:
+        await graph.ainvoke(
+            _input("run-english-only", "thread-english-only"),
+            config=_config("thread-english-only"),
+        )
+
+    assert model.calls == 3
+    assert raised.value.detail.category == ErrorCategory.VALIDATION
+    assert "中文" in raised.value.detail.message
+    _assert_no_paid_side_effects(services)
+    assert await services.repository.count_operations() == 0
+
+
+async def test_approval_edit_with_english_only_prompt_fails_before_generator(
+    fake_services: GraphServices,
+):
+    graph = build_graph(fake_services, InMemorySaver())
+    config = _config("thread-english-approval-edit")
+    first = await graph.ainvoke(
+        _input("run-english-approval-edit", "thread-english-approval-edit"),
+        config=config,
+    )
+    plan = _interrupt_payload(first)["task_plan"]
+    edited_task = plan["tasks"][0] | {
+        "user_intent": "Generate a paper boat video",
+        "prompt": "A paper boat drifts into the distance",
+    }
+
+    with pytest.raises(AgentError) as raised:
+        await graph.ainvoke(
+            Command(
+                resume={
+                    "action": "approve",
+                    "selected_task_ids": ["task-video"],
+                    "tasks": [edited_task],
+                }
+            ),
+            config=config,
+        )
+
+    assert raised.value.detail.category == ErrorCategory.VALIDATION
     _assert_no_paid_side_effects(fake_services)
     assert await fake_services.repository.count_operations() == 0
 

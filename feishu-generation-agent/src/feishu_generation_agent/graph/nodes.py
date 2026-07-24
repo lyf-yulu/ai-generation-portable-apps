@@ -114,7 +114,11 @@ def _safe_error(exc: BaseException) -> AgentError:
         category = exc.detail.category
         retryable = exc.detail.retryable
         if category is ErrorCategory.VALIDATION:
-            message = "The request is invalid"
+            message = (
+                exc.detail.message
+                if exc.detail.message.startswith("模型三次返回的 JSON 均未通过")
+                else "The request is invalid"
+            )
         else:
             message = "The workflow node could not be completed"
     elif isinstance(exc, ValidationError):
@@ -598,6 +602,7 @@ async def revalidate_approval(
                 selected_plan,
                 document,
                 max_output_count=services.settings.max_output_count,
+                require_chinese_task_fields=True,
             )
         )
         if issues:
@@ -1333,6 +1338,7 @@ async def execute_selected_tasks(
             plan,
             document,
             max_output_count=services.settings.max_output_count,
+            require_chinese_task_fields=True,
         )
         if issues:
             raise _validation_error("The approved plan is not valid")
