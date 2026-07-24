@@ -1470,6 +1470,26 @@ class Handler(SimpleHTTPRequestHandler):
         if not self._try_proxy(path, "POST", user):
             self._json(404, {"ok": False, "error": "not found"})
 
+    def do_PUT(self):
+        if self._reject_oversized_upload():
+            return
+        path = urllib.parse.urlparse(self.path).path
+        user = self._require_auth(path)
+        if not user:
+            return
+        if not self._try_proxy(path, "PUT", user):
+            self._json(404, {"ok": False, "error": "not found"})
+
+    def do_PATCH(self):
+        if self._reject_oversized_upload():
+            return
+        path = urllib.parse.urlparse(self.path).path
+        user = self._require_auth(path)
+        if not user:
+            return
+        if not self._try_proxy(path, "PATCH", user):
+            self._json(404, {"ok": False, "error": "not found"})
+
     def do_DELETE(self):
         path = urllib.parse.urlparse(self.path).path
         user = self._require_auth(path)

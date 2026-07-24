@@ -174,6 +174,59 @@ class ProxyIdentityHeadersTests(unittest.TestCase):
         )
 
 
+class ProxyHttpMethodDispatchTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod, cls.tmp = _load_portal_with_temp_state()
+
+    @classmethod
+    def tearDownClass(cls):
+        _restore_data_dir_env()
+
+    def test_authenticated_agent_mutation_methods_are_proxied(self):
+        user = {
+            "user_id": "user-a-immutable",
+            "username": "测试用户",
+            "role": "user",
+        }
+        for method in ("PUT", "PATCH", "DELETE"):
+            with self.subTest(method=method):
+                handler = self.mod.Handler.__new__(self.mod.Handler)
+                handler.path = "/feishu-generation-agent/api/planner-prompt"
+                handler._reject_oversized_upload = lambda: False
+                handler._require_auth = lambda path: user
+                proxied = []
+                handler._try_proxy = (
+                    lambda path, actual_method, actual_user: proxied.append(
+                        (path, actual_method, actual_user)
+                    )
+                    or True
+                )
+                handler._json = lambda status, payload: self.fail(
+                    f"unexpected response {status}: {payload}"
+                )
+
+                dispatch = getattr(handler, f"do_{method}", None)
+                self.assertIsNotNone(
+                    dispatch,
+                    f"Portal does not implement HTTP {method} dispatch",
+                )
+                if dispatch is None:
+                    continue
+                dispatch()
+
+                self.assertEqual(
+                    proxied,
+                    [
+                        (
+                            "/feishu-generation-agent/api/planner-prompt",
+                            method,
+                            user,
+                        )
+                    ],
+                )
+
+
 class FeishuAgentNavigationTests(unittest.TestCase):
     def test_feishu_agent_tab_uses_registered_relative_iframe_url(self):
         html = (PORTAL / "static" / "index.html").read_text(encoding="utf-8")
