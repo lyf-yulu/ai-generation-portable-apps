@@ -209,6 +209,99 @@ async def test_run_events_are_ordered_and_summary_is_safe(tmp_path: Path):
     await repo.close()
 
 
+async def test_repository_migrates_legacy_runs_to_prime_local_owner(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "legacy-runs.sqlite3"
+    async with aiosqlite.connect(db_path) as connection:
+        await connection.execute(
+            """
+            CREATE TABLE runs (
+              run_id TEXT PRIMARY KEY,
+              thread_id TEXT NOT NULL UNIQUE,
+              source_url TEXT NOT NULL,
+              status TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        await connection.execute(
+            """
+            INSERT INTO runs (
+              run_id, thread_id, source_url, status, created_at, updated_at
+            ) VALUES (
+              'legacy-run', 'legacy-thread', 'https://example.test/legacy',
+              'waiting_approval', '2026-07-24T00:00:00+00:00',
+              '2026-07-24T00:00:00+00:00'
+            )
+            """
+        )
+        await connection.commit()
+
+    repository = await Repository.open(db_path)
+    try:
+        run = await repository.get_run(
+            "legacy-run", owner_user_id="prime-local"
+        )
+        assert run is not None
+        assert run["owner_user_id"] == "prime-local"
+        assert (
+            await repository.get_run(
+                "legacy-run", owner_user_id="user-a"
+            )
+            is None
+        )
+    finally:
+        await repository.close()
+
+
+async def test_repository_scopes_run_reads_and_mutations_by_owner(
+    tmp_path: Path,
+) -> None:
+    repository = await Repository.open(tmp_path / "owned-runs.sqlite3")
+    try:
+        await repository.create_run(
+            "run-a",
+            "thread-a",
+            "https://example.test/source",
+            owner_user_id="user-a",
+        )
+        run = await repository.get_run("run-a", owner_user_id="user-a")
+        assert run is not None
+        assert run["owner_user_id"] == "user-a"
+        assert [
+            item["run_id"]
+            for item in await repository.list_runs(
+                owner_user_id="user-a",
+                statuses={"pending"},
+            )
+        ] == ["run-a"]
+
+        assert await repository.get_run("run-a", owner_user_id="user-b") is None
+        assert (
+            await repository.update_run_status(
+                "run-a", "failed", owner_user_id="user-b"
+            )
+            is False
+        )
+        assert (
+            await repository.delete_run("run-a", owner_user_id="user-b")
+            is False
+        )
+        assert (
+            await repository.get_run("run-a", owner_user_id="user-a")
+        ) is not None
+
+        assert (
+            await repository.delete_run("run-a", owner_user_id="user-a")
+            is True
+        )
+        assert await repository.get_run("run-a", owner_user_id="user-a") is None
+    finally:
+        await repository.close()
+
+
 async def test_artifact_is_saved_as_json(tmp_path: Path):
     db_path = tmp_path / "agent.sqlite3"
     repo = await Repository.open(db_path)

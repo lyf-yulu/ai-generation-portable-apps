@@ -10,7 +10,11 @@ from feishu_generation_agent.domain.production_bitable import (
     ProductionSourceSnapshot,
     ProductionTaskSummary,
 )
-from feishu_generation_agent.graph.runtime import RunConflict, RunValidationError
+from feishu_generation_agent.graph.runtime import (
+    RunConflict,
+    RunNotFound,
+    RunValidationError,
+)
 from feishu_generation_agent.storage.production_tasks import ProductionTaskStore
 
 
@@ -229,6 +233,135 @@ async def test_service_lists_active_production_run_for_browser_restore(tmp_path)
         (run_id, "处理中")
     ]
     assert scanned_after_claim == []
+
+
+async def test_service_keeps_scan_global_while_active_runs_are_owner_scoped(
+    tmp_path,
+) -> None:
+    class Bitable:
+        async def ensure_schema(self, location):
+            return object()
+
+        async def list_tasks(self, location, schema, *, include_completed):
+            return [_task()]
+
+    service, store = await _production_service(
+        tmp_path,
+        bitable=Bitable(),
+        sources={"animation": ProductionTaskSource(_location(), "动画类")},
+    )
+    try:
+        run_id = await service.claim(
+            "rec-no-maker", owner_user_id="user-a"
+        )
+        assert [
+            item.run_id
+            for item in await service.active_runs(owner_user_id="user-a")
+        ] == [run_id]
+        assert (
+            await service.active_runs(owner_user_id="user-b")
+        ) == []
+        assert await service.scan() == []
+    finally:
+        await store.close()
+
+
+async def test_service_hides_owned_run_from_wrong_owner_mutations(
+    tmp_path,
+) -> None:
+    class Bitable:
+        async def ensure_schema(self, location):
+            return object()
+
+        async def list_tasks(self, location, schema, *, include_completed):
+            return [_task()]
+
+    class Runtime:
+        async def start_run(
+            self, request, *, run_id=None, thread_id=None
+        ):
+            return run_id
+
+        async def delete_run(self, run_id):
+            raise AssertionError("wrong owner reached runtime")
+
+        async def retry_delivery(self, run_id):
+            raise AssertionError("wrong owner reached runtime")
+
+    store = await ProductionTaskStore.open(tmp_path / "production.sqlite3")
+    service = ProductionBitableService(
+        bitable=Bitable(),
+        store=store,
+        runtime=Runtime(),
+        sources={"animation": ProductionTaskSource(_location(), "动画类")},
+        include_completed_for_test=True,
+    )
+    try:
+        run_id = await service.claim(
+            "rec-no-maker", owner_user_id="user-a"
+        )
+        for operation in (
+            lambda: service.validate_approval(
+                run_id, owner_user_id="user-b"
+            ),
+            lambda: service.retry_delivery(
+                run_id, owner_user_id="user-b"
+            ),
+            lambda: service.delete_run(
+                run_id, owner_user_id="user-b"
+            ),
+            lambda: service.rerun(
+                run_id, owner_user_id="user-b"
+            ),
+        ):
+            with pytest.raises(RunNotFound):
+                await operation()
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    "runtime_status",
+    ["succeeded", "completed_with_errors", "failed", "cancelled", "timed_out"],
+)
+async def test_terminal_runtime_status_releases_shared_production_lock(
+    tmp_path,
+    runtime_status: str,
+) -> None:
+    class Runtime:
+        async def get_run_view(self, run_id):
+            return {"run_id": run_id, "status": runtime_status}
+
+    store = await ProductionTaskStore.open(tmp_path / "production.sqlite3")
+    service = ProductionBitableService(
+        bitable=_MixedCategoryBitable(),
+        store=store,
+        runtime=Runtime(),
+        sources=_category_sources(),
+        include_completed_for_test=False,
+        enabled_task_types=frozenset({"动画类", "真人类"}),
+    )
+    try:
+        binding = await store.claim(
+            _location(),
+            _task(),
+            run_id=f"run-{runtime_status}",
+            thread_id=f"thread-{runtime_status}",
+            owner_user_id="user-a",
+        )
+        await service.sync_once(
+            binding.run_id, owner_user_id="user-a"
+        )
+        replacement = await store.claim(
+            _location(),
+            _task(),
+            run_id=f"replacement-{runtime_status}",
+            thread_id=f"replacement-thread-{runtime_status}",
+            owner_user_id="user-b",
+        )
+        assert replacement.owner_user_id == "user-b"
+    finally:
+        await store.close()
 
 
 async def test_service_rerun_archives_original_binding_and_lists_it_as_recent(tmp_path) -> None:

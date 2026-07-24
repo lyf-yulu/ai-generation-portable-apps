@@ -1,5 +1,6 @@
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
+from inspect import Parameter, signature
 import os
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator, Literal
@@ -388,6 +389,34 @@ def create_app(
             )
         return active
 
+    def runtime_owner_scope(active: Any, owner_user_id: str):
+        repository = getattr(active, "repository", None)
+        owner_scope = getattr(repository, "owner_scope", None)
+        if callable(owner_scope):
+            return owner_scope(owner_user_id)
+        return nullcontext()
+
+    async def ensure_owned_run(
+        active: Any, run_id: str, owner_user_id: str
+    ) -> None:
+        repository = getattr(active, "repository", None)
+        get_run = getattr(repository, "get_run", None)
+        if callable(get_run) and await get_run(
+            run_id, owner_user_id=owner_user_id
+        ) is None:
+            raise RunNotFound("运行不存在")
+
+    def owner_argument(callable_object: Any, owner_user_id: str) -> dict[str, str]:
+        try:
+            parameter = signature(callable_object).parameters.get(
+                "owner_user_id"
+            )
+        except (TypeError, ValueError):
+            parameter = None
+        if parameter is None or parameter.kind is Parameter.POSITIONAL_ONLY:
+            return {}
+        return {"owner_user_id": owner_user_id}
+
     def get_planner_prompt_store(request: Request) -> PlannerPromptStore:
         active = getattr(request.app.state, "planner_prompt_store", None)
         if active is None:
@@ -515,8 +544,13 @@ def create_app(
     @app.get("/api/bitable/active-runs")
     async def list_active_bitable_runs(request: Request) -> list[dict]:
         active = get_bitable_service(request)
+        identity = current_identity(request)
         try:
-            bindings = await active.active_runs()
+            bindings = await active.active_runs(
+                **owner_argument(
+                    active.active_runs, identity.owner_user_id
+                )
+            )
         except Exception as exc:
             raise_bitable_error(exc)
         return [
@@ -531,14 +565,25 @@ def create_app(
     @app.get("/api/bitable/recent-runs")
     async def list_recent_bitable_runs(request: Request) -> list[dict]:
         active = get_bitable_service(request)
+        identity = current_identity(request)
         try:
-            bindings = await active.recent_runs()
+            bindings = await active.recent_runs(
+                **owner_argument(
+                    active.recent_runs, identity.owner_user_id
+                )
+            )
         except Exception as exc:
             raise_bitable_error(exc)
         payload: list[dict] = []
         for binding in bindings:
             try:
-                result_table_url = await active.result_table_url(binding.run_id)
+                result_table_url = await active.result_table_url(
+                    binding.run_id,
+                    **owner_argument(
+                        active.result_table_url,
+                        identity.owner_user_id,
+                    ),
+                )
             except AttributeError:
                 result_table_url = None
             payload.append(
@@ -566,8 +611,17 @@ def create_app(
         category: ProductionCategory = "animation",
     ) -> BitableClaimResponse:
         active = get_bitable_service(request)
+        identity = current_identity(request)
         try:
-            run_id = await active.claim(record_id, category)
+            runtime_for_owner = get_runtime(request)
+            with runtime_owner_scope(
+                runtime_for_owner, identity.owner_user_id
+            ):
+                run_id = await active.claim(
+                    record_id,
+                    category,
+                    **owner_argument(active.claim, identity.owner_user_id),
+                )
         except Exception as exc:
             raise_bitable_error(exc)
         return BitableClaimResponse(run_id=run_id)
@@ -580,8 +634,21 @@ def create_app(
         run_id: str, request: Request
     ) -> BitableRetryResponse:
         active = get_bitable_service(request)
+        identity = current_identity(request)
         try:
-            await active.retry_delivery(run_id)
+            runtime_for_owner = get_runtime(request)
+            await ensure_owned_run(
+                runtime_for_owner, run_id, identity.owner_user_id
+            )
+            with runtime_owner_scope(
+                runtime_for_owner, identity.owner_user_id
+            ):
+                await active.retry_delivery(
+                    run_id,
+                    **owner_argument(
+                        active.retry_delivery, identity.owner_user_id
+                    ),
+                )
         except Exception as exc:
             raise_bitable_error(exc)
         return BitableRetryResponse(run_id=run_id)
@@ -592,8 +659,19 @@ def create_app(
     )
     async def rerun_bitable_run(run_id: str, request: Request) -> BitableClaimResponse:
         active = get_bitable_service(request)
+        identity = current_identity(request)
         try:
-            new_run_id = await active.rerun(run_id)
+            runtime_for_owner = get_runtime(request)
+            await ensure_owned_run(
+                runtime_for_owner, run_id, identity.owner_user_id
+            )
+            with runtime_owner_scope(
+                runtime_for_owner, identity.owner_user_id
+            ):
+                new_run_id = await active.rerun(
+                    run_id,
+                    **owner_argument(active.rerun, identity.owner_user_id),
+                )
         except Exception as exc:
             raise_bitable_error(exc)
         return BitableClaimResponse(run_id=new_run_id)
@@ -601,22 +679,39 @@ def create_app(
     @app.post("/api/runs", status_code=status.HTTP_202_ACCEPTED)
     async def create_run(payload: CreateRunRequest, request: Request) -> dict[str, str]:
         active = get_runtime(request)
-        run_id = await active.start_run(payload.to_domain())
+        identity = current_identity(request)
+        with runtime_owner_scope(active, identity.owner_user_id):
+            run_id = await active.start_run(payload.to_domain())
         return {"run_id": run_id}
 
     @app.get("/api/runs/{run_id}")
     async def get_run(run_id: str, request: Request):
         active = get_runtime(request)
+        identity = current_identity(request)
+        try:
+            await ensure_owned_run(active, run_id, identity.owner_user_id)
+        except RunNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
         active_bitable = getattr(request.app.state, "bitable_service", None)
         if active_bitable is not None:
             try:
-                await active_bitable.sync_once(run_id)
+                with runtime_owner_scope(
+                    active, identity.owner_user_id
+                ):
+                    await active_bitable.sync_once(
+                        run_id,
+                        **owner_argument(
+                            active_bitable.sync_once,
+                            identity.owner_user_id,
+                        ),
+                    )
             except RunNotFound:
                 pass
             except Exception as exc:
                 raise_bitable_error(exc)
         try:
-            return await active.get_run_view(run_id)
+            with runtime_owner_scope(active, identity.owner_user_id):
+                return await active.get_run_view(run_id)
         except RunNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from None
 
@@ -630,12 +725,20 @@ def create_app(
         request: Request,
     ) -> dict[str, str]:
         active = get_runtime(request)
+        identity = current_identity(request)
         try:
+            await ensure_owned_run(active, run_id, identity.owner_user_id)
             active_bitable = getattr(request.app.state, "bitable_service", None)
             validate_approval = getattr(active_bitable, "validate_approval", None)
             if payload.action == "approve" and callable(validate_approval):
-                await validate_approval(run_id)
-            await active.resume_run(run_id, payload.to_domain())
+                await validate_approval(
+                    run_id,
+                    **owner_argument(
+                        validate_approval, identity.owner_user_id
+                    ),
+                )
+            with runtime_owner_scope(active, identity.owner_user_id):
+                await active.resume_run(run_id, payload.to_domain())
         except RunNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from None
         except RunConflict as exc:
@@ -652,8 +755,11 @@ def create_app(
         run_id: str, request: Request
     ) -> dict[str, str]:
         active = get_runtime(request)
+        identity = current_identity(request)
         try:
-            await active.retry_delivery(run_id)
+            await ensure_owned_run(active, run_id, identity.owner_user_id)
+            with runtime_owner_scope(active, identity.owner_user_id):
+                await active.retry_delivery(run_id)
         except (RunNotFound, RunConflict, RunValidationError) as exc:
             raise_runtime_error(exc)
         return {"run_id": run_id, "status": "accepted"}
@@ -662,8 +768,25 @@ def create_app(
     async def delete_run(run_id: str, request: Request) -> dict[str, str]:
         active_bitable = getattr(request.app.state, "bitable_service", None)
         active = active_bitable or get_runtime(request)
+        identity = current_identity(request)
         try:
-            await active.delete_run(run_id)
+            runtime_for_owner = get_runtime(request)
+            await ensure_owned_run(
+                runtime_for_owner, run_id, identity.owner_user_id
+            )
+            if active_bitable is not None:
+                with runtime_owner_scope(
+                    runtime_for_owner, identity.owner_user_id
+                ):
+                    await active.delete_run(
+                        run_id,
+                        **owner_argument(
+                            active.delete_run, identity.owner_user_id
+                        ),
+                    )
+            else:
+                with runtime_owner_scope(active, identity.owner_user_id):
+                    await active.delete_run(run_id)
         except (RunNotFound, RunConflict, RunValidationError) as exc:
             raise_runtime_error(exc)
         return {"run_id": run_id, "status": "deleted"}
@@ -691,19 +814,24 @@ def create_app(
         replaces_asset_id: str | None = Form(default=None),
     ) -> dict:
         active = get_runtime(request)
-        content = await file.read(active.settings.max_download_bytes + 1)
-        if len(content) > active.settings.max_download_bytes:
-            raise HTTPException(status_code=422, detail="图片超过大小限制")
+        identity = current_identity(request)
         try:
-            return await active.add_reference(
-                run_id,
-                task_id=task_id,
-                role=role,
-                order=order,
-                filename=file.filename or "upload",
-                content=content,
-                replaces_asset_id=replaces_asset_id,
-            )
+            await ensure_owned_run(active, run_id, identity.owner_user_id)
+            content = await file.read(active.settings.max_download_bytes + 1)
+            if len(content) > active.settings.max_download_bytes:
+                raise HTTPException(
+                    status_code=422, detail="图片超过大小限制"
+                )
+            with runtime_owner_scope(active, identity.owner_user_id):
+                return await active.add_reference(
+                    run_id,
+                    task_id=task_id,
+                    role=role,
+                    order=order,
+                    filename=file.filename or "upload",
+                    content=content,
+                    replaces_asset_id=replaces_asset_id,
+                )
         except (RunNotFound, RunConflict, RunValidationError) as exc:
             raise_runtime_error(exc)
         raise AssertionError("unreachable")
@@ -716,13 +844,16 @@ def create_app(
         request: Request,
     ) -> dict[str, str]:
         active = get_runtime(request)
+        identity = current_identity(request)
         try:
-            await active.set_references(
-                run_id,
-                task_id=task_id,
-                references=payload.references,
-                reference_mode=payload.reference_mode,
-            )
+            await ensure_owned_run(active, run_id, identity.owner_user_id)
+            with runtime_owner_scope(active, identity.owner_user_id):
+                await active.set_references(
+                    run_id,
+                    task_id=task_id,
+                    references=payload.references,
+                    reference_mode=payload.reference_mode,
+                )
         except (RunNotFound, RunConflict, RunValidationError) as exc:
             raise_runtime_error(exc)
         return {"status": "updated"}
@@ -735,12 +866,15 @@ def create_app(
         request: Request,
     ) -> dict[str, str]:
         active = get_runtime(request)
+        identity = current_identity(request)
         try:
-            await active.unlink_reference(
-                run_id,
-                task_id=task_id,
-                asset_id=asset_id,
-            )
+            await ensure_owned_run(active, run_id, identity.owner_user_id)
+            with runtime_owner_scope(active, identity.owner_user_id):
+                await active.unlink_reference(
+                    run_id,
+                    task_id=task_id,
+                    asset_id=asset_id,
+                )
         except (RunNotFound, RunConflict, RunValidationError) as exc:
             raise_runtime_error(exc)
         return {"status": "unlinked"}
@@ -752,8 +886,13 @@ def create_app(
         request: Request,
     ) -> FileResponse:
         active = get_runtime(request)
+        identity = current_identity(request)
         try:
-            path, mime_type = await active.get_reference_file(run_id, asset_id)
+            await ensure_owned_run(active, run_id, identity.owner_user_id)
+            with runtime_owner_scope(active, identity.owner_user_id):
+                path, mime_type = await active.get_reference_file(
+                    run_id, asset_id
+                )
         except (RunNotFound, RunConflict, RunValidationError) as exc:
             raise_runtime_error(exc)
         return FileResponse(path, media_type=mime_type)

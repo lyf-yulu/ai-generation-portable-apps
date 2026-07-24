@@ -457,13 +457,105 @@ async def _wait_for_status(
     client: httpx.AsyncClient,
     run_id: str,
     expected: str,
+    *,
+    headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     for _ in range(100):
-        response = await client.get(f"/api/runs/{run_id}")
+        response = await client.get(
+            f"/api/runs/{run_id}", headers=headers
+        )
         if response.status_code == 200 and response.json()["status"] == expected:
             return response.json()
         await asyncio.sleep(0.01)
     raise AssertionError(f"run did not reach {expected}")
+
+
+async def test_run_and_reference_routes_hide_user_a_run_from_user_b(
+    tmp_path: Path,
+) -> None:
+    async with _environment(tmp_path) as (
+        client,
+        runtime,
+        graph,
+        repository,
+    ):
+        del runtime, graph
+        created = await client.post(
+            "/api/runs",
+            headers=_USER_A_HEADERS,
+            json={"source_url": "https://acme.feishu.cn/docx/owned"},
+        )
+        run_id = created.json()["run_id"]
+        await _wait_for_status(
+            client,
+            run_id,
+            "waiting_approval",
+            headers=_USER_A_HEADERS,
+        )
+        owned = await repository.get_run(
+            run_id, owner_user_id="user-a"
+        )
+        assert owned is not None
+
+        responses = [
+            await client.get(
+                f"/api/runs/{run_id}", headers=_USER_B_HEADERS
+            ),
+            await client.post(
+                f"/api/runs/{run_id}/decision",
+                headers=_USER_B_HEADERS,
+                json={"action": "cancel"},
+            ),
+            await client.post(
+                f"/api/runs/{run_id}/retry-delivery",
+                headers=_USER_B_HEADERS,
+            ),
+            await client.post(
+                f"/api/runs/{run_id}/references",
+                headers=_USER_B_HEADERS,
+                data={
+                    "task_id": "task-1",
+                    "role": "reference_image",
+                    "order": "2",
+                },
+                files={
+                    "file": ("replacement.png", _png_bytes(), "image/png")
+                },
+            ),
+            await client.patch(
+                f"/api/runs/{run_id}/tasks/task-1/references",
+                headers=_USER_B_HEADERS,
+                json={
+                    "references": [
+                        {
+                            "asset_id": "asset-1",
+                            "role": "reference_image",
+                            "order": 1,
+                        }
+                    ]
+                },
+            ),
+            await client.delete(
+                f"/api/runs/{run_id}/tasks/task-1/references/asset-1",
+                headers=_USER_B_HEADERS,
+            ),
+            await client.get(
+                f"/api/runs/{run_id}/references/asset-1/content",
+                headers=_USER_B_HEADERS,
+            ),
+            await client.delete(
+                f"/api/runs/{run_id}", headers=_USER_B_HEADERS
+            ),
+        ]
+
+        assert [response.status_code for response in responses] == [404] * len(
+            responses
+        )
+        assert (
+            await repository.get_run(
+                run_id, owner_user_id="user-a"
+            )
+        ) is not None
 
 
 async def test_clone_run_for_approval_reuses_approved_draft_without_generation(
