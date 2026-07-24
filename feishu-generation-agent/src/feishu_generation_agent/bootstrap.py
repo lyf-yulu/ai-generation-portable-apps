@@ -204,7 +204,11 @@ async def _open_application_services(
         settings.require(*CAPABILITY_FIELDS["legacy_delivery"])
     settings.ensure_paths()
     repository = await Repository.open(settings.business_db_path)
-    planner_prompt_store = await PlannerPromptStore.open(settings.business_db_path)
+    try:
+        planner_prompt_store = await PlannerPromptStore.open(settings.business_db_path)
+    except BaseException:
+        await repository.close()
+        raise
     provider_http = httpx.AsyncClient(trust_env=False)
     downloader = SafeResultDownloader(
         max_bytes=settings.max_download_bytes,

@@ -39,8 +39,13 @@ class PlannerPromptStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         connection = await aiosqlite.connect(str(path), isolation_level=None)
         connection.row_factory = aiosqlite.Row
-        await connection.execute("PRAGMA busy_timeout = 5000")
-        await connection.executescript(_SCHEMA)
+        try:
+            await connection.execute("PRAGMA busy_timeout = 5000")
+            await connection.executescript(_SCHEMA)
+            await connection.commit()
+        except BaseException:
+            await connection.close()
+            raise
         return cls(connection)
 
     async def get(self, portal_user_id: str) -> PlannerPromptProfile | None:
@@ -77,13 +82,24 @@ class PlannerPromptStore:
                 existing = await cursor.fetchone()
                 await cursor.close()
                 if existing is None:
+                    version = 1
+                    created_at = updated_at
                     await self._connection.execute(
                         """INSERT INTO planner_prompt_profiles (
                           portal_user_id, username, prompt_text, version, created_at, updated_at
                         ) VALUES (?, ?, ?, ?, ?, ?)""",
-                        (portal_user_id, username, prompt_text, 1, updated_at, updated_at),
+                        (
+                            portal_user_id,
+                            username,
+                            prompt_text,
+                            version,
+                            created_at,
+                            updated_at,
+                        ),
                     )
                 else:
+                    version = existing["version"] + 1
+                    created_at = existing["created_at"]
                     await self._connection.execute(
                         """UPDATE planner_prompt_profiles SET
                           username = ?, prompt_text = ?, version = ?, updated_at = ?
@@ -91,18 +107,23 @@ class PlannerPromptStore:
                         (
                             username,
                             prompt_text,
-                            existing["version"] + 1,
+                            version,
                             updated_at,
                             portal_user_id,
                         ),
                     )
                 await self._connection.commit()
+                profile = PlannerPromptProfile(
+                    portal_user_id=portal_user_id,
+                    username=username,
+                    prompt_text=prompt_text,
+                    version=version,
+                    created_at=created_at,
+                    updated_at=updated_at,
+                )
             except Exception:
                 await self._connection.rollback()
                 raise
-
-        profile = await self.get(portal_user_id)
-        assert profile is not None
         return profile
 
     async def delete(self, portal_user_id: str) -> bool:
