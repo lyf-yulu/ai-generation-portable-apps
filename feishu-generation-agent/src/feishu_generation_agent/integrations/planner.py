@@ -26,15 +26,37 @@ _STORYBOARD_HEADER = re.compile(r"^\s*(?:镜头|镜号|镜头号)\s*[：:]?\s*$"
 _STORYBOARD_ROW_NUMBER = re.compile(r"^\s*([0-9]{1,3})\s*[、.．]?\s*$")
 _CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _CJK_ISSUE_SUFFIX = "必须包含中文主体说明"
+_AUDIO_TERM = (
+    r"(?:人声台词|背景音乐|环境音|对白|台词|音效|配音|人声|音乐|声音|BGM)"
+)
 _AUDIO_INTENT = re.compile(
-    r"(?:人声(?:台词)?|对白|台词|音效|配音|环境音|背景音乐|音乐|声音|BGM)",
+    _AUDIO_TERM,
     re.IGNORECASE,
 )
 _NEGATED_AUDIO_INTENT = re.compile(
-    r"(?:无需|不需要|不要|无|关闭|禁用|不生成|不含|没有)"
-    r"(?:任何)?"
-    r"(?:人声(?:台词)?|对白|台词|音效|配音|环境音|背景音乐|音乐|声音|BGM)"
+    r"(?:无需|不需要|不要|无|关闭|禁用|不生成|不含|没有|去掉)"
+    r"(?:有|加入|添加|生成|包含|使用)?(?:任何)?\s*"
+    + _AUDIO_TERM
+    + r"|"
+    + _AUDIO_TERM
+    + r"\s*[：:]?\s*(?:无|不要|关闭|禁用|否|没有|不需要|无需)"
     r"|(?:no|without)\s+(?:voice|dialogue|sound|audio|music|bgm)",
+    re.IGNORECASE,
+)
+_GLOBAL_SILENCE = re.compile(
+    r"(?:全程|整体|视频(?:全程)?)\s*(?:保持|采用|设置为)?\s*(?:静音|无声)"
+    r"|(?:静音|无声)\s*视频"
+    r"|(?:不要|无需|不需要|不含|没有)\s*(?:有|加入|添加|生成|包含)?"
+    r"\s*(?:任何|全部)?\s*(?:声音|音频)",
+    re.IGNORECASE,
+)
+_AUDIO_UI_LITERAL = re.compile(
+    _AUDIO_TERM + r"\s*(?:按钮|图标|开关|选项|文字|字样|UI)",
+    re.IGNORECASE,
+)
+_SPOKEN_DIALOGUE = re.compile(
+    r"(?:[\u3400-\u4dbf\u4e00-\u9fff]{1,12}(?:说|说道)|"
+    r"Girl|Boy|Man|Woman|Narrator|Voiceover)\s*[：:]",
     re.IGNORECASE,
 )
 _GOAL_REJECTING_AUDIT_LANGUAGE = (
@@ -46,6 +68,20 @@ _GOAL_REJECTING_AUDIT_LANGUAGE = (
     "不可行",
     "不能支持",
     "不支持",
+)
+_GOAL_REJECTING_REWRITES = {
+    "无法保证": "需通过风险缓释加强",
+    "无法满足": "需采用可执行方案满足",
+    "不能满足": "需采用可执行方案满足",
+    "不合理": "需进行合理化处理",
+    "做不到": "需采用替代路径完成",
+    "不可行": "需采用替代实施路径",
+    "不能支持": "需切换为可支持的实现方式",
+    "不支持": "需切换为可支持的实现方式",
+}
+_ACTIONABLE_HUMAN_HANDLING = re.compile(
+    r"(?:人工处理|人工确认|手动处理|"
+    r"请(?:补充|提供|确认|申请|开通|上传|替换|联系|调整|选择|改用))"
 )
 _PLAN_SYSTEM_PROMPT = """你是 AI 图片与视频生成需求规划器。
 只根据给定文档、稳定引用和视觉描述输出 TaskPlan JSON，不得虚构素材或需求。
@@ -80,33 +116,59 @@ def _contains_cjk(value: str) -> bool:
     return bool(_CJK.search(value))
 
 
-def _document_requests_audio(document: NormalizedDocument) -> bool:
-    source_text = "\n".join(
-        [
-            document.title,
-            document.text_view,
-            *(block.text for block in document.blocks if block.text),
-        ]
-    )
+def _text_requests_audio(source_text: str) -> bool:
+    if _GLOBAL_SILENCE.search(source_text):
+        return False
     actionable_text = _NEGATED_AUDIO_INTENT.sub("", source_text)
-    actionable_text = re.sub(r"(?:静音|无声)", "", actionable_text)
-    return bool(_AUDIO_INTENT.search(actionable_text))
+    actionable_text = _AUDIO_UI_LITERAL.sub("", actionable_text)
+    return bool(
+        _AUDIO_INTENT.search(actionable_text)
+        or _SPOKEN_DIALOGUE.search(actionable_text)
+    )
 
 
-def _audit_tone_issues(payload: dict[str, Any]) -> list[str]:
-    raw_issues = payload.get("issues", [])
-    if not isinstance(raw_issues, list):
-        return []
-    errors: list[str] = []
-    for index, issue in enumerate(raw_issues):
-        if not isinstance(issue, str) or issue.startswith("技术阻断"):
+def _task_requests_audio(
+    document: NormalizedDocument,
+    task: dict[str, Any],
+    source_block_ids: list[object],
+) -> bool:
+    valid_source_ids = {
+        block_id for block_id in source_block_ids if isinstance(block_id, str)
+    }
+    scoped_text = [
+        block.text
+        for block in document.blocks
+        if block.block_id in valid_source_ids and block.text
+    ]
+    for field_name in ("user_intent", "prompt"):
+        value = task.get(field_name)
+        if isinstance(value, str) and value:
+            scoped_text.append(value)
+    return _text_requests_audio("\n".join(scoped_text))
+
+
+def _normalize_audit_report(report: AuditReport) -> AuditReport:
+    normalized_issues: list[str] = []
+    for issue in report.issues:
+        normalized = issue.strip()
+        if normalized.startswith("技术阻断"):
+            if not _ACTIONABLE_HUMAN_HANDLING.search(normalized):
+                normalized = (
+                    f"{normalized.rstrip('。；; ')}；"
+                    "人工处理：请补充可执行素材或确认替代方案后再继续。"
+                )
+            normalized_issues.append(normalized)
             continue
-        if any(term in issue for term in _GOAL_REJECTING_AUDIT_LANGUAGE):
-            errors.append(
-                f"audit.issues[{index}]: 审计措辞必须改为中文实施策略或风险缓释，"
-                "不得否定或质疑需求目标"
-            )
-    return errors
+        if any(
+            term in normalized
+            for term in _GOAL_REJECTING_AUDIT_LANGUAGE
+        ):
+            for original, replacement in _GOAL_REJECTING_REWRITES.items():
+                normalized = normalized.replace(original, replacement)
+            if not normalized.startswith(("实施策略：", "风险缓释：")):
+                normalized = f"实施策略：{normalized}"
+        normalized_issues.append(normalized)
+    return report.model_copy(update={"issues": normalized_issues})
 
 
 def language_validation_message(issues: list[str]) -> str | None:
@@ -498,7 +560,10 @@ def validate_plan(
                 issues.append(
                     f"{prefix}.generate_audio: must be true, false, or omitted"
                 )
-            elif _document_requests_audio(document) and generate_audio is not True:
+            elif (
+                _task_requests_audio(document, task, source_block_ids)
+                and generate_audio is not True
+            ):
                 issues.append(
                     f"{prefix}.generate_audio: "
                     "文档明确要求对白、音效、配音、环境音或音乐时必须为 true"
@@ -669,13 +734,14 @@ class DeepSeekPlanner:
                 "content": self._audit_prompt(document, plan),
             },
         ]
-        return await self._invoke_with_repair(
+        report = await self._invoke_with_repair(
             messages=messages,
             schema=AuditReport,
-            deterministic_validator=_audit_tone_issues,
+            deterministic_validator=lambda payload: [],
             document_id=document.document_id,
             operation="audit",
         )
+        return _normalize_audit_report(report)
 
     def _planning_prompt(
         self,
