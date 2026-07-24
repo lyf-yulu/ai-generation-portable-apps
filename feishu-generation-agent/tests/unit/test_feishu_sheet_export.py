@@ -806,6 +806,76 @@ def test_extract_sheet_xlsx_rejects_incomplete_image_anchor_position(
     )
 
 
+def test_extract_sheet_xlsx_accepts_maximum_image_anchor_position() -> None:
+    members = _xlsx_members()
+    members["xl/drawings/story-art.xml"] = f"""
+        <xdr:wsDr xmlns:xdr="{_NS_DRAWING}" xmlns:a="{_NS_DRAWING_MAIN}"
+                  xmlns:r="{_NS_REL}">
+          <xdr:oneCellAnchor>
+            <xdr:from>
+              <xdr:col>16383</xdr:col>
+              <xdr:row>1048575</xdr:row>
+            </xdr:from>
+            <xdr:pic>
+              <xdr:blipFill><a:blip r:embed="rIdHero"/></xdr:blipFill>
+            </xdr:pic>
+          </xdr:oneCellAnchor>
+        </xdr:wsDr>
+    """.encode()
+
+    extracted = extract_sheet_xlsx(
+        _make_xlsx(members),
+        target_sheet_id="NuBUx5",
+    )
+
+    assert extracted.images[0].anchors[0].row == 1_048_575
+    assert extracted.images[0].anchors[0].column == 16_383
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("row", "-1"),
+        ("row", "1048576"),
+        ("col", "-1"),
+        ("col", "16384"),
+        ("row", "+1"),
+        ("col", "1_0"),
+        ("row", " 1"),
+        ("col", "1 "),
+        ("row", "\t1"),
+        ("col", "１"),
+        ("row", ""),
+    ],
+)
+def test_extract_sheet_xlsx_rejects_invalid_image_anchor_integer(
+    name: str,
+    value: str,
+) -> None:
+    row = value if name == "row" else "2"
+    column = value if name == "col" else "1"
+    members = _xlsx_members()
+    members["xl/drawings/story-art.xml"] = f"""
+        <xdr:wsDr xmlns:xdr="{_NS_DRAWING}" xmlns:a="{_NS_DRAWING_MAIN}"
+                  xmlns:r="{_NS_REL}">
+          <xdr:oneCellAnchor>
+            <xdr:from>
+              <xdr:col>{column}</xdr:col>
+              <xdr:row>{row}</xdr:row>
+            </xdr:from>
+            <xdr:pic>
+              <xdr:blipFill><a:blip r:embed="rIdHero"/></xdr:blipFill>
+            </xdr:pic>
+          </xdr:oneCellAnchor>
+        </xdr:wsDr>
+    """.encode()
+
+    _assert_document_error(
+        _make_xlsx(members),
+        detail="image anchor position",
+    )
+
+
 def test_extract_sheet_xlsx_rejects_duplicate_drawing_references() -> None:
     members = _xlsx_members()
     members["xl/worksheets/story-board.xml"] = f"""

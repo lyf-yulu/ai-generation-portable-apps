@@ -824,7 +824,22 @@ def _required_anchor_integer(
             "飞书电子表格图片锚点位置不完整",
             "image anchor position is incomplete",
         )
-    return int(child.text)
+    text = child.text
+    if not text or not all("0" <= character <= "9" for character in text):
+        raise _document_error(
+            "飞书电子表格图片锚点位置无效",
+            "image anchor position is invalid",
+        )
+    maximum = 1_048_575 if name == "row" else 16_383
+    value = 0
+    for character in text:
+        value = value * 10 + ord(character) - ord("0")
+        if value > maximum:
+            raise _document_error(
+                "飞书电子表格图片锚点位置超出范围",
+                "image anchor position is out of range",
+            )
+    return value
 
 
 def _parse_xml(content: bytes) -> ElementTree.Element:
