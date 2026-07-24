@@ -90,6 +90,18 @@ class _BlockingPromptCheckGraph(_RecoveryGraph):
         return await super().aget_state(config)
 
 
+class _FailingWorkerPromptCheckGraph(_RecoveryGraph):
+    def __init__(self) -> None:
+        super().__init__()
+        self.prompt_checks = 0
+
+    async def aget_state(self, config: dict):
+        self.prompt_checks += 1
+        if self.prompt_checks == 2:
+            raise RuntimeError("fictional checkpoint read failure")
+        return await super().aget_state(config)
+
+
 def _prime_prompt() -> dict:
     return build_planning_prompt_snapshot(
         owner_user_id="prime-local",
@@ -248,6 +260,44 @@ async def test_concurrent_delivery_retries_reserve_one_external_write(
     assert writer.retry_calls == 1
     await runtime.close()
     await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_delivery_worker_checkpoint_error_reaches_safe_terminal_state(
+    tmp_path: Path,
+) -> None:
+    graph = _FailingWorkerPromptCheckGraph()
+    graph.states["thread-delivery"] = {
+        "run_id": "run-delivery",
+        "thread_id": "thread-delivery",
+        "status": "delivery_failed",
+        "planning_prompt": _prime_prompt(),
+    }
+    writer = _RetryDeliveryWriter()
+    runtime, repository, _ = await _runtime(tmp_path, graph, writer)
+    await repository.create_run(
+        "run-delivery",
+        "thread-delivery",
+        "https://acme.feishu.cn/docx/doccn123",
+        status="delivery_failed",
+    )
+
+    try:
+        await runtime.retry_delivery("run-delivery")
+        for _ in range(100):
+            if not runtime._background_tasks:
+                break
+            await asyncio.sleep(0.01)
+        run = await repository.get_run("run-delivery")
+        events = await repository.list_events("run-delivery")
+    finally:
+        await runtime.close()
+        await repository.close()
+
+    assert run is not None and run["status"] == "delivery_failed"
+    assert writer.retry_calls == 0
+    assert events[-1]["node"] == "deliver_to_feishu"
+    assert events[-1]["status"] == "failed"
 
 
 @pytest.mark.asyncio

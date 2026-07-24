@@ -492,7 +492,10 @@ async def test_runtime_accepts_reserved_ids_and_repeat_start_is_idempotent(
         assert len(graph.calls) == 1
         value, config = graph.calls[0]
         assert value["trigger_type"] == "bitable"
-        assert config == {"configurable": {"thread_id": "thread-reserved"}}
+        assert config == {
+            "configurable": {"thread_id": "thread-reserved"},
+            "callbacks": [],
+        }
 
         with pytest.raises(RunConflict, match="预留"):
             await runtime.start_run(

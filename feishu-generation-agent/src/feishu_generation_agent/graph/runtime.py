@@ -5,7 +5,9 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from langchain_core.runnables.config import set_config_context
 from langgraph.types import Command
+from langsmith import tracing_context
 from pydantic import ValidationError
 
 from feishu_generation_agent.config import Settings
@@ -222,10 +224,10 @@ class GraphRuntime:
             )
             config = self._config(thread_id)
             try:
-                await self.graph.aupdate_state(
+                await self._graph_aupdate_state(
                     config, state, as_node="validate_plan"
                 )
-                result = await self.graph.ainvoke(None, config=config)
+                result = await self._graph_ainvoke(None, config=config)
             except Exception:
                 await self.repository.update_run_status(run_id, "failed")
                 raise RunConflict("重跑审批 checkpoint 初始化失败") from None
@@ -287,7 +289,7 @@ class GraphRuntime:
                     )
                     return
                 await self.repository.update_run_status(run_id, "running")
-                result = await self.graph.ainvoke(
+                result = await self._graph_ainvoke(
                     None, config=self._config(run["thread_id"])
                 )
                 final_status = (
@@ -352,16 +354,16 @@ class GraphRuntime:
     async def _retry_delivery_locked(
         self, run_id: str, thread_id: str
     ) -> None:
-        if not await self._checkpoint_has_valid_planning_prompt(thread_id):
-            await self._fail_missing_planning_prompt(run_id)
-            return
         try:
+            if not await self._checkpoint_has_valid_planning_prompt(thread_id):
+                await self._fail_missing_planning_prompt(run_id)
+                return
             if self.delivery_writer is None:
                 raise RunConflict("交付重试未配置")
             record = await self.delivery_writer.retry_delivery(run_id)
             artifacts = await self.repository.list_artifacts(run_id)
             final_status = "succeeded" if artifacts else "completed_with_errors"
-            await self.graph.aupdate_state(
+            await self._graph_aupdate_state(
                 self._config(thread_id),
                 {
                     "delivery_record": record.model_dump(mode="json"),
@@ -414,7 +416,7 @@ class GraphRuntime:
     ) -> None:
         try:
             await self.repository.update_run_status(run_id, "running")
-            result = await self.graph.ainvoke(
+            result = await self._graph_ainvoke(
                 {
                     "run_id": run_id,
                     "thread_id": thread_id,
@@ -597,7 +599,7 @@ class GraphRuntime:
             self._validate_decision(state, decision)
             await self.repository.update_run_status(run_id, "resuming")
             try:
-                result = await self.graph.ainvoke(
+                result = await self._graph_ainvoke(
                     Command(resume=decision.model_dump(mode="json")),
                     config=self._config(run["thread_id"]),
                 )
@@ -913,12 +915,12 @@ class GraphRuntime:
             updates["source_document"] = source_document
         config = self._config(run["thread_id"])
         try:
-            await self.graph.aupdate_state(
+            await self._graph_aupdate_state(
                 config,
                 updates,
                 as_node="validate_plan",
             )
-            result = await self.graph.ainvoke(None, config=config)
+            result = await self._graph_ainvoke(None, config=config)
         except Exception:
             raise RunConflict("更新审批 checkpoint 失败") from None
         if not self._has_interrupt(result):
@@ -1055,6 +1057,41 @@ class GraphRuntime:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._background_tasks.clear()
+
+    async def _graph_ainvoke(
+        self,
+        value: Any,
+        *,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        private_config = {**config, "callbacks": []}
+        with tracing_context(enabled=False, parent=False):
+            with set_config_context(private_config) as context:
+                task = context.run(
+                    asyncio.create_task,
+                    self.graph.ainvoke(value, config=private_config),
+                )
+                return await task
+
+    async def _graph_aupdate_state(
+        self,
+        config: dict[str, Any],
+        values: dict[str, Any],
+        *,
+        as_node: str,
+    ) -> None:
+        private_config = {**config, "callbacks": []}
+        with tracing_context(enabled=False, parent=False):
+            with set_config_context(private_config) as context:
+                task = context.run(
+                    asyncio.create_task,
+                    self.graph.aupdate_state(
+                        private_config,
+                        values,
+                        as_node=as_node,
+                    ),
+                )
+                await task
 
     @staticmethod
     def _config(thread_id: str) -> dict[str, dict[str, str]]:

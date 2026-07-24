@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
@@ -9,12 +10,18 @@ from typing import Any
 
 import httpx
 import pytest
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.runnables.config import set_config_context
+from langsmith import tracing_context
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 from PIL import Image
 
 from feishu_generation_agent.config import Settings
-from feishu_generation_agent.domain.document import RequirementRequest
+from feishu_generation_agent.domain.document import (
+    RequirementRequest,
+    build_planning_prompt_snapshot,
+)
 from feishu_generation_agent.graph.builder import build_graph
 from feishu_generation_agent.graph.nodes import GraphServices
 from feishu_generation_agent.graph.runtime import (
@@ -768,6 +775,91 @@ async def test_clone_run_for_approval_initializes_a_real_langgraph_checkpoint(
     assert cloned["status"] == "waiting_approval"
     assert cloned["approval"]["tasks"] == original["approval"]["tasks"]
     assert fake_services.planner.plan_calls == 1
+
+
+async def test_runtime_graph_calls_do_not_trace_full_prompt_snapshot(
+    fake_services: GraphServices,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret_prompt = "真实 LangGraph 根追踪绝不能记录的个人完整提示词"
+    planning_prompt = build_planning_prompt_snapshot(
+        owner_user_id="portal-user-a",
+        source="personal",
+        version=2,
+        prompt_text=secret_prompt,
+    )
+    graph = build_graph(fake_services, InMemorySaver())
+    runtime = GraphRuntime(
+        graph=graph,
+        repository=fake_services.repository,
+        file_store=fake_services.file_store,
+        settings=fake_services.settings,
+        delivery_writer=fake_services.delivery_writer,
+    )
+
+    class _Recorder(BaseCallbackHandler):
+        def __init__(self) -> None:
+            self.inputs: list[Any] = []
+            self.outputs: list[Any] = []
+
+        def on_chain_start(
+            self,
+            serialized: dict[str, Any],
+            inputs: Any,
+            **kwargs: Any,
+        ) -> None:
+            del serialized, kwargs
+            self.inputs.append(copy.deepcopy(inputs))
+
+        def on_chain_end(self, outputs: Any, **kwargs: Any) -> None:
+            del kwargs
+            self.outputs.append(copy.deepcopy(outputs))
+
+    class _NoopLangChainTracer(BaseCallbackHandler):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
+        def set_defaults(self, **kwargs: Any) -> None:
+            del kwargs
+
+    monkeypatch.setattr(
+        "langchain_core.tracers.langchain.LangChainTracer",
+        _NoopLangChainTracer,
+    )
+    recorder = _Recorder()
+    try:
+        with tracing_context(enabled=True):
+            with set_config_context({"callbacks": [recorder]}) as context:
+                start_task = context.run(
+                    asyncio.create_task,
+                    runtime.start_run(
+                        RequirementRequest(
+                            source_url="https://tenant.feishu.cn/docx/private",
+                            planning_prompt=planning_prompt,
+                        ),
+                        run_id="trace-private-run",
+                        thread_id="trace-private-thread",
+                    ),
+                )
+                run_id = await start_task
+                for _ in range(100):
+                    run = await runtime.get_run_view(run_id)
+                    if run["status"] == "waiting_approval":
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    raise AssertionError("run did not reach approval")
+                snapshot = await graph.aget_state(
+                    {"configurable": {"thread_id": "trace-private-thread"}}
+                )
+    finally:
+        await runtime.close()
+
+    recorded = repr(recorder.inputs) + repr(recorder.outputs)
+    assert recorder.inputs == []
+    assert recorder.outputs == []
+    assert secret_prompt not in recorded
+    assert snapshot.values["planning_prompt"]["prompt_text"] == secret_prompt
     assert fake_services.image_generator.submit_calls == 0
     assert fake_services.video_generator.submit_calls == 0
 

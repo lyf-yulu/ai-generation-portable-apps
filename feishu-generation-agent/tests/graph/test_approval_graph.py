@@ -115,6 +115,24 @@ class _LegacySystemPromptPlanner:
         return await self.delegate.audit(document, plan)
 
 
+class _NoSystemPromptPlanner:
+    def __init__(self, delegate: Any) -> None:
+        self.delegate = delegate
+        self.plan_calls = 0
+
+    async def plan(
+        self,
+        document: Any,
+        descriptions: list[Any],
+        feedback: str | None,
+    ) -> Any:
+        self.plan_calls += 1
+        return await self.delegate.plan(document, descriptions, feedback)
+
+    async def audit(self, document: Any, plan: Any) -> Any:
+        return await self.delegate.audit(document, plan)
+
+
 class _FailingDeliveryWriter:
     def __init__(self) -> None:
         self.deliver_calls = 0
@@ -351,6 +369,54 @@ async def test_local_prime_fails_closed_for_legacy_planner_without_exact_replay(
 
     assert raised.value.detail.category == ErrorCategory.VALIDATION
     assert legacy_planner.plan_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("source", "version", "prompt_text"),
+    [
+        pytest.param(
+            "personal",
+            2,
+            "个人 v2：保持角色一致",
+            id="personal-v2",
+        ),
+        pytest.param(
+            "prime",
+            0,
+            "Portal 用户当前使用 Prime",
+            id="portal-prime",
+        ),
+    ],
+)
+async def test_portal_prompt_fails_closed_when_planner_cannot_accept_snapshot(
+    fake_services: GraphServices,
+    source: str,
+    version: int,
+    prompt_text: str,
+):
+    planning_prompt = PlanningPromptSnapshot(
+        owner_user_id="portal-user-a",
+        source=source,
+        version=version,
+        prompt_text=prompt_text,
+        prompt_sha256=hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+    )
+    no_prompt_planner = _NoSystemPromptPlanner(fake_services.planner)
+    services = replace(fake_services, planner=no_prompt_planner)
+    graph = build_graph(services, InMemorySaver())
+
+    with pytest.raises(AgentError) as raised:
+        await graph.ainvoke(
+            _input(
+                f"run-no-prompt-{source}",
+                f"thread-no-prompt-{source}",
+                planning_prompt,
+            ),
+            config=_config(f"thread-no-prompt-{source}"),
+        )
+
+    assert raised.value.detail.category == ErrorCategory.VALIDATION
+    assert no_prompt_planner.plan_calls == 0
 
 
 async def test_graph_pauses_before_any_generation(fake_services: GraphServices):

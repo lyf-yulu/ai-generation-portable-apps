@@ -245,7 +245,9 @@ def _planner_prompt_argument(
         )
     parameter = parameters.get("system_prompt")
     if parameter is None or parameter.kind is Parameter.POSITIONAL_ONLY:
-        return {}
+        raise _validation_error(
+            "The planner cannot accept the planning prompt snapshot"
+        )
     return {"system_prompt": planning_prompt.prompt_text}
 
 
