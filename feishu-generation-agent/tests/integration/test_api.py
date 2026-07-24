@@ -914,6 +914,55 @@ def _png_bytes(color: tuple[int, int, int] = (40, 110, 210)) -> bytes:
     return output.getvalue()
 
 
+def _source_asset(path: Path, asset_id: str) -> dict[str, Any]:
+    return {
+        "asset_id": asset_id,
+        "source_block_id": f"image-{asset_id}",
+        "origin": "feishu",
+        "file_token": None,
+        "local_path": str(path),
+        "mime_type": "image/png",
+        "size": path.stat().st_size,
+        "sha256": f"sha-{asset_id}",
+        "width": 16,
+        "height": 16,
+        "download_error": None,
+    }
+
+
+def _normalized_document(
+    media_assets: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "document_id": "doc-test",
+        "title": "纸船需求",
+        "revision": 7,
+        "source_type": "docx",
+        "source_token": "doc-test",
+        "blocks": [
+            {
+                "block_id": "story-1",
+                "parent_id": None,
+                "block_type": "text",
+                "order": 0,
+                "path": [],
+                "text": "生成纸船图片与视频",
+            },
+            {
+                "block_id": "image-request",
+                "parent_id": None,
+                "block_type": "text",
+                "order": 1,
+                "path": [],
+                "text": "生成纸船海报",
+            },
+        ],
+        "text_view": "生成纸船图片与视频",
+        "media_assets": media_assets,
+        "ingest_issues": [],
+    }
+
+
 async def test_create_run_and_read_waiting_approval(tmp_path: Path):
     async with _environment(tmp_path) as (client, runtime, graph, repository):
         del runtime, graph, repository
@@ -1337,6 +1386,187 @@ async def test_replace_and_unlink_reference_keep_content_file(tmp_path: Path):
         ]
 
 
+async def test_reference_edits_reconcile_exclusions_on_the_server(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/coverage-edit"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        second_path = tmp_path / "data" / "second-source.png"
+        second_path.write_bytes(_png_bytes((180, 80, 40)))
+        second = _source_asset(second_path, "asset-2")
+        state["media_assets"].append(second)
+        state["draft_plan"]["excluded_assets"] = [
+            {"asset_id": "asset-2", "reason": "供应商数量限制，暂不使用此图。"}
+        ]
+        state["task_plan"] = copy.deepcopy(state["draft_plan"])
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+
+        added = await client.patch(
+            f"/api/runs/{run_id}/tasks/task-1/references",
+            json={
+                "references": [
+                    {"asset_id": "asset-1", "role": "reference_image", "order": 1},
+                    {"asset_id": "asset-2", "role": "reference_image", "order": 2},
+                ],
+                "reference_mode": "multi_reference",
+            },
+        )
+        assert added.status_code == 200
+        view = (await client.get(f"/api/runs/{run_id}")).json()
+        assert view["approval"]["excluded_assets"] == []
+
+        state["draft_plan"]["tasks"][1]["reference_images"] = [
+            {"asset_id": "asset-2", "role": "reference_image", "order": 1}
+        ]
+        state["task_plan"] = copy.deepcopy(state["draft_plan"])
+        removed = await client.delete(
+            f"/api/runs/{run_id}/tasks/task-1/references/asset-1"
+        )
+        assert removed.status_code == 200
+        view = (await client.get(f"/api/runs/{run_id}")).json()
+        assert view["approval"]["excluded_assets"] == [
+            {"asset_id": "asset-1", "reason": "用户在审批中移除"}
+        ]
+
+
+async def test_replacing_and_uploading_reference_updates_coverage_atomically(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/coverage-replace"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        second_path = tmp_path / "data" / "replace-source.png"
+        second_path.write_bytes(_png_bytes((80, 180, 40)))
+        second = _source_asset(second_path, "asset-2")
+        state["media_assets"].append(second)
+        state["draft_plan"]["tasks"][1]["reference_images"] = [
+            {"asset_id": "asset-2", "role": "reference_image", "order": 1}
+        ]
+        state["draft_plan"]["excluded_assets"] = []
+        state["task_plan"] = copy.deepcopy(state["draft_plan"])
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+
+        replaced = await client.post(
+            f"/api/runs/{run_id}/references",
+            data={
+                "task_id": "task-1",
+                "role": "reference_image",
+                "order": "1",
+                "replaces_asset_id": "asset-1",
+            },
+            files={"file": ("replacement.png", _png_bytes(), "image/png")},
+        )
+
+        assert replaced.status_code == 201
+        replacement_id = replaced.json()["asset_id"]
+        view = (await client.get(f"/api/runs/{run_id}")).json()
+        assert view["approval"]["tasks"][0]["reference_images"][0]["asset_id"] == (
+            replacement_id
+        )
+        assert view["approval"]["excluded_assets"] == [
+            {"asset_id": "asset-1", "reason": "用户在审批中移除"}
+        ]
+        assert view["approval"]["coverage"] == {
+            "successful_total": 3,
+            "referenced_count": 2,
+            "excluded_count": 1,
+            "uncovered_count": 0,
+            "failed_count": 0,
+        }
+
+
+async def test_approval_with_uncovered_asset_returns_422_before_execution(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/coverage-approve"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        second_path = tmp_path / "data" / "uncovered-source.png"
+        second_path.write_bytes(_png_bytes((30, 160, 190)))
+        state["media_assets"].append(_source_asset(second_path, "asset-2"))
+        state["draft_plan"]["excluded_assets"] = []
+        state["task_plan"] = copy.deepcopy(state["draft_plan"])
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+
+        response = await client.post(
+            f"/api/runs/{run_id}/decision",
+            json={"action": "approve", "selected_task_ids": ["task-1"]},
+        )
+
+        assert response.status_code == 422
+        assert "覆盖" in response.text
+        assert graph.resume_calls == 0
+
+
+async def test_approval_task_edit_can_use_a_previously_excluded_asset(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/coverage-decision"},
+            )
+        ).json()["run_id"]
+        view = await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        second_path = tmp_path / "data" / "decision-source.png"
+        second_path.write_bytes(_png_bytes((120, 90, 180)))
+        state["media_assets"].append(_source_asset(second_path, "asset-2"))
+        state["draft_plan"]["excluded_assets"] = [
+            {"asset_id": "asset-2", "reason": "初次规划未选择此素材。"}
+        ]
+        state["task_plan"] = copy.deepcopy(state["draft_plan"])
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+        edited = copy.deepcopy(view["approval"]["tasks"][0])
+        edited["reference_images"].append(
+            {"asset_id": "asset-2", "role": "reference_image", "order": 2}
+        )
+
+        response = await client.post(
+            f"/api/runs/{run_id}/decision",
+            json={
+                "action": "approve",
+                "selected_task_ids": ["task-1"],
+                "tasks": [edited],
+            },
+        )
+
+        assert response.status_code == 202
+        assert graph.resume_calls == 1
+
+
 async def test_reference_upload_rejects_non_image_and_unknown_replacement(
     tmp_path: Path,
 ):
@@ -1665,6 +1895,8 @@ async def test_static_review_workspace_is_served_and_uses_safe_dom_updates():
         "thread ID",
         "负面约束",
         "参考图片",
+        "素材覆盖",
+        "排除素材",
         "退回重新规划",
         "全部取消",
         "批准所选任务",
@@ -1677,6 +1909,9 @@ async def test_static_review_workspace_is_served_and_uses_safe_dom_updates():
     assert "response.ok" in script.text
     assert "detail" in script.text
     assert ".disabled" in script.text
+    assert "coverageLabel" in script.text
+    assert "excludedAssetRows" in script.text
+    assert "coverage-summary" in styles.text
     assert "review-state.js" in page.text
     for source in (script.text, review_state.text):
         for unsafe in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"):

@@ -232,6 +232,7 @@ def validate_plan(
     assets = {asset.asset_id: asset for asset in document.media_assets}
     storyboard_requirements = _storyboard_requirements(document)
     task_ids: set[str] = set()
+    referenced_asset_ids: set[str] = set()
     total_output_count = 0
     task_sources: list[tuple[str, str | None, set[str]]] = []
 
@@ -295,6 +296,7 @@ def validate_plan(
                 f"{prefix}.reference_images: at least one image is required"
             )
             references = []
+        task_reference_ids: list[str] = []
         for reference_index, reference in enumerate(references):
             reference_prefix = (
                 f"{prefix}.reference_images[{reference_index}]"
@@ -308,6 +310,8 @@ def validate_plan(
                     f"{reference_prefix}.asset_id: must be a non-empty string"
                 )
                 continue
+            task_reference_ids.append(asset_id)
+            referenced_asset_ids.add(asset_id)
             asset = assets.get(asset_id)
             if asset is None:
                 issues.append(
@@ -323,10 +327,38 @@ def validate_plan(
                 issues.append(
                     f"{reference_prefix}.asset_id: asset {asset_id} download failed"
                 )
-            if not asset.mime_type.startswith("image/"):
-                issues.append(
-                    f"{reference_prefix}.asset_id: asset {asset_id} must have image MIME"
+            role = reference.get("role")
+            mime_matches_role = (
+                asset.mime_type.startswith("image/")
+                and role in {"reference_image", "first_frame", "last_frame"}
+            ) or (
+                asset.mime_type.startswith("video/")
+                and role == "reference_video"
+            ) or (
+                asset.mime_type.startswith("audio/")
+                and role == "reference_audio"
+            )
+            if not mime_matches_role:
+                expected_mime = (
+                    "image"
+                    if role in {"reference_image", "first_frame", "last_frame"}
+                    else "video"
+                    if role == "reference_video"
+                    else "audio"
                 )
+                issues.append(
+                    f"{reference_prefix}.asset_id: asset {asset_id} must have "
+                    f"{expected_mime} MIME for role {role}"
+                )
+        duplicate_reference_ids = {
+            asset_id
+            for asset_id in task_reference_ids
+            if task_reference_ids.count(asset_id) > 1
+        }
+        for asset_id in sorted(duplicate_reference_ids):
+            issues.append(
+                f"{prefix}.reference_images: duplicate asset_id {asset_id}"
+            )
 
         reference_mode = task.get("reference_mode")
         if reference_mode not in {None, "multi_reference", "first_last_frame"}:
@@ -366,10 +398,15 @@ def validate_plan(
                         f"{prefix}.reference_mode: 首尾帧模式必须且只能按顺序指定一张首帧和一张尾帧"
                     )
             elif reference_mode == "multi_reference" and any(
-                role != "reference_image" for role in roles
+                role not in {
+                    "reference_image",
+                    "reference_video",
+                    "reference_audio",
+                }
+                for role in roles
             ):
                 issues.append(
-                    f"{prefix}.reference_mode: 多参考模式只能使用普通参考图"
+                    f"{prefix}.reference_mode: 多参考模式只能使用普通参考图、参考视频或参考音频"
                 )
 
         if task_type == "image_to_image":
@@ -423,6 +460,61 @@ def validate_plan(
         issues.append(
             "plan.total output_count: "
             f"{total_output_count} exceeds max_output_count {max_output_count}"
+        )
+
+    raw_exclusions = payload.get("excluded_assets", [])
+    excluded_asset_ids: list[str] = []
+    if not isinstance(raw_exclusions, list):
+        issues.append("plan.excluded_assets: must be a list")
+        raw_exclusions = []
+    for index, exclusion in enumerate(raw_exclusions):
+        prefix = f"plan.excluded_assets[{index}]"
+        if not isinstance(exclusion, dict):
+            issues.append(f"{prefix}: must be a JSON object")
+            continue
+        asset_id = exclusion.get("asset_id")
+        reason = exclusion.get("reason")
+        if not isinstance(asset_id, str) or not asset_id:
+            issues.append(f"{prefix}.asset_id: must be a non-empty string")
+            continue
+        excluded_asset_ids.append(asset_id)
+        asset = assets.get(asset_id)
+        if asset is None:
+            issues.append(f"{prefix}.asset_id: unknown asset_id {asset_id}")
+        elif asset.download_error is not None:
+            issues.append(
+                f"{prefix}.asset_id: failed asset {asset_id} cannot be excluded"
+            )
+        if not isinstance(reason, str) or not _contains_cjk(reason):
+            issues.append(f"{prefix}.reason: {_CJK_ISSUE_SUFFIX}")
+
+    duplicate_exclusions = {
+        asset_id
+        for asset_id in excluded_asset_ids
+        if excluded_asset_ids.count(asset_id) > 1
+    }
+    for asset_id in sorted(duplicate_exclusions):
+        issues.append(
+            f"plan.excluded_assets: duplicate asset_id {asset_id}"
+        )
+
+    excluded_set = set(excluded_asset_ids)
+    for asset_id in sorted(referenced_asset_ids.intersection(excluded_set)):
+        issues.append(
+            "plan.excluded_assets: referenced asset "
+            f"{asset_id} cannot also be excluded"
+        )
+    successful_asset_ids = {
+        asset.asset_id
+        for asset in document.media_assets
+        if asset.download_error is None
+    }
+    uncovered = (
+        successful_asset_ids - referenced_asset_ids - excluded_set
+    )
+    for asset_id in sorted(uncovered):
+        issues.append(
+            f"plan.asset_coverage: uncovered successful asset {asset_id}"
         )
 
     for table_id, required_ids in storyboard_requirements.items():
@@ -580,12 +672,17 @@ class DeepSeekPlanner:
                     "自由叙述按完整意图生成任务；混合图片/视频需求按不同意图"
                     "分别生成对应任务，不要错误合并。"
                 ),
+                (
+                    "每个下载成功的素材必须且只能归入任务 reference_images "
+                    "或 excluded_assets；未使用素材必须写入 excluded_assets，"
+                    "reason 必须用中文说明。下载失败素材不得引用或排除。"
+                ),
                 f"max_output_count={self.max_output_count}",
                 f"document_id={document.document_id}",
                 "稳定 text_view（含 [block:*] / [image:*] 引用）：",
                 document.text_view,
                 f"序列化表格及后代 blocks={_compact_json(table_blocks)}",
-                f"可用图片引用={_compact_json(media_references)}",
+                f"可用素材引用={_compact_json(media_references)}",
                 f"全部视觉描述={_compact_json(vision_payload)}",
                 f"用户反馈={_compact_json(feedback)}",
                 f"TaskPlan JSON Schema={_compact_json(schema)}",

@@ -545,6 +545,7 @@ async def test_planning_input_contains_stable_document_and_rules(
     assert '"table_row":0' in user_prompt
     assert '"block_id":"shot-1"' in user_prompt
     assert '"asset_id":"asset-1"' in user_prompt
+    assert "可用素材引用=" in user_prompt
     assert '"scene":"虚构的小河"' in user_prompt
     assert "image_to_image" in user_prompt
     assert "image_to_video" in user_prompt
@@ -555,6 +556,8 @@ async def test_planning_input_contains_stable_document_and_rules(
     ) in user_prompt
     assert "图片匹配优先级" in user_prompt
     assert "同一分镜表" in user_prompt and "一个视频任务" in user_prompt
+    assert "每个下载成功的素材" in user_prompt
+    assert "excluded_assets" in user_prompt
     assert "保留蓝色" in user_prompt
 
 
@@ -890,6 +893,129 @@ def test_validator_accepts_task_plan_and_valid_raw_plan(
 
     assert validate_plan(raw_plan, narrative_document, 4) == []
     assert validate_plan(typed_plan, narrative_document, 4) == []
+
+
+def test_validator_requires_exact_successful_asset_coverage(
+    narrative_document: NormalizedDocument,
+    tmp_path: Path,
+):
+    assets = [
+        _asset(tmp_path, f"asset-{index}", f"image-{index}")
+        for index in range(1, 4)
+    ]
+    document = narrative_document.model_copy(
+        update={"media_assets": assets}
+    )
+    task = _video_task()
+    task["reference_images"] = [
+        {"asset_id": "asset-1", "role": "reference_image", "order": 1},
+        {"asset_id": "asset-2", "role": "reference_image", "order": 2},
+    ]
+    valid = {
+        "tasks": [task],
+        "document_summary": "测试生成需求",
+        "excluded_assets": [
+            {
+                "asset_id": "asset-3",
+                "reason": "供应商最多支持两张参考图，保留主体与场景图。",
+            }
+        ],
+    }
+
+    assert validate_plan(valid, document, 4) == []
+
+    uncovered = copy.deepcopy(valid)
+    uncovered["excluded_assets"] = []
+    issues = validate_plan(uncovered, document, 4)
+    assert any("asset-3" in issue and "uncovered" in issue for issue in issues)
+
+    overlap = copy.deepcopy(valid)
+    overlap["excluded_assets"][0]["asset_id"] = "asset-2"
+    issues = validate_plan(overlap, document, 4)
+    assert any("excluded_assets" in issue and "asset-2" in issue for issue in issues)
+
+    english_reason = copy.deepcopy(valid)
+    english_reason["excluded_assets"][0]["reason"] = "provider supports two"
+    issues = validate_plan(english_reason, document, 4)
+    assert any(
+        "excluded_assets[0].reason" in issue and "中文" in issue
+        for issue in issues
+    )
+
+
+def test_validator_rejects_missing_failed_and_duplicate_asset_assignments(
+    narrative_document: NormalizedDocument,
+    tmp_path: Path,
+):
+    failed = _asset(
+        tmp_path,
+        "asset-failed",
+        "image-failed",
+        download_error="fictional download failure",
+    )
+    document = narrative_document.model_copy(
+        update={"media_assets": [*narrative_document.media_assets, failed]}
+    )
+    task = _video_task()
+    task["reference_images"] = [
+        {"asset_id": "missing", "role": "reference_image", "order": 1},
+        {"asset_id": "asset-failed", "role": "reference_image", "order": 2},
+    ]
+    raw = {
+        "tasks": [task],
+        "document_summary": "测试生成需求",
+        "excluded_assets": [
+            {"asset_id": "asset-1", "reason": "用户选择了其他主体图"},
+            {"asset_id": "asset-1", "reason": "供应商数量限制"},
+        ],
+    }
+
+    issues = validate_plan(raw, document, 4)
+
+    assert any("unknown asset_id missing" in issue for issue in issues)
+    assert any("asset-failed" in issue and "download failed" in issue for issue in issues)
+    assert any("duplicate" in issue and "asset-1" in issue for issue in issues)
+
+
+def test_validator_keeps_existing_multimodal_reference_support(
+    narrative_document: NormalizedDocument,
+    tmp_path: Path,
+):
+    video = _asset(
+        tmp_path,
+        "video-1",
+        "video-block",
+        mime_type="video/mp4",
+    )
+    audio = _asset(
+        tmp_path,
+        "audio-1",
+        "audio-block",
+        mime_type="audio/mpeg",
+    )
+    document = narrative_document.model_copy(
+        update={
+            "media_assets": [
+                *narrative_document.media_assets,
+                video,
+                audio,
+            ]
+        }
+    )
+    task = _video_task()
+    task["reference_images"] = [
+        {"asset_id": "asset-1", "role": "reference_image", "order": 1},
+        {"asset_id": "video-1", "role": "reference_video", "order": 2},
+        {"asset_id": "audio-1", "role": "reference_audio", "order": 3},
+    ]
+    task["reference_mode"] = "multi_reference"
+    raw = {
+        "tasks": [task],
+        "document_summary": "测试多模态生成需求",
+        "excluded_assets": [],
+    }
+
+    assert validate_plan(raw, document, 4) == []
 
 
 @pytest.mark.parametrize(

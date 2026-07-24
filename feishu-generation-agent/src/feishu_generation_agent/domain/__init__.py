@@ -29,11 +29,14 @@ from feishu_generation_agent.domain.errors import (
 from feishu_generation_agent.domain.plan import (
     ApprovalDecision,
     AuditReport,
+    ExcludedAsset,
     GenerationTask,
     ImageReference,
     ReferenceMode,
     TaskPlan,
     TaskType,
+    reconcile_asset_coverage,
+    reconcile_task_asset_coverage,
 )
 from feishu_generation_agent.domain.production_bitable import (
     ProductionBinding,
@@ -56,6 +59,7 @@ __all__ = [
     "DocumentBlock",
     "ErrorCategory",
     "ErrorDetail",
+    "ExcludedAsset",
     "ExecutionRecord",
     "GenerationTask",
     "ImageReference",
@@ -78,4 +82,6 @@ __all__ = [
     "TaskType",
     "VisionDescription",
     "build_planning_prompt_snapshot",
+    "reconcile_asset_coverage",
+    "reconcile_task_asset_coverage",
 ]

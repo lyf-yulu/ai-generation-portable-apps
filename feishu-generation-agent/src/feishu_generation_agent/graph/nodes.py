@@ -33,6 +33,7 @@ from feishu_generation_agent.domain.plan import (
     GenerationTask,
     TaskPlan,
     TaskType,
+    reconcile_task_asset_coverage,
 )
 from feishu_generation_agent.domain.artifact import (
     Artifact,
@@ -529,10 +530,7 @@ async def human_approval(
 
         original = TaskPlan.model_validate(_draft_plan(state))
         candidate = (
-            TaskPlan(
-                tasks=decision.tasks,
-                document_summary=original.document_summary,
-            )
+            reconcile_task_asset_coverage(original, decision.tasks)
             if decision.tasks
             else original
         )
@@ -586,10 +584,7 @@ async def revalidate_approval(
         if decision.action != "approve":
             raise _validation_error()
         candidate = (
-            TaskPlan(
-                tasks=decision.tasks,
-                document_summary=draft.document_summary,
-            )
+            reconcile_task_asset_coverage(draft, decision.tasks)
             if decision.tasks
             else draft
         )
@@ -603,6 +598,7 @@ async def revalidate_approval(
         checkpoint_plan = TaskPlan(
             tasks=state.get("approved_tasks", []),
             document_summary=draft.document_summary,
+            excluded_assets=selected_plan.excluded_assets,
         )
         if checkpoint_plan.model_dump(mode="json") != selected_plan.model_dump(
             mode="json"
@@ -1345,11 +1341,20 @@ async def execute_selected_tasks(
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
+        draft = TaskPlan.model_validate(_draft_plan(state))
+        selected_ids = [
+            task.get("task_id")
+            for task in state.get("approved_tasks", [])
+            if isinstance(task, dict) and isinstance(task.get("task_id"), str)
+        ]
+        selected_exclusions = draft.approved_subset(
+            selected_ids,
+            services.settings.max_output_count,
+        ).excluded_assets
         plan = TaskPlan(
             tasks=state.get("approved_tasks", []),
-            document_summary=TaskPlan.model_validate(
-                _draft_plan(state)
-            ).document_summary,
+            document_summary=draft.document_summary,
+            excluded_assets=selected_exclusions,
         )
         issues = validate_plan(
             plan,
@@ -1470,6 +1475,15 @@ async def deliver_to_feishu(
         plan = TaskPlan(
             tasks=state.get("approved_tasks", []),
             document_summary=draft.document_summary,
+            excluded_assets=draft.approved_subset(
+                [
+                    task.get("task_id")
+                    for task in state.get("approved_tasks", [])
+                    if isinstance(task, dict)
+                    and isinstance(task.get("task_id"), str)
+                ],
+                services.settings.max_output_count,
+            ).excluded_assets,
         )
         artifacts = [
             Artifact.model_validate(item) for item in state.get("artifacts", [])

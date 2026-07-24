@@ -268,3 +268,93 @@ test("reference-only draft changes are saved before adding or replacing an image
   state = ReviewState.patchTask(state, "task-1", { prompt: "unsaved prompt" });
   assert.equal(ReviewState.referenceMutationDirective(state, "task-1"), "blocked");
 });
+
+test("coverage summarizes referenced, excluded, uncovered, and failed assets", () => {
+  const serverView = view();
+  serverView.approval.tasks[0].reference_images = [
+    { asset_id: "asset-1", role: "reference_image", order: 1 },
+    { asset_id: "asset-2", role: "reference_image", order: 2 },
+  ];
+  serverView.approval.tasks[1].reference_images = [
+    { asset_id: "asset-1", role: "reference_image", order: 1 },
+  ];
+  serverView.approval.media_assets = [
+    { asset_id: "asset-1", preview_url: "/asset-1", download_failed: false },
+    { asset_id: "asset-2", preview_url: "/asset-2", download_failed: false },
+    { asset_id: "asset-3", preview_url: "/asset-3", download_failed: false },
+    { asset_id: "asset-failed", preview_url: null, download_failed: true },
+  ];
+  serverView.approval.excluded_assets = [
+    { asset_id: "asset-3", reason: "供应商最多支持两张参考图，保留主体与场景图。" },
+  ];
+  let state = ReviewState.mergeServerView(ReviewState.createReviewState(), serverView);
+
+  assert.deepEqual(ReviewState.assetCoverage(ReviewState.draftView(state)), {
+    successful_total: 3,
+    referenced_count: 2,
+    excluded_count: 1,
+    uncovered_count: 0,
+    failed_count: 1,
+  });
+  assert.equal(
+    ReviewState.coverageLabel(ReviewState.draftView(state)),
+    "已使用 2 / 共 3 张",
+  );
+  assert.deepEqual(
+    ReviewState.excludedAssetRows(ReviewState.draftView(state)),
+    [{
+      asset_id: "asset-3",
+      reason: "供应商最多支持两张参考图，保留主体与场景图。",
+      preview_url: "/asset-3",
+    }],
+  );
+});
+
+test("draft reference changes update coverage and approval availability immediately", () => {
+  const serverView = view();
+  serverView.approval.tasks[0].reference_images = [
+    { asset_id: "asset-1", role: "reference_image", order: 1 },
+  ];
+  serverView.approval.tasks[1].reference_images = [
+    { asset_id: "asset-1", role: "reference_image", order: 1 },
+  ];
+  serverView.approval.media_assets = [
+    { asset_id: "asset-1", preview_url: "/asset-1", download_failed: false },
+    { asset_id: "asset-2", preview_url: "/asset-2", download_failed: false },
+  ];
+  serverView.approval.excluded_assets = [
+    { asset_id: "asset-2", reason: "供应商数量限制，暂不使用此图。" },
+  ];
+  let state = ReviewState.mergeServerView(ReviewState.createReviewState(), serverView);
+  assert.equal(ReviewState.canApprove(state), true);
+
+  state = ReviewState.patchTask(state, "task-1", {
+    reference_images: [
+      { asset_id: "asset-1", role: "reference_image", order: 1 },
+      { asset_id: "asset-2", role: "reference_image", order: 2 },
+    ],
+  });
+  let coverage = ReviewState.assetCoverage(ReviewState.draftView(state));
+  assert.equal(coverage.referenced_count, 2);
+  assert.equal(coverage.excluded_count, 0);
+  assert.equal(coverage.uncovered_count, 0);
+  assert.equal(ReviewState.canApprove(state), true);
+
+  state = ReviewState.patchTask(state, "task-1", {
+    reference_images: [
+      { asset_id: "asset-2", role: "reference_image", order: 1 },
+    ],
+  });
+  state = ReviewState.patchTask(state, "task-2", {
+    reference_images: [
+      { asset_id: "asset-2", role: "reference_image", order: 1 },
+    ],
+  });
+  coverage = ReviewState.assetCoverage(ReviewState.draftView(state));
+  assert.equal(coverage.uncovered_count, 1);
+  assert.equal(ReviewState.canApprove(state), false);
+  assert.throws(
+    () => ReviewState.buildApprovalPayload(state),
+    /素材覆盖不完整/,
+  );
+});

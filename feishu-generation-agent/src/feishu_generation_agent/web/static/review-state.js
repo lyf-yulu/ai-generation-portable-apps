@@ -35,6 +35,8 @@
       tasks: approval.tasks || [],
       document_summary: approval.document_summary || "",
       media_assets: approval.media_assets || [],
+      excluded_assets: approval.excluded_assets || [],
+      coverage: approval.coverage || null,
       selected_task_ids: approval.selected_task_ids || [],
     }));
   }
@@ -201,12 +203,75 @@
     return [...state.selectedTaskIds];
   }
 
+  function assetCoverage(view) {
+    const approval = view?.approval || {};
+    const successfulIds = new Set(
+      (approval.media_assets || [])
+        .filter((asset) => asset?.download_failed !== true)
+        .map((asset) => asset?.asset_id)
+        .filter((assetId) => typeof assetId === "string"),
+    );
+    const failedIds = new Set(
+      (approval.media_assets || [])
+        .filter((asset) => asset?.download_failed === true)
+        .map((asset) => asset?.asset_id)
+        .filter((assetId) => typeof assetId === "string"),
+    );
+    const referencedIds = new Set(
+      (approval.tasks || []).flatMap((task) => (
+        (task?.reference_images || []).map((reference) => reference?.asset_id)
+      )).filter((assetId) => successfulIds.has(assetId)),
+    );
+    const excludedIds = new Set(
+      (approval.excluded_assets || [])
+        .map((item) => item?.asset_id)
+        .filter((assetId) => (
+          successfulIds.has(assetId) && !referencedIds.has(assetId)
+        )),
+    );
+    return {
+      successful_total: successfulIds.size,
+      referenced_count: referencedIds.size,
+      excluded_count: excludedIds.size,
+      uncovered_count: [...successfulIds].filter((assetId) => (
+        !referencedIds.has(assetId) && !excludedIds.has(assetId)
+      )).length,
+      failed_count: failedIds.size,
+    };
+  }
+
+  function coverageLabel(view) {
+    const coverage = assetCoverage(view);
+    return `已使用 ${coverage.referenced_count} / 共 ${coverage.successful_total} 张`;
+  }
+
+  function excludedAssetRows(view) {
+    const approval = view?.approval || {};
+    const referencedIds = new Set(
+      (approval.tasks || []).flatMap((task) => (
+        (task?.reference_images || []).map((reference) => reference?.asset_id)
+      )),
+    );
+    const assets = new Map(
+      (approval.media_assets || []).map((asset) => [asset?.asset_id, asset]),
+    );
+    return (approval.excluded_assets || [])
+      .filter((item) => !referencedIds.has(item?.asset_id))
+      .map((item) => ({
+        asset_id: item.asset_id,
+        reason: item.reason,
+        preview_url: assets.get(item.asset_id)?.preview_url || null,
+      }));
+  }
+
   function canApprove(state) {
+    const view = draftView(state);
     return Boolean(
       state.serverView?.status === "waiting_approval"
       && !state.conflict
       && !state.submitting
-      && state.selectedTaskIds.length,
+      && state.selectedTaskIds.length
+      && assetCoverage(view).uncovered_count === 0
     );
   }
 
@@ -218,6 +283,9 @@
     }
     if (state.selectedTaskIds.length === 0) {
       throw new Error("批准时必须选择至少一个任务");
+    }
+    if (assetCoverage(draftView(state)).uncovered_count !== 0) {
+      throw new Error("素材覆盖不完整，请先处理未使用素材");
     }
     return {
       action: "approve",
@@ -280,6 +348,7 @@
     CONFLICT_MESSAGE,
     beginApprovalSubmit,
     buildApprovalPayload,
+    assetCoverage,
     canApprove,
     canSaveReferences,
     completeApprovalSubmit,
@@ -287,6 +356,7 @@
     createReviewState,
     discardLocalChanges,
     draftView,
+    excludedAssetRows,
     failApprovalSubmit,
     hasDirty,
     isSubmitting,
@@ -294,6 +364,7 @@
     patchTask,
     referenceMutationDirective,
     selectedTaskIds,
+    coverageLabel,
     setReferenceMode,
     setTaskSelected,
   };

@@ -25,8 +25,10 @@ from feishu_generation_agent.domain.plan import (
     GenerationTask,
     ImageReference,
     TaskPlan,
+    reconcile_task_asset_coverage,
 )
 from feishu_generation_agent.integrations.planner import (
+    language_validation_message,
     planner_system_prompt,
     validate_plan,
 )
@@ -515,12 +517,25 @@ class GraphRuntime:
         if plan is None:
             plan = state.get("task_plan")
         if not isinstance(plan, dict):
-            plan = {"tasks": [], "document_summary": ""}
+            plan = {
+                "tasks": [],
+                "document_summary": "",
+                "excluded_assets": [],
+            }
+        try:
+            plan_model = TaskPlan.model_validate(plan)
+            plan = plan_model.model_dump(mode="json")
+        except Exception:
+            plan_model = None
         tasks = plan.get("tasks")
         if not isinstance(tasks, list):
             tasks = []
         media_assets = self._safe_media_assets(
             run_id, state.get("media_assets", [])
+        )
+        coverage = self._asset_coverage(
+            plan_model,
+            state.get("media_assets", []),
         )
         view = {
             "run_id": run_id,
@@ -574,6 +589,8 @@ class GraphRuntime:
                 "tasks": tasks,
                 "document_summary": plan.get("document_summary", ""),
                 "media_assets": media_assets,
+                "excluded_assets": plan.get("excluded_assets", []),
+                "coverage": coverage,
                 "vision_descriptions": state.get("vision_descriptions", []),
                 "validation_issues": state.get("validation_issues", []),
                 "selected_task_ids": [
@@ -897,7 +914,7 @@ class GraphRuntime:
     ) -> TaskPlan:
         tasks = list(plan.tasks)
         tasks[task_index] = task
-        return TaskPlan(tasks=tasks, document_summary=plan.document_summary)
+        return reconcile_task_asset_coverage(plan, tasks)
 
     async def _persist_draft(
         self,
@@ -970,10 +987,7 @@ class GraphRuntime:
         try:
             original = TaskPlan.model_validate(raw_plan)
             candidate = (
-                TaskPlan(
-                    tasks=decision.tasks,
-                    document_summary=original.document_summary,
-                )
+                reconcile_task_asset_coverage(original, decision.tasks)
                 if decision.tasks
                 else original
             )
@@ -987,6 +1001,7 @@ class GraphRuntime:
                     isinstance(item, dict)
                     and isinstance(item.get("asset_id"), str)
                     and isinstance(item.get("mime_type"), str)
+                    and item.get("download_error") is None
                 )
             }
             for task in candidate.tasks:
@@ -1002,6 +1017,20 @@ class GraphRuntime:
             )
             if not approved.tasks:
                 raise ValueError("没有可批准的任务")
+            normalized = state.get("normalized_document")
+            if isinstance(normalized, dict):
+                issues = validate_plan(
+                    approved,
+                    NormalizedDocument.model_validate(normalized),
+                    max_output_count=self.settings.max_output_count,
+                )
+                if issues:
+                    if any("asset_coverage" in issue for issue in issues):
+                        raise RunValidationError("素材覆盖不完整，请先处理未使用素材")
+                    raise RunValidationError(
+                        language_validation_message(issues)
+                        or "审批计划未通过校验"
+                    )
         except RunValidationError:
             raise
         except Exception as exc:
@@ -1149,12 +1178,58 @@ class GraphRuntime:
                     "size": item.get("size"),
                     "width": item.get("width"),
                     "height": item.get("height"),
+                    "download_failed": item.get("download_error") is not None,
                     "preview_url": (
                         f"/api/runs/{run_id}/references/{asset_id}/content"
+                        if item.get("download_error") is None
+                        else None
                     ),
                 }
             )
         return assets
+
+    @staticmethod
+    def _asset_coverage(
+        plan: TaskPlan | None,
+        media_assets: Any,
+    ) -> dict[str, int]:
+        successful_ids: set[str] = set()
+        failed_ids: set[str] = set()
+        if isinstance(media_assets, list):
+            for item in media_assets:
+                if not isinstance(item, dict):
+                    continue
+                asset_id = item.get("asset_id")
+                if not isinstance(asset_id, str) or not asset_id:
+                    continue
+                if item.get("download_error") is None:
+                    successful_ids.add(asset_id)
+                else:
+                    failed_ids.add(asset_id)
+        referenced_ids = (
+            {
+                reference.asset_id
+                for task in plan.tasks
+                for reference in task.reference_images
+            }
+            if plan is not None
+            else set()
+        )
+        excluded_ids = (
+            {item.asset_id for item in plan.excluded_assets}
+            if plan is not None
+            else set()
+        )
+        referenced = successful_ids.intersection(referenced_ids)
+        excluded = successful_ids.intersection(excluded_ids) - referenced
+        uncovered = successful_ids - referenced - excluded
+        return {
+            "successful_total": len(successful_ids),
+            "referenced_count": len(referenced),
+            "excluded_count": len(excluded),
+            "uncovered_count": len(uncovered),
+            "failed_count": len(failed_ids),
+        }
 
     @staticmethod
     def _event_view(events: list[dict[str, Any]]) -> list[dict[str, Any]]:

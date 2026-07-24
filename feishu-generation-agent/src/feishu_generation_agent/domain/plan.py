@@ -1,5 +1,5 @@
 from enum import StrEnum
-from typing import Literal, Self
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -10,6 +10,26 @@ class TaskType(StrEnum):
 
 
 ReferenceMode = Literal["multi_reference", "first_last_frame"]
+
+
+def _contains_chinese(value: str) -> bool:
+    return any(
+        "\u3400" <= character <= "\u4dbf"
+        or "\u4e00" <= character <= "\u9fff"
+        for character in value
+    )
+
+
+class ExcludedAsset(BaseModel):
+    asset_id: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+    @field_validator("reason")
+    @classmethod
+    def require_chinese_reason(cls, value: str) -> str:
+        if not _contains_chinese(value):
+            raise ValueError("排除理由必须包含中文")
+        return value
 
 
 class ImageReference(BaseModel):
@@ -142,12 +162,34 @@ class GenerationTask(BaseModel):
 class TaskPlan(BaseModel):
     tasks: list[GenerationTask]
     document_summary: str = ""
+    excluded_assets: list[ExcludedAsset]
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_missing_exclusions(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "excluded_assets" not in value:
+            return {**value, "excluded_assets": []}
+        return value
 
     @model_validator(mode="after")
-    def reject_duplicate_task_ids(self) -> Self:
+    def validate_plan_identity_sets(self) -> Self:
         task_ids = [task.task_id for task in self.tasks]
         if len(task_ids) != len(set(task_ids)):
             raise ValueError("duplicate task_id")
+        excluded_ids = [item.asset_id for item in self.excluded_assets]
+        if len(excluded_ids) != len(set(excluded_ids)):
+            raise ValueError("duplicate excluded asset_id")
+        referenced_ids = {
+            reference.asset_id
+            for task in self.tasks
+            for reference in task.reference_images
+        }
+        overlap = referenced_ids.intersection(excluded_ids)
+        if overlap:
+            raise ValueError(
+                "referenced and excluded asset sets overlap: "
+                + ", ".join(sorted(overlap))
+            )
         return self
 
     def approved_subset(
@@ -178,10 +220,96 @@ class TaskPlan(BaseModel):
                     f"task {task.task_id} output_count exceeds max_output_count"
                 )
 
+        selected_references = {
+            reference.asset_id
+            for task in selected_tasks
+            for reference in task.reference_images
+        }
+        unselected_references = {
+            reference.asset_id
+            for task in self.tasks
+            if task.task_id not in selected_id_set
+            for reference in task.reference_images
+        }
+        exclusions = list(self.excluded_assets)
+        excluded_ids = {item.asset_id for item in exclusions}
+        for asset_id in sorted(unselected_references - selected_references):
+            if asset_id not in excluded_ids:
+                exclusions.append(
+                    ExcludedAsset(
+                        asset_id=asset_id,
+                        reason="用户未选择对应任务，因此本次不使用该素材。",
+                    )
+                )
+
         return TaskPlan(
             tasks=selected_tasks,
             document_summary=self.document_summary,
+            excluded_assets=exclusions,
         )
+
+
+def reconcile_asset_coverage(
+    plan: TaskPlan,
+    *,
+    added_asset_ids: set[str] = frozenset(),
+    removed_asset_ids: set[str] = frozenset(),
+) -> TaskPlan:
+    referenced_ids = {
+        reference.asset_id
+        for task in plan.tasks
+        for reference in task.reference_images
+    }
+    exclusions = [
+        item
+        for item in plan.excluded_assets
+        if item.asset_id not in referenced_ids
+        and item.asset_id not in added_asset_ids
+    ]
+    excluded_ids = {item.asset_id for item in exclusions}
+    for asset_id in sorted(removed_asset_ids - referenced_ids):
+        if asset_id not in excluded_ids:
+            exclusions.append(
+                ExcludedAsset(
+                    asset_id=asset_id,
+                    reason="用户在审批中移除",
+                )
+            )
+    return TaskPlan(
+        tasks=plan.tasks,
+        document_summary=plan.document_summary,
+        excluded_assets=exclusions,
+    )
+
+
+def reconcile_task_asset_coverage(
+    plan: TaskPlan,
+    tasks: list[GenerationTask],
+) -> TaskPlan:
+    previous_ids = {
+        reference.asset_id
+        for task in plan.tasks
+        for reference in task.reference_images
+    }
+    updated_ids = {
+        reference.asset_id
+        for task in tasks
+        for reference in task.reference_images
+    }
+    candidate = TaskPlan(
+        tasks=tasks,
+        document_summary=plan.document_summary,
+        excluded_assets=[
+            item
+            for item in plan.excluded_assets
+            if item.asset_id not in updated_ids
+        ],
+    )
+    return reconcile_asset_coverage(
+        candidate,
+        added_asset_ids=updated_ids - previous_ids,
+        removed_asset_ids=previous_ids - updated_ids,
+    )
 
 
 class AuditReport(BaseModel):

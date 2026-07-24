@@ -808,6 +808,34 @@
     return section;
   }
 
+  function renderCoverage(view) {
+    const coverage = ReviewState.assetCoverage(view);
+    byId("coverage-label").textContent = ReviewState.coverageLabel(view);
+    const details = [
+      `已排除 ${coverage.excluded_count} 张`,
+      `未覆盖 ${coverage.uncovered_count} 张`,
+      `读取失败 ${coverage.failed_count} 张`,
+    ];
+    byId("coverage-detail").textContent = details.join(" · ");
+    const rows = ReviewState.excludedAssetRows(view).map((item) => {
+      const row = element("div", "excluded-asset-row");
+      const image = document.createElement("img");
+      image.alt = `排除素材 ${item.asset_id}`;
+      if (item.preview_url) image.src = agentUrl(item.preview_url);
+      const content = element("div", "excluded-asset-copy");
+      content.append(
+        element("strong", "", item.asset_id),
+        element("p", "", item.reason),
+      );
+      row.append(image, content);
+      return row;
+    });
+    if (!rows.length) {
+      rows.push(element("p", "mode-message", "暂无排除素材。"));
+    }
+    byId("excluded-asset-list").replaceChildren(...rows);
+  }
+
   function renderTask(task) {
     const card = element("article", "task-card");
     const titleRow = element("div", "task-title-row");
@@ -919,6 +947,7 @@
     const issueBox = byId("validation-issues");
     issueBox.textContent = issues.join("；");
     issueBox.hidden = issues.length === 0;
+    renderCoverage(view);
     taskList.replaceChildren(...(view.approval.tasks || []).map(renderTask));
     updateActionAvailability();
   }

@@ -7,7 +7,11 @@ from pydantic import ValidationError
 from feishu_generation_agent.domain.artifact import Artifact, ProviderResult
 from feishu_generation_agent.domain.document import MediaAsset, SourceType
 from feishu_generation_agent.domain.errors import AgentError, ErrorCategory, ErrorDetail
-from feishu_generation_agent.domain.plan import GenerationTask, TaskPlan
+from feishu_generation_agent.domain.plan import (
+    ExcludedAsset,
+    GenerationTask,
+    TaskPlan,
+)
 from feishu_generation_agent.ports import (
     DeliveryWriter,
     DocumentSource,
@@ -239,6 +243,69 @@ def test_approved_subset_preserves_plan_order_and_document_summary():
     assert approved is not plan
     assert [task.task_id for task in approved.tasks] == ["task-1", "task-2"]
     assert approved.document_summary == "两项生成需求"
+
+
+def test_task_plan_accepts_legacy_json_without_excluded_assets():
+    plan = TaskPlan.model_validate(
+        {"tasks": [image_task().model_dump(mode="json")]}
+    )
+
+    assert plan.excluded_assets == []
+    assert "excluded_assets" in TaskPlan.model_json_schema()["required"]
+
+
+def test_excluded_assets_require_chinese_unique_reasons_and_no_reference_overlap():
+    with pytest.raises(ValidationError, match="必须包含中文"):
+        ExcludedAsset(asset_id="asset-2", reason="not used")
+
+    with pytest.raises(ValidationError, match="duplicate excluded asset_id"):
+        TaskPlan(
+            tasks=[image_task()],
+            excluded_assets=[
+                ExcludedAsset(asset_id="asset-2", reason="供应商数量限制"),
+                ExcludedAsset(asset_id="asset-2", reason="用户没有选择"),
+            ],
+        )
+
+    with pytest.raises(ValidationError, match="referenced and excluded"):
+        TaskPlan(
+            tasks=[image_task()],
+            excluded_assets=[
+                ExcludedAsset(asset_id="asset-1", reason="用户没有选择")
+            ],
+        )
+
+
+def test_approved_subset_preserves_and_explains_assets_unused_by_selection():
+    plan = TaskPlan(
+        tasks=[
+            image_task("task-1"),
+            image_task(
+                "task-2",
+                reference_images=[
+                    {
+                        "asset_id": "asset-2",
+                        "role": "reference_image",
+                        "order": 1,
+                    }
+                ],
+            ),
+        ],
+        excluded_assets=[
+            ExcludedAsset(
+                asset_id="asset-3",
+                reason="供应商最多支持两张参考图，保留主体与场景图。",
+            )
+        ],
+    )
+
+    approved = plan.approved_subset(["task-1"], max_output_count=4)
+
+    assert [item.asset_id for item in approved.excluded_assets] == [
+        "asset-3",
+        "asset-2",
+    ]
+    assert "未选择" in approved.excluded_assets[1].reason
 
 
 def test_domain_models_dump_json_serializable_values():
