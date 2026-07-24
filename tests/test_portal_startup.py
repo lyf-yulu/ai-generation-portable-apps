@@ -93,9 +93,15 @@ class PortalStartupTests(unittest.TestCase):
              mock.patch.object(module.threading, "Thread"):
             manager.start_all()
 
-        manager.shutdown()
+        with mock.patch.object(module.os, "getpgid", return_value=managed_proc.pid) as getpgid, \
+             mock.patch.object(module.os, "killpg") as killpg:
+            manager.shutdown()
 
         self.assertNotIn("external-agent", manager.processes)
+        getpgid.assert_called_once_with(managed_proc.pid)
+        killpg.assert_called_once_with(managed_proc.pid, module.signal.SIGTERM)
+        managed_proc.terminate.assert_not_called()
+        managed_proc.kill.assert_not_called()
         external_proc.terminate.assert_not_called()
         external_proc.kill.assert_not_called()
 
