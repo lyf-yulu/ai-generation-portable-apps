@@ -1294,6 +1294,119 @@ async def test_run_view_exposes_blocking_and_nonblocking_ingest_issues(
         assert "读取失败X" not in response_text
 
 
+async def test_run_view_rebuilds_validation_ingest_issues_without_raw_alignment(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/safe-validation"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+        raw_path = "阻塞：读取失败 /Users/alice/private/customer.xlsx"
+        raw_bearer = "阻塞：读取失败 Bearer sk-live-12345678"
+        raw_extra = "阻塞：读取失败X"
+        state["normalized_document"]["ingest_issues"] = [
+            raw_path,
+            raw_bearer,
+            raw_extra,
+        ]
+        state["normalized_document"]["ingest_issue_records"] = [
+            {
+                "severity": "asset",
+                "code": "media_download_failed",
+                "display_message": "文档图片下载失败，其他素材可继续处理",
+                "source_block_id": "image-block",
+                "asset_id": "image-1",
+            },
+            {
+                "severity": "blocking",
+                "code": "sheet_export_timeout",
+                "display_message": "飞书电子表格导出超时，请稍后重试",
+                "source_block_id": "sheet-block",
+                "asset_id": None,
+            },
+        ]
+        state["source_document"] = copy.deepcopy(state["normalized_document"])
+        state["validation_issues"] = [
+            raw_extra,
+            "任务 task-1 缺少输出尺寸",
+            raw_path,
+            "供应商失败：Bearer sk-live-abcdefgh",
+            raw_bearer,
+            "缓存文件位于 /Volumes/private/customer.png",
+        ]
+
+        response = await client.get(f"/api/runs/{run_id}")
+        view = response.json()
+
+        assert view["approval"]["validation_issues"] == [
+            "任务 task-1 缺少输出尺寸",
+            "任务校验出现未知问题，请检查后重试",
+            "任务校验出现未知问题，请检查后重试",
+            "飞书电子表格导出超时，请稍后重试",
+        ]
+        for secret in (
+            raw_path,
+            raw_bearer,
+            raw_extra,
+            "sk-live-abcdefgh",
+            "/Volumes/private/customer.png",
+        ):
+            assert secret not in response.text
+
+
+async def test_run_view_fails_closed_for_forged_structured_ingest_record(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/forged-ingest"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+        state["normalized_document"]["ingest_issue_records"] = [
+            {
+                "severity": "asset",
+                "code": "sheet_export_failed",
+                "display_message": "Bearer sk-live-12345678",
+                "source_block_id": "sk-live-12345678",
+                "asset_id": None,
+            }
+        ]
+        state["source_document"] = copy.deepcopy(state["normalized_document"])
+
+        response = await client.get(f"/api/runs/{run_id}")
+        view = response.json()
+
+        assert view["approval"]["ingest_issue_records"] == [
+            {
+                "severity": "blocking",
+                "code": "legacy_unknown",
+                "display_message": "文档读取出现未知问题，请重新读取后再审批",
+            }
+        ]
+        assert view["approval"]["blocking_ingest_issues"] == [
+            "文档读取出现未知问题，请重新读取后再审批"
+        ]
+        assert "sk-live-12345678" not in response.text
+        assert "Bearer" not in response.text
+
+
 async def test_blocking_ingest_issue_returns_422_before_edited_approval_resume(
     tmp_path: Path,
 ):
@@ -1372,6 +1485,11 @@ async def test_structured_asset_issue_drives_api_view_and_approval(
         )
 
         assert view["approval"]["ingest_issue_records"][0]["severity"] == "asset"
+        assert set(view["approval"]["ingest_issue_records"][0]) == {
+            "severity",
+            "code",
+            "display_message",
+        }
         assert view["approval"]["blocking_ingest_issues"] == []
         assert response.status_code == 202
         assert graph.resume_calls == 1

@@ -71,9 +71,17 @@ _INGEST_ISSUE_SPECS = {
 
 
 def _issue_identifier_is_safe(identifier: str) -> bool:
-    return not any(
-        marker in identifier.lower()
-        for marker in ("bearer", "token", "secret")
+    lowered = identifier.lower()
+    return (
+        not any(marker in lowered for marker in ("bearer", "token", "secret"))
+        and re.search(
+            r"(?:^|[-_])sk[-_][a-z0-9_-]{8,}",
+            lowered,
+        )
+        is None
+        and "ark-" not in lowered
+        and "ark_" not in lowered
+        and "aklt" not in lowered
     )
 
 
@@ -103,6 +111,18 @@ class IngestIssueRecord(BaseModel):
             ):
                 raise ValueError("ingest issue identifier is not safe")
         return self
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if not update:
+            return super().model_copy(deep=deep)
+        payload = self.model_dump()
+        payload.update(update)
+        return type(self).model_validate(payload)
 
 
 def make_ingest_issue_record(
@@ -205,9 +225,11 @@ def resolve_ingest_issue_records(document: Any) -> list[IngestIssueRecord]:
     )
     if isinstance(records, list) and records:
         return [
-            record
-            if isinstance(record, IngestIssueRecord)
-            else IngestIssueRecord.model_validate(record)
+            IngestIssueRecord.model_validate(
+                record.model_dump()
+                if isinstance(record, IngestIssueRecord)
+                else record
+            )
             for record in records
         ]
     issues = (

@@ -3,7 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from feishu_generation_agent.domain.artifact import Artifact, ProviderResult
 from feishu_generation_agent.domain import document as document_domain
@@ -413,13 +413,59 @@ def test_structured_ingest_record_rejects_unallowlisted_display_message():
         )
 
 
-def test_structured_ingest_record_rejects_secret_like_identifiers():
-    with pytest.raises(ValidationError, match="identifier"):
+def test_structured_ingest_record_model_copy_revalidates_updates():
+    record = document_domain.make_ingest_issue_record(
+        document_domain.IngestIssueCode.MEDIA_DOWNLOAD_FAILED,
+        asset_id="image-1",
+    )
+
+    with pytest.raises(ValidationError, match="do not match"):
+        record.model_copy(update={"severity": "blocking"})
+
+
+def test_ingest_issue_resolver_revalidates_existing_model_instances():
+    record = document_domain.make_ingest_issue_record(
+        document_domain.IngestIssueCode.MEDIA_DOWNLOAD_FAILED,
+        asset_id="image-1",
+    )
+    forged = BaseModel.model_copy(
+        record,
+        update={
+            "severity": document_domain.IngestIssueSeverity.BLOCKING,
+        },
+    )
+
+    with pytest.raises(ValidationError, match="do not match"):
+        document_domain.resolve_ingest_issue_records(
+            SimpleNamespace(
+                ingest_issue_records=[forged],
+                ingest_issues=[],
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "unsafe_identifier",
+    [
+        "Bearer-secret-token",
+        "sk-live-12345678",
+        "image-sk-live-12345678",
+        "ark-live-12345678",
+        "block-ark-live-12345678",
+        "AKLT1234567890",
+        "image-AKLT1234567890",
+        "C:\\Users\\alice\\private.txt",
+    ],
+)
+def test_structured_ingest_record_rejects_secret_like_identifiers(
+    unsafe_identifier: str,
+):
+    with pytest.raises(ValidationError, match="identifier|pattern"):
         document_domain.IngestIssueRecord(
             severity="asset",
             code="media_download_failed",
             display_message="文档图片下载失败，其他素材可继续处理",
-            asset_id="Bearer-secret-token",
+            asset_id=unsafe_identifier,
         )
 
 

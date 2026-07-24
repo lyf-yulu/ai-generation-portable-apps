@@ -1,4 +1,5 @@
 import asyncio
+import re
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -616,7 +617,14 @@ class GraphRuntime:
                 "vision_descriptions": state.get("vision_descriptions", []),
                 "vision_issues": state.get("vision_issues", []),
                 "ingest_issue_records": [
-                    record.model_dump(mode="json")
+                    record.model_dump(
+                        mode="json",
+                        include={
+                            "severity",
+                            "code",
+                            "display_message",
+                        },
+                    )
                     for record in ingest_issue_records
                 ],
                 "ingest_issues": ingest_issues,
@@ -669,27 +677,49 @@ class GraphRuntime:
         validation_issues = state.get("validation_issues")
         if not isinstance(validation_issues, list):
             return []
-        raw_issues: list[str] = []
+        raw_ingest_issues: set[str] = set()
         for key in ("normalized_document", "source_document"):
             document = state.get(key)
             if isinstance(document, dict) and isinstance(
                 document.get("ingest_issues"), list
             ):
-                raw_issues = [
+                raw_ingest_issues.update(
                     issue
                     for issue in document["ingest_issues"]
                     if isinstance(issue, str)
-                ]
-                break
-        replacements = {
-            raw: record.display_message
-            for raw, record in zip(raw_issues, records, strict=False)
-        }
-        return [
-            replacements.get(issue, issue)
+                )
+        safe_issues = [
+            (
+                "任务校验出现未知问题，请检查后重试"
+                if GraphRuntime._validation_issue_is_sensitive(issue)
+                else issue
+            )
             for issue in validation_issues
-            if isinstance(issue, str)
+            if isinstance(issue, str) and issue not in raw_ingest_issues
         ]
+        for record in records:
+            if (
+                record.severity is IngestIssueSeverity.BLOCKING
+                and record.display_message not in safe_issues
+            ):
+                safe_issues.append(record.display_message)
+        return safe_issues
+
+    @staticmethod
+    def _validation_issue_is_sensitive(issue: str) -> bool:
+        return re.search(
+            r"(?i)(?:"
+            r"\bbearer\b|"
+            r"\btoken\b|"
+            r"\bsecret\b|"
+            r"(?:^|[^a-z0-9])sk-[a-z0-9_-]{8,}|"
+            r"(?:^|[^a-z0-9])ark-[a-z0-9_-]+|"
+            r"\baklt[a-z0-9_-]+|"
+            r"(?:^|[\s：:=（(])/(?:[^/\s]+/)+[^/\s]+|"
+            r"[a-z]:\\"
+            r")",
+            issue,
+        ) is not None
 
     async def resume_run(
         self,
