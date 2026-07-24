@@ -5,25 +5,43 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from langchain_core.runnables.config import set_config_context
 from langgraph.types import Command
+from langsmith import tracing_context
+from pydantic import ValidationError
 
 from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain.document import (
+    IngestIssueRecord,
+    IngestIssueCode,
+    IngestIssueSeverity,
     MediaAsset,
     NormalizedDocument,
+    PlanningPromptSnapshot,
     RequirementRequest,
+    build_planning_prompt_snapshot,
+    make_ingest_issue_record,
+    resolve_ingest_issue_records,
 )
 from feishu_generation_agent.domain.errors import AgentError
 from feishu_generation_agent.ports import DeliveryWriter
 from feishu_generation_agent.domain.plan import (
     ApprovalDecision,
+    AuditReport,
     GenerationTask,
     ImageReference,
     TaskPlan,
+    reconcile_task_asset_coverage,
 )
-from feishu_generation_agent.integrations.planner import validate_plan
+from feishu_generation_agent.integrations.planner import (
+    language_validation_message,
+    planner_system_prompt,
+    validate_plan,
+)
 from feishu_generation_agent.storage.files import FileStore
 from feishu_generation_agent.storage.repository import Repository
+
+from .nodes import approved_plan_from_state
 
 
 class RunNotFound(LookupError):
@@ -85,6 +103,7 @@ class GraphRuntime:
     ) -> str:
         if self._closed:
             raise RunConflict("运行时正在关闭")
+        reserved_ids = run_id is not None and thread_id is not None
         run_id = run_id or str(uuid4())
         thread_id = thread_id or str(uuid4())
         async with self._start_lock:
@@ -95,19 +114,52 @@ class GraphRuntime:
                     or existing["source_url"] != request.source_url
                 ):
                     raise RunConflict("预留的运行 ID 与现有运行不一致")
+                snapshot = await self.graph.aget_state(
+                    self._config(thread_id)
+                )
+                state = dict(snapshot.values or {})
+                if state and self._planning_prompt_from_state(state) is None:
+                    await self._fail_missing_planning_prompt(run_id)
+                    return run_id
+                if not state and request.planning_prompt is None:
+                    await self._fail_missing_planning_prompt(run_id)
+                    return run_id
                 approval_name = f"approval-run-{run_id}"
                 if (
                     existing["status"] in {"created", "running"}
                     and not self._has_background(approval_name)
                 ):
-                    snapshot = await self.graph.aget_state(
-                        self._config(thread_id)
-                    )
-                    if not dict(snapshot.values or {}):
+                    if not state:
                         self._start_background(
                             self._run_to_approval(run_id, thread_id, request),
                             name=approval_name,
                         )
+                return run_id
+            if (
+                reserved_ids
+                and request.trigger_type != "local_link"
+                and request.planning_prompt is None
+            ):
+                snapshot = await self.graph.aget_state(
+                    self._config(thread_id)
+                )
+                state = dict(snapshot.values or {})
+                planning_prompt = self._planning_prompt_from_state(state)
+                if planning_prompt is None:
+                    raise RunConflict("无法恢复运行：提示词快照不存在")
+                if (
+                    state.get("run_id") != run_id
+                    or state.get("thread_id") != thread_id
+                    or state.get("source_url") != request.source_url
+                ):
+                    raise RunConflict("恢复运行与 checkpoint 不一致")
+                await self.repository.create_run(
+                    run_id,
+                    thread_id,
+                    request.source_url,
+                    status=self._safe_status(state.get("status"), "failed"),
+                    owner_user_id=planning_prompt.owner_user_id,
+                )
                 return run_id
             await self.repository.create_run(
                 run_id,
@@ -115,6 +167,17 @@ class GraphRuntime:
                 request.source_url,
                 status="created",
             )
+            if request.planning_prompt is None:
+                request = request.model_copy(
+                    update={
+                        "planning_prompt": build_planning_prompt_snapshot(
+                            owner_user_id="prime-local",
+                            source="prime",
+                            version=0,
+                            prompt_text=planner_system_prompt(),
+                        )
+                    }
+                )
             self._start_background(
                 self._run_to_approval(run_id, thread_id, request),
                 name=f"approval-run-{run_id}",
@@ -143,11 +206,21 @@ class GraphRuntime:
                 raise RunConflict("重跑运行 ID 已存在")
             snapshot = await self.graph.aget_state(self._config(source["thread_id"]))
             source_state = dict(snapshot.values or {})
-            if not isinstance(source_state.get("draft_plan") or source_state.get("task_plan"), dict):
-                raise RunValidationError("原运行没有可重跑的审批计划")
-            approved_tasks = source_state.get("approved_tasks")
-            if not isinstance(approved_tasks, list) or not approved_tasks:
+            if self._planning_prompt_from_state(source_state) is None:
+                raise RunValidationError("原运行缺少有效提示词快照")
+            try:
+                approved_plan = approved_plan_from_state(
+                    source_state,
+                    max_output_count=self.settings.max_output_count,
+                )
+            except (TypeError, ValueError):
+                raise RunValidationError("原运行没有可重跑的审批计划") from None
+            if not approved_plan.tasks:
                 raise RunValidationError("原运行没有已批准任务")
+            approved_plan_json = approved_plan.model_dump(mode="json")
+            approved_tasks = [
+                task.model_dump(mode="json") for task in approved_plan.tasks
+            ]
 
             state = deepcopy(source_state)
             state.update(
@@ -155,9 +228,12 @@ class GraphRuntime:
                 thread_id=thread_id,
                 source_url=request.source_url,
                 status="waiting_approval",
+                draft_plan=deepcopy(approved_plan_json),
+                task_plan=deepcopy(approved_plan_json),
                 approval_decision=None,
                 approval_revision=None,
                 approved_tasks=deepcopy(approved_tasks),
+                approved_plan=None,
                 execution_records=[],
                 artifacts=[],
                 delivery_record=None,
@@ -169,10 +245,10 @@ class GraphRuntime:
             )
             config = self._config(thread_id)
             try:
-                await self.graph.aupdate_state(
+                await self._graph_aupdate_state(
                     config, state, as_node="validate_plan"
                 )
-                result = await self.graph.ainvoke(None, config=config)
+                result = await self._graph_ainvoke(None, config=config)
             except Exception:
                 await self.repository.update_run_status(run_id, "failed")
                 raise RunConflict("重跑审批 checkpoint 初始化失败") from None
@@ -218,32 +294,25 @@ class GraphRuntime:
             if run is None or run["status"] not in self._RECOVERABLE_STATUSES:
                 return
             try:
+                snapshot = await self.graph.aget_state(
+                    self._config(run["thread_id"])
+                )
+                state = dict(snapshot.values or {})
+                if (
+                    not state
+                    or self._planning_prompt_from_state(state) is None
+                ):
+                    await self._fail_missing_planning_prompt(run_id)
+                    return
                 if run["status"] == "delivering":
                     await self._retry_delivery_locked(
                         run_id, run["thread_id"]
                     )
                     return
-                snapshot = await self.graph.aget_state(
-                    self._config(run["thread_id"])
-                )
-                state = dict(snapshot.values or {})
                 await self.repository.update_run_status(run_id, "running")
-                if state:
-                    result = await self.graph.ainvoke(
-                        None, config=self._config(run["thread_id"])
-                    )
-                else:
-                    result = await self.graph.ainvoke(
-                        {
-                            "run_id": run_id,
-                            "thread_id": run["thread_id"],
-                            "source_url": run["source_url"],
-                            "trigger_type": "local_link",
-                            "reply_context": {},
-                            "status": "created",
-                        },
-                        config=self._config(run["thread_id"]),
-                    )
+                result = await self._graph_ainvoke(
+                    None, config=self._config(run["thread_id"])
+                )
                 final_status = (
                     "waiting_approval"
                     if self._has_interrupt(result)
@@ -281,16 +350,22 @@ class GraphRuntime:
         lock = self._run_locks.setdefault(run_id, asyncio.Lock())
         if lock.locked():
             raise RunConflict("运行正在处理中，请稍后重试")
-        run = await self.repository.get_run(run_id)
-        if run is None:
-            raise RunNotFound("运行不存在")
-        if run["status"] != "delivery_failed":
-            raise RunConflict("只有交付失败的运行可以重试交付")
-        await self.repository.update_run_status(run_id, "delivering")
-        self._start_background(
-            self._retry_delivery_worker(run_id, run["thread_id"]),
-            name=f"delivery-retry-{run_id}",
-        )
+        async with lock:
+            run = await self.repository.get_run(run_id)
+            if run is None:
+                raise RunNotFound("运行不存在")
+            if run["status"] != "delivery_failed":
+                raise RunConflict("只有交付失败的运行可以重试交付")
+            if not await self._checkpoint_has_valid_planning_prompt(
+                run["thread_id"]
+            ):
+                await self._fail_missing_planning_prompt(run_id)
+                raise RunValidationError("运行缺少有效提示词快照")
+            await self.repository.update_run_status(run_id, "delivering")
+            self._start_background(
+                self._retry_delivery_worker(run_id, run["thread_id"]),
+                name=f"delivery-retry-{run_id}",
+            )
 
     async def _retry_delivery_worker(self, run_id: str, thread_id: str) -> None:
         lock = self._run_locks.setdefault(run_id, asyncio.Lock())
@@ -301,12 +376,15 @@ class GraphRuntime:
         self, run_id: str, thread_id: str
     ) -> None:
         try:
+            if not await self._checkpoint_has_valid_planning_prompt(thread_id):
+                await self._fail_missing_planning_prompt(run_id)
+                return
             if self.delivery_writer is None:
                 raise RunConflict("交付重试未配置")
             record = await self.delivery_writer.retry_delivery(run_id)
             artifacts = await self.repository.list_artifacts(run_id)
             final_status = "succeeded" if artifacts else "completed_with_errors"
-            await self.graph.aupdate_state(
+            await self._graph_aupdate_state(
                 self._config(thread_id),
                 {
                     "delivery_record": record.model_dump(mode="json"),
@@ -359,7 +437,7 @@ class GraphRuntime:
     ) -> None:
         try:
             await self.repository.update_run_status(run_id, "running")
-            result = await self.graph.ainvoke(
+            result = await self._graph_ainvoke(
                 {
                     "run_id": run_id,
                     "thread_id": thread_id,
@@ -367,6 +445,11 @@ class GraphRuntime:
                     "requester_open_id": request.requester_open_id,
                     "trigger_type": request.trigger_type,
                     "reply_context": request.reply_context,
+                    "planning_prompt": (
+                        request.planning_prompt.model_dump(mode="json")
+                        if request.planning_prompt is not None
+                        else None
+                    ),
                     "status": "created",
                 },
                 config=self._config(thread_id),
@@ -379,6 +462,15 @@ class GraphRuntime:
             await self.repository.update_run_status(run_id, status)
         except asyncio.CancelledError:
             raise
+        except AgentError as exc:
+            await self._record_last_error(run_id, thread_id, exc)
+            await self.repository.append_event(
+                run_id,
+                "runtime",
+                "failed",
+                "Workflow background execution failed",
+            )
+            await self.repository.update_run_status(run_id, "failed")
         except Exception:
             await self.repository.append_event(
                 run_id,
@@ -387,6 +479,37 @@ class GraphRuntime:
                 "Workflow background execution failed",
             )
             await self.repository.update_run_status(run_id, "failed")
+
+    @staticmethod
+    def _planning_prompt_from_state(
+        state: dict[str, Any],
+    ) -> PlanningPromptSnapshot | None:
+        try:
+            return PlanningPromptSnapshot.model_validate(
+                state.get("planning_prompt")
+            )
+        except ValidationError:
+            return None
+
+    async def _checkpoint_has_valid_planning_prompt(
+        self,
+        thread_id: str,
+    ) -> bool:
+        snapshot = await self.graph.aget_state(self._config(thread_id))
+        state = dict(snapshot.values or {})
+        return (
+            bool(state)
+            and self._planning_prompt_from_state(state) is not None
+        )
+
+    async def _fail_missing_planning_prompt(self, run_id: str) -> None:
+        await self.repository.append_event(
+            run_id,
+            "planning_prompt",
+            "failed",
+            "Planning prompt snapshot unavailable",
+        )
+        await self.repository.update_run_status(run_id, "failed")
 
     async def get_run_view(self, run_id: str) -> dict[str, Any]:
         run = await self.repository.get_run(run_id)
@@ -413,13 +536,30 @@ class GraphRuntime:
         if plan is None:
             plan = state.get("task_plan")
         if not isinstance(plan, dict):
-            plan = {"tasks": [], "document_summary": ""}
+            plan = {
+                "tasks": [],
+                "document_summary": "",
+                "excluded_assets": [],
+            }
+        try:
+            plan_model = TaskPlan.model_validate(plan)
+            plan = plan_model.model_dump(mode="json")
+        except Exception:
+            plan_model = None
         tasks = plan.get("tasks")
         if not isinstance(tasks, list):
             tasks = []
         media_assets = self._safe_media_assets(
             run_id, state.get("media_assets", [])
         )
+        coverage = self._asset_coverage(
+            plan_model,
+            state.get("media_assets", []),
+        )
+        ingest_issue_records = self._document_ingest_issue_records(state)
+        ingest_issues = [
+            record.display_message for record in ingest_issue_records
+        ]
         view = {
             "run_id": run_id,
             "thread_id": run["thread_id"],
@@ -455,6 +595,7 @@ class GraphRuntime:
                 for artifact in artifacts
             ],
             "delivery": state.get("delivery_record"),
+            "last_error": state.get("last_error"),
             "privacy": {
                 "langsmith_tracing": self.settings.langsmith_tracing,
             },
@@ -471,8 +612,37 @@ class GraphRuntime:
                 "tasks": tasks,
                 "document_summary": plan.get("document_summary", ""),
                 "media_assets": media_assets,
+                "excluded_assets": plan.get("excluded_assets", []),
+                "coverage": coverage,
                 "vision_descriptions": state.get("vision_descriptions", []),
-                "validation_issues": state.get("validation_issues", []),
+                "vision_issues": state.get("vision_issues", []),
+                "ingest_issue_records": [
+                    record.model_dump(
+                        mode="json",
+                        include={
+                            "severity",
+                            "code",
+                            "display_message",
+                        },
+                    )
+                    for record in ingest_issue_records
+                ],
+                "ingest_issues": ingest_issues,
+                "blocking_ingest_issues": [
+                    record.display_message
+                    for record in ingest_issue_records
+                    if record.severity is IngestIssueSeverity.BLOCKING
+                ],
+                "asset_ingest_issues": [
+                    record.display_message
+                    for record in ingest_issue_records
+                    if record.severity is IngestIssueSeverity.ASSET
+                ],
+                "validation_issues": self._rebuild_validation_issues(
+                    state,
+                    plan_model,
+                    ingest_issue_records,
+                ),
                 "selected_task_ids": [
                     task.get("task_id")
                     for task in state.get("approved_tasks", [])
@@ -481,6 +651,61 @@ class GraphRuntime:
             },
         }
         return view
+
+    @staticmethod
+    def _document_ingest_issue_records(
+        state: dict[str, Any],
+    ) -> list[IngestIssueRecord]:
+        for key in ("normalized_document", "source_document"):
+            document = state.get(key)
+            if not isinstance(document, dict):
+                continue
+            try:
+                return resolve_ingest_issue_records(document)
+            except ValidationError:
+                return [
+                    make_ingest_issue_record(
+                        IngestIssueCode.LEGACY_UNKNOWN
+                    )
+                ]
+        return []
+
+    def _rebuild_validation_issues(
+        self,
+        state: dict[str, Any],
+        plan: TaskPlan | None,
+        records: list[IngestIssueRecord],
+    ) -> list[str]:
+        try:
+            if plan is None:
+                raise ValueError("approval plan is invalid")
+            document = self._typed_document_for_view(state)
+            issues = validate_plan(
+                plan,
+                document,
+                max_output_count=self.settings.max_output_count,
+            )
+            audit = AuditReport.model_validate(state.get("audit_report", {}))
+            if audit.corrections_required:
+                issues.extend(f"audit: {issue}" for issue in audit.issues)
+            issues.extend(
+                record.display_message
+                for record in records
+                if record.severity is IngestIssueSeverity.BLOCKING
+            )
+        except Exception:
+            return ["审批校验状态无效，请重新读取后再审批"]
+        return list(dict.fromkeys(issues))
+
+    @staticmethod
+    def _typed_document_for_view(
+        state: dict[str, Any],
+    ) -> NormalizedDocument:
+        for key in ("normalized_document", "source_document"):
+            document = state.get(key)
+            if document is not None:
+                return NormalizedDocument.model_validate(document)
+        raise ValueError("approval document is missing")
 
     async def resume_run(
         self,
@@ -500,14 +725,18 @@ class GraphRuntime:
                 self._config(run["thread_id"])
             )
             state = dict(snapshot.values or {})
+            if self._planning_prompt_from_state(state) is None:
+                await self._fail_missing_planning_prompt(run_id)
+                raise RunValidationError("运行缺少有效提示词快照")
             self._validate_decision(state, decision)
             await self.repository.update_run_status(run_id, "resuming")
             try:
-                result = await self.graph.ainvoke(
+                result = await self._graph_ainvoke(
                     Command(resume=decision.model_dump(mode="json")),
                     config=self._config(run["thread_id"]),
                 )
             except AgentError as exc:
+                await self._record_last_error(run_id, run["thread_id"], exc)
                 await self.repository.update_run_status(run_id, "failed")
                 raise RunValidationError(exc.detail.message) from None
             except Exception:
@@ -525,6 +754,19 @@ class GraphRuntime:
                 else self._safe_status(result.get("status"), "completed")
             )
             await self.repository.update_run_status(run_id, status)
+
+    async def _record_last_error(
+        self,
+        run_id: str,
+        thread_id: str,
+        exc: AgentError,
+    ) -> None:
+        del run_id
+        await self._graph_aupdate_state(
+            self._config(thread_id),
+            {"last_error": exc.detail.model_dump(mode="json")},
+            as_node="revalidate_approval",
+        )
 
     async def add_reference(
         self,
@@ -757,7 +999,7 @@ class GraphRuntime:
             self._validate_references(
                 updated.task_type.value,
                 updated.reference_images,
-                {asset.asset_id: asset.mime_type for asset in assets},
+                {asset.asset_id: asset for asset in assets},
                 updated.reference_mode,
             )
             return updated
@@ -777,7 +1019,7 @@ class GraphRuntime:
     ) -> TaskPlan:
         tasks = list(plan.tasks)
         tasks[task_index] = task
-        return TaskPlan(tasks=tasks, document_summary=plan.document_summary)
+        return reconcile_task_asset_coverage(plan, tasks)
 
     async def _persist_draft(
         self,
@@ -793,10 +1035,18 @@ class GraphRuntime:
         validation_issues: list[str] = []
         if normalized is not None:
             try:
-                validation_issues = validate_plan(
-                    plan,
-                    NormalizedDocument.model_validate(normalized),
-                    max_output_count=self.settings.max_output_count,
+                document = NormalizedDocument.model_validate(normalized)
+                validation_issues = [
+                    record.display_message
+                    for record in resolve_ingest_issue_records(document)
+                    if record.severity is IngestIssueSeverity.BLOCKING
+                ]
+                validation_issues.extend(
+                    validate_plan(
+                        plan,
+                        document,
+                        max_output_count=self.settings.max_output_count,
+                    )
                 )
             except Exception:
                 raise RunValidationError("更新后的任务计划无法验证") from None
@@ -810,6 +1060,7 @@ class GraphRuntime:
             "draft_revision": revision + 1,
             "approval_decision": None,
             "approved_tasks": [],
+            "approved_plan": None,
             "validation_issues": validation_issues,
             "status": "waiting_approval",
         }
@@ -819,12 +1070,12 @@ class GraphRuntime:
             updates["source_document"] = source_document
         config = self._config(run["thread_id"])
         try:
-            await self.graph.aupdate_state(
+            await self._graph_aupdate_state(
                 config,
                 updates,
                 as_node="validate_plan",
             )
-            result = await self.graph.ainvoke(None, config=config)
+            result = await self._graph_ainvoke(None, config=config)
         except Exception:
             raise RunConflict("更新审批 checkpoint 失败") from None
         if not self._has_interrupt(result):
@@ -850,25 +1101,20 @@ class GraphRuntime:
         try:
             original = TaskPlan.model_validate(raw_plan)
             candidate = (
-                TaskPlan(
-                    tasks=decision.tasks,
-                    document_summary=original.document_summary,
-                )
+                reconcile_task_asset_coverage(original, decision.tasks)
                 if decision.tasks
                 else original
             )
             original_ids = {task.task_id for task in original.tasks}
             if any(task.task_id not in original_ids for task in candidate.tasks):
                 raise ValueError("编辑结果包含未知任务")
-            assets = {
-                item["asset_id"]: item["mime_type"]
-                for item in state.get("media_assets", [])
-                if (
-                    isinstance(item, dict)
-                    and isinstance(item.get("asset_id"), str)
-                    and isinstance(item.get("mime_type"), str)
-                )
-            }
+            assets: dict[str, MediaAsset] = {}
+            for item in state.get("media_assets", []):
+                try:
+                    asset = MediaAsset.model_validate(item)
+                except Exception:
+                    continue
+                assets[asset.asset_id] = asset
             for task in candidate.tasks:
                 self._validate_references(
                     task.task_type.value,
@@ -882,6 +1128,29 @@ class GraphRuntime:
             )
             if not approved.tasks:
                 raise ValueError("没有可批准的任务")
+            normalized = state.get("normalized_document")
+            if isinstance(normalized, dict):
+                document = NormalizedDocument.model_validate(normalized)
+                issue_records = resolve_ingest_issue_records(document)
+                if any(
+                    record.severity is IngestIssueSeverity.BLOCKING
+                    for record in issue_records
+                ):
+                    raise RunValidationError(
+                        "文档存在阻断性读取问题，请修复源文档后重试"
+                    )
+                issues = validate_plan(
+                    approved,
+                    document,
+                    max_output_count=self.settings.max_output_count,
+                )
+                if issues:
+                    if any("asset_coverage" in issue for issue in issues):
+                        raise RunValidationError("素材覆盖不完整，请先处理未使用素材")
+                    raise RunValidationError(
+                        language_validation_message(issues)
+                        or "审批计划未通过校验"
+                    )
         except RunValidationError:
             raise
         except Exception as exc:
@@ -895,12 +1164,17 @@ class GraphRuntime:
     def _validate_references(
         task_type: str,
         references: Any,
-        known_assets: dict[str, str],
+        known_assets: dict[str, MediaAsset],
         reference_mode: str | None = None,
     ) -> None:
         asset_ids = [reference.asset_id for reference in references]
         if any(asset_id not in known_assets for asset_id in asset_ids):
             raise RunValidationError("编辑结果引用了未知素材")
+        if any(
+            known_assets[asset_id].download_error is not None
+            for asset_id in asset_ids
+        ):
+            raise RunValidationError("编辑结果引用了下载失败素材")
         if len(asset_ids) != len(set(asset_ids)):
             raise RunValidationError("同一任务不能重复引用同一图片")
         orders = [reference.order for reference in references]
@@ -917,7 +1191,7 @@ class GraphRuntime:
         if any(role not in allowed_roles for role in roles):
             raise RunValidationError("参考素材用途无效")
         for reference in references:
-            mime_type = known_assets[reference.asset_id]
+            mime_type = known_assets[reference.asset_id].mime_type
             valid = (
                 (mime_type.startswith("image/") and reference.role in {"reference_image", "first_frame", "last_frame"})
                 or (mime_type.startswith("video/") and reference.role == "reference_video")
@@ -962,6 +1236,41 @@ class GraphRuntime:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._background_tasks.clear()
 
+    async def _graph_ainvoke(
+        self,
+        value: Any,
+        *,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        private_config = {**config, "callbacks": []}
+        with tracing_context(enabled=False, parent=False):
+            with set_config_context(private_config) as context:
+                task = context.run(
+                    asyncio.create_task,
+                    self.graph.ainvoke(value, config=private_config),
+                )
+                return await task
+
+    async def _graph_aupdate_state(
+        self,
+        config: dict[str, Any],
+        values: dict[str, Any],
+        *,
+        as_node: str,
+    ) -> None:
+        private_config = {**config, "callbacks": []}
+        with tracing_context(enabled=False, parent=False):
+            with set_config_context(private_config) as context:
+                task = context.run(
+                    asyncio.create_task,
+                    self.graph.aupdate_state(
+                        private_config,
+                        values,
+                        as_node=as_node,
+                    ),
+                )
+                await task
+
     @staticmethod
     def _config(thread_id: str) -> dict[str, dict[str, str]]:
         return {"configurable": {"thread_id": thread_id}}
@@ -994,12 +1303,58 @@ class GraphRuntime:
                     "size": item.get("size"),
                     "width": item.get("width"),
                     "height": item.get("height"),
+                    "download_failed": item.get("download_error") is not None,
                     "preview_url": (
                         f"/api/runs/{run_id}/references/{asset_id}/content"
+                        if item.get("download_error") is None
+                        else None
                     ),
                 }
             )
         return assets
+
+    @staticmethod
+    def _asset_coverage(
+        plan: TaskPlan | None,
+        media_assets: Any,
+    ) -> dict[str, int]:
+        successful_ids: set[str] = set()
+        failed_ids: set[str] = set()
+        if isinstance(media_assets, list):
+            for item in media_assets:
+                if not isinstance(item, dict):
+                    continue
+                asset_id = item.get("asset_id")
+                if not isinstance(asset_id, str) or not asset_id:
+                    continue
+                if item.get("download_error") is None:
+                    successful_ids.add(asset_id)
+                else:
+                    failed_ids.add(asset_id)
+        referenced_ids = (
+            {
+                reference.asset_id
+                for task in plan.tasks
+                for reference in task.reference_images
+            }
+            if plan is not None
+            else set()
+        )
+        excluded_ids = (
+            {item.asset_id for item in plan.excluded_assets}
+            if plan is not None
+            else set()
+        )
+        referenced = successful_ids.intersection(referenced_ids)
+        excluded = successful_ids.intersection(excluded_ids) - referenced
+        uncovered = successful_ids - referenced - excluded
+        return {
+            "successful_total": len(successful_ids),
+            "referenced_count": len(referenced),
+            "excluded_count": len(excluded),
+            "uncovered_count": len(uncovered),
+            "failed_count": len(failed_ids),
+        }
 
     @staticmethod
     def _event_view(events: list[dict[str, Any]]) -> list[dict[str, Any]]:

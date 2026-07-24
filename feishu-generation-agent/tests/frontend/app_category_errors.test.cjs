@@ -190,3 +190,79 @@ test("claim errors do not remain in the global box after a cached category switc
     false,
   );
 });
+
+test("approval view distinguishes blocking document and nonblocking asset issues", async () => {
+  const runView = {
+    run_id: "run-ingest-issues",
+    thread_id: "thread-ingest-issues",
+    source_url: "https://acme.feishu.cn/docx/issues",
+    status: "waiting_approval",
+    events: [],
+    privacy: {},
+    approval: {
+      document_title: "素材读取测试",
+      revision: 7,
+      document_summary: "",
+      tasks: [],
+      media_assets: [],
+      excluded_assets: [],
+      selected_task_ids: [],
+      coverage: {
+        successful_total: 1,
+        referenced_count: 1,
+        excluded_count: 0,
+        uncovered_count: 0,
+        failed_count: 1,
+      },
+      validation_issues: [],
+      ingest_issue_records: [
+        {
+          severity: "blocking",
+          code: "sheet_export_timeout",
+          display_message: "飞书电子表格导出超时，请稍后重试",
+        },
+        {
+          severity: "asset",
+          code: "media_download_failed",
+          display_message: "文档图片下载失败，其他素材可继续处理",
+        },
+      ],
+      blocking_ingest_issues: [],
+      asset_ingest_issues: [],
+      vision_issues: ["素材 asset-2 视觉分析失败：图片无法识别"],
+    },
+  };
+  const app = await loadApp(async (url) => {
+    if (url === "/api/health") {
+      return jsonResponse(200, { modes: { bitable: true } });
+    }
+    if (url === "/api/bitable/recent-runs") return jsonResponse(200, []);
+    if (url === "/api/bitable/active-runs") {
+      return jsonResponse(200, [{
+        run_id: runView.run_id,
+        display_text: "素材读取测试",
+      }]);
+    }
+    if (url === `/api/runs/${runView.run_id}`) {
+      return jsonResponse(200, runView);
+    }
+    if (url.startsWith("/api/bitable/tasks?")) return jsonResponse(200, []);
+    throw new Error(`unexpected request: ${url}`);
+  });
+
+  assert.equal(
+    app.getNode("blocking-ingest-issues").textContent,
+    "文档读取阻塞：飞书电子表格导出超时，请稍后重试",
+  );
+  assert.equal(app.getNode("blocking-ingest-issues").hidden, false);
+  assert.equal(
+    app.getNode("asset-ingest-issues").textContent,
+    "素材读取失败（不影响其他素材）：文档图片下载失败，其他素材可继续处理",
+  );
+  assert.equal(app.getNode("asset-ingest-issues").hidden, false);
+  assert.equal(
+    app.getNode("vision-issues").textContent,
+    "素材识别失败（不影响其他素材）：素材 asset-2 视觉分析失败：图片无法识别",
+  );
+  assert.equal(app.getNode("vision-issues").hidden, false);
+});

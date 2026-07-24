@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
@@ -9,18 +10,36 @@ from typing import Any
 
 import httpx
 import pytest
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.runnables.config import set_config_context
+from langsmith import tracing_context
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 from PIL import Image
 
 from feishu_generation_agent.config import Settings
-from feishu_generation_agent.domain.document import RequirementRequest
+from feishu_generation_agent.domain.document import (
+    RequirementRequest,
+    build_planning_prompt_snapshot,
+)
+from feishu_generation_agent.domain.errors import (
+    AgentError,
+    ErrorCategory,
+    ErrorDetail,
+)
+from feishu_generation_agent.domain.plan import ApprovalDecision
 from feishu_generation_agent.graph.builder import build_graph
 from feishu_generation_agent.graph.nodes import GraphServices
-from feishu_generation_agent.graph.runtime import GraphRuntime
+from feishu_generation_agent.graph.runtime import (
+    GraphRuntime,
+    RunNotFound,
+    RunValidationError,
+)
 from feishu_generation_agent.storage.files import FileStore
+from feishu_generation_agent.storage.planner_prompts import PlannerPromptStore
 from feishu_generation_agent.storage.repository import Repository
 from feishu_generation_agent.web.app import create_app
+from feishu_generation_agent.integrations.planner import planner_system_prompt
 from feishu_generation_agent.cli import smoke
 
 
@@ -70,6 +89,7 @@ class FakeApprovalGraph:
         self.states: dict[str, dict[str, Any]] = {}
         self.resume_calls = 0
         self.fail_initial = False
+        self.resume_error: AgentError | None = None
         self.resume_started = asyncio.Event()
         self.resume_release: asyncio.Event | None = None
 
@@ -170,6 +190,8 @@ class FakeApprovalGraph:
         self.resume_started.set()
         if self.resume_release is not None:
             await self.resume_release.wait()
+        if self.resume_error is not None:
+            raise self.resume_error
         decision = value.resume
         if decision["action"] == "cancel":
             state.update(status="cancelled", approval_decision=decision)
@@ -215,7 +237,7 @@ class FakeApprovalGraph:
 
 
 @asynccontextmanager
-async def _environment(tmp_path: Path):
+async def _environment(tmp_path: Path, *, bitable_service=None):
     settings = Settings(
         data_dir=tmp_path / "data",
         outputs_dir=tmp_path / "outputs",
@@ -227,6 +249,9 @@ async def _environment(tmp_path: Path):
     image_path = settings.data_dir / "source.png"
     image_path.write_bytes(b"fake-source-image")
     repository = await Repository.open(settings.business_db_path)
+    prompt_store = await PlannerPromptStore.open(
+        tmp_path / "environment-planner-prompts.sqlite3"
+    )
     file_store = FileStore(
         settings.data_dir,
         settings.outputs_dir,
@@ -239,7 +264,11 @@ async def _environment(tmp_path: Path):
         file_store=file_store,
         settings=settings,
     )
-    app = create_app(runtime=runtime)
+    app = create_app(
+        runtime=runtime,
+        bitable_service=bitable_service,
+        planner_prompt_store=prompt_store,
+    )
     transport = httpx.ASGITransport(app=app)
     try:
         async with app.router.lifespan_context(app):
@@ -249,20 +278,432 @@ async def _environment(tmp_path: Path):
             ) as client:
                 yield client, runtime, graph, repository
     finally:
+        await prompt_store.close()
         await repository.close()
+
+
+@asynccontextmanager
+async def _prompt_environment(tmp_path: Path, *, expose_store: bool = False):
+    store = await PlannerPromptStore.open(tmp_path / "planner-prompts.sqlite3")
+    app = create_app(planner_prompt_store=store)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                yield (client, store) if expose_store else client
+    finally:
+        await store.close()
+
+
+_USER_A_HEADERS = {"X-Portal-User-Id": "user-a", "X-Username": "%E7%94%B2"}
+_USER_B_HEADERS = {"X-Portal-User-Id": "user-b", "X-Username": "%E4%B9%99"}
+
+
+async def test_portal_reserved_prime_identity_is_rejected(tmp_path: Path) -> None:
+    async with _prompt_environment(tmp_path) as client:
+        response = await client.get(
+            "/api/planner-prompt",
+            headers={"X-Portal-User-Id": "prime-local"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Portal 用户身份无效"
+
+
+async def test_direct_local_planner_prompt_is_read_only_prime(tmp_path: Path) -> None:
+    async with _prompt_environment(tmp_path) as client:
+        response = await client.get("/api/planner-prompt")
+        put_response = await client.put(
+            "/api/planner-prompt", json={"prompt_text": "不应保存"}
+        )
+        delete_response = await client.delete("/api/planner-prompt")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "mode": "prime",
+        "editable": False,
+        "prompt_text": planner_system_prompt(),
+        "version": 0,
+        "source": "prime",
+    }
+    assert put_response.status_code == 403
+    assert delete_response.status_code == 403
+
+
+async def test_portal_planner_prompt_isolated_by_header_identity(tmp_path: Path) -> None:
+    first_prompt = "优先保持人物造型一致，并按镜头拆分任务。"
+    second_prompt = "让镜头运动、光线和节奏保持连续。"
+    async with _prompt_environment(tmp_path) as client:
+        inherited = await client.get("/api/planner-prompt", headers=_USER_A_HEADERS)
+        saved_first = await client.put(
+            "/api/planner-prompt",
+            headers=_USER_A_HEADERS,
+            json={"prompt_text": first_prompt},
+        )
+        saved_second = await client.put(
+            "/api/planner-prompt",
+            headers=_USER_A_HEADERS,
+            json={"prompt_text": second_prompt},
+        )
+        user_b = await client.get("/api/planner-prompt", headers=_USER_B_HEADERS)
+        deleted = await client.delete(
+            "/api/planner-prompt", headers=_USER_A_HEADERS
+        )
+        user_b_after_delete = await client.get(
+            "/api/planner-prompt", headers=_USER_B_HEADERS
+        )
+
+    assert inherited.json() == {
+        "mode": "prime",
+        "editable": True,
+        "prompt_text": planner_system_prompt(),
+        "version": 0,
+        "source": "prime",
+    }
+    assert saved_first.json() == {
+        "mode": "personal",
+        "editable": True,
+        "prompt_text": first_prompt,
+        "version": 1,
+        "source": "personal",
+    }
+    assert saved_second.json() == {
+        "mode": "personal",
+        "editable": True,
+        "prompt_text": second_prompt,
+        "version": 2,
+        "source": "personal",
+    }
+    assert user_b.json() == {
+        "mode": "prime",
+        "editable": True,
+        "prompt_text": planner_system_prompt(),
+        "version": 0,
+        "source": "prime",
+    }
+    assert deleted.json() == inherited.json()
+    assert user_b_after_delete.json() == user_b.json()
+
+
+async def test_planner_prompt_uses_only_portal_header_user_id(tmp_path: Path) -> None:
+    prompt = "只应保存给请求头中的用户。"
+    async with _prompt_environment(tmp_path, expose_store=True) as (client, store):
+        saved = await client.put(
+            "/api/planner-prompt?portal_user_id=user-b",
+            headers=_USER_A_HEADERS,
+            json={"prompt_text": prompt, "portal_user_id": "user-b"},
+        )
+        user_a = await client.get("/api/planner-prompt", headers=_USER_A_HEADERS)
+        user_b = await client.get("/api/planner-prompt", headers=_USER_B_HEADERS)
+        profile = await store.get("user-a")
+
+    assert saved.status_code == 200
+    assert user_a.json()["prompt_text"] == prompt
+    assert user_b.json()["source"] == "prime"
+    assert "user-a" not in user_a.text
+    assert "user-b" not in user_a.text
+    assert profile is not None
+    assert profile.username == "甲"
+
+
+@pytest.mark.parametrize("prompt_text", [" \t\n", "文" * 20_001])
+async def test_planner_prompt_rejects_blank_and_overlong_values(
+    tmp_path: Path, prompt_text: str
+) -> None:
+    async with _prompt_environment(tmp_path) as client:
+        response = await client.put(
+            "/api/planner-prompt",
+            headers=_USER_A_HEADERS,
+            json={"prompt_text": prompt_text},
+        )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"X-Portal-User-Id": " ", "X-Username": "%E7%94%B2"},
+        {"X-Portal-User-Id": "user-a", "X-Username": "%ZZ"},
+        {"X-Portal-User-Id": "user-a" * 100, "X-Username": "%E7%94%B2"},
+    ],
+)
+async def test_planner_prompt_rejects_malformed_or_overlong_identity(
+    tmp_path: Path, headers: dict[str, str]
+) -> None:
+    async with _prompt_environment(tmp_path) as client:
+        response = await client.get("/api/planner-prompt", headers=headers)
+
+    assert response.status_code == 400
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected_status"),
+    [
+        ({}, 403),
+        ({"X-Portal-User-Id": " ", "X-Username": "%E7%94%B2"}, 400),
+    ],
+    ids=["anonymous", "malformed-identity"],
+)
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {"prompt_text": " \t\n"},
+        {"prompt_text": "secret-prompt-" + "文" * 20_000},
+    ],
+    ids=["missing-body", "blank-prompt", "overlong-prompt"],
+)
+async def test_planner_prompt_put_checks_identity_before_invalid_body(
+    tmp_path: Path,
+    headers: dict[str, str],
+    expected_status: int,
+    payload: dict[str, str] | None,
+) -> None:
+    async with _prompt_environment(tmp_path) as client:
+        request_kwargs = {"headers": headers}
+        if payload is not None:
+            request_kwargs["json"] = payload
+        response = await client.put("/api/planner-prompt", **request_kwargs)
+
+    assert response.status_code == expected_status
+    assert "secret-prompt-" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected_status"),
+    [
+        ({}, 403),
+        ({"X-Portal-User-Id": " ", "X-Username": "%E7%94%B2"}, 400),
+    ],
+    ids=["anonymous", "malformed-identity"],
+)
+async def test_planner_prompt_delete_checks_identity(
+    tmp_path: Path,
+    headers: dict[str, str],
+    expected_status: int,
+) -> None:
+    async with _prompt_environment(tmp_path) as client:
+        response = await client.delete("/api/planner-prompt", headers=headers)
+
+    assert response.status_code == expected_status
 
 
 async def _wait_for_status(
     client: httpx.AsyncClient,
     run_id: str,
     expected: str,
+    *,
+    headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     for _ in range(100):
-        response = await client.get(f"/api/runs/{run_id}")
+        response = await client.get(
+            f"/api/runs/{run_id}", headers=headers
+        )
         if response.status_code == 200 and response.json()["status"] == expected:
             return response.json()
         await asyncio.sleep(0.01)
     raise AssertionError(f"run did not reach {expected}")
+
+
+async def test_run_view_exposes_safe_chinese_validation_field_paths(
+    tmp_path: Path,
+) -> None:
+    raw_prompt = "English prompt that must not be exposed"
+    message = "以下字段必须包含中文主体说明：tasks[0].prompt"
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime, repository
+        created = await client.post(
+            "/api/runs",
+            json={"source_url": "https://tenant.feishu.cn/docx/chinese"},
+        )
+        run_id = created.json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        graph.resume_error = AgentError(
+            ErrorDetail(
+                category=ErrorCategory.VALIDATION,
+                message=message,
+                technical_detail="safe validation error",
+                retryable=False,
+            )
+        )
+
+        response = await client.post(
+            f"/api/runs/{run_id}/decision",
+            json={"action": "approve", "selected_task_ids": ["task-1"]},
+        )
+        view = await client.get(f"/api/runs/{run_id}")
+
+    assert response.status_code == 422
+    assert "tasks[0].prompt" in response.text
+    assert raw_prompt not in response.text
+    assert view.status_code == 200
+    assert view.json()["last_error"]["message"] == message
+    assert raw_prompt not in view.text
+
+
+async def test_run_and_reference_routes_hide_user_a_run_from_user_b(
+    tmp_path: Path,
+) -> None:
+    async with _environment(tmp_path) as (
+        client,
+        runtime,
+        graph,
+        repository,
+    ):
+        del runtime, graph
+        created = await client.post(
+            "/api/runs",
+            headers=_USER_A_HEADERS,
+            json={"source_url": "https://acme.feishu.cn/docx/owned"},
+        )
+        run_id = created.json()["run_id"]
+        await _wait_for_status(
+            client,
+            run_id,
+            "waiting_approval",
+            headers=_USER_A_HEADERS,
+        )
+        owned = await repository.get_run(
+            run_id, owner_user_id="user-a"
+        )
+        assert owned is not None
+
+        responses = [
+            await client.get(
+                f"/api/runs/{run_id}", headers=_USER_B_HEADERS
+            ),
+            await client.post(
+                f"/api/runs/{run_id}/decision",
+                headers=_USER_B_HEADERS,
+                json={"action": "cancel"},
+            ),
+            await client.post(
+                f"/api/runs/{run_id}/retry-delivery",
+                headers=_USER_B_HEADERS,
+            ),
+            await client.post(
+                f"/api/runs/{run_id}/references",
+                headers=_USER_B_HEADERS,
+                data={
+                    "task_id": "task-1",
+                    "role": "reference_image",
+                    "order": "2",
+                },
+                files={
+                    "file": ("replacement.png", _png_bytes(), "image/png")
+                },
+            ),
+            await client.patch(
+                f"/api/runs/{run_id}/tasks/task-1/references",
+                headers=_USER_B_HEADERS,
+                json={
+                    "references": [
+                        {
+                            "asset_id": "asset-1",
+                            "role": "reference_image",
+                            "order": 1,
+                        }
+                    ]
+                },
+            ),
+            await client.delete(
+                f"/api/runs/{run_id}/tasks/task-1/references/asset-1",
+                headers=_USER_B_HEADERS,
+            ),
+            await client.get(
+                f"/api/runs/{run_id}/references/asset-1/content",
+                headers=_USER_B_HEADERS,
+            ),
+            await client.delete(
+                f"/api/runs/{run_id}", headers=_USER_B_HEADERS
+            ),
+        ]
+
+        assert [response.status_code for response in responses] == [404] * len(
+            responses
+        )
+        assert (
+            await repository.get_run(
+                run_id, owner_user_id="user-a"
+            )
+        ) is not None
+
+
+async def test_normal_run_approve_and_delete_with_production_service_enabled(
+    tmp_path: Path,
+) -> None:
+    class ProductionWithoutBindings:
+        async def sync_once(
+            self, run_id: str, *, owner_user_id: str
+        ) -> None:
+            raise RunNotFound("多维表格运行不存在")
+
+        async def is_production_run(
+            self, run_id: str, *, owner_user_id: str
+        ) -> bool:
+            return False
+
+        async def validate_approval(
+            self, run_id: str, *, owner_user_id: str
+        ) -> None:
+            raise AssertionError("normal run reached production validation")
+
+        async def delete_run(
+            self, run_id: str, *, owner_user_id: str
+        ) -> None:
+            raise AssertionError("normal run reached production deletion")
+
+        async def close(self) -> None:
+            pass
+
+    production = ProductionWithoutBindings()
+    async with _environment(
+        tmp_path, bitable_service=production
+    ) as (client, runtime, graph, repository):
+        del runtime, graph, repository
+        first = await client.post(
+            "/api/runs",
+            headers=_USER_A_HEADERS,
+            json={"source_url": "https://acme.feishu.cn/docx/normal-approve"},
+        )
+        first_run_id = first.json()["run_id"]
+        await _wait_for_status(
+            client,
+            first_run_id,
+            "waiting_approval",
+            headers=_USER_A_HEADERS,
+        )
+        approved = await client.post(
+            f"/api/runs/{first_run_id}/decision",
+            headers=_USER_A_HEADERS,
+            json={
+                "action": "approve",
+                "selected_task_ids": ["task-1"],
+            },
+        )
+
+        second = await client.post(
+            "/api/runs",
+            headers=_USER_A_HEADERS,
+            json={"source_url": "https://acme.feishu.cn/docx/normal-delete"},
+        )
+        second_run_id = second.json()["run_id"]
+        await _wait_for_status(
+            client,
+            second_run_id,
+            "waiting_approval",
+            headers=_USER_A_HEADERS,
+        )
+        deleted = await client.delete(
+            f"/api/runs/{second_run_id}", headers=_USER_A_HEADERS
+        )
+
+    assert approved.status_code == 202
+    assert deleted.status_code == 200
 
 
 async def test_clone_run_for_approval_reuses_approved_draft_without_generation(
@@ -287,9 +728,70 @@ async def test_clone_run_for_approval_reuses_approved_draft_without_generation(
         cloned = await _wait_for_status(client, cloned_run_id, "waiting_approval")
 
     assert cloned_run_id == "rerun-1"
-    assert cloned["approval"]["tasks"] == original["approval"]["tasks"]
+    assert cloned["approval"]["tasks"] == [original["approval"]["tasks"][0]]
     assert cloned["approval"]["selected_task_ids"] == ["task-1"]
     assert graph.resume_calls == 0
+
+
+async def test_clone_prefers_approved_plan_when_approved_tasks_are_missing(
+    tmp_path: Path,
+) -> None:
+    async with _environment(tmp_path) as (client, runtime, graph, _repository):
+        created = await client.post(
+            "/api/runs",
+            json={"source_url": "https://tenant.feishu.cn/docx/prefer-approved"},
+        )
+        original_run_id = created.json()["run_id"]
+        original = await _wait_for_status(
+            client, original_run_id, "waiting_approval"
+        )
+        approved = {
+            "tasks": [copy.deepcopy(original["approval"]["tasks"][0])],
+            "document_summary": original["approval"]["document_summary"],
+            "excluded_assets": [],
+        }
+        source_state = graph.states[original["thread_id"]]
+        source_state["approved_plan"] = approved
+        source_state["approved_tasks"] = []
+
+        cloned_run_id = await runtime.clone_run_for_approval(
+            original_run_id,
+            RequirementRequest(source_url=original["source_url"]),
+            run_id="rerun-prefer-approved",
+            thread_id="rerun-prefer-approved-thread",
+        )
+        cloned = await _wait_for_status(
+            client, cloned_run_id, "waiting_approval"
+        )
+
+    assert cloned["approval"]["tasks"] == approved["tasks"]
+    assert cloned["approval"]["selected_task_ids"] == ["task-1"]
+    assert graph.resume_calls == 0
+
+
+async def test_clone_run_fails_closed_without_source_prompt_snapshot(
+    tmp_path: Path,
+) -> None:
+    async with _environment(tmp_path) as (client, runtime, graph, _repository):
+        created = await client.post(
+            "/api/runs",
+            json={"source_url": "https://tenant.feishu.cn/docx/source"},
+        )
+        original_run_id = created.json()["run_id"]
+        original = await _wait_for_status(
+            client, original_run_id, "waiting_approval"
+        )
+        state = graph.states[original["thread_id"]]
+        state["approved_tasks"] = [original["approval"]["tasks"][0]]
+        state.pop("planning_prompt")
+
+        with pytest.raises(RunValidationError, match="提示词快照"):
+            await runtime.clone_run_for_approval(
+                original_run_id,
+                RequirementRequest(source_url=original["source_url"]),
+                run_id="rerun-no-prompt",
+                thread_id="rerun-no-prompt-thread",
+            )
 
 
 async def test_clone_run_for_approval_requires_a_previously_approved_task(
@@ -354,6 +856,284 @@ async def test_clone_run_for_approval_initializes_a_real_langgraph_checkpoint(
     assert cloned["status"] == "waiting_approval"
     assert cloned["approval"]["tasks"] == original["approval"]["tasks"]
     assert fake_services.planner.plan_calls == 1
+
+
+async def _complete_run_with_approval_edits(
+    runtime: GraphRuntime,
+    graph: Any,
+    services: GraphServices,
+    *,
+    run_id: str,
+    thread_id: str,
+) -> dict[str, Any]:
+    source_url = "https://tenant.feishu.cn/docx/clone-approved-source"
+    await runtime.start_run(
+        RequirementRequest(source_url=source_url),
+        run_id=run_id,
+        thread_id=thread_id,
+    )
+    for _ in range(100):
+        source = await runtime.get_run_view(run_id)
+        if source["status"] == "waiting_approval":
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("source run did not reach approval")
+
+    uploaded = await runtime.add_reference(
+        run_id,
+        task_id="task-video",
+        role="reference_image",
+        order=2,
+        filename="second-reference.png",
+        content=_png_bytes((80, 170, 120)),
+    )
+    edited_view = await runtime.get_run_view(run_id)
+    edited_task = copy.deepcopy(edited_view["approval"]["tasks"][0])
+    edited_task.update(
+        prompt="纸船在雨夜河面缓慢漂流，镜头持续向前推进。",
+        aspect_ratio="9:16",
+        duration=5,
+        resolution="1080p",
+        reference_images=[
+            {
+                "asset_id": uploaded["asset_id"],
+                "role": "reference_image",
+                "order": 1,
+            }
+        ],
+    )
+    await runtime.resume_run(
+        run_id,
+        ApprovalDecision(
+            action="approve",
+            selected_task_ids=["task-video"],
+            tasks=[edited_task],
+        ),
+    )
+    source = await runtime.get_run_view(run_id)
+    assert source["status"] == "succeeded"
+    snapshot = await graph.aget_state(
+        {"configurable": {"thread_id": source["thread_id"]}}
+    )
+    approved = copy.deepcopy(snapshot.values["approved_plan"])
+    assert approved["tasks"][0]["prompt"] == edited_task["prompt"]
+    assert (
+        approved["tasks"][0]["reference_images"]
+        == edited_task["reference_images"]
+    )
+    assert approved["tasks"][0]["aspect_ratio"] == "9:16"
+    assert approved["tasks"][0]["duration"] == 5
+    assert approved["tasks"][0]["resolution"] == "1080p"
+    assert approved["excluded_assets"] == [
+        {"asset_id": "asset-1", "reason": "用户在审批中移除"}
+    ]
+    assert services.video_generator.submit_calls == 1
+    return approved
+
+
+async def _assert_cloned_approval_matches(
+    runtime: GraphRuntime,
+    graph: Any,
+    services: GraphServices,
+    approved: dict[str, Any],
+    *,
+    source_run_id: str,
+    clone_run_id: str,
+    clone_thread_id: str,
+) -> None:
+    image_submit_calls = services.image_generator.submit_calls
+    submit_calls = services.video_generator.submit_calls
+    delivery_calls = services.delivery_writer.deliver_calls
+    planner_calls = services.planner.plan_calls
+
+    await runtime.clone_run_for_approval(
+        source_run_id,
+        RequirementRequest(
+            source_url="https://tenant.feishu.cn/docx/clone-approved-source"
+        ),
+        run_id=clone_run_id,
+        thread_id=clone_thread_id,
+    )
+    cloned = await runtime.get_run_view(clone_run_id)
+    snapshot = await graph.aget_state(
+        {"configurable": {"thread_id": clone_thread_id}}
+    )
+    clone_state = snapshot.values
+
+    assert cloned["status"] == "waiting_approval"
+    assert {
+        "tasks": cloned["approval"]["tasks"],
+        "document_summary": cloned["approval"]["document_summary"],
+        "excluded_assets": cloned["approval"]["excluded_assets"],
+    } == approved
+    assert clone_state["draft_plan"] == approved
+    assert clone_state["task_plan"] == approved
+    assert clone_state["approved_tasks"] == approved["tasks"]
+    assert clone_state["approved_plan"] is None
+    assert clone_state["approval_decision"] is None
+    assert clone_state["approval_revision"] is None
+    assert clone_state["execution_records"] == []
+    assert clone_state["artifacts"] == []
+    assert clone_state["delivery_record"] is None
+    assert services.image_generator.submit_calls == image_submit_calls
+    assert services.video_generator.submit_calls == submit_calls
+    assert services.delivery_writer.deliver_calls == delivery_calls
+    assert services.planner.plan_calls == planner_calls
+
+
+async def test_clone_uses_complete_approved_plan_without_generation(
+    fake_services: GraphServices,
+) -> None:
+    graph = build_graph(fake_services, InMemorySaver())
+    runtime = GraphRuntime(
+        graph=graph,
+        repository=fake_services.repository,
+        file_store=fake_services.file_store,
+        settings=fake_services.settings,
+        delivery_writer=fake_services.delivery_writer,
+    )
+    try:
+        approved = await _complete_run_with_approval_edits(
+            runtime,
+            graph,
+            fake_services,
+            run_id="clone-approved-original",
+            thread_id="clone-approved-original-thread",
+        )
+        await _assert_cloned_approval_matches(
+            runtime,
+            graph,
+            fake_services,
+            approved,
+            source_run_id="clone-approved-original",
+            clone_run_id="clone-approved-new",
+            clone_thread_id="clone-approved-new-thread",
+        )
+    finally:
+        await runtime.close()
+
+
+async def test_clone_rebuilds_complete_plan_from_legacy_checkpoint(
+    fake_services: GraphServices,
+) -> None:
+    graph = build_graph(fake_services, InMemorySaver())
+    runtime = GraphRuntime(
+        graph=graph,
+        repository=fake_services.repository,
+        file_store=fake_services.file_store,
+        settings=fake_services.settings,
+        delivery_writer=fake_services.delivery_writer,
+    )
+    try:
+        approved = await _complete_run_with_approval_edits(
+            runtime,
+            graph,
+            fake_services,
+            run_id="clone-legacy-original",
+            thread_id="clone-legacy-original-thread",
+        )
+        await graph.aupdate_state(
+            {"configurable": {"thread_id": "clone-legacy-original-thread"}},
+            {"approved_plan": None},
+            as_node="deliver_to_feishu",
+        )
+        await _assert_cloned_approval_matches(
+            runtime,
+            graph,
+            fake_services,
+            approved,
+            source_run_id="clone-legacy-original",
+            clone_run_id="clone-legacy-new",
+            clone_thread_id="clone-legacy-new-thread",
+        )
+    finally:
+        await runtime.close()
+
+
+async def test_runtime_graph_calls_do_not_trace_full_prompt_snapshot(
+    fake_services: GraphServices,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret_prompt = "真实 LangGraph 根追踪绝不能记录的个人完整提示词"
+    planning_prompt = build_planning_prompt_snapshot(
+        owner_user_id="portal-user-a",
+        source="personal",
+        version=2,
+        prompt_text=secret_prompt,
+    )
+    graph = build_graph(fake_services, InMemorySaver())
+    runtime = GraphRuntime(
+        graph=graph,
+        repository=fake_services.repository,
+        file_store=fake_services.file_store,
+        settings=fake_services.settings,
+        delivery_writer=fake_services.delivery_writer,
+    )
+
+    class _Recorder(BaseCallbackHandler):
+        def __init__(self) -> None:
+            self.inputs: list[Any] = []
+            self.outputs: list[Any] = []
+
+        def on_chain_start(
+            self,
+            serialized: dict[str, Any],
+            inputs: Any,
+            **kwargs: Any,
+        ) -> None:
+            del serialized, kwargs
+            self.inputs.append(copy.deepcopy(inputs))
+
+        def on_chain_end(self, outputs: Any, **kwargs: Any) -> None:
+            del kwargs
+            self.outputs.append(copy.deepcopy(outputs))
+
+    class _NoopLangChainTracer(BaseCallbackHandler):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
+        def set_defaults(self, **kwargs: Any) -> None:
+            del kwargs
+
+    monkeypatch.setattr(
+        "langchain_core.tracers.langchain.LangChainTracer",
+        _NoopLangChainTracer,
+    )
+    recorder = _Recorder()
+    try:
+        with tracing_context(enabled=True):
+            with set_config_context({"callbacks": [recorder]}) as context:
+                start_task = context.run(
+                    asyncio.create_task,
+                    runtime.start_run(
+                        RequirementRequest(
+                            source_url="https://tenant.feishu.cn/docx/private",
+                            planning_prompt=planning_prompt,
+                        ),
+                        run_id="trace-private-run",
+                        thread_id="trace-private-thread",
+                    ),
+                )
+                run_id = await start_task
+                for _ in range(100):
+                    run = await runtime.get_run_view(run_id)
+                    if run["status"] == "waiting_approval":
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    raise AssertionError("run did not reach approval")
+                snapshot = await graph.aget_state(
+                    {"configurable": {"thread_id": "trace-private-thread"}}
+                )
+    finally:
+        await runtime.close()
+
+    recorded = repr(recorder.inputs) + repr(recorder.outputs)
+    assert recorder.inputs == []
+    assert recorder.outputs == []
+    assert secret_prompt not in recorded
+    assert snapshot.values["planning_prompt"]["prompt_text"] == secret_prompt
     assert fake_services.image_generator.submit_calls == 0
     assert fake_services.video_generator.submit_calls == 0
 
@@ -362,6 +1142,55 @@ def _png_bytes(color: tuple[int, int, int] = (40, 110, 210)) -> bytes:
     output = BytesIO()
     Image.new("RGB", (24, 18), color).save(output, format="PNG")
     return output.getvalue()
+
+
+def _source_asset(path: Path, asset_id: str) -> dict[str, Any]:
+    return {
+        "asset_id": asset_id,
+        "source_block_id": f"image-{asset_id}",
+        "origin": "feishu",
+        "file_token": None,
+        "local_path": str(path),
+        "mime_type": "image/png",
+        "size": path.stat().st_size,
+        "sha256": f"sha-{asset_id}",
+        "width": 16,
+        "height": 16,
+        "download_error": None,
+    }
+
+
+def _normalized_document(
+    media_assets: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "document_id": "doc-test",
+        "title": "纸船需求",
+        "revision": 7,
+        "source_type": "docx",
+        "source_token": "doc-test",
+        "blocks": [
+            {
+                "block_id": "story-1",
+                "parent_id": None,
+                "block_type": "text",
+                "order": 0,
+                "path": [],
+                "text": "生成纸船图片与视频",
+            },
+            {
+                "block_id": "image-request",
+                "parent_id": None,
+                "block_type": "text",
+                "order": 1,
+                "path": [],
+                "text": "生成纸船海报",
+            },
+        ],
+        "text_view": "生成纸船图片与视频",
+        "media_assets": media_assets,
+        "ingest_issues": [],
+    }
 
 
 async def test_create_run_and_read_waiting_approval(tmp_path: Path):
@@ -382,6 +1211,362 @@ async def test_create_run_and_read_waiting_approval(tmp_path: Path):
             "action": "review_plan",
             "status": "waiting_approval",
         }
+
+
+async def test_run_view_exposes_blocking_and_nonblocking_ingest_issues(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/ingest-view"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        failed_asset = {
+            **state["media_assets"][0],
+            "asset_id": "asset-failed",
+            "source_block_id": "image-failed",
+            "local_path": str(
+                tmp_path / "__missing__" / "asset-failed.missing"
+            ),
+            "size": 0,
+            "sha256": "",
+            "download_error": "图片保存失败",
+        }
+        state["media_assets"].append(failed_asset)
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+        state["normalized_document"]["ingest_issues"] = [
+            (
+                "阻塞：内嵌电子表格 NuBUx5 读取失败"
+                "（Block fiction-sheet）：/Users/alice/private/secret-token.xlsx"
+            ),
+            "阻塞：素材 image-old 下载失败：Bearer sk-secret-value",
+            "阻塞：内嵌电子表格 NuBUx5 读取失败X",
+            "阻塞：素材 image-legacy 下载失败",
+        ]
+        state["source_document"] = copy.deepcopy(state["normalized_document"])
+        state["validation_issues"] = [
+            state["normalized_document"]["ingest_issues"][0]
+        ]
+        state["vision_issues"] = [
+            "素材 asset-failed 视觉分析失败：图片无法识别"
+        ]
+
+        view = (await client.get(f"/api/runs/{run_id}")).json()
+
+        assert view["approval"]["ingest_issues"] == [
+            "文档读取出现未知问题，请重新读取后再审批",
+            "文档读取出现未知问题，请重新读取后再审批",
+            "文档读取出现未知问题，请重新读取后再审批",
+            "文档图片下载失败，其他素材可继续处理",
+        ]
+        assert view["approval"]["blocking_ingest_issues"] == [
+            "文档读取出现未知问题，请重新读取后再审批",
+            "文档读取出现未知问题，请重新读取后再审批",
+            "文档读取出现未知问题，请重新读取后再审批",
+        ]
+        assert view["approval"]["asset_ingest_issues"] == [
+            "文档图片下载失败，其他素材可继续处理",
+        ]
+        assert [
+            (record["severity"], record["code"])
+            for record in view["approval"]["ingest_issue_records"]
+        ] == [
+            ("blocking", "legacy_unknown"),
+            ("blocking", "legacy_unknown"),
+            ("blocking", "legacy_unknown"),
+            ("asset", "media_download_failed"),
+        ]
+        assert view["approval"]["vision_issues"] == [
+            "素材 asset-failed 视觉分析失败：图片无法识别"
+        ]
+        assert view["approval"]["coverage"]["failed_count"] == 1
+        assert view["approval"]["validation_issues"] == [
+            "文档读取出现未知问题，请重新读取后再审批"
+        ]
+        assert "secret-token" not in (await client.get(f"/api/runs/{run_id}")).text
+        response_text = (await client.get(f"/api/runs/{run_id}")).text
+        assert "Bearer" not in response_text
+        assert "读取失败X" not in response_text
+
+
+async def test_run_view_rebuilds_validation_ingest_issues_without_raw_alignment(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/safe-validation"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+        raw_path = "阻塞：读取失败 /Users/alice/private/customer.xlsx"
+        raw_bearer = "阻塞：读取失败 Bearer sk-live-12345678"
+        raw_extra = "阻塞：读取失败X"
+        state["normalized_document"]["ingest_issues"] = [
+            raw_path,
+            raw_bearer,
+            raw_extra,
+        ]
+        state["normalized_document"]["ingest_issue_records"] = [
+            {
+                "severity": "asset",
+                "code": "media_download_failed",
+                "display_message": "文档图片下载失败，其他素材可继续处理",
+                "source_block_id": "image-block",
+                "asset_id": "image-1",
+            },
+            {
+                "severity": "blocking",
+                "code": "sheet_export_timeout",
+                "display_message": "飞书电子表格导出超时，请稍后重试",
+                "source_block_id": "sheet-block",
+                "asset_id": None,
+            },
+        ]
+        state["source_document"] = copy.deepcopy(state["normalized_document"])
+        state["validation_issues"] = [
+            raw_extra,
+            raw_path,
+            raw_bearer,
+            "供应商失败：sk_live_abcdefgh",
+            "供应商失败：ark_live_abcdefgh",
+            "缓存文件 file:///Users/alice/private/customer.png",
+            "缓存文件位于中文/Volumes/private/customer.png",
+            "任何未登记的原始校验文本",
+        ]
+
+        response = await client.get(f"/api/runs/{run_id}")
+        view = response.json()
+
+        assert view["approval"]["validation_issues"] == [
+            "飞书电子表格导出超时，请稍后重试",
+        ]
+        for secret in (
+            raw_path,
+            raw_bearer,
+            raw_extra,
+            "sk_live_abcdefgh",
+            "ark_live_abcdefgh",
+            "file:///Users/alice/private/customer.png",
+            "中文/Volumes/private/customer.png",
+            "任何未登记的原始校验文本",
+        ):
+            assert secret not in response.text
+
+
+async def test_run_view_recomputes_real_plan_and_audit_validation_issues(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/rebuilt-validation"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+        state["source_document"] = copy.deepcopy(state["normalized_document"])
+        state["draft_plan"]["tasks"][0]["source_block_ids"] = ["missing-block"]
+        state["task_plan"] = copy.deepcopy(state["draft_plan"])
+        state["audit_report"] = {
+            "issues": [
+                "镜头动作缺少可执行细节",
+                "镜头动作缺少可执行细节",
+            ],
+            "corrections_required": True,
+        }
+        state["validation_issues"] = ["任意旧原文绝不能回传"]
+
+        response = await client.get(f"/api/runs/{run_id}")
+        validation_issues = response.json()["approval"]["validation_issues"]
+
+        assert validation_issues == [
+            "tasks[0].source_block_ids: unknown block_id 'missing-block'",
+            "audit: 镜头动作缺少可执行细节",
+        ]
+        assert "任意旧原文绝不能回传" not in response.text
+
+
+async def test_run_view_validation_rebuild_fails_closed_for_invalid_typed_state(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/invalid-validation"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+        state["normalized_document"]["blocks"] = "invalid-block-state"
+        state["source_document"] = copy.deepcopy(state["normalized_document"])
+        state["validation_issues"] = [
+            "Bearer sk_live_abcdefgh file:///Users/alice/private/customer.png"
+        ]
+
+        response = await client.get(f"/api/runs/{run_id}")
+        view = response.json()
+
+        assert view["approval"]["validation_issues"] == [
+            "审批校验状态无效，请重新读取后再审批"
+        ]
+        assert "sk_live_abcdefgh" not in response.text
+        assert "file:///Users/alice/private/customer.png" not in response.text
+
+
+async def test_run_view_fails_closed_for_forged_structured_ingest_record(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/forged-ingest"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+        state["normalized_document"]["ingest_issue_records"] = [
+            {
+                "severity": "asset",
+                "code": "sheet_export_failed",
+                "display_message": "Bearer sk-live-12345678",
+                "source_block_id": "sk-live-12345678",
+                "asset_id": None,
+            }
+        ]
+        state["source_document"] = copy.deepcopy(state["normalized_document"])
+
+        response = await client.get(f"/api/runs/{run_id}")
+        view = response.json()
+
+        assert view["approval"]["ingest_issue_records"] == [
+            {
+                "severity": "blocking",
+                "code": "legacy_unknown",
+                "display_message": "文档读取出现未知问题，请重新读取后再审批",
+            }
+        ]
+        assert view["approval"]["blocking_ingest_issues"] == [
+            "文档读取出现未知问题，请重新读取后再审批"
+        ]
+        assert "sk-live-12345678" not in response.text
+        assert "Bearer" not in response.text
+
+
+async def test_blocking_ingest_issue_returns_422_before_edited_approval_resume(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/ingest-blocked"},
+            )
+        ).json()["run_id"]
+        view = await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+        state["normalized_document"]["ingest_issues"] = [
+            (
+                "阻塞：内嵌电子表格 NuBUx5 读取失败"
+                "（Block fiction-sheet）：/Users/alice/private/secret-token.xlsx"
+            )
+        ]
+        state["source_document"] = copy.deepcopy(state["normalized_document"])
+        edited = copy.deepcopy(view["approval"]["tasks"][0])
+        edited["prompt"] = "用户编辑后的提示词"
+
+        response = await client.post(
+            f"/api/runs/{run_id}/decision",
+            json={
+                "action": "approve",
+                "selected_task_ids": ["task-1"],
+                "tasks": [edited],
+            },
+        )
+
+        assert response.status_code == 422
+        assert "文档存在阻断性读取问题" in response.text
+        assert "secret-token" not in response.text
+        assert graph.resume_calls == 0
+
+
+async def test_structured_asset_issue_drives_api_view_and_approval(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/record-source"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+        state["normalized_document"]["ingest_issue_records"] = [
+            {
+                "severity": "asset",
+                "code": "media_download_failed",
+                "display_message": "文档图片下载失败，其他素材可继续处理",
+                "source_block_id": "image-block",
+                "asset_id": "image-1",
+            }
+        ]
+        state["normalized_document"]["ingest_issues"] = [
+            "阻塞：内嵌电子表格 NuBUx5 读取失败X"
+        ]
+        state["source_document"] = copy.deepcopy(state["normalized_document"])
+
+        view = (await client.get(f"/api/runs/{run_id}")).json()
+        response = await client.post(
+            f"/api/runs/{run_id}/decision",
+            json={"action": "approve", "selected_task_ids": ["task-1"]},
+        )
+
+        assert view["approval"]["ingest_issue_records"][0]["severity"] == "asset"
+        assert set(view["approval"]["ingest_issue_records"][0]) == {
+            "severity",
+            "code",
+            "display_message",
+        }
+        assert view["approval"]["blocking_ingest_issues"] == []
+        assert response.status_code == 202
+        assert graph.resume_calls == 1
 
 
 async def test_delete_waiting_run_removes_api_view(tmp_path: Path):
@@ -787,6 +1972,187 @@ async def test_replace_and_unlink_reference_keep_content_file(tmp_path: Path):
         ]
 
 
+async def test_reference_edits_reconcile_exclusions_on_the_server(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/coverage-edit"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        second_path = tmp_path / "data" / "second-source.png"
+        second_path.write_bytes(_png_bytes((180, 80, 40)))
+        second = _source_asset(second_path, "asset-2")
+        state["media_assets"].append(second)
+        state["draft_plan"]["excluded_assets"] = [
+            {"asset_id": "asset-2", "reason": "供应商数量限制，暂不使用此图。"}
+        ]
+        state["task_plan"] = copy.deepcopy(state["draft_plan"])
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+
+        added = await client.patch(
+            f"/api/runs/{run_id}/tasks/task-1/references",
+            json={
+                "references": [
+                    {"asset_id": "asset-1", "role": "reference_image", "order": 1},
+                    {"asset_id": "asset-2", "role": "reference_image", "order": 2},
+                ],
+                "reference_mode": "multi_reference",
+            },
+        )
+        assert added.status_code == 200
+        view = (await client.get(f"/api/runs/{run_id}")).json()
+        assert view["approval"]["excluded_assets"] == []
+
+        state["draft_plan"]["tasks"][1]["reference_images"] = [
+            {"asset_id": "asset-2", "role": "reference_image", "order": 1}
+        ]
+        state["task_plan"] = copy.deepcopy(state["draft_plan"])
+        removed = await client.delete(
+            f"/api/runs/{run_id}/tasks/task-1/references/asset-1"
+        )
+        assert removed.status_code == 200
+        view = (await client.get(f"/api/runs/{run_id}")).json()
+        assert view["approval"]["excluded_assets"] == [
+            {"asset_id": "asset-1", "reason": "用户在审批中移除"}
+        ]
+
+
+async def test_replacing_and_uploading_reference_updates_coverage_atomically(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/coverage-replace"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        second_path = tmp_path / "data" / "replace-source.png"
+        second_path.write_bytes(_png_bytes((80, 180, 40)))
+        second = _source_asset(second_path, "asset-2")
+        state["media_assets"].append(second)
+        state["draft_plan"]["tasks"][1]["reference_images"] = [
+            {"asset_id": "asset-2", "role": "reference_image", "order": 1}
+        ]
+        state["draft_plan"]["excluded_assets"] = []
+        state["task_plan"] = copy.deepcopy(state["draft_plan"])
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+
+        replaced = await client.post(
+            f"/api/runs/{run_id}/references",
+            data={
+                "task_id": "task-1",
+                "role": "reference_image",
+                "order": "1",
+                "replaces_asset_id": "asset-1",
+            },
+            files={"file": ("replacement.png", _png_bytes(), "image/png")},
+        )
+
+        assert replaced.status_code == 201
+        replacement_id = replaced.json()["asset_id"]
+        view = (await client.get(f"/api/runs/{run_id}")).json()
+        assert view["approval"]["tasks"][0]["reference_images"][0]["asset_id"] == (
+            replacement_id
+        )
+        assert view["approval"]["excluded_assets"] == [
+            {"asset_id": "asset-1", "reason": "用户在审批中移除"}
+        ]
+        assert view["approval"]["coverage"] == {
+            "successful_total": 3,
+            "referenced_count": 2,
+            "excluded_count": 1,
+            "uncovered_count": 0,
+            "failed_count": 0,
+        }
+
+
+async def test_approval_with_uncovered_asset_returns_422_before_execution(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/coverage-approve"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        second_path = tmp_path / "data" / "uncovered-source.png"
+        second_path.write_bytes(_png_bytes((30, 160, 190)))
+        state["media_assets"].append(_source_asset(second_path, "asset-2"))
+        state["draft_plan"]["excluded_assets"] = []
+        state["task_plan"] = copy.deepcopy(state["draft_plan"])
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+
+        response = await client.post(
+            f"/api/runs/{run_id}/decision",
+            json={"action": "approve", "selected_task_ids": ["task-1"]},
+        )
+
+        assert response.status_code == 422
+        assert "覆盖" in response.text
+        assert graph.resume_calls == 0
+
+
+async def test_approval_task_edit_can_use_a_previously_excluded_asset(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/coverage-decision"},
+            )
+        ).json()["run_id"]
+        view = await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        second_path = tmp_path / "data" / "decision-source.png"
+        second_path.write_bytes(_png_bytes((120, 90, 180)))
+        state["media_assets"].append(_source_asset(second_path, "asset-2"))
+        state["draft_plan"]["excluded_assets"] = [
+            {"asset_id": "asset-2", "reason": "初次规划未选择此素材。"}
+        ]
+        state["task_plan"] = copy.deepcopy(state["draft_plan"])
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+        edited = copy.deepcopy(view["approval"]["tasks"][0])
+        edited["reference_images"].append(
+            {"asset_id": "asset-2", "role": "reference_image", "order": 2}
+        )
+
+        response = await client.post(
+            f"/api/runs/{run_id}/decision",
+            json={
+                "action": "approve",
+                "selected_task_ids": ["task-1"],
+                "tasks": [edited],
+            },
+        )
+
+        assert response.status_code == 202
+        assert graph.resume_calls == 1
+
+
 async def test_reference_upload_rejects_non_image_and_unknown_replacement(
     tmp_path: Path,
 ):
@@ -859,6 +2225,53 @@ async def test_reference_patch_rejects_unknown_asset_duplicate_order_and_role(
             )
             assert response.status_code == 422
             assert response.json()["detail"]
+
+
+async def test_reference_patch_rejects_failed_asset_atomically(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/failed-ref"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        failed = copy.deepcopy(state["media_assets"][0])
+        failed.update(
+            asset_id="asset-failed",
+            source_block_id="image-failed",
+            download_error="fictional download failure",
+        )
+        state["media_assets"].append(failed)
+        before_plan = copy.deepcopy(state["draft_plan"])
+        before_revision = state.get("draft_revision")
+
+        response = await client.patch(
+            f"/api/runs/{run_id}/tasks/task-1/references",
+            json={
+                "references": [
+                    {"asset_id": "asset-1", "role": "reference_image", "order": 1},
+                    {
+                        "asset_id": "asset-failed",
+                        "role": "reference_image",
+                        "order": 2,
+                    },
+                ],
+                "reference_mode": "multi_reference",
+            },
+        )
+
+        assert response.status_code == 422
+        assert "下载失败" in response.text
+        assert state["draft_plan"] == before_plan
+        assert state.get("draft_revision") == before_revision
+        assert state["approved_tasks"] == []
 
 
 async def test_reference_add_persists_in_real_graph_checkpoint(
@@ -1115,6 +2528,8 @@ async def test_static_review_workspace_is_served_and_uses_safe_dom_updates():
         "thread ID",
         "负面约束",
         "参考图片",
+        "素材覆盖",
+        "排除素材",
         "退回重新规划",
         "全部取消",
         "批准所选任务",
@@ -1127,6 +2542,9 @@ async def test_static_review_workspace_is_served_and_uses_safe_dom_updates():
     assert "response.ok" in script.text
     assert "detail" in script.text
     assert ".disabled" in script.text
+    assert "coverageLabel" in script.text
+    assert "excludedAssetRows" in script.text
+    assert "coverage-summary" in styles.text
     assert "review-state.js" in page.text
     for source in (script.text, review_state.text):
         for unsafe in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"):

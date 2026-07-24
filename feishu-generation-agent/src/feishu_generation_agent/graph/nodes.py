@@ -1,4 +1,5 @@
 import asyncio
+from inspect import Parameter, signature
 import json
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -16,8 +17,12 @@ from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain.document import (
     MediaAsset,
     NormalizedDocument,
+    PlanningPromptSnapshot,
     RequirementRequest,
     VisionDescription,
+    IngestIssueSeverity,
+    build_planning_prompt_snapshot,
+    resolve_ingest_issue_records,
 )
 from feishu_generation_agent.domain.errors import (
     AgentError,
@@ -30,13 +35,18 @@ from feishu_generation_agent.domain.plan import (
     GenerationTask,
     TaskPlan,
     TaskType,
+    reconcile_task_asset_coverage,
 )
 from feishu_generation_agent.domain.artifact import (
     Artifact,
     ExecutionRecord,
     ProviderSubmission,
 )
-from feishu_generation_agent.integrations.planner import validate_plan
+from feishu_generation_agent.integrations.planner import (
+    language_validation_message,
+    planner_system_prompt,
+    validate_plan,
+)
 from feishu_generation_agent.ports import (
     DeliveryWriter,
     DocumentSource,
@@ -108,7 +118,13 @@ def _safe_error(exc: BaseException) -> AgentError:
         category = exc.detail.category
         retryable = exc.detail.retryable
         if category is ErrorCategory.VALIDATION:
-            message = "The request is invalid"
+            message = (
+                exc.detail.message
+                if exc.detail.message.startswith(
+                    ("模型三次返回的 JSON 均未通过", "以下字段必须包含中文主体说明")
+                )
+                else "The request is invalid"
+            )
         else:
             message = "The workflow node could not be completed"
     elif isinstance(exc, ValidationError):
@@ -197,9 +213,77 @@ def _draft_plan(state: AgentState) -> Any:
     return plan if plan is not None else state.get("task_plan")
 
 
+def approved_plan_from_state(
+    state: AgentState,
+    *,
+    max_output_count: int,
+) -> TaskPlan:
+    saved = state.get("approved_plan")
+    if isinstance(saved, dict):
+        return TaskPlan.model_validate(saved)
+
+    draft = TaskPlan.model_validate(_draft_plan(state))
+    approved_tasks = [
+        GenerationTask.model_validate(task)
+        for task in state.get("approved_tasks", [])
+    ]
+    selected_ids = [
+        task.task_id
+        for task in approved_tasks
+    ]
+    reconciled = reconcile_task_asset_coverage(draft, approved_tasks)
+    return reconciled.approved_subset(
+        selected_ids,
+        max_output_count,
+    )
+
+
 def _document_revision(state: AgentState) -> Any:
     revision = state.get("document_revision")
     return revision if revision is not None else state.get("source_revision")
+
+
+def _planning_prompt(state: AgentState) -> PlanningPromptSnapshot:
+    value = state.get("planning_prompt")
+    if value is not None:
+        return PlanningPromptSnapshot.model_validate(value)
+    return build_planning_prompt_snapshot(
+        owner_user_id="prime-local",
+        source="prime",
+        version=0,
+        prompt_text=planner_system_prompt(),
+    )
+
+
+def _planner_prompt_argument(
+    planner: RequirementPlanner,
+    planning_prompt: PlanningPromptSnapshot,
+) -> dict[str, str | None]:
+    try:
+        parameters = signature(planner.plan).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    exact_parameter = parameters.get("exact_system_prompt")
+    is_local_prime = (
+        planning_prompt.owner_user_id == "prime-local"
+        and planning_prompt.source == "prime"
+    )
+    if (
+        is_local_prime
+        and exact_parameter is not None
+        and exact_parameter.kind is not Parameter.POSITIONAL_ONLY
+    ):
+        return {"exact_system_prompt": planning_prompt.prompt_text}
+    if is_local_prime:
+        raise _validation_error(
+            "The planner cannot replay the Prime prompt snapshot exactly"
+        )
+    parameter = parameters.get("system_prompt")
+    if parameter is None or parameter.kind is Parameter.POSITIONAL_ONLY:
+        raise _validation_error(
+            "The planner cannot accept the planning prompt snapshot"
+        )
+    return {"system_prompt": planning_prompt.prompt_text}
 
 
 async def ingest_source(
@@ -213,11 +297,13 @@ async def ingest_source(
         source_url = state.get("source_url")
         if not isinstance(source_url, str) or not source_url:
             raise _validation_error("A source URL is required")
+        planning_prompt = _planning_prompt(state)
         request = RequirementRequest(
             source_url=source_url,
             requester_open_id=state.get("requester_open_id"),
             trigger_type=state.get("trigger_type", "local_link"),
             reply_context=state.get("reply_context", {}),
+            planning_prompt=planning_prompt,
         )
         document = _document_for_checkpoint(
             await services.document_source.ingest(request)
@@ -226,6 +312,7 @@ async def ingest_source(
         return {
             "status": "running",
             "requirement_request": _json_model(request),
+            "planning_prompt": _json_model(planning_prompt),
             "source_document": document_json,
             "source_type": document.source_type.value,
             "source_token": document.source_token,
@@ -235,6 +322,7 @@ async def ingest_source(
             "media_assets": document_json["media_assets"],
             "approval_decision": None,
             "approved_tasks": [],
+            "approved_plan": None,
             "execution_records": [],
             "artifacts": [],
             "delivery_record": None,
@@ -279,15 +367,27 @@ async def analyze_images(
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
-        descriptions = [
-            await services.vision_analyzer.analyze(asset)
-            for asset in document.media_assets
-        ]
+        descriptions: list[VisionDescription] = []
+        issues: list[str] = []
+        for asset in document.media_assets:
+            try:
+                descriptions.append(
+                    await services.vision_analyzer.analyze(asset)
+                )
+            except Exception as exc:
+                reason = (
+                    exc.detail.message
+                    if isinstance(exc, AgentError)
+                    else "图片无法完成视觉分析"
+                )
+                issues.append(
+                    f"素材 {asset.asset_id} 视觉分析失败：{reason}"
+                )
         return {
             "vision_descriptions": [
                 _json_model(description) for description in descriptions
             ],
-            "vision_issues": [],
+            "vision_issues": issues,
         }
 
     return await _run_node(state, "analyze_images", services, operation)
@@ -308,10 +408,12 @@ async def plan_requirements(
             VisionDescription.model_validate(item)
             for item in state.get("vision_descriptions", [])
         ]
+        planning_prompt = _planning_prompt(state)
         plan = await services.planner.plan(
             document,
             descriptions,
             state.get("planner_feedback"),
+            **_planner_prompt_argument(services.planner, planning_prompt),
         )
         plan_json = _json_model(plan)
         return {"draft_plan": plan_json, "task_plan": plan_json}
@@ -349,7 +451,11 @@ async def validate_planned_tasks(
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
-        issues = list(state.get("vision_issues", []))
+        issues = [
+            record.display_message
+            for record in resolve_ingest_issue_records(document)
+            if record.severity is IngestIssueSeverity.BLOCKING
+        ]
         issues.extend(
             validate_plan(
                 plan,
@@ -440,6 +546,7 @@ async def human_approval(
                     "approval_decision": decision_json,
                     "planner_feedback": decision.feedback.strip(),
                     "approved_tasks": [],
+                    "approved_plan": None,
                     "status": "running",
                 },
                 goto="plan_requirements",
@@ -449,6 +556,7 @@ async def human_approval(
                 update={
                     "approval_decision": decision_json,
                     "approved_tasks": [],
+                    "approved_plan": None,
                     "status": "cancelled",
                 },
                 goto=END,
@@ -456,10 +564,7 @@ async def human_approval(
 
         original = TaskPlan.model_validate(_draft_plan(state))
         candidate = (
-            TaskPlan(
-                tasks=decision.tasks,
-                document_summary=original.document_summary,
-            )
+            reconcile_task_asset_coverage(original, decision.tasks)
             if decision.tasks
             else original
         )
@@ -482,6 +587,7 @@ async def human_approval(
                 "approved_tasks": [
                     _json_model(task) for task in approved.tasks
                 ],
+                "approved_plan": _json_model(approved),
                 "status": "approval_pending_validation",
             },
             goto="revalidate_approval",
@@ -513,10 +619,7 @@ async def revalidate_approval(
         if decision.action != "approve":
             raise _validation_error()
         candidate = (
-            TaskPlan(
-                tasks=decision.tasks,
-                document_summary=draft.document_summary,
-            )
+            reconcile_task_asset_coverage(draft, decision.tasks)
             if decision.tasks
             else draft
         )
@@ -527,9 +630,9 @@ async def revalidate_approval(
             decision.selected_task_ids,
             services.settings.max_output_count,
         )
-        checkpoint_plan = TaskPlan(
-            tasks=state.get("approved_tasks", []),
-            document_summary=draft.document_summary,
+        checkpoint_plan = approved_plan_from_state(
+            state,
+            max_output_count=services.settings.max_output_count,
         )
         if checkpoint_plan.model_dump(mode="json") != selected_plan.model_dump(
             mode="json"
@@ -538,7 +641,11 @@ async def revalidate_approval(
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
-        issues = list(state.get("vision_issues", []))
+        issues = [
+            record.display_message
+            for record in resolve_ingest_issue_records(document)
+            if record.severity is IngestIssueSeverity.BLOCKING
+        ]
         issues.extend(
             validate_plan(
                 selected_plan,
@@ -547,7 +654,10 @@ async def revalidate_approval(
             )
         )
         if issues:
-            raise _validation_error("The approved plan is not valid")
+            raise _validation_error(
+                language_validation_message(issues)
+                or "The approved plan is not valid"
+            )
         return {"validation_issues": [], "status": "approved"}
 
     return await _run_node(
@@ -586,6 +696,7 @@ async def check_source_revision(
                     "approval_decision": None,
                     "approval_revision": None,
                     "approved_tasks": [],
+                    "approved_plan": None,
                     "status": "running",
                 },
                 goto="ingest_source",
@@ -1269,19 +1380,27 @@ async def execute_selected_tasks(
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
-        plan = TaskPlan(
-            tasks=state.get("approved_tasks", []),
-            document_summary=TaskPlan.model_validate(
-                _draft_plan(state)
-            ).document_summary,
-        )
-        issues = validate_plan(
-            plan,
-            document,
+        plan = approved_plan_from_state(
+            state,
             max_output_count=services.settings.max_output_count,
         )
+        issues = [
+            record.display_message
+            for record in resolve_ingest_issue_records(document)
+            if record.severity is IngestIssueSeverity.BLOCKING
+        ]
+        issues.extend(
+            validate_plan(
+                plan,
+                document,
+                max_output_count=services.settings.max_output_count,
+            )
+        )
         if issues:
-            raise _validation_error("The approved plan is not valid")
+            raise _validation_error(
+                language_validation_message(issues)
+                or "The approved plan is not valid"
+            )
         task_assets = [(task, _task_assets(task, document)) for task in plan.tasks]
 
         records: list[ExecutionRecord] = []
@@ -1387,10 +1506,9 @@ async def deliver_to_feishu(
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
-        draft = TaskPlan.model_validate(_draft_plan(state))
-        plan = TaskPlan(
-            tasks=state.get("approved_tasks", []),
-            document_summary=draft.document_summary,
+        plan = approved_plan_from_state(
+            state,
+            max_output_count=services.settings.max_output_count,
         )
         artifacts = [
             Artifact.model_validate(item) for item in state.get("artifacts", [])

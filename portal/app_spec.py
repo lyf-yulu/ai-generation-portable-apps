@@ -40,6 +40,7 @@ class AppSpec:
     dir_path: Path                       # absolute path to sub-app directory
     port_env: str                        # e.g. "SEEDANCE_PORT"
     port_default: int                    # e.g. 8787
+    managed: bool = True
 
     mount: Mount = "iframe"
     iframe_url: Optional[str] = None     # mount=iframe
@@ -85,6 +86,7 @@ def _spec_from_dict(d: dict[str, Any], repo_root: Path) -> AppSpec:
         dir_path=repo_root / dir_str,
         port_env=d["port_env"],
         port_default=int(d["port_default"]),
+        managed=bool(d.get("managed", True)),
         mount=d.get("mount", "iframe"),
         iframe_url=d.get("iframe_url"),
         component_factory=d.get("component_factory"),

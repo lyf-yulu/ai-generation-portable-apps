@@ -7,6 +7,8 @@
   if (!BitableState) throw new Error("多维表格状态模块加载失败");
   const ReferenceUploadState = globalThis.ReferenceUploadState;
   if (!ReferenceUploadState) throw new Error("参考图片上传状态模块加载失败");
+  const PlannerPromptState = globalThis.PlannerPromptState;
+  const ApiPaths = globalThis.ApiPaths;
 
   const state = {
     runId: null,
@@ -18,6 +20,7 @@
     bitable: BitableState.createState(),
     review: ReviewState.createReviewState(),
     referenceUploads: ReferenceUploadState.createState(),
+    plannerPrompt: PlannerPromptState?.createPlannerPromptState?.() || null,
   };
   const byId = (id) => document.getElementById(id);
   const errorMessage = byId("error-message");
@@ -40,6 +43,15 @@
   const nextTaskButton = byId("next-task-button");
   const rerunButton = byId("rerun-button");
   const pollingNote = byId("polling-note");
+  const plannerPromptEntry = byId("planner-prompt-entry");
+  const plannerPromptButton = byId("planner-prompt-button");
+  const plannerPromptMode = byId("planner-prompt-mode");
+  const plannerPromptModal = byId("planner-prompt-modal");
+  const plannerPromptModalMode = byId("planner-prompt-modal-mode");
+  const plannerPromptText = byId("planner-prompt-text");
+  const plannerPromptSave = byId("planner-prompt-save");
+  const plannerPromptReset = byId("planner-prompt-reset");
+  const plannerPromptFeedback = byId("planner-prompt-feedback");
   const TERMINAL_RUN_STATUSES = new Set([
     "succeeded", "completed_with_errors", "failed", "cancelled", "delivery_failed",
   ]);
@@ -73,8 +85,15 @@
     errorMessage.hidden = true;
   }
 
+  function agentUrl(path) {
+    if (/^(?:https?:|blob:)/i.test(path)) return path;
+    return ApiPaths
+      ? ApiPaths.apiUrl(globalThis.location?.pathname || "/", path)
+      : path;
+  }
+
   async function api(url, options = {}) {
-    const response = await fetch(url, options);
+    const response = await fetch(agentUrl(url), options);
     const contentType = response.headers.get("content-type") || "";
     const payload = contentType.includes("application/json")
       ? await response.json()
@@ -86,6 +105,93 @@
       throw error;
     }
     return payload;
+  }
+
+  function renderPlannerPrompt() {
+    if (!PlannerPromptState || !state.plannerPrompt) return;
+    const prompt = state.plannerPrompt;
+    plannerPromptEntry.hidden = !prompt.entryVisible;
+    plannerPromptButton.disabled = prompt.entryDisabled;
+    plannerPromptMode.textContent = prompt.modeLabel;
+    plannerPromptModal.hidden = !prompt.editorOpen;
+    plannerPromptModalMode.textContent = prompt.modeLabel;
+    if (plannerPromptText.value !== prompt.promptText) {
+      plannerPromptText.value = prompt.promptText;
+    }
+    plannerPromptText.disabled = !prompt.editable || prompt.saving || prompt.resetting;
+    plannerPromptSave.disabled = prompt.saveDisabled;
+    plannerPromptReset.disabled = prompt.resetDisabled;
+    plannerPromptFeedback.textContent = prompt.statusMessage;
+    plannerPromptFeedback.className = `planner-prompt-feedback${prompt.statusType ? ` is-${prompt.statusType}` : ""}`;
+  }
+
+  async function loadPlannerPrompt() {
+    if (!PlannerPromptState || !state.plannerPrompt) return;
+    try {
+      const payload = await api("/api/planner-prompt");
+      state.plannerPrompt = PlannerPromptState.applyPlannerPromptResponse(
+        state.plannerPrompt, payload,
+      );
+    } catch (error) {
+      state.plannerPrompt = {
+        ...state.plannerPrompt,
+        statusMessage: error.message,
+        statusType: "error",
+      };
+    }
+    renderPlannerPrompt();
+  }
+
+  async function savePlannerPrompt() {
+    if (!PlannerPromptState || !state.plannerPrompt) return;
+    if (state.plannerPrompt.saving || state.plannerPrompt.resetting) return;
+    try {
+      state.plannerPrompt = PlannerPromptState.beginPromptSave(state.plannerPrompt);
+      renderPlannerPrompt();
+      const payload = await api("/api/planner-prompt", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt_text: state.plannerPrompt.promptText }),
+      });
+      state.plannerPrompt = PlannerPromptState.finishPromptSave(state.plannerPrompt, payload);
+    } catch (error) {
+      state.plannerPrompt = PlannerPromptState.failPromptSave(
+        state.plannerPrompt, error.message,
+      );
+    }
+    renderPlannerPrompt();
+  }
+
+  async function resetPlannerPrompt() {
+    if (!PlannerPromptState || !state.plannerPrompt) return;
+    if (state.plannerPrompt.saving || state.plannerPrompt.resetting) return;
+    if (!globalThis.confirm("恢复 Prime 将删除当前个人版本，是否继续？")) return;
+    try {
+      state.plannerPrompt = PlannerPromptState.beginPromptReset(state.plannerPrompt);
+      renderPlannerPrompt();
+      const payload = await api("/api/planner-prompt", { method: "DELETE" });
+      state.plannerPrompt = PlannerPromptState.finishPromptReset(state.plannerPrompt, payload);
+    } catch (error) {
+      state.plannerPrompt = PlannerPromptState.failPromptReset(
+        state.plannerPrompt, error.message,
+      );
+    }
+    renderPlannerPrompt();
+  }
+
+  function closePlannerPromptEditor() {
+    if (!PlannerPromptState || !state.plannerPrompt) return;
+    const next = PlannerPromptState.requestPromptEditorClose(state.plannerPrompt);
+    if (next.closeConfirmationNeeded) {
+      if (!globalThis.confirm("尚有未保存的提示词，确定放弃这些修改吗？")) {
+        state.plannerPrompt = { ...next, closeConfirmationNeeded: false };
+      } else {
+        state.plannerPrompt = PlannerPromptState.discardPromptEditorChanges(next);
+      }
+    } else {
+      state.plannerPrompt = next;
+    }
+    renderPlannerPrompt();
   }
 
   function setBusy(value) {
@@ -541,7 +647,7 @@
       image.controls = true;
       image.preload = "metadata";
     }
-    if (asset?.preview_url) image.src = asset.preview_url;
+    if (asset?.preview_url) image.src = agentUrl(asset.preview_url);
 
     const descriptionText = description
       ? [description.subjects?.join("、"), description.scene, description.probable_role]
@@ -702,6 +808,57 @@
     return section;
   }
 
+  function renderCoverage(view) {
+    const coverage = ReviewState.assetCoverage(view);
+    byId("coverage-label").textContent = ReviewState.coverageLabel(view);
+    const details = [
+      `已排除 ${coverage.excluded_count} 张`,
+      `未覆盖 ${coverage.uncovered_count} 张`,
+      `读取失败 ${coverage.failed_count} 张`,
+    ];
+    byId("coverage-detail").textContent = details.join(" · ");
+    const rows = ReviewState.excludedAssetRows(view).map((item) => {
+      const row = element("div", "excluded-asset-row");
+      let preview;
+      if (item.media_kind === "image") {
+        preview = document.createElement("img");
+        preview.alt = `排除素材 ${item.asset_id}`;
+      } else if (item.media_kind === "video") {
+        preview = document.createElement("video");
+        preview.controls = true;
+        preview.preload = "metadata";
+        preview.muted = true;
+        preview.playsInline = true;
+        preview.setAttribute("aria-label", `排除视频 ${item.asset_id}`);
+      } else if (item.media_kind === "audio") {
+        preview = document.createElement("audio");
+        preview.controls = true;
+        preview.preload = "metadata";
+        preview.setAttribute("aria-label", `排除音频 ${item.asset_id}`);
+      } else {
+        preview = element(
+          "div",
+          "excluded-asset-placeholder",
+          item.mime_type || "附件",
+        );
+      }
+      if (item.preview_url && item.media_kind !== "file") {
+        preview.src = agentUrl(item.preview_url);
+      }
+      const content = element("div", "excluded-asset-copy");
+      content.append(
+        element("strong", "", item.asset_id),
+        element("p", "", item.reason),
+      );
+      row.append(preview, content);
+      return row;
+    });
+    if (!rows.length) {
+      rows.push(element("p", "mode-message", "暂无排除素材。"));
+    }
+    byId("excluded-asset-list").replaceChildren(...rows);
+  }
+
   function renderTask(task) {
     const card = element("article", "task-card");
     const titleRow = element("div", "task-title-row");
@@ -809,10 +966,35 @@
     byId("langsmith-warning").hidden = !view.privacy?.langsmith_tracing;
     renderEvents(view.events);
 
-    const issues = view.approval.validation_issues || [];
+    const ingestIssueRecords = view.approval.ingest_issue_records || [];
+    const blockingIngestIssues = ingestIssueRecords
+      .filter((record) => record.severity === "blocking")
+      .map((record) => record.display_message);
+    const issues = (view.approval.validation_issues || [])
+      .filter((issue) => !blockingIngestIssues.includes(issue));
     const issueBox = byId("validation-issues");
     issueBox.textContent = issues.join("；");
     issueBox.hidden = issues.length === 0;
+    const blockingIngestBox = byId("blocking-ingest-issues");
+    blockingIngestBox.textContent = blockingIngestIssues.length
+      ? `文档读取阻塞：${blockingIngestIssues.join("；")}`
+      : "";
+    blockingIngestBox.hidden = blockingIngestIssues.length === 0;
+    const assetIngestIssues = ingestIssueRecords
+      .filter((record) => record.severity === "asset")
+      .map((record) => record.display_message);
+    const assetIngestBox = byId("asset-ingest-issues");
+    assetIngestBox.textContent = assetIngestIssues.length
+      ? `素材读取失败（不影响其他素材）：${assetIngestIssues.join("；")}`
+      : "";
+    assetIngestBox.hidden = assetIngestIssues.length === 0;
+    const visionIssues = view.approval.vision_issues || [];
+    const visionIssueBox = byId("vision-issues");
+    visionIssueBox.textContent = visionIssues.length
+      ? `素材识别失败（不影响其他素材）：${visionIssues.join("；")}`
+      : "";
+    visionIssueBox.hidden = visionIssues.length === 0;
+    renderCoverage(view);
     taskList.replaceChildren(...(view.approval.tasks || []).map(renderTask));
     updateActionAvailability();
   }
@@ -871,6 +1053,15 @@
     byId("document-title").textContent = "等待选择多维表格任务";
     byId("document-summary").textContent = "";
     byId("delivery-target").hidden = true;
+    [
+      "validation-issues",
+      "blocking-ingest-issues",
+      "asset-ingest-issues",
+      "vision-issues",
+    ].forEach((id) => {
+      byId(id).textContent = "";
+      byId(id).hidden = true;
+    });
     byId("event-list").replaceChildren();
     taskList.replaceChildren();
     pollingNote.textContent = "请选择下一条任务开始分析";
@@ -986,10 +1177,33 @@
     clearError();
     render(ReviewState.draftView(state.review));
   });
+  if (PlannerPromptState && plannerPromptButton) {
+    plannerPromptButton.addEventListener("click", () => {
+      state.plannerPrompt = PlannerPromptState.openPromptEditor(state.plannerPrompt);
+      renderPlannerPrompt();
+      plannerPromptText.focus();
+    });
+    byId("planner-prompt-close").addEventListener("click", closePlannerPromptEditor);
+    plannerPromptModal.addEventListener("click", (event) => {
+      if (event.target === plannerPromptModal) closePlannerPromptEditor();
+    });
+    plannerPromptText.addEventListener("input", () => {
+      state.plannerPrompt = PlannerPromptState.markPromptDirty(
+        state.plannerPrompt, plannerPromptText.value,
+      );
+      renderPlannerPrompt();
+    });
+    plannerPromptSave.addEventListener("click", savePlannerPrompt);
+    plannerPromptReset.addEventListener("click", resetPlannerPrompt);
+  }
   scanBitableButton.addEventListener("click", scanBitableTasks);
   categoryTabs.forEach((tab) => {
     tab.addEventListener("click", () => selectBitableCategory(tab.dataset.category));
   });
   updateActionAvailability();
+  if (PlannerPromptState) {
+    renderPlannerPrompt();
+    loadPlannerPrompt();
+  }
   configureModes();
 })();

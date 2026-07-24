@@ -1,4 +1,6 @@
 import asyncio
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import re
 from datetime import UTC, datetime
@@ -16,6 +18,7 @@ CREATE TABLE IF NOT EXISTS runs (
   run_id TEXT PRIMARY KEY,
   thread_id TEXT NOT NULL UNIQUE,
   source_url TEXT NOT NULL,
+  owner_user_id TEXT NOT NULL DEFAULT 'prime-local',
   status TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -97,6 +100,9 @@ _OPERATION_TRANSITIONS = {
         }
     ),
 }
+_OWNER_USER_ID: ContextVar[str | None] = ContextVar(
+    "repository_owner_user_id", default=None
+)
 
 
 def _now() -> str:
@@ -121,9 +127,11 @@ class Repository:
         connection.row_factory = aiosqlite.Row
         try:
             await connection.executescript(_SCHEMA)
+            await cls._migrate_runs(connection)
             await cls._migrate_operations(connection)
             await connection.commit()
         except BaseException:
+            await connection.rollback()
             await connection.close()
             raise
         return cls(connection)
@@ -137,38 +145,68 @@ class Repository:
         thread_id: str,
         source_url: str,
         status: str = "pending",
+        *,
+        owner_user_id: str | None = None,
     ) -> None:
+        owner_user_id = self._write_owner(owner_user_id)
         timestamp = _now()
         await self._write(
             """
             INSERT INTO runs (
-              run_id, thread_id, source_url, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+              run_id, thread_id, source_url, owner_user_id, status,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id) DO UPDATE SET
               thread_id = excluded.thread_id,
               source_url = excluded.source_url,
               status = excluded.status,
               updated_at = excluded.updated_at
+            WHERE runs.owner_user_id = excluded.owner_user_id
             """,
-            (run_id, thread_id, source_url, status, timestamp, timestamp),
+            (
+                run_id,
+                thread_id,
+                source_url,
+                owner_user_id,
+                status,
+                timestamp,
+                timestamp,
+            ),
         )
 
-    async def get_run(self, run_id: str) -> dict[str, Any] | None:
+    async def get_run(
+        self, run_id: str, *, owner_user_id: str | None = None
+    ) -> dict[str, Any] | None:
+        owner_user_id = self._read_owner(owner_user_id)
+        where, parameters = self._owned_where(
+            "run_id = ?", (run_id,), owner_user_id
+        )
         cursor = await self._connection.execute(
-            """
-            SELECT run_id, thread_id, source_url, status, created_at, updated_at
+            f"""
+            SELECT run_id, thread_id, source_url, owner_user_id, status,
+                   created_at, updated_at
             FROM runs
-            WHERE run_id = ?
+            WHERE {where}
             """,
-            (run_id,),
+            parameters,
         )
         row = await cursor.fetchone()
         await cursor.close()
         return dict(row) if row is not None else None
 
     async def list_runs(
-        self, *, statuses: set[str] | frozenset[str] | None = None
+        self,
+        *,
+        owner_user_id: str | None = None,
+        statuses: set[str] | frozenset[str] | None = None,
     ) -> list[dict[str, Any]]:
+        owner_user_id = self._read_owner(owner_user_id)
+        owner_clause = (
+            "owner_user_id = ?" if owner_user_id is not None else "1 = 1"
+        )
+        owner_parameters: tuple[str, ...] = (
+            (owner_user_id,) if owner_user_id is not None else ()
+        )
         if statuses is not None:
             values = sorted(statuses)
             if not values:
@@ -176,29 +214,47 @@ class Repository:
             placeholders = ",".join("?" for _ in values)
             cursor = await self._connection.execute(
                 f"""
-                SELECT run_id, thread_id, source_url, status, created_at, updated_at
+                SELECT run_id, thread_id, source_url, owner_user_id, status,
+                       created_at, updated_at
                 FROM runs
-                WHERE status IN ({placeholders})
+                WHERE {owner_clause} AND status IN ({placeholders})
                 ORDER BY created_at ASC
                 """,
-                tuple(values),
+                (*owner_parameters, *values),
             )
         else:
             cursor = await self._connection.execute(
-                """
-                SELECT run_id, thread_id, source_url, status, created_at, updated_at
+                f"""
+                SELECT run_id, thread_id, source_url, owner_user_id, status,
+                       created_at, updated_at
                 FROM runs
+                WHERE {owner_clause}
                 ORDER BY created_at ASC
-                """
+                """,
+                owner_parameters,
             )
         rows = await cursor.fetchall()
         await cursor.close()
         return [dict(row) for row in rows]
 
-    async def delete_run(self, run_id: str) -> bool:
+    async def delete_run(
+        self, run_id: str, *, owner_user_id: str | None = None
+    ) -> bool:
+        owner_user_id = self._read_owner(owner_user_id)
         async with self._write_lock:
             try:
                 await self._connection.execute("BEGIN IMMEDIATE")
+                where, parameters = self._owned_where(
+                    "run_id = ?", (run_id,), owner_user_id
+                )
+                owner_cursor = await self._connection.execute(
+                    f"SELECT 1 FROM runs WHERE {where}", parameters
+                )
+                exists = await owner_cursor.fetchone() is not None
+                await owner_cursor.close()
+                if not exists:
+                    await self._connection.commit()
+                    return False
                 for table in ("events", "operations", "artifacts"):
                     await self._connection.execute(
                         f"DELETE FROM {table} WHERE run_id = ?", (run_id,)
@@ -214,16 +270,26 @@ class Repository:
                 raise
         return changed
 
-    async def update_run_status(self, run_id: str, status: str) -> bool:
+    async def update_run_status(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        owner_user_id: str | None = None,
+    ) -> bool:
+        owner_user_id = self._read_owner(owner_user_id)
+        where, owner_parameters = self._owned_where(
+            "run_id = ?", (run_id,), owner_user_id
+        )
         async with self._write_lock:
             try:
                 cursor = await self._connection.execute(
-                    """
+                    f"""
                     UPDATE runs
                     SET status = ?, updated_at = ?
-                    WHERE run_id = ?
+                    WHERE {where}
                     """,
-                    (status, _now(), run_id),
+                    (status, _now(), *owner_parameters),
                 )
                 await self._connection.commit()
             except BaseException:
@@ -232,6 +298,15 @@ class Repository:
         changed = cursor.rowcount > 0
         await cursor.close()
         return changed
+
+    @contextmanager
+    def owner_scope(self, owner_user_id: str):
+        self._validate_identity_segment(owner_user_id, "owner_user_id")
+        token = _OWNER_USER_ID.set(owner_user_id)
+        try:
+            yield
+        finally:
+            _OWNER_USER_ID.reset(token)
 
     async def append_event(
         self,
@@ -805,6 +880,18 @@ class Repository:
                 raise
 
     @staticmethod
+    async def _migrate_runs(connection: aiosqlite.Connection) -> None:
+        cursor = await connection.execute("PRAGMA table_info(runs)")
+        rows = await cursor.fetchall()
+        await cursor.close()
+        columns = {str(row[1]) for row in rows}
+        if "owner_user_id" not in columns:
+            await connection.execute(
+                "ALTER TABLE runs ADD COLUMN owner_user_id "
+                "TEXT NOT NULL DEFAULT 'prime-local'"
+            )
+
+    @staticmethod
     async def _migrate_operations(connection: aiosqlite.Connection) -> None:
         cursor = await connection.execute("PRAGMA table_info(operations)")
         rows = await cursor.fetchall()
@@ -912,6 +999,30 @@ class Repository:
             or any(ord(character) < 32 or ord(character) == 127 for character in value)
         ):
             raise ValueError(f"invalid {field_name}")
+
+    def _write_owner(self, owner_user_id: str | None) -> str:
+        resolved = owner_user_id or _OWNER_USER_ID.get() or "prime-local"
+        self._validate_identity_segment(resolved, "owner_user_id")
+        return resolved
+
+    def _read_owner(self, owner_user_id: str | None) -> str | None:
+        resolved = owner_user_id if owner_user_id is not None else _OWNER_USER_ID.get()
+        if resolved is not None:
+            self._validate_identity_segment(resolved, "owner_user_id")
+        return resolved
+
+    @staticmethod
+    def _owned_where(
+        clause: str,
+        parameters: tuple[Any, ...],
+        owner_user_id: str | None,
+    ) -> tuple[str, tuple[Any, ...]]:
+        if owner_user_id is None:
+            return clause, parameters
+        return (
+            f"{clause} AND owner_user_id = ?",
+            (*parameters, owner_user_id),
+        )
 
     @staticmethod
     def _validate_client_submission_id(value: str) -> None:

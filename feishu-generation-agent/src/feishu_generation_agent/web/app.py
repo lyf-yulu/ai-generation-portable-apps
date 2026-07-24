@@ -1,9 +1,14 @@
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
+from dataclasses import dataclass
+from inspect import Parameter, signature
+import logging
 import os
 from pathlib import Path
-from typing import Any, AsyncIterator, Literal
+from typing import Annotated, Any, AsyncIterator, Literal
+from urllib.parse import unquote_to_bytes
 
 from fastapi import (
+    Depends,
     FastAPI,
     File,
     Form,
@@ -25,6 +30,10 @@ from feishu_generation_agent.bootstrap import (
 )
 from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain.bitable import TableTaskStatus
+from feishu_generation_agent.domain.document import (
+    PlanningPromptSnapshot,
+    build_planning_prompt_snapshot,
+)
 from feishu_generation_agent.domain.errors import AgentError, ErrorCategory
 from feishu_generation_agent.graph.nodes import GraphServices
 from feishu_generation_agent.graph.runtime import (
@@ -37,18 +46,90 @@ from feishu_generation_agent.integrations.bitable_delivery import (
     BitableResultConflict,
 )
 from feishu_generation_agent.integrations.feishu_bitable import BitableSchemaError
+from feishu_generation_agent.integrations.planner import planner_system_prompt
 from feishu_generation_agent.storage.bitable_tasks import TaskAlreadyClaimed
 from feishu_generation_agent.storage.production_tasks import ProductionTaskAlreadyClaimed
 from feishu_generation_agent.storage.checkpoints import open_checkpointer
+from feishu_generation_agent.storage.planner_prompts import PlannerPromptStore
 from feishu_generation_agent.web.schemas import (
     BitableClaimResponse,
     BitableRetryResponse,
     CreateRunRequest,
     DecisionRequest,
+    PlannerPromptResponse,
+    PlannerPromptUpdate,
     ReferenceListRequest,
 )
 
 ProductionCategory = Literal["animation", "portrait"]
+_MAX_IDENTITY_LENGTH = 255
+_LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class RequestIdentity:
+    owner_user_id: str
+    portal_user_id: str | None
+    username: str
+    is_portal: bool
+
+
+def current_identity(request: Request) -> RequestIdentity:
+    portal_user_id = request.headers.get("X-Portal-User-Id")
+    if portal_user_id is None:
+        return RequestIdentity(
+            owner_user_id="prime-local",
+            portal_user_id=None,
+            username="",
+            is_portal=False,
+        )
+
+    _validate_portal_user_id(portal_user_id)
+    username = _decode_username(request.headers.get("X-Username", ""))
+    return RequestIdentity(
+        owner_user_id=portal_user_id,
+        portal_user_id=portal_user_id,
+        username=username,
+        is_portal=True,
+    )
+
+
+def require_portal_identity(request: Request) -> RequestIdentity:
+    identity = current_identity(request)
+    if not identity.is_portal:
+        raise HTTPException(status_code=403, detail="本地 Prime 提示词不可修改")
+    return identity
+
+
+def _validate_portal_user_id(value: str) -> None:
+    if (
+        not value
+        or value == "prime-local"
+        or value != value.strip()
+        or len(value) > _MAX_IDENTITY_LENGTH
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise HTTPException(status_code=400, detail="Portal 用户身份无效")
+
+
+def _decode_username(value: str) -> str:
+    for index, character in enumerate(value):
+        if character == "%" and (
+            index + 2 >= len(value)
+            or value[index + 1] not in "0123456789abcdefABCDEF"
+            or value[index + 2] not in "0123456789abcdefABCDEF"
+        ):
+            raise HTTPException(status_code=400, detail="Portal 用户名编码无效")
+    try:
+        decoded = unquote_to_bytes(value).decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Portal 用户名编码无效") from exc
+    if (
+        len(decoded) > _MAX_IDENTITY_LENGTH
+        or any(ord(character) < 32 or ord(character) == 127 for character in decoded)
+    ):
+        raise HTTPException(status_code=400, detail="Portal 用户名无效")
+    return decoded
 
 
 def create_app(
@@ -57,6 +138,7 @@ def create_app(
     services: GraphServices | None = None,
     settings: Settings | None = None,
     bitable_service: BitableMvpService | Any | None = None,
+    planner_prompt_store: PlannerPromptStore | None = None,
 ) -> FastAPI:
     if sum(value is not None for value in (runtime, services, settings)) > 1:
         raise ValueError("runtime, services and settings are mutually exclusive")
@@ -121,24 +203,28 @@ def create_app(
                 async with activated_services(services) as active:
                     app.state.runtime = active
                     app.state.bitable_service = bitable_service
+                    app.state.planner_prompt_store = planner_prompt_store
                     try:
                         yield
                     finally:
                         if bitable_service is not None:
                             await bitable_service.close()
                         app.state.bitable_service = None
+                        app.state.planner_prompt_store = None
                         app.state.runtime = None
             return
 
         if runtime is not None:
             app.state.runtime = runtime
             app.state.bitable_service = bitable_service
+            app.state.planner_prompt_store = planner_prompt_store
             try:
                 yield
             finally:
                 if bitable_service is not None:
                     await bitable_service.close()
                 app.state.bitable_service = None
+                app.state.planner_prompt_store = None
                 await runtime.close()
                 app.state.runtime = None
             return
@@ -157,6 +243,10 @@ def create_app(
                             else None
                         )
                         app.state.bitable_service = active_bitable
+                        app.state.planner_prompt_store = (
+                            planner_prompt_store
+                            or getattr(application, "planner_prompt_store", None)
+                        )
                         try:
                             if active_bitable is not None:
                                 try:
@@ -172,16 +262,19 @@ def create_app(
                             if active_bitable is not None:
                                 await active_bitable.close()
                             app.state.bitable_service = None
+                            app.state.planner_prompt_store = None
                             app.state.runtime = None
             return
 
         async with tracing_environment(local_settings):
             app.state.runtime = None
             app.state.bitable_service = None
+            app.state.planner_prompt_store = planner_prompt_store
             try:
                 yield
             finally:
                 app.state.bitable_service = None
+                app.state.planner_prompt_store = None
                 app.state.runtime = None
 
     app = FastAPI(title="本地飞书生成任务 Agent", lifespan=lifespan)
@@ -189,7 +282,8 @@ def create_app(
     @app.middleware("http")
     async def prevent_static_asset_caching(request: Request, call_next):
         response = await call_next(request)
-        if request.url.path.startswith("/static/"):
+        # Portal forwards static assets after stripping its Agent mount prefix.
+        if request.scope["path"].startswith("/static/"):
             response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         return response
 
@@ -302,6 +396,170 @@ def create_app(
             )
         return active
 
+    def runtime_owner_scope(active: Any, owner_user_id: str):
+        repository = getattr(active, "repository", None)
+        owner_scope = getattr(repository, "owner_scope", None)
+        if callable(owner_scope):
+            return owner_scope(owner_user_id)
+        return nullcontext()
+
+    async def ensure_owned_run(
+        active: Any, run_id: str, owner_user_id: str
+    ) -> None:
+        repository = getattr(active, "repository", None)
+        get_run = getattr(repository, "get_run", None)
+        if callable(get_run) and await get_run(
+            run_id, owner_user_id=owner_user_id
+        ) is None:
+            raise RunNotFound("运行不存在")
+
+    def owner_argument(callable_object: Any, owner_user_id: str) -> dict[str, str]:
+        try:
+            parameter = signature(callable_object).parameters.get(
+                "owner_user_id"
+            )
+        except (TypeError, ValueError):
+            parameter = None
+        if parameter is None or parameter.kind is Parameter.POSITIONAL_ONLY:
+            return {}
+        return {"owner_user_id": owner_user_id}
+
+    def planning_prompt_argument(
+        callable_object: Any,
+        planning_prompt: PlanningPromptSnapshot,
+    ) -> dict[str, PlanningPromptSnapshot]:
+        try:
+            parameter = signature(callable_object).parameters.get(
+                "planning_prompt"
+            )
+        except (TypeError, ValueError):
+            parameter = None
+        if parameter is None or parameter.kind is Parameter.POSITIONAL_ONLY:
+            return {}
+        return {"planning_prompt": planning_prompt}
+
+    async def filter_bindings_by_runtime_owner(
+        active_runtime: Any,
+        bindings: list[Any],
+        owner_user_id: str,
+    ) -> list[Any]:
+        repository = getattr(active_runtime, "repository", None)
+        get_run = getattr(repository, "get_run", None)
+        if not callable(get_run):
+            return []
+        visible: list[Any] = []
+        for binding in bindings:
+            if await get_run(
+                binding.run_id, owner_user_id=owner_user_id
+            ) is not None:
+                visible.append(binding)
+        return visible
+
+    async def production_run_kind(
+        active_bitable: Any,
+        run_id: str,
+        owner_user_id: str,
+    ) -> bool | None:
+        classifier = getattr(active_bitable, "is_production_run", None)
+        if not callable(classifier):
+            return None
+        return await classifier(
+            run_id,
+            **owner_argument(classifier, owner_user_id),
+        )
+
+    def get_planner_prompt_store(request: Request) -> PlannerPromptStore:
+        active = getattr(request.app.state, "planner_prompt_store", None)
+        if active is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="提示词存储尚未配置",
+            )
+        return active
+
+    def planner_prompt_response(
+        identity: RequestIdentity,
+        profile: Any | None = None,
+    ) -> PlannerPromptResponse:
+        if profile is not None:
+            return PlannerPromptResponse(
+                mode="personal",
+                editable=True,
+                prompt_text=profile.prompt_text,
+                version=profile.version,
+                source="personal",
+            )
+        return PlannerPromptResponse(
+            mode="prime",
+            editable=identity.is_portal,
+            prompt_text=planner_system_prompt(),
+            version=0,
+            source="prime",
+        )
+
+    async def effective_planning_prompt(
+        request: Request,
+        identity: RequestIdentity,
+    ) -> PlanningPromptSnapshot:
+        profile = None
+        if identity.is_portal:
+            profile = await get_planner_prompt_store(request).get(
+                identity.owner_user_id
+            )
+        snapshot = build_planning_prompt_snapshot(
+            owner_user_id=identity.owner_user_id,
+            source="personal" if profile is not None else "prime",
+            version=profile.version if profile is not None else 0,
+            prompt_text=(
+                profile.prompt_text
+                if profile is not None
+                else planner_system_prompt()
+            ),
+        )
+        _LOGGER.info(
+            "Planning prompt snapshot owner_user_id=%s source=%s "
+            "version=%d sha256=%s",
+            snapshot.owner_user_id,
+            snapshot.source,
+            snapshot.version,
+            snapshot.prompt_sha256,
+        )
+        return snapshot
+
+    @app.get("/api/planner-prompt", response_model=PlannerPromptResponse)
+    async def get_planner_prompt(request: Request) -> PlannerPromptResponse:
+        identity = current_identity(request)
+        if not identity.is_portal:
+            return planner_prompt_response(identity)
+        profile = await get_planner_prompt_store(request).get(
+            identity.owner_user_id
+        )
+        return planner_prompt_response(identity, profile)
+
+    @app.put("/api/planner-prompt", response_model=PlannerPromptResponse)
+    async def update_planner_prompt(
+        request: Request,
+        identity: Annotated[RequestIdentity, Depends(require_portal_identity)],
+        payload: PlannerPromptUpdate,
+    ) -> PlannerPromptResponse:
+        try:
+            profile = await get_planner_prompt_store(request).save(
+                portal_user_id=identity.owner_user_id,
+                username=identity.username,
+                prompt_text=payload.prompt_text,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="提示词无效") from exc
+        return planner_prompt_response(identity, profile)
+
+    @app.delete("/api/planner-prompt", response_model=PlannerPromptResponse)
+    async def delete_planner_prompt(request: Request) -> PlannerPromptResponse:
+        identity = current_identity(request)
+        if not identity.is_portal:
+            raise HTTPException(status_code=403, detail="本地 Prime 提示词不可删除")
+        await get_planner_prompt_store(request).delete(identity.owner_user_id)
+        return planner_prompt_response(identity)
+
     def raise_bitable_error(exc: Exception) -> None:
         if (
             isinstance(exc, AgentError)
@@ -366,8 +624,20 @@ def create_app(
     @app.get("/api/bitable/active-runs")
     async def list_active_bitable_runs(request: Request) -> list[dict]:
         active = get_bitable_service(request)
+        identity = current_identity(request)
         try:
-            bindings = await active.active_runs()
+            ownership = owner_argument(
+                active.active_runs, identity.owner_user_id
+            )
+            bindings = await active.active_runs(
+                **ownership
+            )
+            if not ownership:
+                bindings = await filter_bindings_by_runtime_owner(
+                    get_runtime(request),
+                    bindings,
+                    identity.owner_user_id,
+                )
         except Exception as exc:
             raise_bitable_error(exc)
         return [
@@ -382,14 +652,25 @@ def create_app(
     @app.get("/api/bitable/recent-runs")
     async def list_recent_bitable_runs(request: Request) -> list[dict]:
         active = get_bitable_service(request)
+        identity = current_identity(request)
         try:
-            bindings = await active.recent_runs()
+            bindings = await active.recent_runs(
+                **owner_argument(
+                    active.recent_runs, identity.owner_user_id
+                )
+            )
         except Exception as exc:
             raise_bitable_error(exc)
         payload: list[dict] = []
         for binding in bindings:
             try:
-                result_table_url = await active.result_table_url(binding.run_id)
+                result_table_url = await active.result_table_url(
+                    binding.run_id,
+                    **owner_argument(
+                        active.result_table_url,
+                        identity.owner_user_id,
+                    ),
+                )
             except AttributeError:
                 result_table_url = None
             payload.append(
@@ -417,8 +698,23 @@ def create_app(
         category: ProductionCategory = "animation",
     ) -> BitableClaimResponse:
         active = get_bitable_service(request)
+        identity = current_identity(request)
+        planning_prompt = await effective_planning_prompt(
+            request, identity
+        )
         try:
-            run_id = await active.claim(record_id, category)
+            runtime_for_owner = get_runtime(request)
+            with runtime_owner_scope(
+                runtime_for_owner, identity.owner_user_id
+            ):
+                run_id = await active.claim(
+                    record_id,
+                    category,
+                    **owner_argument(active.claim, identity.owner_user_id),
+                    **planning_prompt_argument(
+                        active.claim, planning_prompt
+                    ),
+                )
         except Exception as exc:
             raise_bitable_error(exc)
         return BitableClaimResponse(run_id=run_id)
@@ -431,8 +727,21 @@ def create_app(
         run_id: str, request: Request
     ) -> BitableRetryResponse:
         active = get_bitable_service(request)
+        identity = current_identity(request)
         try:
-            await active.retry_delivery(run_id)
+            runtime_for_owner = get_runtime(request)
+            await ensure_owned_run(
+                runtime_for_owner, run_id, identity.owner_user_id
+            )
+            with runtime_owner_scope(
+                runtime_for_owner, identity.owner_user_id
+            ):
+                await active.retry_delivery(
+                    run_id,
+                    **owner_argument(
+                        active.retry_delivery, identity.owner_user_id
+                    ),
+                )
         except Exception as exc:
             raise_bitable_error(exc)
         return BitableRetryResponse(run_id=run_id)
@@ -443,8 +752,19 @@ def create_app(
     )
     async def rerun_bitable_run(run_id: str, request: Request) -> BitableClaimResponse:
         active = get_bitable_service(request)
+        identity = current_identity(request)
         try:
-            new_run_id = await active.rerun(run_id)
+            runtime_for_owner = get_runtime(request)
+            await ensure_owned_run(
+                runtime_for_owner, run_id, identity.owner_user_id
+            )
+            with runtime_owner_scope(
+                runtime_for_owner, identity.owner_user_id
+            ):
+                new_run_id = await active.rerun(
+                    run_id,
+                    **owner_argument(active.rerun, identity.owner_user_id),
+                )
         except Exception as exc:
             raise_bitable_error(exc)
         return BitableClaimResponse(run_id=new_run_id)
@@ -452,22 +772,43 @@ def create_app(
     @app.post("/api/runs", status_code=status.HTTP_202_ACCEPTED)
     async def create_run(payload: CreateRunRequest, request: Request) -> dict[str, str]:
         active = get_runtime(request)
-        run_id = await active.start_run(payload.to_domain())
+        identity = current_identity(request)
+        planning_prompt = await effective_planning_prompt(request, identity)
+        domain_request = payload.to_domain().model_copy(
+            update={"planning_prompt": planning_prompt}
+        )
+        with runtime_owner_scope(active, identity.owner_user_id):
+            run_id = await active.start_run(domain_request)
         return {"run_id": run_id}
 
     @app.get("/api/runs/{run_id}")
     async def get_run(run_id: str, request: Request):
         active = get_runtime(request)
+        identity = current_identity(request)
+        try:
+            await ensure_owned_run(active, run_id, identity.owner_user_id)
+        except RunNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
         active_bitable = getattr(request.app.state, "bitable_service", None)
         if active_bitable is not None:
             try:
-                await active_bitable.sync_once(run_id)
+                with runtime_owner_scope(
+                    active, identity.owner_user_id
+                ):
+                    await active_bitable.sync_once(
+                        run_id,
+                        **owner_argument(
+                            active_bitable.sync_once,
+                            identity.owner_user_id,
+                        ),
+                    )
             except RunNotFound:
                 pass
             except Exception as exc:
                 raise_bitable_error(exc)
         try:
-            return await active.get_run_view(run_id)
+            with runtime_owner_scope(active, identity.owner_user_id):
+                return await active.get_run_view(run_id)
         except RunNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from None
 
@@ -481,12 +822,27 @@ def create_app(
         request: Request,
     ) -> dict[str, str]:
         active = get_runtime(request)
+        identity = current_identity(request)
         try:
+            await ensure_owned_run(active, run_id, identity.owner_user_id)
             active_bitable = getattr(request.app.state, "bitable_service", None)
             validate_approval = getattr(active_bitable, "validate_approval", None)
-            if payload.action == "approve" and callable(validate_approval):
-                await validate_approval(run_id)
-            await active.resume_run(run_id, payload.to_domain())
+            production_kind = await production_run_kind(
+                active_bitable, run_id, identity.owner_user_id
+            )
+            if (
+                payload.action == "approve"
+                and callable(validate_approval)
+                and production_kind is not False
+            ):
+                await validate_approval(
+                    run_id,
+                    **owner_argument(
+                        validate_approval, identity.owner_user_id
+                    ),
+                )
+            with runtime_owner_scope(active, identity.owner_user_id):
+                await active.resume_run(run_id, payload.to_domain())
         except RunNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from None
         except RunConflict as exc:
@@ -503,8 +859,11 @@ def create_app(
         run_id: str, request: Request
     ) -> dict[str, str]:
         active = get_runtime(request)
+        identity = current_identity(request)
         try:
-            await active.retry_delivery(run_id)
+            await ensure_owned_run(active, run_id, identity.owner_user_id)
+            with runtime_owner_scope(active, identity.owner_user_id):
+                await active.retry_delivery(run_id)
         except (RunNotFound, RunConflict, RunValidationError) as exc:
             raise_runtime_error(exc)
         return {"run_id": run_id, "status": "accepted"}
@@ -513,8 +872,30 @@ def create_app(
     async def delete_run(run_id: str, request: Request) -> dict[str, str]:
         active_bitable = getattr(request.app.state, "bitable_service", None)
         active = active_bitable or get_runtime(request)
+        identity = current_identity(request)
         try:
-            await active.delete_run(run_id)
+            runtime_for_owner = get_runtime(request)
+            await ensure_owned_run(
+                runtime_for_owner, run_id, identity.owner_user_id
+            )
+            production_kind = await production_run_kind(
+                active_bitable, run_id, identity.owner_user_id
+            )
+            if active_bitable is not None and production_kind is not False:
+                with runtime_owner_scope(
+                    runtime_for_owner, identity.owner_user_id
+                ):
+                    await active.delete_run(
+                        run_id,
+                        **owner_argument(
+                            active.delete_run, identity.owner_user_id
+                        ),
+                    )
+            else:
+                with runtime_owner_scope(
+                    runtime_for_owner, identity.owner_user_id
+                ):
+                    await runtime_for_owner.delete_run(run_id)
         except (RunNotFound, RunConflict, RunValidationError) as exc:
             raise_runtime_error(exc)
         return {"run_id": run_id, "status": "deleted"}
@@ -542,19 +923,24 @@ def create_app(
         replaces_asset_id: str | None = Form(default=None),
     ) -> dict:
         active = get_runtime(request)
-        content = await file.read(active.settings.max_download_bytes + 1)
-        if len(content) > active.settings.max_download_bytes:
-            raise HTTPException(status_code=422, detail="图片超过大小限制")
+        identity = current_identity(request)
         try:
-            return await active.add_reference(
-                run_id,
-                task_id=task_id,
-                role=role,
-                order=order,
-                filename=file.filename or "upload",
-                content=content,
-                replaces_asset_id=replaces_asset_id,
-            )
+            await ensure_owned_run(active, run_id, identity.owner_user_id)
+            content = await file.read(active.settings.max_download_bytes + 1)
+            if len(content) > active.settings.max_download_bytes:
+                raise HTTPException(
+                    status_code=422, detail="图片超过大小限制"
+                )
+            with runtime_owner_scope(active, identity.owner_user_id):
+                return await active.add_reference(
+                    run_id,
+                    task_id=task_id,
+                    role=role,
+                    order=order,
+                    filename=file.filename or "upload",
+                    content=content,
+                    replaces_asset_id=replaces_asset_id,
+                )
         except (RunNotFound, RunConflict, RunValidationError) as exc:
             raise_runtime_error(exc)
         raise AssertionError("unreachable")
@@ -567,13 +953,16 @@ def create_app(
         request: Request,
     ) -> dict[str, str]:
         active = get_runtime(request)
+        identity = current_identity(request)
         try:
-            await active.set_references(
-                run_id,
-                task_id=task_id,
-                references=payload.references,
-                reference_mode=payload.reference_mode,
-            )
+            await ensure_owned_run(active, run_id, identity.owner_user_id)
+            with runtime_owner_scope(active, identity.owner_user_id):
+                await active.set_references(
+                    run_id,
+                    task_id=task_id,
+                    references=payload.references,
+                    reference_mode=payload.reference_mode,
+                )
         except (RunNotFound, RunConflict, RunValidationError) as exc:
             raise_runtime_error(exc)
         return {"status": "updated"}
@@ -586,12 +975,15 @@ def create_app(
         request: Request,
     ) -> dict[str, str]:
         active = get_runtime(request)
+        identity = current_identity(request)
         try:
-            await active.unlink_reference(
-                run_id,
-                task_id=task_id,
-                asset_id=asset_id,
-            )
+            await ensure_owned_run(active, run_id, identity.owner_user_id)
+            with runtime_owner_scope(active, identity.owner_user_id):
+                await active.unlink_reference(
+                    run_id,
+                    task_id=task_id,
+                    asset_id=asset_id,
+                )
         except (RunNotFound, RunConflict, RunValidationError) as exc:
             raise_runtime_error(exc)
         return {"status": "unlinked"}
@@ -603,8 +995,13 @@ def create_app(
         request: Request,
     ) -> FileResponse:
         active = get_runtime(request)
+        identity = current_identity(request)
         try:
-            path, mime_type = await active.get_reference_file(run_id, asset_id)
+            await ensure_owned_run(active, run_id, identity.owner_user_id)
+            with runtime_owner_scope(active, identity.owner_user_id):
+                path, mime_type = await active.get_reference_file(
+                    run_id, asset_id
+                )
         except (RunNotFound, RunConflict, RunValidationError) as exc:
             raise_runtime_error(exc)
         return FileResponse(path, media_type=mime_type)

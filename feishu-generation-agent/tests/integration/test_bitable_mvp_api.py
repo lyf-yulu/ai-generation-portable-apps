@@ -13,7 +13,11 @@ from feishu_generation_agent.cli.smoke import (
 )
 import feishu_generation_agent.web.app as web_app_module
 from feishu_generation_agent.config import Settings
-from feishu_generation_agent.domain import BitableTaskSummary
+from feishu_generation_agent.domain import (
+    BitableBinding,
+    BitableTaskSummary,
+    TableTaskStatus,
+)
 from feishu_generation_agent.domain.errors import (
     AgentError,
     ErrorCategory,
@@ -25,6 +29,7 @@ from feishu_generation_agent.integrations.bitable_delivery import (
     BitableResultConflict,
 )
 from feishu_generation_agent.integrations.feishu_bitable import BitableSchemaError
+from feishu_generation_agent.storage.repository import Repository
 from feishu_generation_agent.web.app import create_app
 
 
@@ -179,6 +184,68 @@ async def test_scan_claim_duplicate_and_run_detail_sync(tmp_path: Path) -> None:
     assert service.synced == ["run-bitable-1"]
     assert runtime.closed is True
     assert service.closed is True
+
+
+async def test_mvp_active_runs_are_filtered_by_portal_owner(
+    tmp_path: Path,
+) -> None:
+    repository = await Repository.open(tmp_path / "owned.sqlite3")
+    await repository.create_run(
+        "run-a",
+        "thread-a",
+        "https://tenant.feishu.cn/docx/docA",
+        owner_user_id="user-a",
+    )
+    await repository.create_run(
+        "run-b",
+        "thread-b",
+        "https://tenant.feishu.cn/docx/docB",
+        owner_user_id="user-b",
+    )
+
+    class Runtime(_Runtime):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.repository = repository
+
+    class MvpService(_BitableService):
+        async def active_runs(self) -> list[BitableBinding]:
+            return [
+                BitableBinding(
+                    app_token="app",
+                    table_id="table",
+                    view_id="view",
+                    record_id=f"record-{owner}",
+                    source_url=f"https://tenant.feishu.cn/docx/doc{owner}",
+                    display_text=f"任务 {owner}",
+                    run_id=f"run-{owner}",
+                    thread_id=f"thread-{owner}",
+                    claimant_open_id="local-mvp",
+                    status=TableTaskStatus.PROCESSING,
+                )
+                for owner in ("a", "b")
+            ]
+
+    runtime = Runtime(tmp_path)
+    app = create_app(runtime=runtime, bitable_service=MvpService())
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with app.router.lifespan_context(app), httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            user_a = await client.get(
+                "/api/bitable/active-runs",
+                headers={"X-Portal-User-Id": "user-a"},
+            )
+            user_b = await client.get(
+                "/api/bitable/active-runs",
+                headers={"X-Portal-User-Id": "user-b"},
+            )
+    finally:
+        await repository.close()
+
+    assert [item["run_id"] for item in user_a.json()] == ["run-a"]
+    assert [item["run_id"] for item in user_b.json()] == ["run-b"]
 
 
 async def test_bitable_approval_smoke_stops_at_waiting_approval() -> None:

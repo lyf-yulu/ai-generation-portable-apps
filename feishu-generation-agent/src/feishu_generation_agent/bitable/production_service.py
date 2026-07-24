@@ -1,12 +1,22 @@
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
 from feishu_generation_agent.domain.bitable import BitableLocation, TableTaskStatus
-from feishu_generation_agent.domain.document import RequirementRequest
+from feishu_generation_agent.domain.document import (
+    PlanningPromptSnapshot,
+    RequirementRequest,
+    build_planning_prompt_snapshot,
+)
 from feishu_generation_agent.domain.production_bitable import ProductionTaskSummary
-from feishu_generation_agent.graph.runtime import RunConflict, RunValidationError
+from feishu_generation_agent.graph.runtime import (
+    RunConflict,
+    RunNotFound,
+    RunValidationError,
+)
+from feishu_generation_agent.integrations.planner import planner_system_prompt
 from feishu_generation_agent.storage.production_tasks import ProductionTaskStore
 
 
@@ -15,6 +25,7 @@ _RELEASED_STATUSES = {
     "completed_with_errors": TableTaskStatus.FAILED,
     "failed": TableTaskStatus.FAILED,
     "cancelled": TableTaskStatus.FAILED,
+    "timed_out": TableTaskStatus.FAILED,
 }
 _ACTIVE_STATUSES = {
     "created": TableTaskStatus.PROCESSING,
@@ -80,7 +91,14 @@ class ProductionBitableService:
             and task.record_id not in active_record_ids
         ]
 
-    async def claim(self, record_id: str, category: str = "animation") -> str:
+    async def claim(
+        self,
+        record_id: str,
+        category: str = "animation",
+        *,
+        owner_user_id: str = "prime-local",
+        planning_prompt: PlanningPromptSnapshot | None = None,
+    ) -> str:
         source = await self._prepared_source(category)
         task = next(
             (item for item in await self.scan(category) if item.record_id == record_id),
@@ -95,31 +113,72 @@ class ProductionBitableService:
             task,
             run_id=str(uuid4()),
             thread_id=str(uuid4()),
+            owner_user_id=owner_user_id,
         )
-        return await self._runtime.start_run(
-            RequirementRequest(source_url=binding.source_url, trigger_type="production_bitable"),
-            run_id=binding.run_id,
-            thread_id=binding.thread_id,
+        if planning_prompt is None:
+            planning_prompt = build_planning_prompt_snapshot(
+                owner_user_id=owner_user_id,
+                source="prime",
+                version=0,
+                prompt_text=planner_system_prompt(),
+            )
+        with self._runtime_owner_scope(owner_user_id):
+            return await self._runtime.start_run(
+                RequirementRequest(
+                    source_url=binding.source_url,
+                    trigger_type="production_bitable",
+                    planning_prompt=planning_prompt,
+                ),
+                run_id=binding.run_id,
+                thread_id=binding.thread_id,
+            )
+
+    async def active_runs(self, *, owner_user_id: str = "prime-local"):
+        location = await self._table_location()
+        return await self._store.list_active(
+            location.app_token or "",
+            location.table_id,
+            owner_user_id=owner_user_id,
         )
 
-    async def active_runs(self):
+    async def recent_runs(self, *, owner_user_id: str = "prime-local"):
         location = await self._table_location()
-        return await self._store.list_active(location.app_token or "", location.table_id)
+        return await self._store.list_recent(
+            location.app_token or "",
+            location.table_id,
+            owner_user_id=owner_user_id,
+        )
 
-    async def recent_runs(self):
-        location = await self._table_location()
-        return await self._store.list_recent(location.app_token or "", location.table_id)
-
-    async def result_table_url(self, run_id: str) -> str | None:
-        binding = await self._store.get_by_run(run_id)
+    async def result_table_url(
+        self, run_id: str, *, owner_user_id: str = "prime-local"
+    ) -> str | None:
+        binding = await self._store.get_by_run(
+            run_id, owner_user_id=owner_user_id
+        )
         if binding is None:
             return None
         target = await self._store.get_result_target(_SHARED_RESULT_TARGET)
         return target.url if target is not None else None
 
-    async def rerun(self, run_id: str) -> str:
-        source = await self._store.get_by_run(run_id)
-        if source is None or source.status not in {
+    async def is_production_run(
+        self, run_id: str, *, owner_user_id: str = "prime-local"
+    ) -> bool:
+        state = await self._store.run_owner_state(
+            run_id, owner_user_id=owner_user_id
+        )
+        if state == "other":
+            raise RunNotFound("多维表格运行不存在")
+        return state == "owned"
+
+    async def rerun(
+        self, run_id: str, *, owner_user_id: str = "prime-local"
+    ) -> str:
+        source = await self._store.get_by_run(
+            run_id, owner_user_id=owner_user_id
+        )
+        if source is None:
+            raise RunNotFound("多维表格运行不存在")
+        if source.status not in {
             TableTaskStatus.COMPLETED,
             TableTaskStatus.FAILED,
         }:
@@ -141,69 +200,111 @@ class ProductionBitableService:
             task,
             run_id=str(uuid4()),
             thread_id=str(uuid4()),
+            owner_user_id=owner_user_id,
         )
         try:
-            return await self._runtime.clone_run_for_approval(
-                run_id,
-                RequirementRequest(
-                    source_url=rerun.source_url, trigger_type="production_bitable"
-                ),
-                run_id=rerun.run_id,
-                thread_id=rerun.thread_id,
-            )
+            with self._runtime_owner_scope(owner_user_id):
+                return await self._runtime.clone_run_for_approval(
+                    run_id,
+                    RequirementRequest(
+                        source_url=rerun.source_url,
+                        trigger_type="production_bitable",
+                    ),
+                    run_id=rerun.run_id,
+                    thread_id=rerun.thread_id,
+                )
         except Exception:
             await self._store.release(
                 rerun.run_id,
                 status=TableTaskStatus.FAILED,
                 last_error="重跑初始化失败",
+                owner_user_id=owner_user_id,
             )
             raise
 
-    async def sync_once(self, run_id: str):
-        binding = await self._store.get_by_run(run_id)
+    async def sync_once(
+        self, run_id: str, *, owner_user_id: str | None = None
+    ):
+        binding = await self._store.get_by_run(
+            run_id, owner_user_id=owner_user_id
+        )
         if binding is None:
-            from feishu_generation_agent.graph.runtime import RunNotFound
             raise RunNotFound("多维表格运行不存在")
-        view = await self._runtime.get_run_view(run_id)
+        with self._runtime_owner_scope(binding.owner_user_id):
+            view = await self._runtime.get_run_view(run_id)
         runtime_status = view.get("status")
         if not isinstance(runtime_status, str):
             raise RunConflict("运行状态无效")
         released = _RELEASED_STATUSES.get(runtime_status)
         if released is not None:
-            return await self._store.release(run_id, status=released)
+            return await self._store.release(
+                run_id,
+                status=released,
+                owner_user_id=binding.owner_user_id,
+            )
         active = _ACTIVE_STATUSES.get(runtime_status)
         if active is None:
             raise RunConflict(f"无法同步运行状态：{runtime_status}")
-        return await self._store.set_status(run_id, active)
+        return await self._store.set_status(
+            run_id, active, owner_user_id=binding.owner_user_id
+        )
 
-    async def retry_delivery(self, run_id: str) -> None:
-        binding = await self._store.get_by_run(run_id)
-        if binding is None or binding.status is not TableTaskStatus.WRITEBACK_FAILED:
+    async def retry_delivery(
+        self, run_id: str, *, owner_user_id: str = "prime-local"
+    ) -> None:
+        binding = await self._store.get_by_run(
+            run_id, owner_user_id=owner_user_id
+        )
+        if binding is None:
+            raise RunNotFound("多维表格运行不存在")
+        if binding.status is not TableTaskStatus.WRITEBACK_FAILED:
             raise RunConflict("只有交付失败的运行可以重试交付")
-        await self._runtime.retry_delivery(run_id)
-        await self._store.set_status(run_id, TableTaskStatus.WRITING_BACK)
+        with self._runtime_owner_scope(owner_user_id):
+            await self._runtime.retry_delivery(run_id)
+        await self._store.set_status(
+            run_id,
+            TableTaskStatus.WRITING_BACK,
+            owner_user_id=owner_user_id,
+        )
 
-    async def delete_run(self, run_id: str) -> None:
-        binding = await self._store.get_by_run(run_id)
-        await self._runtime.delete_run(run_id)
-        if binding is not None and binding.status not in {
+    async def delete_run(
+        self, run_id: str, *, owner_user_id: str = "prime-local"
+    ) -> None:
+        binding = await self._store.get_by_run(
+            run_id, owner_user_id=owner_user_id
+        )
+        if binding is None:
+            raise RunNotFound("多维表格运行不存在")
+        with self._runtime_owner_scope(owner_user_id):
+            await self._runtime.delete_run(run_id)
+        if binding.status not in {
             TableTaskStatus.COMPLETED,
             TableTaskStatus.FAILED,
         }:
             await self._store.release(
-                run_id, status=TableTaskStatus.FAILED, last_error="本地运行已删除"
+                run_id,
+                status=TableTaskStatus.FAILED,
+                last_error="本地运行已删除",
+                owner_user_id=owner_user_id,
             )
 
     async def resume_incomplete(self) -> list[str]:
-        bindings = await self.active_runs()
+        location = await self._table_location()
+        # Startup recovery is intentionally cross-owner and never exposed by
+        # a user-facing route.
+        bindings = await self._store.list_active(
+            location.app_token or "", location.table_id
+        )
         for binding in bindings:
-            await self._runtime.start_run(
-                RequirementRequest(
-                    source_url=binding.source_url, trigger_type="production_bitable"
-                ),
-                run_id=binding.run_id,
-                thread_id=binding.thread_id,
-            )
+            with self._runtime_owner_scope(binding.owner_user_id):
+                await self._runtime.start_run(
+                    RequirementRequest(
+                        source_url=binding.source_url,
+                        trigger_type="production_bitable",
+                    ),
+                    run_id=binding.run_id,
+                    thread_id=binding.thread_id,
+                )
         await self._runtime.resume_pending_runs()
         return [binding.run_id for binding in bindings]
 
@@ -212,9 +313,15 @@ class ProductionBitableService:
             self._closed = True
             await self._store.close()
 
-    async def validate_approval(self, run_id: str) -> None:
-        binding = await self._store.get_by_run(run_id)
-        if binding is not None and binding.snapshot.task_type not in self._enabled_task_types:
+    async def validate_approval(
+        self, run_id: str, *, owner_user_id: str = "prime-local"
+    ) -> None:
+        binding = await self._store.get_by_run(
+            run_id, owner_user_id=owner_user_id
+        )
+        if binding is None:
+            raise RunNotFound("多维表格运行不存在")
+        if binding.snapshot.task_type not in self._enabled_task_types:
             raise RunValidationError(f"{binding.snapshot.task_type or '未分类'}任务暂未启用")
 
     async def _prepared_source(self, category: str) -> ProductionTaskSource:
@@ -232,3 +339,10 @@ class ProductionBitableService:
 
     async def _table_location(self) -> BitableLocation:
         return (await self._prepared_source("animation")).location
+
+    def _runtime_owner_scope(self, owner_user_id: str):
+        repository = getattr(self._runtime, "repository", None)
+        owner_scope = getattr(repository, "owner_scope", None)
+        if callable(owner_scope):
+            return owner_scope(owner_user_id)
+        return nullcontext()

@@ -413,9 +413,15 @@ class _TwoTaskPlanner:
     def __init__(self, tasks: list[dict[str, Any]]) -> None:
         self.tasks = tasks
 
-    async def plan(self, document, descriptions, feedback):
-        del document, descriptions, feedback
-        return TaskPlan(tasks=self.tasks, document_summary="two selectable tasks")
+    async def plan(
+        self,
+        document,
+        descriptions,
+        feedback,
+        exact_system_prompt=None,
+    ):
+        del document, descriptions, feedback, exact_system_prompt
+        return TaskPlan(tasks=self.tasks, document_summary="两个可选择任务")
 
     async def audit(self, document, plan):
         del document, plan
@@ -846,7 +852,7 @@ async def test_tasks_execute_serially_and_later_task_survives_partial_failure(
     state["approved_tasks"] = [image_task, video_task]
     state["draft_plan"] = {
         "tasks": [image_task, video_task],
-        "document_summary": "two serial tasks",
+        "document_summary": "两个串行任务",
     }
     call_order: list[str] = []
     image = _ScriptedGenerator(
@@ -1408,7 +1414,7 @@ async def test_chiyun_local_result_materializes_with_single_client_id(
     state["approved_tasks"] = [image_task]
     state["draft_plan"] = {
         "tasks": [image_task],
-        "document_summary": "image task",
+        "document_summary": "图片任务",
     }
 
     result = await execute_selected_tasks(state, config, services=services)
@@ -1441,7 +1447,7 @@ async def test_chiyun_submitted_staging_tamper_fails_without_resubmit(
     state["approved_tasks"] = [image_task]
     state["draft_plan"] = {
         "tasks": [image_task],
-        "document_summary": "image recovery",
+        "document_summary": "图片恢复任务",
     }
     client_id = "5" * 32
     provider_store = ProviderResultStore(
@@ -1537,6 +1543,115 @@ async def test_local_validation_failure_creates_no_intent(
 
 
 @pytest.mark.asyncio
+async def test_old_approved_checkpoint_with_blocking_ingest_issue_never_executes(
+    fake_services: GraphServices,
+) -> None:
+    state, config = await _waiting_state(
+        fake_services,
+        "run-old-blocking-ingest",
+        "thread-old-blocking-ingest",
+    )
+    state["approved_tasks"] = state["draft_plan"]["tasks"]
+    state["normalized_document"]["ingest_issues"] = [
+        "阻塞：内嵌电子表格 NuBUx5 读取失败（Block fiction-sheet）：旧错误"
+    ]
+
+    with pytest.raises(AgentError) as caught:
+        await execute_selected_tasks(state, config, services=fake_services)
+
+    assert caught.value.detail.category == ErrorCategory.VALIDATION
+    assert await fake_services.repository.count_operations() == 0
+    _assert_zero_generation(fake_services)
+
+
+@pytest.mark.asyncio
+async def test_old_asset_failure_checkpoint_remains_nonblocking(
+    fake_services: GraphServices,
+) -> None:
+    state, config = await _waiting_state(
+        fake_services,
+        "run-old-asset-ingest",
+        "thread-old-asset-ingest",
+    )
+    state["approved_tasks"] = state["draft_plan"]["tasks"]
+    state["normalized_document"]["ingest_issues"] = [
+        "阻塞：内嵌电子表格素材 sheet-old 保存失败",
+        "阻塞：素材 image-old 下载失败",
+    ]
+
+    result = await execute_selected_tasks(
+        state,
+        config,
+        services=fake_services,
+    )
+
+    assert result["status"] == "verification_pending"
+    assert fake_services.video_generator.submit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_structured_asset_issue_controls_execution_without_text_matching(
+    fake_services: GraphServices,
+) -> None:
+    state, config = await _waiting_state(
+        fake_services,
+        "run-structured-asset-ingest",
+        "thread-structured-asset-ingest",
+    )
+    state["approved_tasks"] = state["draft_plan"]["tasks"]
+    state["normalized_document"]["ingest_issue_records"] = [
+        {
+            "severity": "asset",
+            "code": "media_download_failed",
+            "display_message": "文档图片下载失败，其他素材可继续处理",
+            "source_block_id": "image-block",
+            "asset_id": "image-1",
+        }
+    ]
+    state["normalized_document"]["ingest_issues"] = [
+        "阻塞：内嵌电子表格 NuBUx5 读取失败（Block fiction-sheet）"
+    ]
+
+    result = await execute_selected_tasks(
+        state,
+        config,
+        services=fake_services,
+    )
+
+    assert result["status"] == "verification_pending"
+    assert fake_services.video_generator.submit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_structured_blocking_issue_stops_old_checkpoint_execution(
+    fake_services: GraphServices,
+) -> None:
+    state, config = await _waiting_state(
+        fake_services,
+        "run-structured-blocking-ingest",
+        "thread-structured-blocking-ingest",
+    )
+    state["approved_tasks"] = state["draft_plan"]["tasks"]
+    state["normalized_document"]["ingest_issue_records"] = [
+        {
+            "severity": "blocking",
+            "code": "sheet_export_timeout",
+            "display_message": "飞书电子表格导出超时，请稍后重试",
+            "source_block_id": "fiction-sheet",
+            "asset_id": None,
+        }
+    ]
+    state["normalized_document"]["ingest_issues"] = []
+
+    with pytest.raises(AgentError) as caught:
+        await execute_selected_tasks(state, config, services=fake_services)
+
+    assert caught.value.detail.category == ErrorCategory.VALIDATION
+    assert await fake_services.repository.count_operations() == 0
+    _assert_zero_generation(fake_services)
+
+
+@pytest.mark.asyncio
 async def test_chiyun_mismatched_official_id_becomes_uncertain(
     fake_services: GraphServices,
 ) -> None:
@@ -1554,7 +1669,7 @@ async def test_chiyun_mismatched_official_id_becomes_uncertain(
     state["approved_tasks"] = [image_task]
     state["draft_plan"] = {
         "tasks": [image_task],
-        "document_summary": "identity mismatch",
+        "document_summary": "身份不匹配",
     }
 
     result = await execute_selected_tasks(state, config, services=services)

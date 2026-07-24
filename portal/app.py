@@ -528,7 +528,14 @@ class AppManager:
 
     def start_all(self):
         for name, config in APPS.items():
-            self.start_app(name, config)
+            if config["spec"].managed:
+                self.start_app(name, config)
+            else:
+                alive = self._tcp_probe(config["port"])
+                self.status[name] = {
+                    "status": "running" if alive else "unavailable",
+                    "port": config["port"],
+                }
         threading.Thread(target=self._health_loop, daemon=True).start()
         threading.Thread(target=self._log_rotation_loop, daemon=True).start()
 
@@ -572,6 +579,14 @@ class AppManager:
             return "", ""
 
     def start_app(self, name: str, config: dict):
+        spec: AppSpec | None = config.get("spec")
+        if spec is not None and not spec.managed:
+            alive = self._tcp_probe(config["port"])
+            self.status[name] = {
+                "status": "running" if alive else "unavailable",
+                "port": config["port"],
+            }
+            return
         app_dir = config["dir"]
         if not (app_dir / "app.py").exists():
             self.status[name] = {"status": "missing", "error": "app.py not found"}
@@ -583,7 +598,6 @@ class AppManager:
         env["CORS"] = "1"
         if "DATA_DIR" in os.environ:
             env["DATA_DIR"] = str(app_dir / "test-data")
-        spec: AppSpec | None = config.get("spec")
         if spec is not None and spec.needs_tos_creds:
             ak, sk = self._read_tos_source_keys()
             if ak and sk:
@@ -650,6 +664,13 @@ class AppManager:
         while not self._stop_event.is_set():
             time.sleep(15)
             for name, config in APPS.items():
+                if not config["spec"].managed:
+                    alive = self._tcp_probe(config["port"])
+                    self.status[name] = {
+                        "status": "running" if alive else "unavailable",
+                        "port": config["port"],
+                    }
+                    continue
                 proc = self.processes.get(name)
                 if proc and proc.poll() is not None:
                     self.status[name] = {"status": "crashed", "exit_code": proc.returncode, "port": config["port"]}
@@ -1449,7 +1470,29 @@ class Handler(SimpleHTTPRequestHandler):
         if not self._try_proxy(path, "POST", user):
             self._json(404, {"ok": False, "error": "not found"})
 
+    def do_PUT(self):
+        if self._reject_oversized_upload():
+            return
+        path = urllib.parse.urlparse(self.path).path
+        user = self._require_auth(path)
+        if not user:
+            return
+        if not self._try_proxy(path, "PUT", user):
+            self._json(404, {"ok": False, "error": "not found"})
+
+    def do_PATCH(self):
+        if self._reject_oversized_upload():
+            return
+        path = urllib.parse.urlparse(self.path).path
+        user = self._require_auth(path)
+        if not user:
+            return
+        if not self._try_proxy(path, "PATCH", user):
+            self._json(404, {"ok": False, "error": "not found"})
+
     def do_DELETE(self):
+        if self._reject_oversized_upload():
+            return
         path = urllib.parse.urlparse(self.path).path
         user = self._require_auth(path)
         if not user:
@@ -1850,6 +1893,8 @@ class Handler(SimpleHTTPRequestHandler):
             return
         merged = []
         for name, config in APPS.items():
+            if not config["spec"].managed:
+                continue
             try:
                 conn = http.client.HTTPConnection("127.0.0.1", config["port"], timeout=5)
                 conn.request("GET", "/api/activity")
@@ -1907,7 +1952,7 @@ class Handler(SimpleHTTPRequestHandler):
 
         try:
             body = None
-            if method == "POST":
+            if method in {"POST", "PUT", "PATCH", "DELETE"}:
                 length = int(self.headers.get("Content-Length") or "0")
                 if length > 0:
                     body = self.rfile.read(length)
@@ -1959,6 +2004,9 @@ class Handler(SimpleHTTPRequestHandler):
             # names pass through unchanged.
             username_encoded = urllib.parse.quote(user.get("username", ""), safe="")
             headers["X-Username"] = username_encoded
+            # User identity comes only from the authenticated Portal session.
+            # Never accept a browser-supplied X-Portal-User-Id value.
+            headers["X-Portal-User-Id"] = str(user["user_id"])
             # X-Is-Admin: raised for the admin role and also for any spec that
             # declares an `admin_permission` and the user has that permission
             # (dreamina lets `manage_dreamina_accounts` proxy admin so ops folks

@@ -3,6 +3,7 @@ import re
 from typing import Any, Callable
 
 import httpx
+from langsmith import tracing_context
 from pydantic import BaseModel, ValidationError
 
 from feishu_generation_agent.domain.document import (
@@ -23,16 +24,162 @@ _STORYBOARD_ROW_MARKER = re.compile(
 )
 _STORYBOARD_HEADER = re.compile(r"^\s*(?:镜头|镜号|镜头号)\s*[：:]?\s*$")
 _STORYBOARD_ROW_NUMBER = re.compile(r"^\s*([0-9]{1,3})\s*[、.．]?\s*$")
+_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+_CJK_ISSUE_SUFFIX = "必须包含中文主体说明"
+_AUDIO_TERM = (
+    r"(?:人声台词|背景音乐|环境音|对白|台词|音效|配音|人声|音乐|声音|BGM)"
+)
+_AUDIO_INTENT = re.compile(
+    _AUDIO_TERM,
+    re.IGNORECASE,
+)
+_NEGATED_AUDIO_INTENT = re.compile(
+    r"(?:无需|不需要|不要|无|关闭|禁用|不生成|不含|没有|去掉)"
+    r"(?:有|加入|添加|生成|包含|使用)?(?:任何)?\s*"
+    + _AUDIO_TERM
+    + r"|"
+    + _AUDIO_TERM
+    + r"\s*[：:]?\s*(?:无|不要|关闭|禁用|否|没有|不需要|无需)"
+    r"|(?:no|without)\s+(?:voice|dialogue|sound|audio|music|bgm)",
+    re.IGNORECASE,
+)
+_GLOBAL_SILENCE = re.compile(
+    r"(?:全程|整体|视频(?:全程)?)\s*(?:保持|采用|设置为)?\s*(?:静音|无声)"
+    r"|(?:静音|无声)\s*视频"
+    r"|(?:不要|无需|不需要|不含|没有)\s*(?:有|加入|添加|生成|包含)?"
+    r"\s*(?:任何|全部)?\s*(?:声音|音频)",
+    re.IGNORECASE,
+)
+_AUDIO_UI_LITERAL = re.compile(
+    _AUDIO_TERM + r"\s*(?:按钮|图标|开关|选项|文字|字样|UI)",
+    re.IGNORECASE,
+)
+_SPOKEN_DIALOGUE = re.compile(
+    r"(?:[\u3400-\u4dbf\u4e00-\u9fff]{1,12}(?:说|说道)|"
+    r"Girl|Boy|Man|Woman|Narrator|Voiceover)\s*[：:]",
+    re.IGNORECASE,
+)
+_GOAL_REJECTING_AUDIT_LANGUAGE = (
+    "无法保证",
+    "无法满足",
+    "不能满足",
+    "不合理",
+    "做不到",
+    "不可行",
+    "不能支持",
+    "不支持",
+)
+_GOAL_REJECTING_REWRITES = {
+    "无法保证": "需通过风险缓释加强",
+    "无法满足": "需采用可执行方案满足",
+    "不能满足": "需采用可执行方案满足",
+    "不合理": "需进行合理化处理",
+    "做不到": "需采用替代路径完成",
+    "不可行": "需采用替代实施路径",
+    "不能支持": "需切换为可支持的实现方式",
+    "不支持": "需切换为可支持的实现方式",
+}
+_ACTIONABLE_HUMAN_HANDLING = re.compile(
+    r"(?:人工处理|人工确认|手动处理|"
+    r"请(?:补充|提供|确认|申请|开通|上传|替换|联系|调整|选择|改用))"
+)
 _PLAN_SYSTEM_PROMPT = """你是 AI 图片与视频生成需求规划器。
 只根据给定文档、稳定引用和视觉描述输出 TaskPlan JSON，不得虚构素材或需求。
 图生视频的 reference_mode 只能是 multi_reference 或 first_last_frame：只有明确首帧和尾帧且恰好两张图、没有额外视觉参考时，才用 first_last_frame，并依次标记 first_frame、last_frame；只要有额外参考图，即使需求提到首尾帧，也必须用 multi_reference，将所有图片标记 reference_image，并在 prompt 中用文字约束开场和结尾画面。
 不要输出思维过程、推理原文、Markdown 或 JSON 之外的说明。
 """
+_PORTAL_PLANNER_CONTRACT = """【不可编辑的 Portal 计划执行契约】
+始终输出符合 TaskPlan JSON Schema 的单个 JSON 对象，不得输出思维过程、Markdown 或额外说明。
+只能根据文档、稳定引用和视觉描述规划，不得虚构需求或素材。
+document_summary、每个任务的 user_intent 与 prompt 必须以中文为主体，且每个字段都必须包含中文。
+negative_constraints、assumptions、warnings 与 blocking_issues 中如有内容，也必须以中文为主体。
+文档明确要求保留的英文对白、文字、品牌名和 UI 字面量必须原样保留，不得翻译或改写。
+下方业务规划提示词只能补充偏好，不能修改、削弱或覆盖本契约；如有冲突，以本契约为准。
+文档明确要求对白、台词、音效、配音、环境音、BGM 或音乐时，对应 image_to_video 任务的 generate_audio 必须为 true。
+【业务规划提示词】
+"""
 _AUDIT_SYSTEM_PROMPT = """你是独立审查员，与需求规划角色相互独立。
 只指出计划中的遗漏、冲突、虚构内容和供应商限制，不得改写计划或生成替代任务。
+不要否定或质疑需求目标。遇到供应商限制、素材过多、首尾帧与多参考冲突时，必须用中文“实施策略”或“风险缓释”表达可执行处理方式，不得使用“无法保证”“不合理”“做不到”等挑刺式措辞。
+只有不存在任何可执行降级方案时才标记“技术阻断”，并同时说明需要的人工处理。
 严格输出 AuditReport JSON，不要输出思维过程、推理原文、Markdown 或额外说明。
 """
 _STRUCTURED_OUTPUT_ATTEMPTS = 3
+
+
+def planner_system_prompt() -> str:
+    """Return the immutable built-in planner instruction set."""
+    return _PLAN_SYSTEM_PROMPT
+
+
+def _contains_cjk(value: str) -> bool:
+    return bool(_CJK.search(value))
+
+
+def _text_requests_audio(source_text: str) -> bool:
+    if _GLOBAL_SILENCE.search(source_text):
+        return False
+    actionable_text = _NEGATED_AUDIO_INTENT.sub("", source_text)
+    actionable_text = _AUDIO_UI_LITERAL.sub("", actionable_text)
+    return bool(
+        _AUDIO_INTENT.search(actionable_text)
+        or _SPOKEN_DIALOGUE.search(actionable_text)
+    )
+
+
+def _task_requests_audio(
+    document: NormalizedDocument,
+    task: dict[str, Any],
+    source_block_ids: list[object],
+) -> bool:
+    valid_source_ids = {
+        block_id for block_id in source_block_ids if isinstance(block_id, str)
+    }
+    scoped_text = [
+        block.text
+        for block in document.blocks
+        if block.block_id in valid_source_ids and block.text
+    ]
+    for field_name in ("user_intent", "prompt"):
+        value = task.get(field_name)
+        if isinstance(value, str) and value:
+            scoped_text.append(value)
+    return _text_requests_audio("\n".join(scoped_text))
+
+
+def _normalize_audit_report(report: AuditReport) -> AuditReport:
+    normalized_issues: list[str] = []
+    for issue in report.issues:
+        normalized = issue.strip()
+        if normalized.startswith("技术阻断"):
+            if not _ACTIONABLE_HUMAN_HANDLING.search(normalized):
+                normalized = (
+                    f"{normalized.rstrip('。；; ')}；"
+                    "人工处理：请补充可执行素材或确认替代方案后再继续。"
+                )
+            normalized_issues.append(normalized)
+            continue
+        if any(
+            term in normalized
+            for term in _GOAL_REJECTING_AUDIT_LANGUAGE
+        ):
+            for original, replacement in _GOAL_REJECTING_REWRITES.items():
+                normalized = normalized.replace(original, replacement)
+            if not normalized.startswith(("实施策略：", "风险缓释：")):
+                normalized = f"实施策略：{normalized}"
+        normalized_issues.append(normalized)
+    return report.model_copy(update={"issues": normalized_issues})
+
+
+def language_validation_message(issues: list[str]) -> str | None:
+    fields = [
+        issue.partition(":")[0]
+        for issue in issues
+        if _CJK_ISSUE_SUFFIX in issue
+    ]
+    if not fields:
+        return None
+    return f"以下字段{_CJK_ISSUE_SUFFIX}：{'、'.join(dict.fromkeys(fields))}"
 
 
 def _compact_json(value: Any) -> str:
@@ -185,6 +332,11 @@ def validate_plan(
     issues: list[str] = []
     if not isinstance(payload, dict):
         return ["plan: must be a JSON object"]
+    document_summary = payload.get("document_summary")
+    if not isinstance(document_summary, str) or not _contains_cjk(
+        document_summary
+    ):
+        issues.append(f"plan.document_summary: {_CJK_ISSUE_SUFFIX}")
     tasks = payload.get("tasks")
     if not isinstance(tasks, list):
         return ["plan.tasks: must be a list"]
@@ -195,6 +347,7 @@ def validate_plan(
     assets = {asset.asset_id: asset for asset in document.media_assets}
     storyboard_requirements = _storyboard_requirements(document)
     task_ids: set[str] = set()
+    referenced_asset_ids: set[str] = set()
     total_output_count = 0
     task_sources: list[tuple[str, str | None, set[str]]] = []
 
@@ -212,6 +365,11 @@ def validate_plan(
             issues.append(f"{prefix}.task_id: duplicate task_id {task_id}")
         else:
             task_ids.add(task_id)
+
+        for field_name in ("user_intent", "prompt"):
+            value = task.get(field_name)
+            if not isinstance(value, str) or not _contains_cjk(value):
+                issues.append(f"{prefix}.{field_name}: {_CJK_ISSUE_SUFFIX}")
 
         task_type = task.get("task_type")
         if (
@@ -253,6 +411,7 @@ def validate_plan(
                 f"{prefix}.reference_images: at least one image is required"
             )
             references = []
+        task_reference_ids: list[str] = []
         for reference_index, reference in enumerate(references):
             reference_prefix = (
                 f"{prefix}.reference_images[{reference_index}]"
@@ -266,6 +425,8 @@ def validate_plan(
                     f"{reference_prefix}.asset_id: must be a non-empty string"
                 )
                 continue
+            task_reference_ids.append(asset_id)
+            referenced_asset_ids.add(asset_id)
             asset = assets.get(asset_id)
             if asset is None:
                 issues.append(
@@ -281,10 +442,38 @@ def validate_plan(
                 issues.append(
                     f"{reference_prefix}.asset_id: asset {asset_id} download failed"
                 )
-            if not asset.mime_type.startswith("image/"):
-                issues.append(
-                    f"{reference_prefix}.asset_id: asset {asset_id} must have image MIME"
+            role = reference.get("role")
+            mime_matches_role = (
+                asset.mime_type.startswith("image/")
+                and role in {"reference_image", "first_frame", "last_frame"}
+            ) or (
+                asset.mime_type.startswith("video/")
+                and role == "reference_video"
+            ) or (
+                asset.mime_type.startswith("audio/")
+                and role == "reference_audio"
+            )
+            if not mime_matches_role:
+                expected_mime = (
+                    "image"
+                    if role in {"reference_image", "first_frame", "last_frame"}
+                    else "video"
+                    if role == "reference_video"
+                    else "audio"
                 )
+                issues.append(
+                    f"{reference_prefix}.asset_id: asset {asset_id} must have "
+                    f"{expected_mime} MIME for role {role}"
+                )
+        duplicate_reference_ids = {
+            asset_id
+            for asset_id in task_reference_ids
+            if task_reference_ids.count(asset_id) > 1
+        }
+        for asset_id in sorted(duplicate_reference_ids):
+            issues.append(
+                f"{prefix}.reference_images: duplicate asset_id {asset_id}"
+            )
 
         reference_mode = task.get("reference_mode")
         if reference_mode not in {None, "multi_reference", "first_last_frame"}:
@@ -324,10 +513,15 @@ def validate_plan(
                         f"{prefix}.reference_mode: 首尾帧模式必须且只能按顺序指定一张首帧和一张尾帧"
                     )
             elif reference_mode == "multi_reference" and any(
-                role != "reference_image" for role in roles
+                role not in {
+                    "reference_image",
+                    "reference_video",
+                    "reference_audio",
+                }
+                for role in roles
             ):
                 issues.append(
-                    f"{prefix}.reference_mode: 多参考模式只能使用普通参考图"
+                    f"{prefix}.reference_mode: 多参考模式只能使用普通参考图、参考视频或参考音频"
                 )
 
         if task_type == "image_to_image":
@@ -366,6 +560,14 @@ def validate_plan(
                 issues.append(
                     f"{prefix}.generate_audio: must be true, false, or omitted"
                 )
+            elif (
+                _task_requests_audio(document, task, source_block_ids)
+                and generate_audio is not True
+            ):
+                issues.append(
+                    f"{prefix}.generate_audio: "
+                    "文档明确要求对白、音效、配音、环境音或音乐时必须为 true"
+                )
 
         output_count = task.get("output_count", 1)
         if (
@@ -381,6 +583,61 @@ def validate_plan(
         issues.append(
             "plan.total output_count: "
             f"{total_output_count} exceeds max_output_count {max_output_count}"
+        )
+
+    raw_exclusions = payload.get("excluded_assets", [])
+    excluded_asset_ids: list[str] = []
+    if not isinstance(raw_exclusions, list):
+        issues.append("plan.excluded_assets: must be a list")
+        raw_exclusions = []
+    for index, exclusion in enumerate(raw_exclusions):
+        prefix = f"plan.excluded_assets[{index}]"
+        if not isinstance(exclusion, dict):
+            issues.append(f"{prefix}: must be a JSON object")
+            continue
+        asset_id = exclusion.get("asset_id")
+        reason = exclusion.get("reason")
+        if not isinstance(asset_id, str) or not asset_id:
+            issues.append(f"{prefix}.asset_id: must be a non-empty string")
+            continue
+        excluded_asset_ids.append(asset_id)
+        asset = assets.get(asset_id)
+        if asset is None:
+            issues.append(f"{prefix}.asset_id: unknown asset_id {asset_id}")
+        elif asset.download_error is not None:
+            issues.append(
+                f"{prefix}.asset_id: failed asset {asset_id} cannot be excluded"
+            )
+        if not isinstance(reason, str) or not _contains_cjk(reason):
+            issues.append(f"{prefix}.reason: {_CJK_ISSUE_SUFFIX}")
+
+    duplicate_exclusions = {
+        asset_id
+        for asset_id in excluded_asset_ids
+        if excluded_asset_ids.count(asset_id) > 1
+    }
+    for asset_id in sorted(duplicate_exclusions):
+        issues.append(
+            f"plan.excluded_assets: duplicate asset_id {asset_id}"
+        )
+
+    excluded_set = set(excluded_asset_ids)
+    for asset_id in sorted(referenced_asset_ids.intersection(excluded_set)):
+        issues.append(
+            "plan.excluded_assets: referenced asset "
+            f"{asset_id} cannot also be excluded"
+        )
+    successful_asset_ids = {
+        asset.asset_id
+        for asset in document.media_assets
+        if asset.download_error is None
+    }
+    uncovered = (
+        successful_asset_ids - referenced_asset_ids - excluded_set
+    )
+    for asset_id in sorted(uncovered):
+        issues.append(
+            f"plan.asset_coverage: uncovered successful asset {asset_id}"
         )
 
     for table_id, required_ids in storyboard_requirements.items():
@@ -434,9 +691,19 @@ class DeepSeekPlanner:
         document: NormalizedDocument,
         visions: list[VisionDescription],
         feedback: str | None = None,
+        system_prompt: str | None = None,
+        exact_system_prompt: str | None = None,
     ) -> TaskPlan:
+        if exact_system_prompt is not None:
+            effective_system_prompt = exact_system_prompt
+        else:
+            effective_system_prompt = (
+                planner_system_prompt()
+                if system_prompt is None
+                else f"{_PORTAL_PLANNER_CONTRACT}{system_prompt}"
+            )
         messages = [
-            {"role": "system", "content": _PLAN_SYSTEM_PROMPT},
+            {"role": "system", "content": effective_system_prompt},
             {
                 "role": "user",
                 "content": self._planning_prompt(document, visions, feedback),
@@ -467,13 +734,14 @@ class DeepSeekPlanner:
                 "content": self._audit_prompt(document, plan),
             },
         ]
-        return await self._invoke_with_repair(
+        report = await self._invoke_with_repair(
             messages=messages,
             schema=AuditReport,
             deterministic_validator=lambda payload: [],
             document_id=document.document_id,
             operation="audit",
         )
+        return _normalize_audit_report(report)
 
     def _planning_prompt(
         self,
@@ -528,12 +796,22 @@ class DeepSeekPlanner:
                     "自由叙述按完整意图生成任务；混合图片/视频需求按不同意图"
                     "分别生成对应任务，不要错误合并。"
                 ),
+                (
+                    "每个下载成功的素材必须且只能归入任务 reference_images "
+                    "或 excluded_assets；未使用素材必须写入 excluded_assets，"
+                    "reason 必须用中文说明。下载失败素材不得引用或排除。"
+                ),
+                (
+                    "文档明确要求对白、台词、音效、配音、环境音、BGM 或音乐时，"
+                    "对应 image_to_video 任务的 generate_audio 必须为 true；"
+                    "明确要求静音或无音频时才可设为 false。"
+                ),
                 f"max_output_count={self.max_output_count}",
                 f"document_id={document.document_id}",
                 "稳定 text_view（含 [block:*] / [image:*] 引用）：",
                 document.text_view,
                 f"序列化表格及后代 blocks={_compact_json(table_blocks)}",
-                f"可用图片引用={_compact_json(media_references)}",
+                f"可用素材引用={_compact_json(media_references)}",
                 f"全部视觉描述={_compact_json(vision_payload)}",
                 f"用户反馈={_compact_json(feedback)}",
                 f"TaskPlan JSON Schema={_compact_json(schema)}",
@@ -550,6 +828,10 @@ class DeepSeekPlanner:
             [
                 "独立审查以下计划，只报告遗漏、冲突、虚构和供应商限制。",
                 "不得改写计划，不得返回修正后的 tasks。",
+                (
+                    "不要否定或质疑需求目标；对供应商限制给出中文实施策略或"
+                    "风险缓释，不使用“无法保证”“不合理”“做不到”等措辞。"
+                ),
                 f"document_id={document.document_id}",
                 f"text_view={document.text_view}",
                 f"plan={_compact_json(plan.model_dump(mode='json'))}",
@@ -580,7 +862,11 @@ class DeepSeekPlanner:
             model_error: AgentError | None = None
             response: object | None = None
             try:
-                response = await self._model.ainvoke(request_messages)
+                with tracing_context(enabled=False, parent=False):
+                    response = await self._model.ainvoke(
+                        request_messages,
+                        config={"callbacks": []},
+                    )
             except Exception as exc:
                 model_error = self._model_error(document_id, operation, exc)
             if model_error is not None:
@@ -601,11 +887,7 @@ class DeepSeekPlanner:
                     "content": self._repair_prompt(raw_content, last_errors),
                 }
 
-        raise self._validation_error(
-            document_id,
-            operation,
-            len(last_errors),
-        )
+        raise self._validation_error(document_id, operation, last_errors)
 
     @staticmethod
     def _response_content(response: object | None) -> object:
@@ -662,13 +944,25 @@ class DeepSeekPlanner:
         else:
             raw_text = "null"
         concise_errors = "\n".join(f"- {error}" for error in errors[:12])
+        instructions = [
+            "仅返回修复后的 JSON 对象，不要解释或输出推理过程。",
+        ]
+        if language_validation_message(errors) is not None:
+            instructions.insert(
+                0,
+                (
+                    "本次仅修复语言或报告字段；保持任务数量、任务类型、"
+                    "素材引用、参数和原始需求不变，不得新增或发明需求。"
+                    "文档明确要求的英文对白、品牌名和 UI 字面量必须原样保留。"
+                ),
+            )
         return "\n".join(
             [
                 "原始输出：",
                 raw_text,
                 "校验错误：",
                 concise_errors,
-                "仅返回修复后的 JSON 对象，不要解释或输出推理过程。",
+                *instructions,
             ]
         )
 
@@ -726,19 +1020,23 @@ class DeepSeekPlanner:
     def _validation_error(
         document_id: str,
         operation: str,
-        error_count: int,
+        errors: list[str],
     ) -> AgentError:
+        language_failure = language_validation_message(errors)
+        message_prefix = (
+            "模型三次返回的 JSON 均未通过中文规划校验："
+            f"{language_failure}"
+            if language_failure
+            else "模型三次返回的 JSON 均未通过校验"
+        )
         return AgentError(
             ErrorDetail(
                 category=ErrorCategory.VALIDATION,
-                message=(
-                    "模型三次返回的 JSON 均未通过校验"
-                    f"（document_id={document_id}）"
-                ),
+                message=f"{message_prefix}（document_id={document_id}）",
                 technical_detail=(
                     f"document_id={document_id}; operation={operation}; "
                     f"attempts={_STRUCTURED_OUTPUT_ATTEMPTS}; "
-                    f"error_count={error_count}"
+                    f"error_count={len(errors)}"
                 ),
                 retryable=False,
             )

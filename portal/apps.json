@@ -64,5 +64,19 @@
     "metrics": ["seconds"],
     "unit_label": "秒",
     "stats_combine": "images_or_seconds"
+  },
+  {
+    "name": "feishu-generation-agent",
+    "display_name": "飞书任务 Agent",
+    "dir": "feishu-generation-agent",
+    "port_env": "FEISHU_GENERATION_AGENT_PORT",
+    "port_default": 8765,
+    "mount": "iframe",
+    "iframe_url": "/feishu-generation-agent/",
+    "managed": false,
+    "credential_scheme": "none",
+    "job_type": "dynamic",
+    "metrics": ["images", "seconds"],
+    "unit_label": "项"
   }
 ]

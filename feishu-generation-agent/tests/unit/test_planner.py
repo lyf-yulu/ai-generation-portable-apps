@@ -1,4 +1,6 @@
 import copy
+import asyncio
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -6,6 +8,9 @@ from typing import Any
 
 import httpx
 import pytest
+from langchain_core.runnables.config import ensure_config, set_config_context
+from langsmith import tracing_context
+from langsmith.utils import tracing_is_enabled
 
 from feishu_generation_agent.domain.document import (
     DocumentBlock,
@@ -18,8 +23,17 @@ from feishu_generation_agent.domain.errors import AgentError, ErrorCategory
 from feishu_generation_agent.domain.plan import AuditReport, TaskPlan
 from feishu_generation_agent.integrations.planner import (
     DeepSeekPlanner,
+    planner_system_prompt,
     validate_plan,
 )
+
+
+def test_planner_system_prompt_prime_hash_is_frozen() -> None:
+    prime = planner_system_prompt()
+
+    assert hashlib.sha256(prime.encode("utf-8")).hexdigest() == (
+        "5dd2463a9bfddb3bc9e55c3a93148f7316f1259a6eaf70644a610b386a9c6ce4"
+    )
 
 
 def _asset(
@@ -440,15 +454,30 @@ class FakeDeepSeekModel:
         self.calls = 0
         self.bind_calls: list[dict[str, Any]] = []
         self.requests: list[list[dict[str, Any]]] = []
+        self.configs: list[dict[str, Any]] = []
+        self.tracing_enabled: list[bool | str] = []
         self.api_key = "fictional-deepseek-key-must-not-leak"
 
     def bind(self, **kwargs: Any) -> "FakeDeepSeekModel":
         self.bind_calls.append(kwargs)
         return self
 
-    async def ainvoke(self, messages: list[dict[str, Any]]) -> object:
+    async def ainvoke(
+        self,
+        messages: list[dict[str, Any]],
+        config: dict[str, Any] | None = None,
+    ) -> object:
         self.calls += 1
         self.requests.append(copy.deepcopy(messages))
+        resolved_config = ensure_config(config)
+        self.configs.append(resolved_config)
+        self.tracing_enabled.append(tracing_is_enabled())
+        callbacks = resolved_config.get("callbacks")
+        if isinstance(callbacks, list):
+            for callback in callbacks:
+                recorder = getattr(callback, "record_model_input", None)
+                if recorder is not None:
+                    recorder(messages)
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -516,6 +545,7 @@ async def test_planning_input_contains_stable_document_and_rules(
     assert '"table_row":0' in user_prompt
     assert '"block_id":"shot-1"' in user_prompt
     assert '"asset_id":"asset-1"' in user_prompt
+    assert "可用素材引用=" in user_prompt
     assert '"scene":"虚构的小河"' in user_prompt
     assert "image_to_image" in user_prompt
     assert "image_to_video" in user_prompt
@@ -526,7 +556,119 @@ async def test_planning_input_contains_stable_document_and_rules(
     ) in user_prompt
     assert "图片匹配优先级" in user_prompt
     assert "同一分镜表" in user_prompt and "一个视频任务" in user_prompt
+    assert "每个下载成功的素材" in user_prompt
+    assert "excluded_assets" in user_prompt
     assert "保留蓝色" in user_prompt
+
+
+async def test_default_and_portal_planner_system_prompts_are_composed_safely(
+    narrative_document: NormalizedDocument,
+    vision_descriptions: list[VisionDescription],
+):
+    portal_prompt = "个人业务偏好：优先保持角色一致。"
+    default_model = FakeDeepSeekModel([_plan_json(_video_task())])
+    portal_model = FakeDeepSeekModel([_plan_json(_video_task())])
+
+    await DeepSeekPlanner(default_model).plan(
+        narrative_document, vision_descriptions
+    )
+    await DeepSeekPlanner(portal_model).plan(
+        narrative_document,
+        vision_descriptions,
+        system_prompt=portal_prompt,
+    )
+
+    assert default_model.requests[0][0]["content"] == planner_system_prompt()
+    composed = portal_model.requests[0][0]["content"]
+    assert composed != planner_system_prompt()
+    assert "不可编辑" in composed
+    assert "冲突" in composed
+    assert composed.index("不可编辑") < composed.index(portal_prompt)
+    assert composed.endswith(portal_prompt)
+
+
+async def test_exact_system_prompt_override_replays_checkpoint_verbatim(
+    narrative_document: NormalizedDocument,
+    vision_descriptions: list[VisionDescription],
+):
+    historical_prime = "历史 Prime 快照：必须逐字复用"
+    model = FakeDeepSeekModel([_plan_json(_video_task())])
+
+    await DeepSeekPlanner(model).plan(
+        narrative_document,
+        vision_descriptions,
+        exact_system_prompt=historical_prime,
+    )
+
+    assert model.requests[0][0]["content"] == historical_prime
+
+
+async def test_portal_prompt_is_not_exposed_in_planner_error_or_logs(
+    narrative_document: NormalizedDocument,
+    vision_descriptions: list[VisionDescription],
+    caplog: pytest.LogCaptureFixture,
+):
+    secret_prompt = "绝不允许泄漏的个人完整提示词标记"
+    model = FakeDeepSeekModel(
+        [
+            RateLimitFailure("fictional-secret-rate-limit"),
+        ]
+    )
+
+    with pytest.raises(AgentError) as raised:
+        await DeepSeekPlanner(model).plan(
+            narrative_document,
+            vision_descriptions,
+            system_prompt=secret_prompt,
+        )
+
+    serialized = json.dumps(
+        raised.value.detail.model_dump(mode="json"), ensure_ascii=False
+    )
+    assert secret_prompt not in serialized
+    assert secret_prompt not in caplog.text
+
+
+async def test_planner_and_audit_inputs_do_not_enter_inherited_tracing_callbacks(
+    narrative_document: NormalizedDocument,
+    vision_descriptions: list[VisionDescription],
+):
+    secret_prompt = "私有业务系统提示词：禁止进入任何追踪记录"
+    audit_json = json.dumps(
+        {"issues": [], "corrections_required": False},
+        ensure_ascii=False,
+    )
+    model = FakeDeepSeekModel([_plan_json(_video_task()), audit_json])
+    planner = DeepSeekPlanner(model)
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.inputs: list[list[dict[str, Any]]] = []
+
+        def record_model_input(self, messages: list[dict[str, Any]]) -> None:
+            self.inputs.append(copy.deepcopy(messages))
+
+    recorder = _Recorder()
+    with tracing_context(enabled=True):
+        with set_config_context({"callbacks": [recorder]}) as context:
+            plan_task = context.run(
+                asyncio.create_task,
+                planner.plan(
+                    narrative_document,
+                    vision_descriptions,
+                    system_prompt=secret_prompt,
+                ),
+            )
+            plan = await plan_task
+            audit_task = context.run(
+                asyncio.create_task,
+                planner.audit(narrative_document, plan),
+            )
+            await audit_task
+
+    assert recorder.inputs == []
+    assert model.tracing_enabled == [False, False]
+    assert [config.get("callbacks") for config in model.configs] == [[], []]
 
 
 async def test_planning_prompt_does_not_send_download_error_detail(
@@ -751,6 +893,370 @@ def test_validator_accepts_task_plan_and_valid_raw_plan(
 
     assert validate_plan(raw_plan, narrative_document, 4) == []
     assert validate_plan(typed_plan, narrative_document, 4) == []
+
+
+def test_validator_requires_exact_successful_asset_coverage(
+    narrative_document: NormalizedDocument,
+    tmp_path: Path,
+):
+    assets = [
+        _asset(tmp_path, f"asset-{index}", f"image-{index}")
+        for index in range(1, 4)
+    ]
+    document = narrative_document.model_copy(
+        update={"media_assets": assets}
+    )
+    task = _video_task()
+    task["reference_images"] = [
+        {"asset_id": "asset-1", "role": "reference_image", "order": 1},
+        {"asset_id": "asset-2", "role": "reference_image", "order": 2},
+    ]
+    valid = {
+        "tasks": [task],
+        "document_summary": "测试生成需求",
+        "excluded_assets": [
+            {
+                "asset_id": "asset-3",
+                "reason": "供应商最多支持两张参考图，保留主体与场景图。",
+            }
+        ],
+    }
+
+    assert validate_plan(valid, document, 4) == []
+
+    uncovered = copy.deepcopy(valid)
+    uncovered["excluded_assets"] = []
+    issues = validate_plan(uncovered, document, 4)
+    assert any("asset-3" in issue and "uncovered" in issue for issue in issues)
+
+    overlap = copy.deepcopy(valid)
+    overlap["excluded_assets"][0]["asset_id"] = "asset-2"
+    issues = validate_plan(overlap, document, 4)
+    assert any("excluded_assets" in issue and "asset-2" in issue for issue in issues)
+
+    english_reason = copy.deepcopy(valid)
+    english_reason["excluded_assets"][0]["reason"] = "provider supports two"
+    issues = validate_plan(english_reason, document, 4)
+    assert any(
+        "excluded_assets[0].reason" in issue and "中文" in issue
+        for issue in issues
+    )
+
+
+def test_validator_rejects_missing_failed_and_duplicate_asset_assignments(
+    narrative_document: NormalizedDocument,
+    tmp_path: Path,
+):
+    failed = _asset(
+        tmp_path,
+        "asset-failed",
+        "image-failed",
+        download_error="fictional download failure",
+    )
+    document = narrative_document.model_copy(
+        update={"media_assets": [*narrative_document.media_assets, failed]}
+    )
+    task = _video_task()
+    task["reference_images"] = [
+        {"asset_id": "missing", "role": "reference_image", "order": 1},
+        {"asset_id": "asset-failed", "role": "reference_image", "order": 2},
+    ]
+    raw = {
+        "tasks": [task],
+        "document_summary": "测试生成需求",
+        "excluded_assets": [
+            {"asset_id": "asset-1", "reason": "用户选择了其他主体图"},
+            {"asset_id": "asset-1", "reason": "供应商数量限制"},
+        ],
+    }
+
+    issues = validate_plan(raw, document, 4)
+
+    assert any("unknown asset_id missing" in issue for issue in issues)
+    assert any("asset-failed" in issue and "download failed" in issue for issue in issues)
+    assert any("duplicate" in issue and "asset-1" in issue for issue in issues)
+
+
+def test_validator_keeps_existing_multimodal_reference_support(
+    narrative_document: NormalizedDocument,
+    tmp_path: Path,
+):
+    video = _asset(
+        tmp_path,
+        "video-1",
+        "video-block",
+        mime_type="video/mp4",
+    )
+    audio = _asset(
+        tmp_path,
+        "audio-1",
+        "audio-block",
+        mime_type="audio/mpeg",
+    )
+    document = narrative_document.model_copy(
+        update={
+            "media_assets": [
+                *narrative_document.media_assets,
+                video,
+                audio,
+            ]
+        }
+    )
+    task = _video_task()
+    task["reference_images"] = [
+        {"asset_id": "asset-1", "role": "reference_image", "order": 1},
+        {"asset_id": "video-1", "role": "reference_video", "order": 2},
+        {"asset_id": "audio-1", "role": "reference_audio", "order": 3},
+    ]
+    task["reference_mode"] = "multi_reference"
+    raw = {
+        "tasks": [task],
+        "document_summary": "测试多模态生成需求",
+        "excluded_assets": [],
+    }
+
+    assert validate_plan(raw, document, 4) == []
+
+
+@pytest.mark.parametrize(
+    ("field_path", "value", "expected_issue"),
+    [
+        ("document_summary", "Generate a paper boat video", "document_summary"),
+        ("user_intent", "Generate a paper boat video", "tasks[0].user_intent"),
+        ("prompt", "A paper boat drifts down a river", "tasks[0].prompt"),
+    ],
+)
+def test_validator_rejects_english_only_required_planning_fields(
+    narrative_document: NormalizedDocument,
+    field_path: str,
+    value: str,
+    expected_issue: str,
+):
+    raw_plan = json.loads(_plan_json(_video_task()))
+    if field_path == "document_summary":
+        raw_plan[field_path] = value
+    else:
+        raw_plan["tasks"][0][field_path] = value
+
+    issues = validate_plan(raw_plan, narrative_document, 4)
+
+    assert any(expected_issue in issue and "中文" in issue for issue in issues)
+
+
+@pytest.mark.parametrize("summary", [None, "", "English summary only"])
+def test_validator_requires_cjk_document_summary_for_raw_json(
+    narrative_document: NormalizedDocument,
+    summary: str | None,
+):
+    raw_plan = json.loads(_plan_json(_video_task()))
+    if summary is None:
+        raw_plan.pop("document_summary")
+    else:
+        raw_plan["document_summary"] = summary
+
+    issues = validate_plan(raw_plan, narrative_document, 4)
+
+    assert "plan.document_summary: 必须包含中文主体说明" in issues
+
+
+def test_validator_requires_cjk_document_summary_for_task_plan(
+    narrative_document: NormalizedDocument,
+):
+    typed_plan = TaskPlan.model_validate(
+        {
+            "tasks": [_video_task()],
+            "document_summary": "English summary only",
+        }
+    )
+
+    issues = validate_plan(typed_plan, narrative_document, 4)
+
+    assert "plan.document_summary: 必须包含中文主体说明" in issues
+
+
+def test_validator_accepts_chinese_prompt_with_requested_english_dialogue_brand_and_ui(
+    narrative_document: NormalizedDocument,
+):
+    raw_plan = json.loads(_plan_json(_video_task()))
+    raw_plan["tasks"][0]["prompt"] = (
+        "近景镜头中，角色说：\"Don't move.\"；画面保留 Coca-Cola 品牌，"
+        "并在 UI 上显示 Start 按钮。"
+    )
+    raw_plan["tasks"][0]["generate_audio"] = True
+
+    assert validate_plan(raw_plan, narrative_document, 4) == []
+
+
+@pytest.mark.parametrize("generate_audio", [None, False])
+def test_validator_requires_audio_for_video_when_document_requests_it(
+    narrative_document: NormalizedDocument,
+    generate_audio: bool | None,
+):
+    blocks = [
+        block.model_copy(
+            update={
+                "text": (
+                    "女孩说：\"Wait, what's this?\"；"
+                    "音效：清脆提示音；Upbeat electronic BGM starts。"
+                )
+            }
+        )
+        if block.block_id == "story-1"
+        else block
+        for block in narrative_document.blocks
+    ]
+    document = narrative_document.model_copy(
+        update={
+            "blocks": blocks,
+            "text_view": (
+                "[block:story-1] 女孩说：\"Wait, what's this?\"；"
+                "音效：清脆提示音；Upbeat electronic BGM starts。\n"
+                "[block:image-1] [image:asset-1]"
+            ),
+        }
+    )
+    task = _video_task()
+    task["generate_audio"] = generate_audio
+
+    issues = validate_plan(
+        json.loads(_plan_json(task)),
+        document,
+        4,
+    )
+
+    assert (
+        "tasks[0].generate_audio: "
+        "文档明确要求对白、音效、配音、环境音或音乐时必须为 true"
+    ) in issues
+
+
+def test_validator_scopes_audio_intent_to_each_video_task(
+    narrative_document: NormalizedDocument,
+    tmp_path: Path,
+):
+    second_asset = _asset(tmp_path, "asset-2", "story-2")
+    blocks = [
+        block.model_copy(
+            update={"text": "女孩说：\"开始吧。\"；音效：清脆提示音。"}
+        )
+        if block.block_id == "story-1"
+        else block
+        for block in narrative_document.blocks
+    ]
+    blocks.append(
+        DocumentBlock(
+            block_id="story-2",
+            parent_id="page-1",
+            block_type="text",
+            order=3,
+            path=["page-1", "story-2"],
+            text="第二条视频只展示纸船漂流，视频保持静音。",
+        )
+    )
+    document = narrative_document.model_copy(
+        update={
+            "blocks": blocks,
+            "text_view": (
+                "[block:story-1] 女孩说：\"开始吧。\"；音效：清脆提示音。\n"
+                "[block:story-2] 第二条视频只展示纸船漂流，视频保持静音。\n"
+                "[block:image-1] [image:asset-1]"
+            ),
+            "media_assets": [*narrative_document.media_assets, second_asset],
+        }
+    )
+    audio_task = _video_task()
+    audio_task["generate_audio"] = True
+    silent_task = _video_task(
+        "task-silent",
+        source_block_ids=["story-2"],
+        asset_id="asset-2",
+    )
+    silent_task["generate_audio"] = False
+
+    assert validate_plan(
+        json.loads(_plan_json(audio_task, silent_task)),
+        document,
+        4,
+    ) == []
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    [
+        "女孩说：\"Wait, what's this?\"",
+        "对白：保持安静。",
+        "台词旁白：Remove all arrows.",
+        "音效：清脆提示音。",
+        "Upbeat electronic BGM starts.",
+    ],
+)
+def test_validator_recognizes_positive_audio_intent_without_global_keywords(
+    narrative_document: NormalizedDocument,
+    requirement: str,
+):
+    blocks = [
+        block.model_copy(update={"text": requirement})
+        if block.block_id == "story-1"
+        else block
+        for block in narrative_document.blocks
+    ]
+    document = narrative_document.model_copy(
+        update={
+            "blocks": blocks,
+            "text_view": (
+                f"[block:story-1] {requirement}\n"
+                "[block:image-1] [image:asset-1]"
+            ),
+        }
+    )
+    task = _video_task()
+    task["generate_audio"] = None
+
+    issues = validate_plan(
+        json.loads(_plan_json(task)),
+        document,
+        4,
+    )
+
+    assert any("tasks[0].generate_audio" in issue for issue in issues)
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    [
+        "视频保持静音，无需配音，不要音效，无背景音乐。",
+        "不要有配音。",
+        "背景音乐：无。",
+        "无声视频，但画面出现音效按钮。",
+    ],
+)
+def test_validator_does_not_treat_explicit_silence_or_ui_text_as_audio_intent(
+    narrative_document: NormalizedDocument,
+    requirement: str,
+):
+    blocks = [
+        block.model_copy(update={"text": requirement})
+        if block.block_id == "story-1"
+        else block
+        for block in narrative_document.blocks
+    ]
+    document = narrative_document.model_copy(
+        update={
+            "blocks": blocks,
+            "text_view": (
+                f"[block:story-1] {requirement}\n"
+                "[block:image-1] [image:asset-1]"
+            ),
+        }
+    )
+    task = _video_task()
+    task["generate_audio"] = False
+
+    assert validate_plan(
+        json.loads(_plan_json(task)),
+        document,
+        4,
+    ) == []
 
 
 def test_validator_rejects_frame_mode_without_exactly_two_frame_roles(
@@ -1219,3 +1725,77 @@ async def test_audit_uses_independent_prompt_and_does_not_rewrite_plan(
         ensure_ascii=False,
         separators=(",", ":"),
     ) in model.requests[1][1]["content"]
+
+
+async def test_audit_repairs_goal_rejecting_supplier_limit_language(
+    narrative_document: NormalizedDocument,
+    vision_descriptions: list[VisionDescription],
+):
+    plan_json = _plan_json(_video_task())
+    rejecting_audit = json.dumps(
+        {
+            "issues": [
+                "供应商无法保证尾帧一致。",
+                "多参考接口做不到使用全部参考图。",
+            ],
+            "corrections_required": True,
+        },
+        ensure_ascii=False,
+    )
+    forged_empty_repair = json.dumps(
+        {
+            "issues": [],
+            "corrections_required": False,
+        },
+        ensure_ascii=False,
+    )
+    model = FakeDeepSeekModel(
+        [plan_json, rejecting_audit, forged_empty_repair]
+    )
+    planner = DeepSeekPlanner(model, max_output_count=4)
+    plan = await planner.plan(narrative_document, vision_descriptions)
+
+    report = await planner.audit(narrative_document, plan)
+
+    assert len(report.issues) == 2
+    assert "尾帧一致" in report.issues[0]
+    assert "全部参考图" in report.issues[1]
+    assert report.corrections_required is True
+    assert not any(
+        term in issue
+        for issue in report.issues
+        for term in ("无法保证", "做不到")
+    )
+    assert all(
+        issue.startswith(("实施策略：", "风险缓释："))
+        for issue in report.issues
+    )
+    assert model.calls == 2
+    audit_system = model.requests[1][0]["content"]
+    assert "不要否定或质疑需求目标" in audit_system
+    assert "实施策略" in audit_system
+
+
+async def test_audit_technical_blocker_requires_actionable_human_handling(
+    narrative_document: NormalizedDocument,
+    vision_descriptions: list[VisionDescription],
+):
+    plan_json = _plan_json(_video_task())
+    audit_json = json.dumps(
+        {
+            "issues": ["技术阻断：供应商不支持该素材格式。"],
+            "corrections_required": True,
+        },
+        ensure_ascii=False,
+    )
+    model = FakeDeepSeekModel([plan_json, audit_json])
+    planner = DeepSeekPlanner(model, max_output_count=4)
+    plan = await planner.plan(narrative_document, vision_descriptions)
+
+    report = await planner.audit(narrative_document, plan)
+
+    assert len(report.issues) == 1
+    assert report.issues[0].startswith("技术阻断：")
+    assert "该素材格式" in report.issues[0]
+    assert "人工处理" in report.issues[0]
+    assert report.corrections_required is True

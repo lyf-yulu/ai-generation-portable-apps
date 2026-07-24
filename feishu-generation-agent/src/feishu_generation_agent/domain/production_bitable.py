@@ -48,6 +48,7 @@ class ProductionTaskSummary(BaseModel):
 class ProductionBinding(BaseModel):
     source_location: BitableLocation
     record_id: str
+    owner_user_id: str
     source_url: str
     display_text: str
     progress: str

@@ -1,3 +1,4 @@
+import hashlib
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -5,15 +6,24 @@ from urllib.parse import unquote, urlsplit
 
 from feishu_generation_agent.domain.document import (
     DocumentBlock,
+    IngestIssueCode,
+    IngestIssueRecord,
     MediaAsset,
     NormalizedDocument,
     RequirementRequest,
     SourceType,
+    legacy_ingest_issue_text,
+    make_ingest_issue_record,
 )
 from feishu_generation_agent.domain.errors import (
     AgentError,
     ErrorCategory,
     ErrorDetail,
+)
+from feishu_generation_agent.integrations.feishu_sheet_export import (
+    ExtractedSheetImage,
+    SheetImageAnchor,
+    parse_sheet_block_token,
 )
 from feishu_generation_agent.storage.files import FileStore, StoredFile
 
@@ -38,6 +48,7 @@ _BLOCK_TYPE_NAMES = {
     22: "divider",
     23: "file",
     27: "image",
+    30: "sheet",
     31: "table",
     32: "table_cell",
 }
@@ -66,9 +77,16 @@ def parse_feishu_url(url: str) -> tuple[SourceType, str]:
 
 
 class FeishuDocumentSource:
-    def __init__(self, client: Any, file_store: FileStore) -> None:
+    def __init__(
+        self,
+        client: Any,
+        file_store: FileStore,
+        *,
+        sheet_exporter: Any | None = None,
+    ) -> None:
         self._client = client
         self._file_store = file_store
+        self._sheet_exporter = sheet_exporter
 
     async def get_revision(self, source_url: str) -> int:
         source_type, source_token = parse_feishu_url(source_url)
@@ -88,9 +106,10 @@ class FeishuDocumentSource:
 
         normalized_blocks: list[DocumentBlock] = []
         media_assets: list[MediaAsset] = []
-        ingest_issues: list[str] = []
+        ingest_issue_records: list[IngestIssueRecord] = []
         text_lines: list[str] = []
         media_cache: dict[str, StoredFile | Exception] = {}
+        normal_image_count = 0
 
         for order, (raw, path, row, column) in enumerate(ordered):
             block_id = raw["block_id"]
@@ -100,21 +119,37 @@ class FeishuDocumentSource:
             )
             text = self._extract_text(raw, block_type)
             image_asset_id: str | None = None
-            if text:
-                text_lines.append(f"[block:{block_id}] {text}")
+
+            if block_type_number == 30:
+                (
+                    text,
+                    sheet_text_lines,
+                    sheet_assets,
+                    sheet_issue_records,
+                ) = await self._embedded_sheet(
+                    raw,
+                    document_id=document_id,
+                )
+                text_lines.extend(sheet_text_lines)
+                media_assets.extend(sheet_assets)
+                ingest_issue_records.extend(sheet_issue_records)
+            else:
+                if text:
+                    text_lines.append(f"[block:{block_id}] {text}")
 
             if block_type_number == 27:
-                image_asset_id = f"image-{len(media_assets) + 1}"
+                normal_image_count += 1
+                image_asset_id = f"image-{normal_image_count}"
                 text_lines.append(f"[image:{image_asset_id}]")
-                asset, issue = await self._media_asset(
+                asset, issue_record = await self._media_asset(
                     raw,
                     document_id=document_id,
                     asset_id=image_asset_id,
                     cache=media_cache,
                 )
                 media_assets.append(asset)
-                if issue is not None:
-                    ingest_issues.append(issue)
+                if issue_record is not None:
+                    ingest_issue_records.append(issue_record)
 
             normalized_blocks.append(
                 DocumentBlock(
@@ -139,7 +174,202 @@ class FeishuDocumentSource:
             blocks=normalized_blocks,
             text_view="\n".join(text_lines),
             media_assets=media_assets,
-            ingest_issues=ingest_issues,
+            ingest_issue_records=ingest_issue_records,
+            ingest_issues=[
+                legacy_ingest_issue_text(record)
+                for record in ingest_issue_records
+            ],
+        )
+
+    async def _embedded_sheet(
+        self,
+        raw: dict[str, Any],
+        *,
+        document_id: str,
+    ) -> tuple[str, list[str], list[MediaAsset], list[IngestIssueRecord]]:
+        block_id = raw["block_id"]
+        sheet = raw.get("sheet")
+        token = sheet.get("token") if isinstance(sheet, Mapping) else None
+        if not isinstance(token, str) or not token:
+            issue = make_ingest_issue_record(
+                IngestIssueCode.SHEET_REFERENCE_INVALID,
+                source_block_id=block_id,
+            )
+            return "", [], [], [issue]
+        try:
+            ref = parse_sheet_block_token(token)
+        except (TypeError, ValueError):
+            issue = make_ingest_issue_record(
+                IngestIssueCode.SHEET_REFERENCE_INVALID,
+                source_block_id=block_id,
+            )
+            return "", [], [], [issue]
+
+        if self._sheet_exporter is None:
+            issue = make_ingest_issue_record(
+                IngestIssueCode.SHEET_EXPORTER_UNAVAILABLE,
+                source_block_id=block_id,
+            )
+            return "", [], [], [issue]
+
+        try:
+            extracted = await self._sheet_exporter.export(ref)
+        except Exception as exc:
+            code = (
+                IngestIssueCode.SHEET_EXPORT_TIMEOUT
+                if isinstance(exc, AgentError)
+                and exc.detail.message
+                == "飞书电子表格导出超时，请稍后重试"
+                else IngestIssueCode.SHEET_EXPORT_FAILED
+            )
+            issue = make_ingest_issue_record(
+                code,
+                source_block_id=block_id,
+            )
+            return "", [], [], [issue]
+        if not extracted.text_lines and not extracted.images:
+            issue = make_ingest_issue_record(
+                IngestIssueCode.SHEET_EXPORT_EMPTY,
+                source_block_id=block_id,
+            )
+            return "", [], [], [issue]
+
+        sheet_text_lines = list(extracted.text_lines)
+        assets: list[MediaAsset] = []
+        issues: list[IngestIssueRecord] = []
+        for image in self._deduplicate_sheet_images(
+            extracted.images
+        ):
+            asset, image_lines, issue = self._sheet_media_asset(
+                image,
+                document_id=document_id,
+                sheet_id=ref.sheet_id,
+                block_id=block_id,
+            )
+            assets.append(asset)
+            sheet_text_lines.extend(image_lines)
+            if issue is not None:
+                issues.append(issue)
+        return (
+            "\n".join(extracted.text_lines),
+            sheet_text_lines,
+            assets,
+            issues,
+        )
+
+    @staticmethod
+    def _deduplicate_sheet_images(
+        images: tuple[ExtractedSheetImage, ...],
+    ) -> tuple[ExtractedSheetImage, ...]:
+        by_hash: dict[str, ExtractedSheetImage] = {}
+        for image in images:
+            digest = hashlib.sha256(image.content).hexdigest()
+            existing = by_hash.get(digest)
+            if existing is None:
+                by_hash[digest] = ExtractedSheetImage(
+                    media_name=image.media_name,
+                    content=image.content,
+                    sha256=image.sha256,
+                    anchors=image.anchors,
+                )
+                continue
+            by_hash[digest] = ExtractedSheetImage(
+                media_name=existing.media_name,
+                content=existing.content,
+                sha256=existing.sha256,
+                anchors=(*existing.anchors, *image.anchors),
+            )
+        return tuple(by_hash.values())
+
+    def _sheet_media_asset(
+        self,
+        image: ExtractedSheetImage,
+        *,
+        document_id: str,
+        sheet_id: str,
+        block_id: str,
+    ) -> tuple[MediaAsset, list[str], IngestIssueRecord | None]:
+        digest = hashlib.sha256(image.content).hexdigest()
+        first_anchor = image.anchors[0] if image.anchors else None
+        asset_id = self._sheet_asset_id(
+            document_id=document_id,
+            sheet_id=sheet_id,
+            first_anchor=first_anchor,
+            content_sha256=digest,
+        )
+        anchor_lines = [
+            (
+                f"[sheet-image:{asset_id} sheet:{anchor.source_sheet_id} "
+                f"worksheet:{anchor.worksheet_name} "
+                f"anchor:R{anchor.row + 1}C{anchor.column + 1}]"
+            )
+            for anchor in image.anchors
+        ]
+        if not image.anchors:
+            anchor_lines.append(
+                f"[sheet-image:{asset_id} sheet:{sheet_id} anchor:missing]"
+            )
+        try:
+            if image.sha256 != digest:
+                raise ValueError("电子表格图片内容哈希不匹配")
+            if first_anchor is None:
+                raise ValueError("电子表格图片缺少锚点")
+            stored = self._file_store.save_input(
+                document_id,
+                image.media_name,
+                image.content,
+            )
+        except Exception:
+            issue = make_ingest_issue_record(
+                IngestIssueCode.SHEET_ASSET_SAVE_FAILED,
+                source_block_id=block_id,
+            )
+            asset = MediaAsset(
+                asset_id=asset_id,
+                source_block_id=block_id,
+                origin="feishu_embedded_sheet",
+                local_path=Path("__missing__")
+                / document_id
+                / f"{digest}.missing",
+                mime_type="application/octet-stream",
+                size=0,
+                sha256="",
+                download_error=issue.display_message,
+            )
+            return asset, anchor_lines, issue
+
+        asset = MediaAsset(
+            asset_id=asset_id,
+            source_block_id=block_id,
+            origin="feishu_embedded_sheet",
+            local_path=stored.local_path,
+            mime_type=stored.mime_type,
+            size=stored.size,
+            sha256=stored.sha256,
+            width=stored.width,
+            height=stored.height,
+        )
+        return asset, anchor_lines, None
+
+    @staticmethod
+    def _sheet_asset_id(
+        *,
+        document_id: str,
+        sheet_id: str,
+        first_anchor: SheetImageAnchor | None,
+        content_sha256: str,
+    ) -> str:
+        if first_anchor is None:
+            anchor_part = "unanchored"
+        else:
+            worksheet_hash = hashlib.sha256(
+                first_anchor.worksheet_name.encode("utf-8")
+            ).hexdigest()[:12]
+            anchor_part = (
+                f"w{worksheet_hash}-r{first_anchor.row}-c{first_anchor.column}"
+            )
+        return (
+            f"sheet-{document_id}-{sheet_id}-{anchor_part}-{content_sha256}"
         )
 
     async def _resolve_document_id(
@@ -417,14 +647,13 @@ class FeishuDocumentSource:
         document_id: str,
         asset_id: str,
         cache: dict[str, StoredFile | Exception],
-    ) -> tuple[MediaAsset, str | None]:
+    ) -> tuple[MediaAsset, IngestIssueRecord | None]:
         image = raw.get("image")
         file_token = image.get("token") if isinstance(image, Mapping) else None
         block_id = raw["block_id"]
         if not isinstance(file_token, str) or not file_token:
-            error = "图片 Block 缺少 file_token"
             return self._failed_media_asset(
-                document_id, asset_id, block_id, None, error
+                document_id, asset_id, block_id, None
             )
 
         cached = cache.get(file_token)
@@ -440,7 +669,7 @@ class FeishuDocumentSource:
 
         if isinstance(cached, Exception):
             return self._failed_media_asset(
-                document_id, asset_id, block_id, file_token, str(cached)
+                document_id, asset_id, block_id, file_token
             )
 
         width = image.get("width") if isinstance(image, Mapping) else None
@@ -467,8 +696,12 @@ class FeishuDocumentSource:
         asset_id: str,
         block_id: str,
         file_token: str | None,
-        error: str,
-    ) -> tuple[MediaAsset, str]:
+    ) -> tuple[MediaAsset, IngestIssueRecord]:
+        issue = make_ingest_issue_record(
+            IngestIssueCode.MEDIA_DOWNLOAD_FAILED,
+            source_block_id=block_id,
+            asset_id=asset_id,
+        )
         return (
             MediaAsset(
                 asset_id=asset_id,
@@ -481,9 +714,9 @@ class FeishuDocumentSource:
                 mime_type="application/octet-stream",
                 size=0,
                 sha256="",
-                download_error=error,
+                download_error=issue.display_message,
             ),
-            f"阻塞：素材 {asset_id} 下载失败（Block {block_id}）：{error}",
+            issue,
         )
 
     @staticmethod

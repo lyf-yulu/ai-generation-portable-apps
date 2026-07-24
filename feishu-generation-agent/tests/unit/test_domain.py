@@ -1,13 +1,22 @@
 from inspect import signature
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from feishu_generation_agent.domain.artifact import Artifact, ProviderResult
-from feishu_generation_agent.domain.document import MediaAsset, SourceType
+from feishu_generation_agent.domain import document as document_domain
+from feishu_generation_agent.domain.document import (
+    MediaAsset,
+    SourceType,
+)
 from feishu_generation_agent.domain.errors import AgentError, ErrorCategory, ErrorDetail
-from feishu_generation_agent.domain.plan import GenerationTask, TaskPlan
+from feishu_generation_agent.domain.plan import (
+    ExcludedAsset,
+    GenerationTask,
+    TaskPlan,
+)
 from feishu_generation_agent.ports import (
     DeliveryWriter,
     DocumentSource,
@@ -241,6 +250,69 @@ def test_approved_subset_preserves_plan_order_and_document_summary():
     assert approved.document_summary == "两项生成需求"
 
 
+def test_task_plan_accepts_legacy_json_without_excluded_assets():
+    plan = TaskPlan.model_validate(
+        {"tasks": [image_task().model_dump(mode="json")]}
+    )
+
+    assert plan.excluded_assets == []
+    assert "excluded_assets" in TaskPlan.model_json_schema()["required"]
+
+
+def test_excluded_assets_require_chinese_unique_reasons_and_no_reference_overlap():
+    with pytest.raises(ValidationError, match="必须包含中文"):
+        ExcludedAsset(asset_id="asset-2", reason="not used")
+
+    with pytest.raises(ValidationError, match="duplicate excluded asset_id"):
+        TaskPlan(
+            tasks=[image_task()],
+            excluded_assets=[
+                ExcludedAsset(asset_id="asset-2", reason="供应商数量限制"),
+                ExcludedAsset(asset_id="asset-2", reason="用户没有选择"),
+            ],
+        )
+
+    with pytest.raises(ValidationError, match="referenced and excluded"):
+        TaskPlan(
+            tasks=[image_task()],
+            excluded_assets=[
+                ExcludedAsset(asset_id="asset-1", reason="用户没有选择")
+            ],
+        )
+
+
+def test_approved_subset_preserves_and_explains_assets_unused_by_selection():
+    plan = TaskPlan(
+        tasks=[
+            image_task("task-1"),
+            image_task(
+                "task-2",
+                reference_images=[
+                    {
+                        "asset_id": "asset-2",
+                        "role": "reference_image",
+                        "order": 1,
+                    }
+                ],
+            ),
+        ],
+        excluded_assets=[
+            ExcludedAsset(
+                asset_id="asset-3",
+                reason="供应商最多支持两张参考图，保留主体与场景图。",
+            )
+        ],
+    )
+
+    approved = plan.approved_subset(["task-1"], max_output_count=4)
+
+    assert [item.asset_id for item in approved.excluded_assets] == [
+        "asset-3",
+        "asset-2",
+    ]
+    assert "未选择" in approved.excluded_assets[1].reason
+
+
 def test_domain_models_dump_json_serializable_values():
     media = MediaAsset(
         asset_id="asset-1",
@@ -278,6 +350,224 @@ def test_agent_error_exposes_serializable_detail():
 
     assert str(error) == "任务无效"
     assert error.detail.model_dump(mode="json")["category"] == "validation_error"
+
+
+def test_ingest_issue_classification_supports_new_and_legacy_formats():
+    whole_sheet_issues = [
+        "阻塞：内嵌电子表格读取失败（Block sheet-block）：缺少 token",
+        "阻塞：内嵌电子表格 NuBUx5 读取失败（Block sheet-block）：导出失败",
+    ]
+    asset_issues = [
+        "素材失败：内嵌电子表格素材 sheet-1 保存失败",
+        "素材失败：素材 image-1 下载失败",
+        "阻塞：内嵌电子表格素材 sheet-legacy 保存失败",
+        "阻塞：素材 image-legacy 下载失败",
+    ]
+    records = document_domain.resolve_ingest_issue_records(
+        SimpleNamespace(
+            ingest_issue_records=[],
+            ingest_issues=[*whole_sheet_issues, *asset_issues],
+        )
+    )
+
+    assert [record.severity for record in records] == [
+        "blocking",
+        "blocking",
+        "asset",
+        "asset",
+        "asset",
+        "asset",
+    ]
+
+
+def test_structured_ingest_record_is_the_classification_source_of_truth():
+    assert hasattr(document_domain, "IngestIssueRecord")
+    record_type = document_domain.IngestIssueRecord
+    resolver = document_domain.resolve_ingest_issue_records
+    record = record_type(
+        severity="asset",
+        code="media_download_failed",
+        display_message="文档图片下载失败，其他素材可继续处理",
+        source_block_id="image-block",
+        asset_id="image-1",
+    )
+    document = SimpleNamespace(
+        ingest_issue_records=[record],
+        ingest_issues=["阻塞：内嵌电子表格 NuBUx5 读取失败X"],
+    )
+
+    resolved = resolver(document)
+
+    assert resolved == [record]
+    assert resolved[0].severity == "asset"
+
+
+def test_structured_ingest_record_rejects_unallowlisted_display_message():
+    assert hasattr(document_domain, "IngestIssueRecord")
+    with pytest.raises(ValidationError, match="do not match"):
+        document_domain.IngestIssueRecord(
+            severity="blocking",
+            code="sheet_export_failed",
+            display_message="Bearer sk-secret-value",
+            source_block_id="fiction-sheet",
+        )
+
+
+def test_structured_ingest_record_model_copy_revalidates_updates():
+    record = document_domain.make_ingest_issue_record(
+        document_domain.IngestIssueCode.MEDIA_DOWNLOAD_FAILED,
+        asset_id="image-1",
+    )
+
+    with pytest.raises(ValidationError, match="do not match"):
+        record.model_copy(update={"severity": "blocking"})
+
+
+def test_ingest_issue_resolver_revalidates_existing_model_instances():
+    record = document_domain.make_ingest_issue_record(
+        document_domain.IngestIssueCode.MEDIA_DOWNLOAD_FAILED,
+        asset_id="image-1",
+    )
+    forged = BaseModel.model_copy(
+        record,
+        update={
+            "severity": document_domain.IngestIssueSeverity.BLOCKING,
+        },
+    )
+
+    with pytest.raises(ValidationError, match="do not match"):
+        document_domain.resolve_ingest_issue_records(
+            SimpleNamespace(
+                ingest_issue_records=[forged],
+                ingest_issues=[],
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "unsafe_identifier",
+    [
+        "Bearer-secret-token",
+        "sk-live-12345678",
+        "image-sk-live-12345678",
+        "ark-live-12345678",
+        "block-ark-live-12345678",
+        "AKLT1234567890",
+        "image-AKLT1234567890",
+        "C:\\Users\\alice\\private.txt",
+    ],
+)
+def test_structured_ingest_record_rejects_secret_like_identifiers(
+    unsafe_identifier: str,
+):
+    with pytest.raises(ValidationError, match="identifier|pattern"):
+        document_domain.IngestIssueRecord(
+            severity="asset",
+            code="media_download_failed",
+            display_message="文档图片下载失败，其他素材可继续处理",
+            asset_id=unsafe_identifier,
+        )
+
+
+@pytest.mark.parametrize(
+    "legacy_issue",
+    [
+        (
+            "阻塞：内嵌电子表格 NuBUx5 读取失败（Block fiction-sheet）："
+            "/Users/alice/private/secret-token.xlsx"
+        ),
+        "阻塞：素材 image-old 下载失败：Bearer sk-secret-value",
+        "阻塞：内嵌电子表格 NuBUx5 读取失败X",
+    ],
+)
+def test_malformed_or_sensitive_legacy_ingest_issue_fails_closed(
+    legacy_issue: str,
+):
+    assert hasattr(document_domain, "resolve_ingest_issue_records")
+    records = document_domain.resolve_ingest_issue_records(
+        SimpleNamespace(ingest_issue_records=[], ingest_issues=[legacy_issue])
+    )
+
+    assert len(records) == 1
+    assert records[0].severity == "blocking"
+    assert records[0].code == "legacy_unknown"
+    assert records[0].display_message == (
+        "文档读取出现未知问题，请重新读取后再审批"
+    )
+    assert "secret" not in records[0].model_dump_json()
+    assert "/Users/" not in records[0].model_dump_json()
+    assert "Bearer" not in records[0].model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("legacy_issue", "severity", "code"),
+    [
+        (
+            "阻塞：内嵌电子表格素材 sheet-old 保存失败",
+            "asset",
+            "sheet_asset_save_failed",
+        ),
+        (
+            "阻塞：素材 image-old 下载失败",
+            "asset",
+            "media_download_failed",
+        ),
+        (
+            (
+                "素材失败：内嵌电子表格素材 sheet-current 保存失败"
+                "（Block fiction-sheet，Sheet NuBUx5）：图片保存失败，请稍后重试"
+            ),
+            "asset",
+            "sheet_asset_save_failed",
+        ),
+        (
+            (
+                "素材失败：素材 image-current 下载失败"
+                "（Block fiction-image）：图片下载或保存失败，请稍后重试"
+            ),
+            "asset",
+            "media_download_failed",
+        ),
+        (
+            "阻塞：内嵌电子表格 NuBUx5 读取失败（Block fiction-sheet）",
+            "blocking",
+            "legacy_sheet_read_failed",
+        ),
+    ],
+)
+def test_strict_standard_legacy_formats_migrate_deterministically(
+    legacy_issue: str,
+    severity: str,
+    code: str,
+):
+    assert hasattr(document_domain, "resolve_ingest_issue_records")
+    records = document_domain.resolve_ingest_issue_records(
+        SimpleNamespace(ingest_issue_records=[], ingest_issues=[legacy_issue])
+    )
+
+    assert [(record.severity, record.code) for record in records] == [
+        (severity, code)
+    ]
+
+
+def test_known_legacy_timeout_preserves_safe_actionable_reason():
+    assert hasattr(document_domain, "resolve_ingest_issue_records")
+    records = document_domain.resolve_ingest_issue_records(
+        SimpleNamespace(
+            ingest_issue_records=[],
+            ingest_issues=[
+                (
+                    "阻塞：内嵌电子表格 NuBUx5 读取失败"
+                    "（Block fiction-sheet）："
+                    "飞书电子表格导出超时，请稍后重试"
+                )
+            ],
+        )
+    )
+
+    assert records[0].severity == "blocking"
+    assert records[0].code == "sheet_export_timeout"
+    assert records[0].display_message == "飞书电子表格导出超时，请稍后重试"
 
 
 def test_provider_result_url_requires_explicit_untrusted_boundary() -> None:

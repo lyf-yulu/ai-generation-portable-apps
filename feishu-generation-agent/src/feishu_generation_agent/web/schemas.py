@@ -69,6 +69,27 @@ class ReferenceListRequest(BaseModel):
     reference_mode: ReferenceMode | None = None
 
 
+class PlannerPromptUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    prompt_text: str = Field(min_length=1, max_length=20_000)
+
+    @field_validator("prompt_text")
+    @classmethod
+    def validate_prompt_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("提示词不能为空白")
+        return value
+
+
+class PlannerPromptResponse(BaseModel):
+    mode: Literal["prime", "personal"]
+    editable: bool
+    prompt_text: str
+    version: int = Field(ge=0)
+    source: Literal["prime", "personal"]
+
+
 class BitableClaimResponse(BaseModel):
     run_id: str
 

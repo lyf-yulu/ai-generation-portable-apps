@@ -11,7 +11,11 @@ from feishu_generation_agent.domain.bitable import (
     BitableTaskSummary,
     TableTaskStatus,
 )
-from feishu_generation_agent.domain.document import RequirementRequest
+from feishu_generation_agent.domain.document import (
+    PlanningPromptSnapshot,
+    RequirementRequest,
+    build_planning_prompt_snapshot,
+)
 from feishu_generation_agent.graph.runtime import (
     GraphRuntime,
     RunConflict,
@@ -21,6 +25,7 @@ from feishu_generation_agent.integrations.feishu_bitable import (
     BitableSchema,
     FeishuBitableClient,
 )
+from feishu_generation_agent.integrations.planner import planner_system_prompt
 from feishu_generation_agent.storage.bitable_tasks import BitableTaskStore
 
 
@@ -133,7 +138,13 @@ class BitableMvpService:
             location.table_id,
         )
 
-    async def claim(self, record_id: str, category: str = "animation") -> str:
+    async def claim(
+        self,
+        record_id: str,
+        category: str = "animation",
+        *,
+        planning_prompt: PlanningPromptSnapshot | None = None,
+    ) -> str:
         del category
         location, schema = await self._prepared()
         tasks = await self._bitable.list_tasks(location, schema)
@@ -161,10 +172,18 @@ class BitableMvpService:
             thread_id=thread_id,
             reply_context={},
         )
+        if planning_prompt is None:
+            planning_prompt = build_planning_prompt_snapshot(
+                owner_user_id="prime-local",
+                source="prime",
+                version=0,
+                prompt_text=planner_system_prompt(),
+            )
         request = RequirementRequest(
             source_url=binding.source_url,
             trigger_type="bitable",
             reply_context={},
+            planning_prompt=planning_prompt,
         )
         await self._runtime.start_run(
             request,

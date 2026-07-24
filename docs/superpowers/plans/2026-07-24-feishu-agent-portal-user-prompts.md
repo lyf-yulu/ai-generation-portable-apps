@@ -1311,6 +1311,81 @@ git add feishu-generation-agent/src/feishu_generation_agent/domain/plan.py feish
 git commit -m "feat(agent): require explicit source asset coverage"
 ```
 
+- [ ] **Step 11: Add clone regression tests**
+
+In `tests/integration/test_api.py`, complete an original real LangGraph run
+whose approval edits the prompt, references, generation parameters, and
+exclusions. Clone it and assert:
+
+- the cloned approval plan equals the source `approved_plan`;
+- the cloned checkpoint stores that plan in both `draft_plan` and `task_plan`;
+- `approved_plan`, decision, execution records, artifacts, and delivery are
+  reset in the clone;
+- supplier submit counts do not increase before the clone is approved.
+
+Add a second case that removes `approved_plan` from the source checkpoint and
+asserts the same result is rebuilt from `draft_plan + approved_tasks`.
+
+- [ ] **Step 12: Verify clone regressions fail**
+
+Run:
+
+```bash
+cd feishu-generation-agent
+uv run pytest \
+  tests/integration/test_api.py::test_clone_uses_complete_approved_plan_without_generation \
+  tests/integration/test_api.py::test_clone_rebuilds_complete_plan_from_legacy_checkpoint \
+  -q
+```
+
+Expected: the cloned approval still contains the original draft instead of the
+approved edits.
+
+- [ ] **Step 13: Restore the approved plan before cloning**
+
+Expose one shared helper that returns a validated approved `TaskPlan`:
+
+```python
+def approved_plan_from_state(
+    state: AgentState,
+    *,
+    max_output_count: int,
+) -> TaskPlan
+```
+
+Prefer `state["approved_plan"]`; otherwise reconcile `draft_plan` with
+`approved_tasks`. In `clone_run_for_approval()`, write its JSON to both
+`draft_plan` and `task_plan`, retain its tasks as `approved_tasks`, then clear
+`approved_plan`, approval decision/revision, execution records, artifacts, and
+delivery before entering `waiting_approval`.
+
+- [ ] **Step 14: Run clone, Task 12, Task 11 and full regressions**
+
+Run:
+
+```bash
+cd feishu-generation-agent
+uv run pytest tests/integration/test_api.py -k clone -q
+uv run pytest tests/unit/test_domain.py tests/unit/test_planner.py \
+  tests/integration/test_api.py tests/graph/test_approval_graph.py -q
+uv run pytest tests/unit/test_feishu_source.py tests/unit/test_vision.py \
+  tests/unit/test_planner.py tests/graph/test_approval_graph.py -q
+uv run pytest -q
+node --test tests/frontend/*.test.cjs
+git diff --check
+```
+
+Expected: all suites pass and the diff has no whitespace errors.
+
+- [ ] **Step 15: Commit the review fix**
+
+```bash
+git add feishu-generation-agent/src/feishu_generation_agent/graph/nodes.py \
+  feishu-generation-agent/src/feishu_generation_agent/graph/runtime.py \
+  feishu-generation-agent/tests/integration/test_api.py
+git commit -m "fix(agent): restore approved plan when cloning runs"
+```
+
 ---
 
 ## Task 13: Full Regression, Real Read-Only Canary, and Configurable Deployment

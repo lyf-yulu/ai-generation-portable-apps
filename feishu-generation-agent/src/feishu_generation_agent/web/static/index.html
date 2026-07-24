@@ -4,13 +4,19 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>飞书生成任务审批工作区</title>
-    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="static/styles.css">
   </head>
   <body>
     <header class="topbar">
       <div>
         <p class="eyebrow">LOCAL GENERATION AGENT</p>
         <h1>飞书生成任务审批工作区</h1>
+      </div>
+      <div id="planner-prompt-entry" class="planner-prompt-entry" hidden>
+        <span id="planner-prompt-mode" class="planner-prompt-mode">使用 Prime</span>
+        <button id="planner-prompt-button" type="button" class="secondary" disabled>
+          计划提示词设置
+        </button>
       </div>
     </header>
 
@@ -86,12 +92,26 @@
         <p id="document-summary" class="document-summary"></p>
         <p class="document-meta">可编辑提示词、负面约束、生成参数与参考图片。</p>
         <div id="validation-issues" class="validation-issues" hidden></div>
+        <div id="blocking-ingest-issues" class="blocking-ingest-issues" role="alert" hidden></div>
+        <div id="asset-ingest-issues" class="asset-issue-message" hidden></div>
+        <div id="vision-issues" class="asset-issue-message" hidden></div>
         <div id="review-conflict" class="review-conflict" role="alert" hidden>
           <span id="review-conflict-text"></span>
           <button id="discard-review-draft" type="button" class="quiet-button">
             放弃本地修改并刷新
           </button>
         </div>
+        <section id="coverage-summary" class="coverage-summary" aria-label="素材覆盖">
+          <div class="panel-heading">
+            <h3>素材覆盖</h3>
+            <strong id="coverage-label">已使用 0 / 共 0 张</strong>
+          </div>
+          <p id="coverage-detail" class="mode-message"></p>
+          <div class="excluded-assets">
+            <h3>排除素材</h3>
+            <div id="excluded-asset-list" class="excluded-asset-list"></div>
+          </div>
+        </section>
         <div id="task-list" class="task-list"></div>
 
         <div class="feedback-box">
@@ -115,9 +135,33 @@
       </div>
     </footer>
 
-    <script src="/static/review-state.js" defer></script>
-    <script src="/static/bitable-state.js" defer></script>
-    <script src="/static/reference-upload-state.js" defer></script>
-    <script src="/static/app.js" defer></script>
+    <div id="planner-prompt-modal" class="modal-overlay" hidden>
+      <section class="planner-prompt-modal" role="dialog" aria-modal="true"
+        aria-labelledby="planner-prompt-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">PLANNER PROMPT</p>
+            <h2 id="planner-prompt-title">计划提示词设置</h2>
+          </div>
+          <button id="planner-prompt-close" type="button" class="quiet-button">关闭</button>
+        </div>
+        <p id="planner-prompt-modal-mode" class="mode-message">使用 Prime</p>
+        <label for="planner-prompt-text">计划提示词</label>
+        <textarea id="planner-prompt-text" rows="14" spellcheck="false"></textarea>
+        <p class="planner-prompt-note">修改只影响之后领取的新任务</p>
+        <p id="planner-prompt-feedback" class="planner-prompt-feedback" aria-live="polite"></p>
+        <div class="planner-prompt-actions">
+          <button id="planner-prompt-reset" type="button" class="secondary">恢复 Prime</button>
+          <button id="planner-prompt-save" type="button" class="primary">保存个人版本</button>
+        </div>
+      </section>
+    </div>
+
+    <script src="static/review-state.js" defer></script>
+    <script src="static/bitable-state.js" defer></script>
+    <script src="static/reference-upload-state.js" defer></script>
+    <script src="static/api-paths.js" defer></script>
+    <script src="static/planner-prompt-state.js" defer></script>
+    <script src="static/app.js" defer></script>
   </body>
 </html>

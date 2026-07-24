@@ -80,6 +80,18 @@ document.querySelectorAll('.app-tab').forEach(btn => btn.addEventListener('click
   document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
 }));
 
+// Iframe URLs are supplied by the Portal's app registry so they stay relative
+// to whichever origin, protocol, and hostname serves this Portal instance.
+async function initConfiguredIframes() {
+  const res = await api('/api/apps');
+  if (!res?.ok || !Array.isArray(res.apps)) return;
+  document.querySelectorAll('iframe[data-app]').forEach(iframe => {
+    const app = res.apps.find(item => item.name === iframe.dataset.app);
+    if (app?.mount === 'iframe' && app.iframe_url) iframe.src = app.iframe_url;
+  });
+}
+initConfiguredIframes();
+
 document.getElementById('closePreviewBtn').addEventListener('click', () => document.getElementById('previewDialog').close());
 document.getElementById('previewDialog').addEventListener('click', e => { if (e.target.id === 'previewDialog') e.target.close(); });
 
