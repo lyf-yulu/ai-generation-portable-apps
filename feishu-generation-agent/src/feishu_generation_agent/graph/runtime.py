@@ -12,14 +12,16 @@ from pydantic import ValidationError
 
 from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain.document import (
+    IngestIssueRecord,
+    IngestIssueCode,
+    IngestIssueSeverity,
     MediaAsset,
     NormalizedDocument,
     PlanningPromptSnapshot,
     RequirementRequest,
-    blocking_ingest_issues,
     build_planning_prompt_snapshot,
-    non_blocking_ingest_issues,
-    safe_ingest_issue_for_display,
+    make_ingest_issue_record,
+    resolve_ingest_issue_records,
 )
 from feishu_generation_agent.domain.errors import AgentError
 from feishu_generation_agent.ports import DeliveryWriter
@@ -553,7 +555,10 @@ class GraphRuntime:
             plan_model,
             state.get("media_assets", []),
         )
-        ingest_issues = self._document_ingest_issues(state)
+        ingest_issue_records = self._document_ingest_issue_records(state)
+        ingest_issues = [
+            record.display_message for record in ingest_issue_records
+        ]
         view = {
             "run_id": run_id,
             "thread_id": run["thread_id"],
@@ -610,14 +615,25 @@ class GraphRuntime:
                 "coverage": coverage,
                 "vision_descriptions": state.get("vision_descriptions", []),
                 "vision_issues": state.get("vision_issues", []),
-                "ingest_issues": ingest_issues,
-                "blocking_ingest_issues": blocking_ingest_issues(ingest_issues),
-                "asset_ingest_issues": non_blocking_ingest_issues(ingest_issues),
-                "validation_issues": [
-                    safe_ingest_issue_for_display(issue)
-                    for issue in state.get("validation_issues", [])
-                    if isinstance(issue, str)
+                "ingest_issue_records": [
+                    record.model_dump(mode="json")
+                    for record in ingest_issue_records
                 ],
+                "ingest_issues": ingest_issues,
+                "blocking_ingest_issues": [
+                    record.display_message
+                    for record in ingest_issue_records
+                    if record.severity is IngestIssueSeverity.BLOCKING
+                ],
+                "asset_ingest_issues": [
+                    record.display_message
+                    for record in ingest_issue_records
+                    if record.severity is IngestIssueSeverity.ASSET
+                ],
+                "validation_issues": self._safe_validation_issues(
+                    state,
+                    ingest_issue_records,
+                ),
                 "selected_task_ids": [
                     task.get("task_id")
                     for task in state.get("approved_tasks", [])
@@ -628,19 +644,52 @@ class GraphRuntime:
         return view
 
     @staticmethod
-    def _document_ingest_issues(state: dict[str, Any]) -> list[str]:
+    def _document_ingest_issue_records(
+        state: dict[str, Any],
+    ) -> list[IngestIssueRecord]:
         for key in ("normalized_document", "source_document"):
             document = state.get(key)
             if not isinstance(document, dict):
                 continue
-            issues = document.get("ingest_issues")
-            if isinstance(issues, list):
+            try:
+                return resolve_ingest_issue_records(document)
+            except ValidationError:
                 return [
-                    safe_ingest_issue_for_display(issue)
-                    for issue in issues
-                    if isinstance(issue, str) and issue
+                    make_ingest_issue_record(
+                        IngestIssueCode.LEGACY_UNKNOWN
+                    )
                 ]
         return []
+
+    @staticmethod
+    def _safe_validation_issues(
+        state: dict[str, Any],
+        records: list[IngestIssueRecord],
+    ) -> list[str]:
+        validation_issues = state.get("validation_issues")
+        if not isinstance(validation_issues, list):
+            return []
+        raw_issues: list[str] = []
+        for key in ("normalized_document", "source_document"):
+            document = state.get(key)
+            if isinstance(document, dict) and isinstance(
+                document.get("ingest_issues"), list
+            ):
+                raw_issues = [
+                    issue
+                    for issue in document["ingest_issues"]
+                    if isinstance(issue, str)
+                ]
+                break
+        replacements = {
+            raw: record.display_message
+            for raw, record in zip(raw_issues, records, strict=False)
+        }
+        return [
+            replacements.get(issue, issue)
+            for issue in validation_issues
+            if isinstance(issue, str)
+        ]
 
     async def resume_run(
         self,
@@ -971,7 +1020,11 @@ class GraphRuntime:
         if normalized is not None:
             try:
                 document = NormalizedDocument.model_validate(normalized)
-                validation_issues = blocking_ingest_issues(document.ingest_issues)
+                validation_issues = [
+                    record.display_message
+                    for record in resolve_ingest_issue_records(document)
+                    if record.severity is IngestIssueSeverity.BLOCKING
+                ]
                 validation_issues.extend(
                     validate_plan(
                         plan,
@@ -1062,8 +1115,11 @@ class GraphRuntime:
             normalized = state.get("normalized_document")
             if isinstance(normalized, dict):
                 document = NormalizedDocument.model_validate(normalized)
-                ingest_issues = blocking_ingest_issues(document.ingest_issues)
-                if ingest_issues:
+                issue_records = resolve_ingest_issue_records(document)
+                if any(
+                    record.severity is IngestIssueSeverity.BLOCKING
+                    for record in issue_records
+                ):
                     raise RunValidationError(
                         "文档存在阻断性读取问题，请修复源文档后重试"
                     )

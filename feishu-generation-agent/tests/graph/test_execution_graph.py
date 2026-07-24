@@ -1590,6 +1590,68 @@ async def test_old_asset_failure_checkpoint_remains_nonblocking(
 
 
 @pytest.mark.asyncio
+async def test_structured_asset_issue_controls_execution_without_text_matching(
+    fake_services: GraphServices,
+) -> None:
+    state, config = await _waiting_state(
+        fake_services,
+        "run-structured-asset-ingest",
+        "thread-structured-asset-ingest",
+    )
+    state["approved_tasks"] = state["draft_plan"]["tasks"]
+    state["normalized_document"]["ingest_issue_records"] = [
+        {
+            "severity": "asset",
+            "code": "media_download_failed",
+            "display_message": "文档图片下载失败，其他素材可继续处理",
+            "source_block_id": "image-block",
+            "asset_id": "image-1",
+        }
+    ]
+    state["normalized_document"]["ingest_issues"] = [
+        "阻塞：内嵌电子表格 NuBUx5 读取失败（Block fiction-sheet）"
+    ]
+
+    result = await execute_selected_tasks(
+        state,
+        config,
+        services=fake_services,
+    )
+
+    assert result["status"] == "verification_pending"
+    assert fake_services.video_generator.submit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_structured_blocking_issue_stops_old_checkpoint_execution(
+    fake_services: GraphServices,
+) -> None:
+    state, config = await _waiting_state(
+        fake_services,
+        "run-structured-blocking-ingest",
+        "thread-structured-blocking-ingest",
+    )
+    state["approved_tasks"] = state["draft_plan"]["tasks"]
+    state["normalized_document"]["ingest_issue_records"] = [
+        {
+            "severity": "blocking",
+            "code": "sheet_export_timeout",
+            "display_message": "飞书电子表格导出超时，请稍后重试",
+            "source_block_id": "fiction-sheet",
+            "asset_id": None,
+        }
+    ]
+    state["normalized_document"]["ingest_issues"] = []
+
+    with pytest.raises(AgentError) as caught:
+        await execute_selected_tasks(state, config, services=fake_services)
+
+    assert caught.value.detail.category == ErrorCategory.VALIDATION
+    assert await fake_services.repository.count_operations() == 0
+    _assert_zero_generation(fake_services)
+
+
+@pytest.mark.asyncio
 async def test_chiyun_mismatched_official_id_becomes_uncertain(
     fake_services: GraphServices,
 ) -> None:

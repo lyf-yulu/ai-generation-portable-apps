@@ -686,14 +686,17 @@ async def test_embedded_sheet_export_failure_is_a_blocking_ingest_issue(
 
     issue = next(issue for issue in document.ingest_issues if "阻塞" in issue)
     assert "fiction-sheet" in issue
-    assert "NuBUx5" in issue
     assert "读取失败" in issue
     assert secret not in issue
+    assert [
+        (record.severity, record.code, record.source_block_id)
+        for record in document.ingest_issue_records
+    ] == [("blocking", "sheet_export_failed", "fiction-sheet")]
     assert any(block.block_type == "sheet" for block in document.blocks)
     assert len(document.media_assets) == 1
 
 
-async def test_embedded_sheet_agent_error_uses_only_safe_user_message(
+async def test_embedded_sheet_timeout_preserves_allowlisted_user_message(
     file_store: FileStore,
 ):
     fixture = _fixture("feishu_docx_blocks.json")
@@ -701,7 +704,7 @@ async def test_embedded_sheet_agent_error_uses_only_safe_user_message(
         error=AgentError(
             ErrorDetail(
                 category=ErrorCategory.DOCUMENT,
-                message="电子表格暂时无法读取",
+                message="飞书电子表格导出超时，请稍后重试",
                 technical_detail="/Users/alice/private/secret-token.xlsx",
                 retryable=True,
             )
@@ -720,8 +723,12 @@ async def test_embedded_sheet_agent_error_uses_only_safe_user_message(
     )
 
     joined = "；".join(document.ingest_issues)
-    assert "电子表格暂时无法读取" in joined
+    assert "飞书电子表格导出超时，请稍后重试" in joined
     assert "secret-token" not in joined
+    assert document.ingest_issue_records[0].code == "sheet_export_timeout"
+    assert document.ingest_issue_records[0].display_message == (
+        "飞书电子表格导出超时，请稍后重试"
+    )
 
 
 @pytest.mark.parametrize(
@@ -766,8 +773,11 @@ async def test_embedded_sheet_blocks_only_when_export_is_completely_empty(
     sheet_issues = [
         issue for issue in document.ingest_issues if "内嵌电子表格" in issue
     ]
-    assert any("导出结果为空" in issue for issue in sheet_issues) is blocked
     assert any(issue.startswith("阻塞：") for issue in sheet_issues) is blocked
+    if blocked:
+        assert document.ingest_issue_records[0].code == "sheet_export_empty"
+    else:
+        assert document.ingest_issue_records == []
 
 
 async def test_malformed_sheet_image_keeps_others_and_reports_issue(
@@ -814,11 +824,13 @@ async def test_malformed_sheet_image_keeps_others_and_reports_issue(
     assert sheet_assets[1].download_error is None
     assert sheet_assets[1].local_path.is_file()
     assert any(
-        issue.startswith("素材失败：")
-        and "fiction-sheet" in issue
-        and sheet_assets[0].asset_id in issue
+        issue == "素材失败：内嵌电子表格素材保存失败"
         for issue in document.ingest_issues
     )
+    assert document.ingest_issue_records[0].severity == "asset"
+    assert document.ingest_issue_records[0].code == "sheet_asset_save_failed"
+    assert document.ingest_issue_records[0].source_block_id == "fiction-sheet"
+    assert document.ingest_issue_records[0].asset_id is None
 
 
 async def test_sheet_file_store_oserror_path_is_not_exposed(
@@ -861,7 +873,9 @@ async def test_sheet_file_store_oserror_path_is_not_exposed(
         for asset in document.media_assets
         if asset.origin == "feishu_embedded_sheet"
     )
-    assert sheet_asset.download_error == "图片保存失败，请稍后重试"
+    assert sheet_asset.download_error == (
+        "电子表格图片保存失败，其他素材可继续处理"
+    )
     assert secret not in sheet_asset.download_error
     assert secret not in "；".join(document.ingest_issues)
 
@@ -1119,7 +1133,7 @@ async def test_image_download_failure_is_nonblocking_and_visible(
     assert asset.size == 0
     assert asset.sha256 == ""
     assert asset.mime_type == "application/octet-stream"
-    assert asset.download_error == "图片下载或保存失败，请稍后重试"
+    assert asset.download_error == "文档图片下载失败，其他素材可继续处理"
     assert secret not in asset.download_error
     assert asset.local_path == Path("__missing__") / "doccn123" / "image-1.missing"
     assert not asset.local_path.exists()
@@ -1131,6 +1145,10 @@ async def test_image_download_failure_is_nonblocking_and_visible(
         issue.startswith("阻塞：") for issue in document.ingest_issues
     )
     assert secret not in "；".join(document.ingest_issues)
+    assert [
+        (record.severity, record.code, record.asset_id)
+        for record in document.ingest_issue_records
+    ] == [("asset", "media_download_failed", "image-1")]
 
 
 async def test_file_store_oserror_path_is_not_exposed_in_asset_or_issue(
@@ -1163,7 +1181,7 @@ async def test_file_store_oserror_path_is_not_exposed_in_asset_or_issue(
     )
 
     assert document.media_assets[0].download_error == (
-        "图片下载或保存失败，请稍后重试"
+        "文档图片下载失败，其他素材可继续处理"
     )
     assert secret not in document.media_assets[0].download_error
     assert secret not in "；".join(document.ingest_issues)

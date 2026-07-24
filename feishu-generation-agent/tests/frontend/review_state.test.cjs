@@ -98,6 +98,7 @@ test("new ingest issue state is part of server identity and survives the draft v
   initial.approval.blocking_ingest_issues = [];
   initial.approval.asset_ingest_issues = [];
   initial.approval.vision_issues = [];
+  initial.approval.ingest_issue_records = [];
   let state = ReviewState.mergeServerView(
     ReviewState.createReviewState(),
     initial,
@@ -105,9 +106,14 @@ test("new ingest issue state is part of server identity and survives the draft v
   state = ReviewState.patchTask(state, "task-1", { prompt: "本地编辑" });
 
   const updated = view();
-  updated.approval.blocking_ingest_issues = ["阻塞：内嵌电子表格读取失败"];
-  updated.approval.asset_ingest_issues = ["素材失败：图片 asset-2 保存失败"];
+  updated.approval.blocking_ingest_issues = [];
+  updated.approval.asset_ingest_issues = [];
   updated.approval.vision_issues = ["素材 asset-2 视觉分析失败"];
+  updated.approval.ingest_issue_records = [{
+    severity: "blocking",
+    code: "legacy_unknown",
+    display_message: "文档读取出现未知问题，请重新读取后再审批",
+  }];
   state = ReviewState.mergeServerView(state, updated);
 
   assert.equal(
@@ -117,12 +123,16 @@ test("new ingest issue state is part of server identity and survives the draft v
   state = ReviewState.discardLocalChanges(state);
   const draft = ReviewState.draftView(state);
   assert.deepEqual(
-    draft.approval.blocking_ingest_issues,
-    ["阻塞：内嵌电子表格读取失败"],
+    draft.approval.ingest_issue_records,
+    [{
+      severity: "blocking",
+      code: "legacy_unknown",
+      display_message: "文档读取出现未知问题，请重新读取后再审批",
+    }],
   );
   assert.deepEqual(
     draft.approval.asset_ingest_issues,
-    ["素材失败：图片 asset-2 保存失败"],
+    [],
   );
   assert.deepEqual(
     draft.approval.vision_issues,

@@ -20,8 +20,9 @@ from feishu_generation_agent.domain.document import (
     PlanningPromptSnapshot,
     RequirementRequest,
     VisionDescription,
-    blocking_ingest_issues,
+    IngestIssueSeverity,
     build_planning_prompt_snapshot,
+    resolve_ingest_issue_records,
 )
 from feishu_generation_agent.domain.errors import (
     AgentError,
@@ -450,7 +451,11 @@ async def validate_planned_tasks(
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
-        issues = blocking_ingest_issues(document.ingest_issues)
+        issues = [
+            record.display_message
+            for record in resolve_ingest_issue_records(document)
+            if record.severity is IngestIssueSeverity.BLOCKING
+        ]
         issues.extend(
             validate_plan(
                 plan,
@@ -636,7 +641,11 @@ async def revalidate_approval(
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
-        issues = blocking_ingest_issues(document.ingest_issues)
+        issues = [
+            record.display_message
+            for record in resolve_ingest_issue_records(document)
+            if record.severity is IngestIssueSeverity.BLOCKING
+        ]
         issues.extend(
             validate_plan(
                 selected_plan,
@@ -1375,7 +1384,11 @@ async def execute_selected_tasks(
             state,
             max_output_count=services.settings.max_output_count,
         )
-        issues = blocking_ingest_issues(document.ingest_issues)
+        issues = [
+            record.display_message
+            for record in resolve_ingest_issue_records(document)
+            if record.severity is IngestIssueSeverity.BLOCKING
+        ]
         issues.extend(
             validate_plan(
                 plan,

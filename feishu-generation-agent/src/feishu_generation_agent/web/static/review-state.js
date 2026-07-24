@@ -37,6 +37,7 @@
       media_assets: approval.media_assets || [],
       excluded_assets: approval.excluded_assets || [],
       coverage: approval.coverage || null,
+      ingest_issue_records: approval.ingest_issue_records || [],
       ingest_issues: approval.ingest_issues || [],
       blocking_ingest_issues: approval.blocking_ingest_issues || [],
       asset_ingest_issues: approval.asset_ingest_issues || [],

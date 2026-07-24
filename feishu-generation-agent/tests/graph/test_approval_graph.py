@@ -578,7 +578,9 @@ async def test_blocking_ingest_issue_is_visible_and_blocks_edited_approval(
     )
 
     payload = _interrupt_payload(first)
-    assert payload["validation_issues"] == [issue]
+    assert payload["validation_issues"] == [
+        "飞书电子表格读取失败，请重新读取后再审批"
+    ]
     edited_tasks = payload["draft_plan"]["tasks"]
     edited_tasks[0]["prompt"] += "，保持构图不变"
     with pytest.raises(AgentError) as raised:

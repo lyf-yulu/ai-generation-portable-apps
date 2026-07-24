@@ -5,13 +5,15 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from feishu_generation_agent.domain.document import (
-    BLOCKING_INGEST_ISSUE_PREFIX,
-    NON_BLOCKING_INGEST_ISSUE_PREFIX,
     DocumentBlock,
+    IngestIssueCode,
+    IngestIssueRecord,
     MediaAsset,
     NormalizedDocument,
     RequirementRequest,
     SourceType,
+    legacy_ingest_issue_text,
+    make_ingest_issue_record,
 )
 from feishu_generation_agent.domain.errors import (
     AgentError,
@@ -104,7 +106,7 @@ class FeishuDocumentSource:
 
         normalized_blocks: list[DocumentBlock] = []
         media_assets: list[MediaAsset] = []
-        ingest_issues: list[str] = []
+        ingest_issue_records: list[IngestIssueRecord] = []
         text_lines: list[str] = []
         media_cache: dict[str, StoredFile | Exception] = {}
         normal_image_count = 0
@@ -123,14 +125,14 @@ class FeishuDocumentSource:
                     text,
                     sheet_text_lines,
                     sheet_assets,
-                    sheet_issues,
+                    sheet_issue_records,
                 ) = await self._embedded_sheet(
                     raw,
                     document_id=document_id,
                 )
                 text_lines.extend(sheet_text_lines)
                 media_assets.extend(sheet_assets)
-                ingest_issues.extend(sheet_issues)
+                ingest_issue_records.extend(sheet_issue_records)
             else:
                 if text:
                     text_lines.append(f"[block:{block_id}] {text}")
@@ -139,15 +141,15 @@ class FeishuDocumentSource:
                 normal_image_count += 1
                 image_asset_id = f"image-{normal_image_count}"
                 text_lines.append(f"[image:{image_asset_id}]")
-                asset, issue = await self._media_asset(
+                asset, issue_record = await self._media_asset(
                     raw,
                     document_id=document_id,
                     asset_id=image_asset_id,
                     cache=media_cache,
                 )
                 media_assets.append(asset)
-                if issue is not None:
-                    ingest_issues.append(issue)
+                if issue_record is not None:
+                    ingest_issue_records.append(issue_record)
 
             normalized_blocks.append(
                 DocumentBlock(
@@ -172,7 +174,11 @@ class FeishuDocumentSource:
             blocks=normalized_blocks,
             text_view="\n".join(text_lines),
             media_assets=media_assets,
-            ingest_issues=ingest_issues,
+            ingest_issue_records=ingest_issue_records,
+            ingest_issues=[
+                legacy_ingest_issue_text(record)
+                for record in ingest_issue_records
+            ],
         )
 
     async def _embedded_sheet(
@@ -180,59 +186,57 @@ class FeishuDocumentSource:
         raw: dict[str, Any],
         *,
         document_id: str,
-    ) -> tuple[str, list[str], list[MediaAsset], list[str]]:
+    ) -> tuple[str, list[str], list[MediaAsset], list[IngestIssueRecord]]:
         block_id = raw["block_id"]
         sheet = raw.get("sheet")
         token = sheet.get("token") if isinstance(sheet, Mapping) else None
         if not isinstance(token, str) or not token:
-            issue = (
-                f"{BLOCKING_INGEST_ISSUE_PREFIX}"
-                f"内嵌电子表格读取失败（Block {block_id}）："
-                "Sheet Block 缺少 token"
+            issue = make_ingest_issue_record(
+                IngestIssueCode.SHEET_REFERENCE_INVALID,
+                source_block_id=block_id,
             )
             return "", [], [], [issue]
         try:
             ref = parse_sheet_block_token(token)
         except (TypeError, ValueError):
-            issue = (
-                f"{BLOCKING_INGEST_ISSUE_PREFIX}"
-                f"内嵌电子表格读取失败（Block {block_id}）："
-                "电子表格引用无效"
+            issue = make_ingest_issue_record(
+                IngestIssueCode.SHEET_REFERENCE_INVALID,
+                source_block_id=block_id,
             )
             return "", [], [], [issue]
 
         if self._sheet_exporter is None:
-            issue = (
-                f"{BLOCKING_INGEST_ISSUE_PREFIX}"
-                f"内嵌电子表格 {ref.sheet_id} 读取失败"
-                f"（Block {block_id}）：未配置电子表格导出器"
+            issue = make_ingest_issue_record(
+                IngestIssueCode.SHEET_EXPORTER_UNAVAILABLE,
+                source_block_id=block_id,
             )
             return "", [], [], [issue]
 
         try:
             extracted = await self._sheet_exporter.export(ref)
         except Exception as exc:
-            message = self._safe_exception_message(
-                exc,
-                "电子表格导出失败，请稍后重试",
+            code = (
+                IngestIssueCode.SHEET_EXPORT_TIMEOUT
+                if isinstance(exc, AgentError)
+                and exc.detail.message
+                == "飞书电子表格导出超时，请稍后重试"
+                else IngestIssueCode.SHEET_EXPORT_FAILED
             )
-            issue = (
-                f"{BLOCKING_INGEST_ISSUE_PREFIX}"
-                f"内嵌电子表格 {ref.sheet_id} 读取失败"
-                f"（Block {block_id}）：{message}"
+            issue = make_ingest_issue_record(
+                code,
+                source_block_id=block_id,
             )
             return "", [], [], [issue]
         if not extracted.text_lines and not extracted.images:
-            issue = (
-                f"{BLOCKING_INGEST_ISSUE_PREFIX}"
-                f"内嵌电子表格 {ref.sheet_id} 读取失败"
-                f"（Block {block_id}）：导出结果为空"
+            issue = make_ingest_issue_record(
+                IngestIssueCode.SHEET_EXPORT_EMPTY,
+                source_block_id=block_id,
             )
             return "", [], [], [issue]
 
         sheet_text_lines = list(extracted.text_lines)
         assets: list[MediaAsset] = []
-        issues: list[str] = []
+        issues: list[IngestIssueRecord] = []
         for image in self._deduplicate_sheet_images(
             extracted.images
         ):
@@ -284,7 +288,7 @@ class FeishuDocumentSource:
         document_id: str,
         sheet_id: str,
         block_id: str,
-    ) -> tuple[MediaAsset, list[str], str | None]:
+    ) -> tuple[MediaAsset, list[str], IngestIssueRecord | None]:
         digest = hashlib.sha256(image.content).hexdigest()
         first_anchor = image.anchors[0] if image.anchors else None
         asset_id = self._sheet_asset_id(
@@ -315,10 +319,10 @@ class FeishuDocumentSource:
                 image.media_name,
                 image.content,
             )
-        except Exception as exc:
-            message = self._safe_exception_message(
-                exc,
-                "图片保存失败，请稍后重试",
+        except Exception:
+            issue = make_ingest_issue_record(
+                IngestIssueCode.SHEET_ASSET_SAVE_FAILED,
+                source_block_id=block_id,
             )
             asset = MediaAsset(
                 asset_id=asset_id,
@@ -330,12 +334,7 @@ class FeishuDocumentSource:
                 mime_type="application/octet-stream",
                 size=0,
                 sha256="",
-                download_error=message,
-            )
-            issue = (
-                f"{NON_BLOCKING_INGEST_ISSUE_PREFIX}"
-                f"内嵌电子表格素材 {asset_id} 保存失败"
-                f"（Block {block_id}，Sheet {sheet_id}）：{message}"
+                download_error=issue.display_message,
             )
             return asset, anchor_lines, issue
 
@@ -648,14 +647,13 @@ class FeishuDocumentSource:
         document_id: str,
         asset_id: str,
         cache: dict[str, StoredFile | Exception],
-    ) -> tuple[MediaAsset, str | None]:
+    ) -> tuple[MediaAsset, IngestIssueRecord | None]:
         image = raw.get("image")
         file_token = image.get("token") if isinstance(image, Mapping) else None
         block_id = raw["block_id"]
         if not isinstance(file_token, str) or not file_token:
-            error = "图片 Block 缺少 file_token"
             return self._failed_media_asset(
-                document_id, asset_id, block_id, None, error
+                document_id, asset_id, block_id, None
             )
 
         cached = cache.get(file_token)
@@ -670,12 +668,8 @@ class FeishuDocumentSource:
             cache[file_token] = cached
 
         if isinstance(cached, Exception):
-            message = self._safe_exception_message(
-                cached,
-                "图片下载或保存失败，请稍后重试",
-            )
             return self._failed_media_asset(
-                document_id, asset_id, block_id, file_token, message
+                document_id, asset_id, block_id, file_token
             )
 
         width = image.get("width") if isinstance(image, Mapping) else None
@@ -702,8 +696,12 @@ class FeishuDocumentSource:
         asset_id: str,
         block_id: str,
         file_token: str | None,
-        error: str,
-    ) -> tuple[MediaAsset, str]:
+    ) -> tuple[MediaAsset, IngestIssueRecord]:
+        issue = make_ingest_issue_record(
+            IngestIssueCode.MEDIA_DOWNLOAD_FAILED,
+            source_block_id=block_id,
+            asset_id=asset_id,
+        )
         return (
             MediaAsset(
                 asset_id=asset_id,
@@ -716,10 +714,9 @@ class FeishuDocumentSource:
                 mime_type="application/octet-stream",
                 size=0,
                 sha256="",
-                download_error=error,
+                download_error=issue.display_message,
             ),
-            f"{NON_BLOCKING_INGEST_ISSUE_PREFIX}"
-            f"素材 {asset_id} 下载失败（Block {block_id}）：{error}",
+            issue,
         )
 
     @staticmethod
@@ -732,12 +729,6 @@ class FeishuDocumentSource:
                 return None
             current = current.get(key)
         return current if isinstance(current, Mapping) else None
-
-    @staticmethod
-    def _safe_exception_message(exc: Exception, fallback: str) -> str:
-        if isinstance(exc, AgentError) and exc.detail.message:
-            return exc.detail.message
-        return fallback
 
     @staticmethod
     def _string_or_none(value: Any) -> str | None:

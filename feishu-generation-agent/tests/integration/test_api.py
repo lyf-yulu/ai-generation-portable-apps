@@ -1244,8 +1244,9 @@ async def test_run_view_exposes_blocking_and_nonblocking_ingest_issues(
                 "阻塞：内嵌电子表格 NuBUx5 读取失败"
                 "（Block fiction-sheet）：/Users/alice/private/secret-token.xlsx"
             ),
-            "素材失败：图片 asset-failed 保存失败",
-            "阻塞：素材 image-legacy 下载失败：/Volumes/private/token.png",
+            "阻塞：素材 image-old 下载失败：Bearer sk-secret-value",
+            "阻塞：内嵌电子表格 NuBUx5 读取失败X",
+            "阻塞：素材 image-legacy 下载失败",
         ]
         state["source_document"] = copy.deepcopy(state["normalized_document"])
         state["validation_issues"] = [
@@ -1258,28 +1259,39 @@ async def test_run_view_exposes_blocking_and_nonblocking_ingest_issues(
         view = (await client.get(f"/api/runs/{run_id}")).json()
 
         assert view["approval"]["ingest_issues"] == [
-            "阻塞：内嵌电子表格读取失败，请检查文档后重试",
-            "素材失败：图片 asset-failed 保存失败",
-            "素材失败：文档图片下载失败",
+            "文档读取出现未知问题，请重新读取后再审批",
+            "文档读取出现未知问题，请重新读取后再审批",
+            "文档读取出现未知问题，请重新读取后再审批",
+            "文档图片下载失败，其他素材可继续处理",
         ]
         assert view["approval"]["blocking_ingest_issues"] == [
-            "阻塞：内嵌电子表格读取失败，请检查文档后重试"
+            "文档读取出现未知问题，请重新读取后再审批",
+            "文档读取出现未知问题，请重新读取后再审批",
+            "文档读取出现未知问题，请重新读取后再审批",
         ]
         assert view["approval"]["asset_ingest_issues"] == [
-            "素材失败：图片 asset-failed 保存失败",
-            "素材失败：文档图片下载失败",
+            "文档图片下载失败，其他素材可继续处理",
+        ]
+        assert [
+            (record["severity"], record["code"])
+            for record in view["approval"]["ingest_issue_records"]
+        ] == [
+            ("blocking", "legacy_unknown"),
+            ("blocking", "legacy_unknown"),
+            ("blocking", "legacy_unknown"),
+            ("asset", "media_download_failed"),
         ]
         assert view["approval"]["vision_issues"] == [
             "素材 asset-failed 视觉分析失败：图片无法识别"
         ]
         assert view["approval"]["coverage"]["failed_count"] == 1
         assert view["approval"]["validation_issues"] == [
-            "阻塞：内嵌电子表格读取失败，请检查文档后重试"
+            "文档读取出现未知问题，请重新读取后再审批"
         ]
         assert "secret-token" not in (await client.get(f"/api/runs/{run_id}")).text
-        assert "/Volumes/private" not in (
-            await client.get(f"/api/runs/{run_id}")
-        ).text
+        response_text = (await client.get(f"/api/runs/{run_id}")).text
+        assert "Bearer" not in response_text
+        assert "读取失败X" not in response_text
 
 
 async def test_blocking_ingest_issue_returns_422_before_edited_approval_resume(
@@ -1321,6 +1333,48 @@ async def test_blocking_ingest_issue_returns_422_before_edited_approval_resume(
         assert "文档存在阻断性读取问题" in response.text
         assert "secret-token" not in response.text
         assert graph.resume_calls == 0
+
+
+async def test_structured_asset_issue_drives_api_view_and_approval(
+    tmp_path: Path,
+):
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={"source_url": "https://acme.feishu.cn/docx/record-source"},
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        state["normalized_document"] = _normalized_document(state["media_assets"])
+        state["normalized_document"]["ingest_issue_records"] = [
+            {
+                "severity": "asset",
+                "code": "media_download_failed",
+                "display_message": "文档图片下载失败，其他素材可继续处理",
+                "source_block_id": "image-block",
+                "asset_id": "image-1",
+            }
+        ]
+        state["normalized_document"]["ingest_issues"] = [
+            "阻塞：内嵌电子表格 NuBUx5 读取失败X"
+        ]
+        state["source_document"] = copy.deepcopy(state["normalized_document"])
+
+        view = (await client.get(f"/api/runs/{run_id}")).json()
+        response = await client.post(
+            f"/api/runs/{run_id}/decision",
+            json={"action": "approve", "selected_task_ids": ["task-1"]},
+        )
+
+        assert view["approval"]["ingest_issue_records"][0]["severity"] == "asset"
+        assert view["approval"]["blocking_ingest_issues"] == []
+        assert response.status_code == 202
+        assert graph.resume_calls == 1
 
 
 async def test_delete_waiting_run_removes_api_view(tmp_path: Path):
