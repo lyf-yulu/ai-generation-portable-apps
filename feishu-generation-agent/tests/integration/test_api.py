@@ -401,6 +401,58 @@ async def test_planner_prompt_rejects_malformed_or_overlong_identity(
     assert response.status_code == 400
 
 
+@pytest.mark.parametrize(
+    ("headers", "expected_status"),
+    [
+        ({}, 403),
+        ({"X-Portal-User-Id": " ", "X-Username": "%E7%94%B2"}, 400),
+    ],
+    ids=["anonymous", "malformed-identity"],
+)
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {"prompt_text": " \t\n"},
+        {"prompt_text": "secret-prompt-" + "文" * 20_000},
+    ],
+    ids=["missing-body", "blank-prompt", "overlong-prompt"],
+)
+async def test_planner_prompt_put_checks_identity_before_invalid_body(
+    tmp_path: Path,
+    headers: dict[str, str],
+    expected_status: int,
+    payload: dict[str, str] | None,
+) -> None:
+    async with _prompt_environment(tmp_path) as client:
+        request_kwargs = {"headers": headers}
+        if payload is not None:
+            request_kwargs["json"] = payload
+        response = await client.put("/api/planner-prompt", **request_kwargs)
+
+    assert response.status_code == expected_status
+    assert "secret-prompt-" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected_status"),
+    [
+        ({}, 403),
+        ({"X-Portal-User-Id": " ", "X-Username": "%E7%94%B2"}, 400),
+    ],
+    ids=["anonymous", "malformed-identity"],
+)
+async def test_planner_prompt_delete_checks_identity(
+    tmp_path: Path,
+    headers: dict[str, str],
+    expected_status: int,
+) -> None:
+    async with _prompt_environment(tmp_path) as client:
+        response = await client.delete("/api/planner-prompt", headers=headers)
+
+    assert response.status_code == expected_status
+
+
 async def _wait_for_status(
     client: httpx.AsyncClient,
     run_id: str,

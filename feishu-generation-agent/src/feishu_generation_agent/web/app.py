@@ -2,10 +2,11 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from typing import Any, AsyncIterator, Literal
+from typing import Annotated, Any, AsyncIterator, Literal
 from urllib.parse import unquote_to_bytes
 
 from fastapi import (
+    Depends,
     FastAPI,
     File,
     Form,
@@ -84,6 +85,13 @@ def current_identity(request: Request) -> RequestIdentity:
         username=username,
         is_portal=True,
     )
+
+
+def require_portal_identity(request: Request) -> RequestIdentity:
+    identity = current_identity(request)
+    if not identity.is_portal:
+        raise HTTPException(status_code=403, detail="本地 Prime 提示词不可修改")
+    return identity
 
 
 def _validate_portal_user_id(value: str) -> None:
@@ -421,12 +429,10 @@ def create_app(
 
     @app.put("/api/planner-prompt", response_model=PlannerPromptResponse)
     async def update_planner_prompt(
-        payload: PlannerPromptUpdate,
         request: Request,
+        identity: Annotated[RequestIdentity, Depends(require_portal_identity)],
+        payload: PlannerPromptUpdate,
     ) -> PlannerPromptResponse:
-        identity = current_identity(request)
-        if not identity.is_portal:
-            raise HTTPException(status_code=403, detail="本地 Prime 提示词不可修改")
         try:
             profile = await get_planner_prompt_store(request).save(
                 portal_user_id=identity.owner_user_id,
