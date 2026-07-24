@@ -320,6 +320,39 @@ async def test_service_hides_owned_run_from_wrong_owner_mutations(
         await store.close()
 
 
+async def test_service_distinguishes_missing_and_wrong_owner_production_runs(
+    tmp_path,
+) -> None:
+    class Bitable:
+        async def ensure_schema(self, location):
+            return object()
+
+        async def list_tasks(self, location, schema, *, include_completed):
+            return [_task()]
+
+    service, store = await _production_service(
+        tmp_path,
+        bitable=Bitable(),
+        sources={"animation": ProductionTaskSource(_location(), "动画类")},
+    )
+    try:
+        run_id = await service.claim(
+            "rec-no-maker", owner_user_id="user-a"
+        )
+        assert await service.is_production_run(
+            run_id, owner_user_id="user-a"
+        )
+        assert not await service.is_production_run(
+            "missing-run", owner_user_id="user-a"
+        )
+        with pytest.raises(RunNotFound):
+            await service.is_production_run(
+                run_id, owner_user_id="user-b"
+            )
+    finally:
+        await store.close()
+
+
 @pytest.mark.parametrize(
     "runtime_status",
     ["succeeded", "completed_with_errors", "failed", "cancelled", "timed_out"],

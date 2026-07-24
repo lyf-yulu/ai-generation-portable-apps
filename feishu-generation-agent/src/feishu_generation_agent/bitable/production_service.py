@@ -146,6 +146,16 @@ class ProductionBitableService:
         target = await self._store.get_result_target(_SHARED_RESULT_TARGET)
         return target.url if target is not None else None
 
+    async def is_production_run(
+        self, run_id: str, *, owner_user_id: str = "prime-local"
+    ) -> bool:
+        state = await self._store.run_owner_state(
+            run_id, owner_user_id=owner_user_id
+        )
+        if state == "other":
+            raise RunNotFound("多维表格运行不存在")
+        return state == "owned"
+
     async def rerun(
         self, run_id: str, *, owner_user_id: str = "prime-local"
     ) -> str:

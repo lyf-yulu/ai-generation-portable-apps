@@ -417,6 +417,36 @@ def create_app(
             return {}
         return {"owner_user_id": owner_user_id}
 
+    async def filter_bindings_by_runtime_owner(
+        active_runtime: Any,
+        bindings: list[Any],
+        owner_user_id: str,
+    ) -> list[Any]:
+        repository = getattr(active_runtime, "repository", None)
+        get_run = getattr(repository, "get_run", None)
+        if not callable(get_run):
+            return []
+        visible: list[Any] = []
+        for binding in bindings:
+            if await get_run(
+                binding.run_id, owner_user_id=owner_user_id
+            ) is not None:
+                visible.append(binding)
+        return visible
+
+    async def production_run_kind(
+        active_bitable: Any,
+        run_id: str,
+        owner_user_id: str,
+    ) -> bool | None:
+        classifier = getattr(active_bitable, "is_production_run", None)
+        if not callable(classifier):
+            return None
+        return await classifier(
+            run_id,
+            **owner_argument(classifier, owner_user_id),
+        )
+
     def get_planner_prompt_store(request: Request) -> PlannerPromptStore:
         active = getattr(request.app.state, "planner_prompt_store", None)
         if active is None:
@@ -546,11 +576,18 @@ def create_app(
         active = get_bitable_service(request)
         identity = current_identity(request)
         try:
-            bindings = await active.active_runs(
-                **owner_argument(
-                    active.active_runs, identity.owner_user_id
-                )
+            ownership = owner_argument(
+                active.active_runs, identity.owner_user_id
             )
+            bindings = await active.active_runs(
+                **ownership
+            )
+            if not ownership:
+                bindings = await filter_bindings_by_runtime_owner(
+                    get_runtime(request),
+                    bindings,
+                    identity.owner_user_id,
+                )
         except Exception as exc:
             raise_bitable_error(exc)
         return [
@@ -730,7 +767,14 @@ def create_app(
             await ensure_owned_run(active, run_id, identity.owner_user_id)
             active_bitable = getattr(request.app.state, "bitable_service", None)
             validate_approval = getattr(active_bitable, "validate_approval", None)
-            if payload.action == "approve" and callable(validate_approval):
+            production_kind = await production_run_kind(
+                active_bitable, run_id, identity.owner_user_id
+            )
+            if (
+                payload.action == "approve"
+                and callable(validate_approval)
+                and production_kind is not False
+            ):
                 await validate_approval(
                     run_id,
                     **owner_argument(
@@ -774,7 +818,10 @@ def create_app(
             await ensure_owned_run(
                 runtime_for_owner, run_id, identity.owner_user_id
             )
-            if active_bitable is not None:
+            production_kind = await production_run_kind(
+                active_bitable, run_id, identity.owner_user_id
+            )
+            if active_bitable is not None and production_kind is not False:
                 with runtime_owner_scope(
                     runtime_for_owner, identity.owner_user_id
                 ):
@@ -785,8 +832,10 @@ def create_app(
                         ),
                     )
             else:
-                with runtime_owner_scope(active, identity.owner_user_id):
-                    await active.delete_run(run_id)
+                with runtime_owner_scope(
+                    runtime_for_owner, identity.owner_user_id
+                ):
+                    await runtime_for_owner.delete_run(run_id)
         except (RunNotFound, RunConflict, RunValidationError) as exc:
             raise_runtime_error(exc)
         return {"run_id": run_id, "status": "deleted"}

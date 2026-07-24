@@ -17,7 +17,7 @@ from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain.document import RequirementRequest
 from feishu_generation_agent.graph.builder import build_graph
 from feishu_generation_agent.graph.nodes import GraphServices
-from feishu_generation_agent.graph.runtime import GraphRuntime
+from feishu_generation_agent.graph.runtime import GraphRuntime, RunNotFound
 from feishu_generation_agent.storage.files import FileStore
 from feishu_generation_agent.storage.planner_prompts import PlannerPromptStore
 from feishu_generation_agent.storage.repository import Repository
@@ -217,7 +217,7 @@ class FakeApprovalGraph:
 
 
 @asynccontextmanager
-async def _environment(tmp_path: Path):
+async def _environment(tmp_path: Path, *, bitable_service=None):
     settings = Settings(
         data_dir=tmp_path / "data",
         outputs_dir=tmp_path / "outputs",
@@ -241,7 +241,7 @@ async def _environment(tmp_path: Path):
         file_store=file_store,
         settings=settings,
     )
-    app = create_app(runtime=runtime)
+    app = create_app(runtime=runtime, bitable_service=bitable_service)
     transport = httpx.ASGITransport(app=app)
     try:
         async with app.router.lifespan_context(app):
@@ -556,6 +556,79 @@ async def test_run_and_reference_routes_hide_user_a_run_from_user_b(
                 run_id, owner_user_id="user-a"
             )
         ) is not None
+
+
+async def test_normal_run_approve_and_delete_with_production_service_enabled(
+    tmp_path: Path,
+) -> None:
+    class ProductionWithoutBindings:
+        async def sync_once(
+            self, run_id: str, *, owner_user_id: str
+        ) -> None:
+            raise RunNotFound("多维表格运行不存在")
+
+        async def is_production_run(
+            self, run_id: str, *, owner_user_id: str
+        ) -> bool:
+            return False
+
+        async def validate_approval(
+            self, run_id: str, *, owner_user_id: str
+        ) -> None:
+            raise AssertionError("normal run reached production validation")
+
+        async def delete_run(
+            self, run_id: str, *, owner_user_id: str
+        ) -> None:
+            raise AssertionError("normal run reached production deletion")
+
+        async def close(self) -> None:
+            pass
+
+    production = ProductionWithoutBindings()
+    async with _environment(
+        tmp_path, bitable_service=production
+    ) as (client, runtime, graph, repository):
+        del runtime, graph, repository
+        first = await client.post(
+            "/api/runs",
+            headers=_USER_A_HEADERS,
+            json={"source_url": "https://acme.feishu.cn/docx/normal-approve"},
+        )
+        first_run_id = first.json()["run_id"]
+        await _wait_for_status(
+            client,
+            first_run_id,
+            "waiting_approval",
+            headers=_USER_A_HEADERS,
+        )
+        approved = await client.post(
+            f"/api/runs/{first_run_id}/decision",
+            headers=_USER_A_HEADERS,
+            json={
+                "action": "approve",
+                "selected_task_ids": ["task-1"],
+            },
+        )
+
+        second = await client.post(
+            "/api/runs",
+            headers=_USER_A_HEADERS,
+            json={"source_url": "https://acme.feishu.cn/docx/normal-delete"},
+        )
+        second_run_id = second.json()["run_id"]
+        await _wait_for_status(
+            client,
+            second_run_id,
+            "waiting_approval",
+            headers=_USER_A_HEADERS,
+        )
+        deleted = await client.delete(
+            f"/api/runs/{second_run_id}", headers=_USER_A_HEADERS
+        )
+
+    assert approved.status_code == 202
+    assert deleted.status_code == 200
 
 
 async def test_clone_run_for_approval_reuses_approved_draft_without_generation(

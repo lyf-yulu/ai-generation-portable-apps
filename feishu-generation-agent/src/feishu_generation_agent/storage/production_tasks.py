@@ -1,6 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
+from typing import Literal
 
 import aiosqlite
 
@@ -205,6 +206,27 @@ class ProductionTaskStore:
             return await self._get_by_run_locked(
                 run_id, owner_user_id=owner_user_id
             )
+
+    async def run_owner_state(
+        self, run_id: str, *, owner_user_id: str
+    ) -> Literal["missing", "owned", "other"]:
+        _validate_owner(owner_user_id)
+        async with self._lock:
+            cursor = await self._connection.execute(
+                """
+                SELECT owner_user_id FROM production_tasks WHERE run_id = ?
+                UNION ALL
+                SELECT owner_user_id FROM production_task_history
+                WHERE run_id = ?
+                LIMIT 1
+                """,
+                (run_id, run_id),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        if row is None:
+            return "missing"
+        return "owned" if row["owner_user_id"] == owner_user_id else "other"
 
     async def list_active(
         self,
