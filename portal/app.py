@@ -1950,7 +1950,7 @@ class Handler(SimpleHTTPRequestHandler):
 
         try:
             body = None
-            if method == "POST":
+            if method in {"POST", "PUT", "PATCH"}:
                 length = int(self.headers.get("Content-Length") or "0")
                 if length > 0:
                     body = self.rfile.read(length)

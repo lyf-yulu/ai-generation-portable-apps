@@ -173,6 +173,70 @@ class ProxyIdentityHeadersTests(unittest.TestCase):
             self.mod._sign_admin_header(upstream_headers["X-Username"], False, ts),
         )
 
+    def test_proxy_forwards_put_and_patch_request_bodies(self):
+        payload = b'{"prompt_text":"Chinese plan"}'
+        forwarded = []
+
+        class FakeResponse(io.BytesIO):
+            status = 200
+
+            def getheader(self, name, default=None):
+                return default
+
+            def getheaders(self):
+                return []
+
+        class FakeConnection:
+            def __init__(self, host, port, timeout):
+                self.response = FakeResponse()
+
+            def request(self, method, path, body=None, headers=None):
+                forwarded.append((method, body, headers))
+
+            def getresponse(self):
+                return self.response
+
+            def close(self):
+                pass
+
+        user = {
+            "user_id": "user-a-immutable",
+            "username": "测试用户",
+            "role": "user",
+        }
+        for method in ("PUT", "PATCH"):
+            with self.subTest(method=method):
+                handler = self.mod.Handler.__new__(self.mod.Handler)
+                handler.client_address = ("127.0.0.1", 12345)
+                handler.headers = Message()
+                handler.headers["Content-Type"] = "application/json"
+                handler.headers["Content-Length"] = str(len(payload))
+                handler.rfile = io.BytesIO(payload)
+                handler.wfile = io.BytesIO()
+                handler._is_https = lambda: False
+                handler.send_response = lambda status: None
+                handler.send_header = lambda key, value: None
+                handler._cors_headers = lambda: None
+                handler.end_headers = lambda: None
+
+                with patch.object(
+                    self.mod.http.client,
+                    "HTTPConnection",
+                    FakeConnection,
+                ):
+                    handler._proxy(
+                        "feishu-generation-agent",
+                        8765,
+                        method,
+                        "/api/planner-prompt",
+                        user,
+                    )
+
+        self.assertEqual(
+            [(method, body) for method, body, _ in forwarded],
+            [("PUT", payload), ("PATCH", payload)],
+        )
+
 
 class ProxyHttpMethodDispatchTests(unittest.TestCase):
     @classmethod
