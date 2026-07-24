@@ -25,6 +25,9 @@ MAX_XLSX_ENTRY_COUNT = 4_096
 MAX_XLSX_MEDIA_COUNT = 256
 MAX_XLSX_MEDIA_BYTES = 32 * 1024 * 1024
 MAX_XLSX_ANCHOR_COUNT = 10_000
+MAX_XLSX_TEXT_LINES = 50_000
+MAX_XLSX_TEXT_CHARACTERS = 4 * 1024 * 1024
+MAX_XLSX_TEXT_BYTES = 8 * 1024 * 1024
 MAX_XML_DEPTH = 64
 MAX_XML_NODES = 100_000
 MAX_XML_BYTES = 8 * 1024 * 1024
@@ -35,11 +38,149 @@ _DOCUMENT_REL = (
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 )
 _PACKAGE_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+_STRICT_DOCUMENT_REL = (
+    "http://purl.oclc.org/ooxml/officeDocument/relationships"
+)
 _SPREADSHEET = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _DRAWING = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
 _DRAWING_MAIN = "http://schemas.openxmlformats.org/drawingml/2006/main"
-_REL_ID = f"{{{_DOCUMENT_REL}}}id"
-_REL_EMBED = f"{{{_DOCUMENT_REL}}}embed"
+
+_TRANSITIONAL_OFFICE_RELATIONSHIP_NAMES = frozenset(
+    {
+        "calcChain",
+        "chartsheet",
+        "comments",
+        "connections",
+        "control",
+        "ctrlProp",
+        "custom-properties",
+        "customXml",
+        "customXmlProps",
+        "dialogsheet",
+        "drawing",
+        "extended-properties",
+        "externalLink",
+        "externalLinkPath",
+        "hyperlink",
+        "image",
+        "officeDocument",
+        "oleObject",
+        "package",
+        "pivotCacheDefinition",
+        "pivotCacheRecords",
+        "pivotTable",
+        "printerSettings",
+        "queryTable",
+        "revisionHeaders",
+        "revisionLog",
+        "sharedStrings",
+        "styles",
+        "table",
+        "theme",
+        "usernames",
+        "vmlDrawing",
+        "worksheet",
+    }
+)
+_STRICT_OFFICE_RELATIONSHIP_NAMES = frozenset(
+    {
+        "calcChain",
+        "chartsheet",
+        "comments",
+        "connections",
+        "control",
+        "ctrlProp",
+        "custom-properties",
+        "customXml",
+        "customXmlProps",
+        "drawing",
+        "extended-properties",
+        "externalLink",
+        "externalLinkPath",
+        "hyperlink",
+        "image",
+        "officeDocument",
+        "oleObject",
+        "package",
+        "pivotCacheDefinition",
+        "pivotCacheRecords",
+        "pivotTable",
+        "printerSettings",
+        "queryTable",
+        "sharedStrings",
+        "styles",
+        "table",
+        "theme",
+        "worksheet",
+    }
+)
+_RELATIONSHIP_TYPE_NAMES = {
+    f"{_DOCUMENT_REL}/{name}": name
+    for name in _TRANSITIONAL_OFFICE_RELATIONSHIP_NAMES
+}
+_RELATIONSHIP_TYPE_NAMES.update(
+    {
+        f"{_STRICT_DOCUMENT_REL}/{name}": name
+        for name in _STRICT_OFFICE_RELATIONSHIP_NAMES
+    }
+)
+_RELATIONSHIP_TYPE_NAMES.update(
+    {
+        (
+            "http://schemas.microsoft.com/office/2007/relationships/slicer"
+        ): "slicer",
+        (
+            "http://schemas.microsoft.com/office/2007/relationships/slicerCache"
+        ): "slicerCache",
+        (
+            "http://schemas.microsoft.com/office/2011/relationships/timeline"
+        ): "timeline",
+        (
+            "http://schemas.microsoft.com/office/2011/relationships/timelineCache"
+        ): "timelineCache",
+        (
+            "http://schemas.microsoft.com/office/2010/relationships/Timeline"
+        ): "timeline",
+        (
+            "http://schemas.microsoft.com/office/2010/relationships/TimelineCache"
+        ): "timelineCache",
+        (
+            "http://schemas.microsoft.com/office/2017/10/relationships/person"
+        ): "person",
+        (
+            "http://schemas.microsoft.com/office/2017/10/relationships/"
+            "threadedComment"
+        ): "threadedComment",
+    }
+)
+_RELATIONSHIP_TYPE_NAMES.update(
+    {
+        f"{_PACKAGE_REL}/metadata/core-properties": "core-properties",
+        f"{_PACKAGE_REL}/metadata/thumbnail": "thumbnail",
+        (
+            f"{_PACKAGE_REL}/digital-signature/certificate"
+        ): "digital-signature-certificate",
+        (
+            f"{_PACKAGE_REL}/digital-signature/origin"
+        ): "digital-signature-origin",
+        (
+            f"{_PACKAGE_REL}/digital-signature/signature"
+        ): "digital-signature-signature",
+    }
+)
+_EXTERNAL_RELATIONSHIP_TYPES = frozenset(
+    {"externalLinkPath", "hyperlink"}
+)
+_DANGEROUS_PERCENT_ENCODINGS = (
+    "%00",
+    "%23",
+    "%25",
+    "%2e",
+    "%2f",
+    "%3a",
+    "%3f",
+    "%5c",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +228,13 @@ class _ImageExtractionState:
     anchor_count: int
 
 
+@dataclass(slots=True)
+class _TextExtractionState:
+    line_count: int
+    character_count: int
+    utf8_bytes: int
+
+
 def parse_sheet_block_token(raw: str) -> EmbeddedSheetRef:
     if (
         not isinstance(raw, str)
@@ -117,7 +265,18 @@ class FeishuSheetExporter:
             raise TypeError("ref must be an EmbeddedSheetRef")
         _validate_api_token(ref.spreadsheet_token, "spreadsheet token")
         _validate_source_sheet_id(ref.sheet_id)
+        deadline = monotonic() + EXPORT_TIMEOUT_SECONDS
+        try:
+            async with asyncio.timeout(EXPORT_TIMEOUT_SECONDS):
+                return await self._export_before_deadline(ref, deadline)
+        except TimeoutError:
+            raise _export_timeout() from None
 
+    async def _export_before_deadline(
+        self,
+        ref: EmbeddedSheetRef,
+        deadline: float,
+    ) -> ExtractedSheet:
         create_payload = await self._client.request_json(
             "POST",
             "/open-apis/drive/v1/export_tasks",
@@ -126,22 +285,19 @@ class FeishuSheetExporter:
                 "token": ref.spreadsheet_token,
                 "type": "sheet",
             },
+            sensitive_values=(ref.spreadsheet_token,),
         )
         ticket = _response_token(create_payload, "ticket")
-        deadline = monotonic() + EXPORT_TIMEOUT_SECONDS
         while True:
             remaining = deadline - monotonic()
             if remaining <= 0:
                 raise _export_timeout()
-            try:
-                async with asyncio.timeout(remaining):
-                    status_payload = await self._client.request_json(
-                        "GET",
-                        f"/open-apis/drive/v1/export_tasks/{ticket}",
-                        params={"token": ref.spreadsheet_token},
-                    )
-            except TimeoutError:
-                raise _export_timeout() from None
+            status_payload = await self._client.request_json(
+                "GET",
+                f"/open-apis/drive/v1/export_tasks/{ticket}",
+                params={"token": ref.spreadsheet_token},
+                sensitive_values=(ref.spreadsheet_token, ticket),
+            )
             result = status_payload.get("data", {}).get("result")
             if not isinstance(result, dict):
                 raise _document_error(
@@ -162,6 +318,11 @@ class FeishuSheetExporter:
                 content = await self._client.download_export_file(
                     file_token,
                     max_bytes=MAX_XLSX_COMPRESSED_BYTES,
+                    sensitive_values=(
+                        ref.spreadsheet_token,
+                        ticket,
+                        file_token,
+                    ),
                 )
                 return extract_sheet_xlsx(
                     content,
@@ -208,6 +369,11 @@ def extract_sheet_xlsx(
             workbook_relationships = _relationships(archive, workbook_path)
             shared_strings = _shared_strings(archive, workbook_relationships)
             text_lines: list[str] = []
+            text_state = _TextExtractionState(
+                line_count=0,
+                character_count=0,
+                utf8_bytes=0,
+            )
             image_state = _ImageExtractionState(
                 images_by_hash={},
                 media_by_path={},
@@ -221,7 +387,7 @@ def extract_sheet_xlsx(
             for sheet in () if sheets is None else tuple(sheets):
                 if sheet.tag != f"{{{_SPREADSHEET}}}sheet":
                     continue
-                relationship_id = sheet.get(_REL_ID)
+                relationship_id = _relationship_attribute(sheet, "id")
                 worksheet_name = sheet.get("name")
                 if not relationship_id or not worksheet_name:
                     raise _document_error(
@@ -258,6 +424,7 @@ def extract_sheet_xlsx(
                         worksheet_name=worksheet_name,
                         source_sheet_id=source_sheet_id,
                         shared_strings=shared_strings,
+                        state=text_state,
                     )
                 )
                 _worksheet_images(
@@ -306,12 +473,17 @@ def _relationships(
     else:
         relationship_path = "_rels/.rels"
     root = _parse_xml(_read_member(archive, relationship_path, MAX_XML_BYTES))
+    if root.tag != f"{{{_PACKAGE_REL}}}Relationships":
+        raise _document_error(
+            "飞书电子表格关系文件根节点无效",
+            "relationships root is invalid",
+        )
     relationships: dict[str, tuple[str, str]] = {}
     seen_relationship_ids: set[str] = set()
     for item in root.findall(f"{{{_PACKAGE_REL}}}Relationship"):
         relationship_id = item.get("Id")
         target = item.get("Target")
-        relationship_type = item.get("Type")
+        relationship_type_uri = item.get("Type")
         target_mode = item.get("TargetMode")
         if relationship_id:
             if relationship_id in seen_relationship_ids:
@@ -320,22 +492,24 @@ def _relationships(
                     "duplicate relationship id",
                 )
             seen_relationship_ids.add(relationship_id)
-        if relationship_id and target and relationship_type:
+        if relationship_id and target and relationship_type_uri:
+            relationship_type = _RELATIONSHIP_TYPE_NAMES.get(
+                relationship_type_uri
+            )
+            if relationship_type is None:
+                raise _document_error(
+                    "飞书电子表格关系类型无效",
+                    "relationship type is invalid",
+                )
             if target_mode is not None and target_mode.lower() != "internal":
-                if relationship_type.rsplit("/", 1)[-1] in {
-                    "officeDocument",
-                    "worksheet",
-                    "sharedStrings",
-                    "drawing",
-                    "image",
-                }:
+                if relationship_type not in _EXTERNAL_RELATIONSHIP_TYPES:
                     raise _document_error(
                         "飞书电子表格包含不支持的外部关系",
                         "external relationship target rejected",
                     )
                 continue
             relationships[relationship_id] = (
-                relationship_type.rsplit("/", 1)[-1],
+                relationship_type,
                 _resolve_target(owner_path, target),
             )
     return relationships
@@ -344,6 +518,7 @@ def _relationships(
 def _resolve_target(owner_path: str, target: str) -> str:
     if (
         not target
+        or _has_dangerous_percent_encoding(target)
         or "\\" in target
         or "\x00" in target
         or "?" in target
@@ -415,10 +590,12 @@ def _worksheet_text(
     worksheet_name: str,
     source_sheet_id: str,
     shared_strings: tuple[str, ...],
+    state: _TextExtractionState,
 ) -> list[str]:
     values: list[tuple[tuple[int, int], str, str]] = []
     for cell in worksheet.iter(f"{{{_SPREADSHEET}}}c"):
         reference = cell.get("r", "")
+        position = _cell_position(reference)
         cell_type = cell.get("t")
         value_node = cell.find(f"{{{_SPREADSHEET}}}v")
         value = value_node.text if value_node is not None else None
@@ -442,21 +619,72 @@ def _worksheet_text(
                 for item in cell.iter(f"{{{_SPREADSHEET}}}t")
             )
         if value:
-            values.append((_cell_position(reference), reference, value))
+            values.append((position, reference, value))
     values.sort(key=lambda item: item[0])
-    return [
-        f"[sheet:{source_sheet_id} worksheet:{worksheet_name} cell:{reference}] {value}"
-        for _, reference, value in values
-    ]
+    lines: list[str] = []
+    for _, reference, value in values:
+        line = (
+            f"[sheet:{source_sheet_id} worksheet:{worksheet_name} "
+            f"cell:{reference}] {value}"
+        )
+        next_line_count = state.line_count + 1
+        next_character_count = state.character_count + len(line)
+        next_utf8_bytes = state.utf8_bytes + len(line.encode("utf-8"))
+        if next_line_count > MAX_XLSX_TEXT_LINES:
+            raise _document_error(
+                "飞书电子表格文本行数过多",
+                "xlsx text line count limit exceeded",
+            )
+        if next_character_count > MAX_XLSX_TEXT_CHARACTERS:
+            raise _document_error(
+                "飞书电子表格文本字符过多",
+                "xlsx text character limit exceeded",
+            )
+        if next_utf8_bytes > MAX_XLSX_TEXT_BYTES:
+            raise _document_error(
+                "飞书电子表格文本字节过多",
+                "xlsx text utf-8 bytes limit exceeded",
+            )
+        state.line_count = next_line_count
+        state.character_count = next_character_count
+        state.utf8_bytes = next_utf8_bytes
+        lines.append(line)
+    return lines
 
 
 def _cell_position(reference: str) -> tuple[int, int]:
+    if not isinstance(reference, str) or not 2 <= len(reference) <= 10:
+        raise _document_error(
+            "飞书电子表格单元格引用无效",
+            "cell reference is invalid",
+        )
     column = 0
     index = 0
-    while index < len(reference) and reference[index].isalpha():
+    while (
+        index < len(reference)
+        and index < 3
+        and "A" <= reference[index] <= "Z"
+    ):
         column = column * 26 + ord(reference[index].upper()) - ord("A") + 1
         index += 1
-    row = int(reference[index:])
+    row_text = reference[index:]
+    if (
+        index == 0
+        or column > 16_384
+        or not row_text
+        or row_text[0] == "0"
+        or not all("0" <= character <= "9" for character in row_text)
+    ):
+        raise _document_error(
+            "飞书电子表格单元格引用无效",
+            "cell reference is invalid",
+        )
+    row = int(row_text)
+    if row > 1_048_576:
+        raise _document_error(
+            "飞书电子表格单元格引用无效",
+            "cell reference is invalid",
+        )
     return row, column
 
 
@@ -479,7 +707,7 @@ def _worksheet_images(
         )
     relationships = _relationships(archive, worksheet_path)
     for drawing_reference in drawings:
-        relationship_id = drawing_reference.get(_REL_ID)
+        relationship_id = _relationship_attribute(drawing_reference, "id")
         if not relationship_id:
             raise _document_error(
                 "飞书电子表格图片关系无效",
@@ -503,7 +731,7 @@ def _worksheet_images(
             blip = anchor_node.find(f".//{{{_DRAWING_MAIN}}}blip")
             if blip is None:
                 continue
-            image_relationship_id = blip.get(_REL_EMBED)
+            image_relationship_id = _relationship_attribute(blip, "embed")
             if not image_relationship_id:
                 continue
             media_path = _relationship_target(
@@ -756,6 +984,7 @@ def _validate_archive(archive: ZipFile) -> None:
 def _validate_member_path(raw_path: str) -> str:
     if (
         not raw_path
+        or _has_dangerous_percent_encoding(raw_path)
         or "\\" in raw_path
         or "\x00" in raw_path
         or posixpath.isabs(raw_path)
@@ -777,6 +1006,25 @@ def _validate_member_path(raw_path: str) -> str:
             "unsafe zip member rejected",
         )
     return path
+
+
+def _has_dangerous_percent_encoding(value: str) -> bool:
+    lowered = value.lower()
+    return any(
+        encoding in lowered
+        for encoding in _DANGEROUS_PERCENT_ENCODINGS
+    )
+
+
+def _relationship_attribute(
+    element: ElementTree.Element,
+    name: str,
+) -> str | None:
+    for namespace in (_DOCUMENT_REL, _STRICT_DOCUMENT_REL):
+        value = element.get(f"{{{namespace}}}{name}")
+        if value is not None:
+            return value
+    return None
 
 
 def _read_member(

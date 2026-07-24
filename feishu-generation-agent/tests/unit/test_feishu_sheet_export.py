@@ -22,6 +22,9 @@ from feishu_generation_agent.integrations.feishu_sheet_export import (
     MAX_XLSX_ENTRY_COUNT,
     MAX_XLSX_MEDIA_BYTES,
     MAX_XLSX_MEDIA_COUNT,
+    MAX_XLSX_TEXT_BYTES,
+    MAX_XLSX_TEXT_CHARACTERS,
+    MAX_XLSX_TEXT_LINES,
     MAX_XLSX_UNCOMPRESSED_BYTES,
     MAX_XML_DEPTH,
     MAX_XML_BYTES,
@@ -36,6 +39,8 @@ from feishu_generation_agent.integrations.feishu_sheet_export import (
 
 _NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _NS_PACKAGE_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+_NS_STRICT_REL = "http://purl.oclc.org/ooxml/officeDocument/relationships"
+_NS_FAKE_STRICT_PACKAGE_REL = "http://purl.oclc.org/ooxml/package/relationships"
 _NS_SPREADSHEET = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _NS_DRAWING = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
 _NS_DRAWING_MAIN = "http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -200,6 +205,24 @@ def _assert_document_error(content: bytes, *, detail: str) -> None:
     assert detail in raised.value.detail.technical_detail
 
 
+def _assert_canaries_absent_from_exception_chain(
+    error: BaseException,
+    canaries: tuple[str, ...],
+) -> None:
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        for canary in canaries:
+            assert canary not in str(current)
+        for linked in (current.__cause__, current.__context__):
+            if linked is not None:
+                pending.append(linked)
+
+
 def test_parse_sheet_block_token_splits_on_final_delimiter() -> None:
     ref = parse_sheet_block_token(
         "C7tUs3k3fhoiybtWxzvcqN7Nn3b_NuBUx5"
@@ -270,12 +293,29 @@ def test_xlsx_resource_limit_constants_are_positive_and_bounded() -> None:
     assert 0 < MAX_XLSX_MEDIA_COUNT < MAX_XLSX_ENTRY_COUNT
     assert 0 < MAX_XLSX_ANCHOR_COUNT <= MAX_XML_NODES
     assert 0 < MAX_XLSX_MEDIA_BYTES < MAX_XLSX_UNCOMPRESSED_BYTES
+    assert 0 < MAX_XLSX_TEXT_LINES <= MAX_XML_NODES
+    assert 0 < MAX_XLSX_TEXT_CHARACTERS < MAX_XLSX_UNCOMPRESSED_BYTES
+    assert MAX_XLSX_TEXT_CHARACTERS < MAX_XLSX_TEXT_BYTES
+    assert MAX_XLSX_TEXT_BYTES < MAX_XLSX_UNCOMPRESSED_BYTES
     assert 0 < MAX_XML_BYTES < MAX_XLSX_UNCOMPRESSED_BYTES
     assert 0 < MAX_XML_DEPTH < MAX_XML_NODES
     assert 0 < EXPORT_POLL_INTERVAL_SECONDS < EXPORT_TIMEOUT_SECONDS <= 300
 
 
-@pytest.mark.parametrize("member_name", ["../escape.xml", "/absolute.xml"])
+@pytest.mark.parametrize(
+    "member_name",
+    [
+        "../escape.xml",
+        "/absolute.xml",
+        "%2e%2e/escape.xml",
+        "xl%2fescape.xml",
+        "xl%5cescape.xml",
+        "xl/%252e%252e/escape.xml",
+        "C%3a/escape.xml",
+        "part%3fquery.xml",
+        "part%23fragment.xml",
+    ],
+)
 def test_extract_sheet_xlsx_rejects_unsafe_zip_member_paths(
     member_name: str,
 ) -> None:
@@ -337,6 +377,203 @@ def test_extract_sheet_xlsx_rejects_escaping_relationship_targets() -> None:
     """.encode()
 
     _assert_document_error(_make_xlsx(members), detail="unsafe relationship target")
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "../%2e%2e/outside.xml",
+        "..%2f../outside.xml",
+        "..%5c../outside.xml",
+        "../%252e%252e/outside.xml",
+        "C%3a/escape.xml",
+        "part%3fquery.xml",
+        "part%23fragment.xml",
+    ],
+)
+def test_extract_sheet_xlsx_rejects_percent_encoded_relationship_targets(
+    target: str,
+) -> None:
+    members = _xlsx_members()
+    members["xl/worksheets/_rels/story-board.xml.rels"] = f"""
+        <Relationships xmlns="{_NS_PACKAGE_REL}">
+          <Relationship Id="rIdStoryDrawing" Type="{_NS_REL}/drawing"
+                        Target="{target}"/>
+        </Relationships>
+    """.encode()
+
+    _assert_document_error(_make_xlsx(members), detail="unsafe relationship target")
+
+
+def test_extract_sheet_xlsx_rejects_relationship_type_with_evil_prefix() -> None:
+    members = _xlsx_members()
+    members["_rels/.rels"] = f"""
+        <Relationships xmlns="{_NS_PACKAGE_REL}">
+          <Relationship Id="rIdWorkbook"
+                        Type="https://evil.invalid/officeDocument"
+                        Target="xl/workbook.xml"/>
+        </Relationships>
+    """.encode()
+
+    _assert_document_error(_make_xlsx(members), detail="relationship type is invalid")
+
+
+def test_extract_sheet_xlsx_rejects_non_relationships_xml_root() -> None:
+    members = _xlsx_members()
+    members["_rels/.rels"] = f"""
+        <NotRelationships xmlns="{_NS_PACKAGE_REL}">
+          <Relationship Id="rIdWorkbook" Type="{_NS_REL}/officeDocument"
+                        Target="xl/workbook.xml"/>
+        </NotRelationships>
+    """.encode()
+
+    _assert_document_error(_make_xlsx(members), detail="relationships root is invalid")
+
+
+def test_extract_sheet_xlsx_accepts_strict_relationship_types() -> None:
+    members = _xlsx_members()
+    members["_rels/.rels"] = f"""
+        <Relationships xmlns="{_NS_PACKAGE_REL}">
+          <Relationship Id="rIdWorkbook"
+                        Type="{_NS_STRICT_REL}/officeDocument"
+                        Target="xl/workbook.xml"/>
+        </Relationships>
+    """.encode()
+    members["xl/_rels/workbook.xml.rels"] = f"""
+        <Relationships xmlns="{_NS_PACKAGE_REL}">
+          <Relationship Id="rIdStory" Type="{_NS_STRICT_REL}/worksheet"
+                        Target="worksheets/story-board.xml"/>
+          <Relationship Id="rIdCharacters" Type="{_NS_STRICT_REL}/worksheet"
+                        Target="worksheets/character-board.xml"/>
+          <Relationship Id="rIdStrings" Type="{_NS_STRICT_REL}/sharedStrings"
+                        Target="strings/custom-shared.xml"/>
+        </Relationships>
+    """.encode()
+    members["xl/workbook.xml"] = f"""
+        <workbook xmlns="{_NS_SPREADSHEET}" xmlns:r="{_NS_STRICT_REL}">
+          <sheets>
+            <sheet name="分镜" sheetId="17" r:id="rIdStory"/>
+            <sheet name="角色" sheetId="42" r:id="rIdCharacters"/>
+          </sheets>
+        </workbook>
+    """.encode()
+
+    extracted = extract_sheet_xlsx(
+        _make_xlsx(members),
+        source_sheet_id="NuBUx5",
+    )
+
+    assert len(extracted.text_lines) == 2
+    assert len(extracted.images) == 2
+
+
+def test_extract_sheet_xlsx_rejects_nonstandard_package_relationship_namespace() -> None:
+    members = _xlsx_members()
+    members["_rels/.rels"] = f"""
+        <Relationships xmlns="{_NS_FAKE_STRICT_PACKAGE_REL}">
+          <Relationship Id="rIdWorkbook"
+                        Type="{_NS_STRICT_REL}/officeDocument"
+                        Target="xl/workbook.xml"/>
+        </Relationships>
+    """.encode()
+
+    _assert_document_error(_make_xlsx(members), detail="relationships root is invalid")
+
+
+def test_extract_sheet_xlsx_rejects_nonstandard_package_relationship_type() -> None:
+    members = _xlsx_members()
+    members["_rels/.rels"] = f"""
+        <Relationships xmlns="{_NS_PACKAGE_REL}">
+          <Relationship Id="rIdWorkbook" Type="{_NS_REL}/officeDocument"
+                        Target="xl/workbook.xml"/>
+          <Relationship Id="rIdCore"
+                        Type="{_NS_FAKE_STRICT_PACKAGE_REL}/metadata/core-properties"
+                        Target="docProps/core.xml"/>
+        </Relationships>
+    """.encode()
+
+    _assert_document_error(_make_xlsx(members), detail="relationship type is invalid")
+
+
+@pytest.mark.parametrize(
+    "relationship_type",
+    [
+        f"{_NS_REL}/person",
+        f"{_NS_STRICT_REL}/person",
+        f"{_NS_REL}/threadedComment",
+        f"{_NS_STRICT_REL}/threadedComment",
+        f"{_NS_REL}/slicer",
+        f"{_NS_STRICT_REL}/slicer",
+        f"{_NS_REL}/timeline",
+        f"{_NS_STRICT_REL}/timeline",
+    ],
+)
+def test_extract_sheet_xlsx_rejects_invented_extension_relationship_types(
+    relationship_type: str,
+) -> None:
+    members = _xlsx_members()
+    members["_rels/.rels"] = f"""
+        <Relationships xmlns="{_NS_PACKAGE_REL}">
+          <Relationship Id="rIdWorkbook" Type="{_NS_REL}/officeDocument"
+                        Target="xl/workbook.xml"/>
+          <Relationship Id="rIdExtension" Type="{relationship_type}"
+                        Target="extensions/ignored.xml"/>
+        </Relationships>
+    """.encode()
+
+    _assert_document_error(_make_xlsx(members), detail="relationship type is invalid")
+
+
+def test_extract_sheet_xlsx_safely_ignores_known_microsoft_extension_relationships() -> None:
+    members = _xlsx_members()
+    members["xl/_rels/workbook.xml.rels"] = f"""
+        <Relationships xmlns="{_NS_PACKAGE_REL}">
+          <Relationship Id="rIdStory" Type="{_NS_REL}/worksheet"
+                        Target="worksheets/story-board.xml"/>
+          <Relationship Id="rIdCharacters" Type="{_NS_REL}/worksheet"
+                        Target="worksheets/character-board.xml"/>
+          <Relationship Id="rIdStrings" Type="{_NS_REL}/sharedStrings"
+                        Target="strings/custom-shared.xml"/>
+          <Relationship Id="rIdPerson"
+                        Type="http://schemas.microsoft.com/office/2017/10/relationships/person"
+                        Target="persons/person.xml"/>
+          <Relationship Id="rIdSlicerCache"
+                        Type="http://schemas.microsoft.com/office/2007/relationships/slicerCache"
+                        Target="slicerCaches/cache.xml"/>
+          <Relationship Id="rIdTimelineCache"
+                        Type="http://schemas.microsoft.com/office/2011/relationships/timelineCache"
+                        Target="timelineCaches/cache.xml"/>
+          <Relationship Id="rIdFormalTimelineCache"
+                        Type="http://schemas.microsoft.com/office/2010/relationships/TimelineCache"
+                        Target="timelineCaches/formal-cache.xml"/>
+        </Relationships>
+    """.encode()
+    members["xl/worksheets/_rels/story-board.xml.rels"] = f"""
+        <Relationships xmlns="{_NS_PACKAGE_REL}">
+          <Relationship Id="rIdStoryDrawing" Type="{_NS_REL}/drawing"
+                        Target="../drawings/story-art.xml"/>
+          <Relationship Id="rIdSlicer"
+                        Type="http://schemas.microsoft.com/office/2007/relationships/slicer"
+                        Target="../slicers/slicer.xml"/>
+          <Relationship Id="rIdTimeline"
+                        Type="http://schemas.microsoft.com/office/2011/relationships/timeline"
+                        Target="../timelines/timeline.xml"/>
+          <Relationship Id="rIdFormalTimeline"
+                        Type="http://schemas.microsoft.com/office/2010/relationships/Timeline"
+                        Target="../timelines/formal-timeline.xml"/>
+          <Relationship Id="rIdThreadedComment"
+                        Type="http://schemas.microsoft.com/office/2017/10/relationships/threadedComment"
+                        Target="../threadedcomments/comment.xml"/>
+        </Relationships>
+    """.encode()
+
+    extracted = extract_sheet_xlsx(
+        _make_xlsx(members),
+        source_sheet_id="NuBUx5",
+    )
+
+    assert len(extracted.text_lines) == 2
+    assert len(extracted.images) == 2
 
 
 def test_extract_sheet_xlsx_rejects_misdirected_relationship_targets() -> None:
@@ -537,6 +774,89 @@ def test_extract_sheet_xlsx_rejects_negative_shared_string_index() -> None:
     _assert_document_error(
         _make_xlsx(members),
         detail="shared string index is invalid",
+    )
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit_value", "detail"),
+    [
+        ("MAX_XLSX_TEXT_LINES", 2, "text line count limit"),
+        ("MAX_XLSX_TEXT_CHARACTERS", 90, "text character limit"),
+        ("MAX_XLSX_TEXT_BYTES", 100, "text utf-8 bytes limit"),
+    ],
+)
+def test_extract_sheet_xlsx_bounds_repeated_shared_string_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    limit_value: int,
+    detail: str,
+) -> None:
+    members = _xlsx_members()
+    members["xl/worksheets/story-board.xml"] = f"""
+        <worksheet xmlns="{_NS_SPREADSHEET}">
+          <sheetData>
+            <row r="1">
+              <c r="A1" t="s"><v>1</v></c>
+              <c r="B1" t="s"><v>1</v></c>
+              <c r="C1" t="s"><v>1</v></c>
+            </row>
+          </sheetData>
+        </worksheet>
+    """.encode()
+    monkeypatch.setattr(feishu_sheet_export, limit_name, limit_value)
+
+    _assert_document_error(_make_xlsx(members), detail=detail)
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "AAAA1",
+        "a1",
+        "Ａ1",
+        "A0",
+        "A0000001",
+        "XFE1",
+        "A1048577",
+        "A99999999",
+        f"A{'9' * 100}",
+        "A1A",
+    ],
+)
+def test_extract_sheet_xlsx_rejects_invalid_or_out_of_bounds_cell_references(
+    reference: str,
+) -> None:
+    members = _xlsx_members()
+    members["xl/worksheets/story-board.xml"] = f"""
+        <worksheet xmlns="{_NS_SPREADSHEET}">
+          <sheetData>
+            <row><c r="{reference}" t="s"><v>0</v></c></row>
+          </sheetData>
+        </worksheet>
+    """.encode()
+
+    _assert_document_error(_make_xlsx(members), detail="cell reference is invalid")
+
+
+def test_extract_sheet_xlsx_accepts_maximum_excel_cell_reference() -> None:
+    members = _xlsx_members()
+    members["xl/worksheets/story-board.xml"] = f"""
+        <worksheet xmlns="{_NS_SPREADSHEET}">
+          <sheetData>
+            <row r="1048576">
+              <c r="XFD1048576" t="s"><v>0</v></c>
+            </row>
+          </sheetData>
+        </worksheet>
+    """.encode()
+
+    extracted = extract_sheet_xlsx(
+        _make_xlsx(members),
+        source_sheet_id="NuBUx5",
+    )
+
+    assert extracted.text_lines[0] == (
+        "[sheet:NuBUx5 worksheet:分镜 cell:XFD1048576] 镜头一"
     )
 
 
@@ -772,6 +1092,65 @@ async def test_client_download_export_file_stops_stream_at_size_limit() -> None:
 
     assert raised.value.detail.category is ErrorCategory.DOCUMENT
     assert stream.chunks_read == 2
+
+
+async def test_client_download_export_file_preserves_primary_error_when_close_fails() -> None:
+    canaries = (
+        "spreadsheet-canary-token",
+        "ticket-canary-token",
+        "file-canary-token",
+        "tenant-canary-token",
+    )
+
+    class FailingCloseStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b"oversized"
+
+        async def aclose(self) -> None:
+            raise httpx.ReadError(" ".join(canaries))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "tenant_access_token": "tenant-canary-token",
+                    "expire": 7200,
+                },
+            )
+        return httpx.Response(
+            200,
+            stream=FailingCloseStream(),
+            headers={"Content-Type": "application/octet-stream"},
+        )
+
+    async with httpx.AsyncClient(
+        base_url="https://open.feishu.cn",
+        transport=httpx.MockTransport(handler),
+    ) as http_client:
+        client = FeishuClient(
+            Settings(
+                lark_app_id="fiction-app",
+                lark_app_secret="fiction-app-secret",
+            ),
+            http_client=http_client,
+        )
+        with pytest.raises(AgentError) as raised:
+            await client.download_export_file(
+                "file-canary-token",
+                max_bytes=4,
+                sensitive_values=(
+                    "spreadsheet-canary-token",
+                    "ticket-canary-token",
+                ),
+            )
+
+    assert raised.value.detail.category is ErrorCategory.DOCUMENT
+    assert "size limit" in raised.value.detail.technical_detail
+    _assert_canaries_absent_from_exception_chain(raised.value, canaries)
+    for canary in canaries:
+        assert canary not in raised.value.detail.technical_detail
 
 
 async def test_client_download_export_file_maps_midstream_transport_error() -> None:
@@ -1152,6 +1531,436 @@ async def test_exporter_bounds_status_request_by_remaining_deadline(
 
     assert raised.value.detail.category is ErrorCategory.TRANSIENT
     assert "deadline" in raised.value.detail.technical_detail
+
+
+async def test_exporter_total_deadline_bounds_create_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    never_respond = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "tenant_access_token": "fiction-tenant-token",
+                    "expire": 7200,
+                },
+            )
+        await never_respond.wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(feishu_sheet_export, "EXPORT_TIMEOUT_SECONDS", 0.01)
+    async with httpx.AsyncClient(
+        base_url="https://open.feishu.cn",
+        transport=httpx.MockTransport(handler),
+    ) as http_client:
+        client = FeishuClient(
+            Settings(
+                lark_app_id="fiction-app",
+                lark_app_secret="fiction-app-secret",
+            ),
+            http_client=http_client,
+        )
+        with pytest.raises(AgentError) as raised:
+            await asyncio.wait_for(
+                FeishuSheetExporter(client).export(
+                    EmbeddedSheetRef("fiction-sheet-token", "NuBUx5")
+                ),
+                timeout=0.2,
+            )
+
+    assert raised.value.detail.category is ErrorCategory.TRANSIENT
+    assert "deadline" in raised.value.detail.technical_detail
+
+
+async def test_exporter_total_deadline_bounds_download_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    never_respond = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "tenant_access_token": "fiction-tenant-token",
+                    "expire": 7200,
+                },
+            )
+        if request.method == "POST":
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"ticket": "ticket-123"}},
+            )
+        if request.url.path.endswith("/ticket-123"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "result": {
+                            "job_status": 0,
+                            "file_token": "fiction-file-token",
+                        }
+                    },
+                },
+            )
+        await never_respond.wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(feishu_sheet_export, "EXPORT_TIMEOUT_SECONDS", 0.01)
+    async with httpx.AsyncClient(
+        base_url="https://open.feishu.cn",
+        transport=httpx.MockTransport(handler),
+    ) as http_client:
+        client = FeishuClient(
+            Settings(
+                lark_app_id="fiction-app",
+                lark_app_secret="fiction-app-secret",
+            ),
+            http_client=http_client,
+        )
+        with pytest.raises(AgentError) as raised:
+            await asyncio.wait_for(
+                FeishuSheetExporter(client).export(
+                    EmbeddedSheetRef("fiction-sheet-token", "NuBUx5")
+                ),
+                timeout=0.2,
+            )
+
+    assert raised.value.detail.category is ErrorCategory.TRANSIENT
+    assert "deadline" in raised.value.detail.technical_detail
+
+
+async def test_exporter_total_deadline_bounds_continuous_download_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SlowEndlessStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            while True:
+                await asyncio.sleep(0.005)
+                yield b"x"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "tenant_access_token": "fiction-tenant-token",
+                    "expire": 7200,
+                },
+            )
+        if request.method == "POST":
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"ticket": "ticket-123"}},
+            )
+        if request.url.path.endswith("/ticket-123"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "result": {
+                            "job_status": 0,
+                            "file_token": "fiction-file-token",
+                        }
+                    },
+                },
+            )
+        return httpx.Response(
+            200,
+            stream=SlowEndlessStream(),
+            headers={"Content-Type": "application/octet-stream"},
+        )
+
+    monkeypatch.setattr(feishu_sheet_export, "EXPORT_TIMEOUT_SECONDS", 0.02)
+    async with httpx.AsyncClient(
+        base_url="https://open.feishu.cn",
+        transport=httpx.MockTransport(handler),
+    ) as http_client:
+        client = FeishuClient(
+            Settings(
+                lark_app_id="fiction-app",
+                lark_app_secret="fiction-app-secret",
+            ),
+            http_client=http_client,
+        )
+        with pytest.raises(AgentError) as raised:
+            await asyncio.wait_for(
+                FeishuSheetExporter(client).export(
+                    EmbeddedSheetRef("fiction-sheet-token", "NuBUx5")
+                ),
+                timeout=0.2,
+            )
+
+    assert raised.value.detail.category is ErrorCategory.TRANSIENT
+    assert "deadline" in raised.value.detail.technical_detail
+
+
+async def test_exporter_total_deadline_does_not_wait_for_hanging_stream_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    close_never_finishes = asyncio.Event()
+
+    class HangingCloseStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            while True:
+                await asyncio.sleep(0.005)
+                yield b"x"
+
+        async def aclose(self) -> None:
+            await close_never_finishes.wait()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "tenant_access_token": "fiction-tenant-token",
+                    "expire": 7200,
+                },
+            )
+        if request.method == "POST":
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"ticket": "ticket-123"}},
+            )
+        if request.url.path.endswith("/ticket-123"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "result": {
+                            "job_status": 0,
+                            "file_token": "fiction-file-token",
+                        }
+                    },
+                },
+            )
+        return httpx.Response(
+            200,
+            stream=HangingCloseStream(),
+            headers={"Content-Type": "application/octet-stream"},
+        )
+
+    monkeypatch.setattr(feishu_sheet_export, "EXPORT_TIMEOUT_SECONDS", 0.02)
+    async with httpx.AsyncClient(
+        base_url="https://open.feishu.cn",
+        transport=httpx.MockTransport(handler),
+    ) as http_client:
+        client = FeishuClient(
+            Settings(
+                lark_app_id="fiction-app",
+                lark_app_secret="fiction-app-secret",
+            ),
+            http_client=http_client,
+        )
+        with pytest.raises(AgentError) as raised:
+            await asyncio.wait_for(
+                FeishuSheetExporter(client).export(
+                    EmbeddedSheetRef("fiction-sheet-token", "NuBUx5")
+                ),
+                timeout=0.15,
+            )
+
+    assert raised.value.detail.category is ErrorCategory.TRANSIENT
+    assert "deadline" in raised.value.detail.technical_detail
+
+
+async def _export_error_from_handler(
+    handler: object,
+) -> AgentError:
+    async with httpx.AsyncClient(
+        base_url="https://open.feishu.cn",
+        transport=httpx.MockTransport(handler),  # type: ignore[arg-type]
+    ) as http_client:
+        client = FeishuClient(
+            Settings(
+                lark_app_id="fiction-app",
+                lark_app_secret="fiction-app-secret",
+            ),
+            http_client=http_client,
+        )
+        with pytest.raises(AgentError) as raised:
+            await FeishuSheetExporter(client).export(
+                EmbeddedSheetRef(
+                    "spreadsheet-canary-token",
+                    "NuBUx5",
+                )
+            )
+    return raised.value
+
+
+def _assert_export_canaries_redacted(error: AgentError) -> None:
+    canaries = (
+        "spreadsheet-canary-token",
+        "ticket-canary-token",
+        "file-canary-token",
+        "tenant-canary-token",
+    )
+    _assert_canaries_absent_from_exception_chain(error, canaries)
+    for canary in canaries:
+        assert canary not in str(error)
+        assert canary not in error.detail.technical_detail
+
+
+async def test_exporter_redacts_spreadsheet_and_tenant_tokens_from_server_msg() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "tenant_access_token": "tenant-canary-token",
+                    "expire": 7200,
+                },
+            )
+        return httpx.Response(
+            400,
+            json={
+                "code": 1770001,
+                "msg": (
+                    "spreadsheet-canary-token "
+                    "tenant-canary-token"
+                ),
+            },
+        )
+
+    error = await _export_error_from_handler(handler)
+
+    _assert_export_canaries_redacted(error)
+
+
+async def test_exporter_redacts_ticket_from_poll_path_and_server_msg() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "tenant_access_token": "tenant-canary-token",
+                    "expire": 7200,
+                },
+            )
+        if request.method == "POST":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {"ticket": "ticket-canary-token"},
+                },
+            )
+        return httpx.Response(
+            400,
+            json={
+                "code": 1770001,
+                "msg": "ticket-canary-token",
+            },
+        )
+
+    error = await _export_error_from_handler(handler)
+
+    _assert_export_canaries_redacted(error)
+
+
+async def test_exporter_redacts_file_token_from_download_api_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "tenant_access_token": "tenant-canary-token",
+                    "expire": 7200,
+                },
+            )
+        if request.method == "POST":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {"ticket": "ticket-canary-token"},
+                },
+            )
+        if request.url.path.endswith("/ticket-canary-token"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "result": {
+                            "job_status": 0,
+                            "file_token": "file-canary-token",
+                        }
+                    },
+                },
+            )
+        return httpx.Response(
+            400,
+            json={
+                "code": 1770001,
+                "msg": (
+                    "spreadsheet-canary-token ticket-canary-token "
+                    "file-canary-token tenant-canary-token"
+                ),
+            },
+        )
+
+    error = await _export_error_from_handler(handler)
+
+    _assert_export_canaries_redacted(error)
+
+
+async def test_exporter_redacts_all_tokens_from_download_transport_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "tenant_access_token": "tenant-canary-token",
+                    "expire": 7200,
+                },
+            )
+        if request.method == "POST":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {"ticket": "ticket-canary-token"},
+                },
+            )
+        if request.url.path.endswith("/ticket-canary-token"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "result": {
+                            "job_status": 0,
+                            "file_token": "file-canary-token",
+                        }
+                    },
+                },
+            )
+        raise httpx.ConnectError(
+            (
+                "spreadsheet-canary-token ticket-canary-token "
+                "file-canary-token tenant-canary-token"
+            ),
+            request=request,
+        )
+
+    error = await _export_error_from_handler(handler)
+
+    _assert_export_canaries_redacted(error)
 
 
 @pytest.mark.parametrize(
