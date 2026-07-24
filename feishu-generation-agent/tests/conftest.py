@@ -90,10 +90,15 @@ class FakeGraphPlanner:
         descriptions: list[VisionDescription],
         feedback: str | None,
         system_prompt: str | None = None,
+        exact_system_prompt: str | None = None,
     ) -> TaskPlan:
         self.plan_calls += 1
         self.feedback.append(feedback)
-        self.system_prompts.append(system_prompt)
+        self.system_prompts.append(
+            exact_system_prompt
+            if exact_system_prompt is not None
+            else system_prompt
+        )
         assert document.document_id == "doc-graph"
         assert [description.asset_id for description in descriptions] == [
             "asset-1"

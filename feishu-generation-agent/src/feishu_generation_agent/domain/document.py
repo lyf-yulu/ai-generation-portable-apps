@@ -1,9 +1,10 @@
 import hashlib
+from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class SourceType(StrEnum):
@@ -12,6 +13,8 @@ class SourceType(StrEnum):
 
 
 class PlanningPromptSnapshot(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     owner_user_id: str = Field(min_length=1, max_length=255)
     source: Literal["prime", "personal"]
     version: int = Field(ge=0)
@@ -24,6 +27,18 @@ class PlanningPromptSnapshot(BaseModel):
         if self.prompt_sha256 != expected:
             raise ValueError("prompt_sha256 does not match prompt_text")
         return self
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if not update:
+            return super().model_copy(deep=deep)
+        payload = self.model_dump()
+        payload.update(update)
+        return type(self).model_validate(payload)
 
 
 def build_planning_prompt_snapshot(

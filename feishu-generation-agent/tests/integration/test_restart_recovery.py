@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -6,7 +7,12 @@ import pytest
 from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain.artifact import DeliveryRecord
 from feishu_generation_agent.domain.document import build_planning_prompt_snapshot
-from feishu_generation_agent.graph.runtime import GraphRuntime, RunNotFound
+from feishu_generation_agent.graph.runtime import (
+    GraphRuntime,
+    RunConflict,
+    RunNotFound,
+    RunValidationError,
+)
 from feishu_generation_agent.integrations.planner import planner_system_prompt
 from feishu_generation_agent.storage.files import FileStore
 from feishu_generation_agent.storage.repository import Repository
@@ -67,6 +73,21 @@ class _RetryDeliveryWriter:
             document_url="https://fiction.feishu.cn/docx/delivery-doc",
             status="succeeded",
         )
+
+
+class _BlockingPromptCheckGraph(_RecoveryGraph):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_prompt_check_started = asyncio.Event()
+        self.release_first_prompt_check = asyncio.Event()
+        self._blocked_once = False
+
+    async def aget_state(self, config: dict):
+        if not self._blocked_once:
+            self._blocked_once = True
+            self.first_prompt_check_started.set()
+            await self.release_first_prompt_check.wait()
+        return await super().aget_state(config)
 
 
 def _prime_prompt() -> dict:
@@ -168,6 +189,7 @@ async def test_retry_delivery_does_not_resume_generation(tmp_path: Path) -> None
         "run_id": "run-delivery",
         "thread_id": "thread-delivery",
         "status": "delivery_failed",
+        "planning_prompt": _prime_prompt(),
     }
     writer = _RetryDeliveryWriter()
     runtime, repository, _ = await _runtime(tmp_path, graph, writer)
@@ -191,6 +213,44 @@ async def test_retry_delivery_does_not_resume_generation(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_concurrent_delivery_retries_reserve_one_external_write(
+    tmp_path: Path,
+) -> None:
+    graph = _BlockingPromptCheckGraph()
+    graph.states["thread-delivery"] = {
+        "run_id": "run-delivery",
+        "thread_id": "thread-delivery",
+        "status": "delivery_failed",
+        "planning_prompt": _prime_prompt(),
+    }
+    writer = _RetryDeliveryWriter()
+    runtime, repository, _ = await _runtime(tmp_path, graph, writer)
+    await repository.create_run(
+        "run-delivery",
+        "thread-delivery",
+        "https://acme.feishu.cn/docx/doccn123",
+        status="delivery_failed",
+    )
+
+    first = asyncio.create_task(runtime.retry_delivery("run-delivery"))
+    await graph.first_prompt_check_started.wait()
+    second = asyncio.create_task(runtime.retry_delivery("run-delivery"))
+    await asyncio.sleep(0)
+    graph.release_first_prompt_check.set()
+    outcomes = await asyncio.gather(first, second, return_exceptions=True)
+    for _ in range(100):
+        if not runtime._background_tasks:
+            break
+        await asyncio.sleep(0.01)
+
+    assert sum(outcome is None for outcome in outcomes) == 1
+    assert sum(isinstance(outcome, RunConflict) for outcome in outcomes) == 1
+    assert writer.retry_calls == 1
+    await runtime.close()
+    await repository.close()
+
+
+@pytest.mark.asyncio
 async def test_restart_during_delivery_retry_continues_delivery_only(
     tmp_path: Path,
 ) -> None:
@@ -199,6 +259,7 @@ async def test_restart_during_delivery_retry_continues_delivery_only(
         "run_id": "run-delivery",
         "thread_id": "thread-delivery",
         "status": "delivery_failed",
+        "planning_prompt": _prime_prompt(),
     }
     writer = _RetryDeliveryWriter()
     runtime, repository, _ = await _runtime(tmp_path, graph, writer)
@@ -217,6 +278,65 @@ async def test_restart_during_delivery_retry_continues_delivery_only(
     assert graph.resume_calls == 0
     assert graph.submit_calls == 0
     assert graph.poll_calls == 0
+    await runtime.close()
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_delivery_recovery_without_prompt_fails_before_external_write(
+    tmp_path: Path,
+) -> None:
+    graph = _RecoveryGraph()
+    graph.states["thread-delivery"] = {
+        "run_id": "run-delivery",
+        "thread_id": "thread-delivery",
+        "status": "delivering",
+    }
+    writer = _RetryDeliveryWriter()
+    runtime, repository, _ = await _runtime(tmp_path, graph, writer)
+    await repository.create_run(
+        "run-delivery",
+        "thread-delivery",
+        "https://acme.feishu.cn/docx/doccn123",
+        status="delivering",
+    )
+
+    await runtime.resume_pending_runs()
+    final = await runtime.wait_for_terminal("run-delivery", timeout=1)
+
+    assert final["status"] == "failed"
+    assert writer.retry_calls == 0
+    events = await repository.list_events("run-delivery")
+    assert events[-1]["node"] == "planning_prompt"
+    await runtime.close()
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_delivery_retry_without_prompt_fails_before_external_write(
+    tmp_path: Path,
+) -> None:
+    graph = _RecoveryGraph()
+    graph.states["thread-delivery"] = {
+        "run_id": "run-delivery",
+        "thread_id": "thread-delivery",
+        "status": "delivery_failed",
+    }
+    writer = _RetryDeliveryWriter()
+    runtime, repository, _ = await _runtime(tmp_path, graph, writer)
+    await repository.create_run(
+        "run-delivery",
+        "thread-delivery",
+        "https://acme.feishu.cn/docx/doccn123",
+        status="delivery_failed",
+    )
+
+    with pytest.raises(RunValidationError, match="提示词快照"):
+        await runtime.retry_delivery("run-delivery")
+
+    run = await repository.get_run("run-delivery")
+    assert run is not None and run["status"] == "failed"
+    assert writer.retry_calls == 0
     await runtime.close()
     await repository.close()
 

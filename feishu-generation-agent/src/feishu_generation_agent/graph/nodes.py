@@ -225,21 +225,28 @@ def _planner_prompt_argument(
     planning_prompt: PlanningPromptSnapshot,
 ) -> dict[str, str | None]:
     try:
-        parameter = signature(planner.plan).parameters.get("system_prompt")
+        parameters = signature(planner.plan).parameters
     except (TypeError, ValueError):
-        parameter = None
+        parameters = {}
+    exact_parameter = parameters.get("exact_system_prompt")
+    is_local_prime = (
+        planning_prompt.owner_user_id == "prime-local"
+        and planning_prompt.source == "prime"
+    )
+    if (
+        is_local_prime
+        and exact_parameter is not None
+        and exact_parameter.kind is not Parameter.POSITIONAL_ONLY
+    ):
+        return {"exact_system_prompt": planning_prompt.prompt_text}
+    if is_local_prime:
+        raise _validation_error(
+            "The planner cannot replay the Prime prompt snapshot exactly"
+        )
+    parameter = parameters.get("system_prompt")
     if parameter is None or parameter.kind is Parameter.POSITIONAL_ONLY:
         return {}
-    return {
-        "system_prompt": (
-            None
-            if (
-                planning_prompt.owner_user_id == "prime-local"
-                and planning_prompt.source == "prime"
-            )
-            else planning_prompt.prompt_text
-        )
-    }
+    return {"system_prompt": planning_prompt.prompt_text}
 
 
 async def ingest_source(

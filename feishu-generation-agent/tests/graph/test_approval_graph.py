@@ -7,6 +7,7 @@ import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.types import Command
+from pydantic import ValidationError
 
 from feishu_generation_agent.domain.errors import AgentError, ErrorCategory
 from feishu_generation_agent.domain.document import PlanningPromptSnapshot
@@ -88,6 +89,30 @@ class _NeverCalledPlanner:
         del args, kwargs
         self.audit_calls += 1
         raise AssertionError("resume must not audit again")
+
+
+class _LegacySystemPromptPlanner:
+    def __init__(self, delegate: Any) -> None:
+        self.delegate = delegate
+        self.plan_calls = 0
+
+    async def plan(
+        self,
+        document: Any,
+        descriptions: list[Any],
+        feedback: str | None,
+        system_prompt: str | None = None,
+    ) -> Any:
+        self.plan_calls += 1
+        return await self.delegate.plan(
+            document,
+            descriptions,
+            feedback,
+            system_prompt=system_prompt,
+        )
+
+    async def audit(self, document: Any, plan: Any) -> Any:
+        return await self.delegate.audit(document, plan)
 
 
 class _FailingDeliveryWriter:
@@ -188,6 +213,22 @@ def test_planning_prompt_snapshot_rejects_text_hash_mismatch() -> None:
         )
 
 
+def test_planning_prompt_snapshot_is_immutable_and_copy_updates_are_validated() -> None:
+    prompt_text = "个人版本 v2"
+    snapshot = PlanningPromptSnapshot(
+        owner_user_id="user-a",
+        source="personal",
+        version=2,
+        prompt_text=prompt_text,
+        prompt_sha256=hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+    )
+
+    with pytest.raises(ValidationError):
+        snapshot.prompt_text = "被意外修改"
+    with pytest.raises(ValidationError, match="prompt_sha256"):
+        snapshot.model_copy(update={"prompt_text": "绕过校验的修改"})
+
+
 async def test_personal_prompt_snapshot_is_checkpointed_and_reused_for_replan(
     fake_services: GraphServices,
 ):
@@ -240,7 +281,76 @@ async def test_direct_graph_run_snapshots_exact_prime_prompt(
     assert planning_prompt.prompt_sha256 == (
         "5dd2463a9bfddb3bc9e55c3a93148f7316f1259a6eaf70644a610b386a9c6ce4"
     )
-    assert fake_services.planner.system_prompts == [None]
+    assert fake_services.planner.system_prompts == [planning_prompt.prompt_text]
+
+
+async def test_local_prime_snapshot_is_used_verbatim_for_initial_and_replan(
+    fake_services: GraphServices,
+):
+    historical_prompt = "历史 Prime 快照：这一版本必须原样复用"
+    planning_prompt = PlanningPromptSnapshot(
+        owner_user_id="prime-local",
+        source="prime",
+        version=0,
+        prompt_text=historical_prompt,
+        prompt_sha256=hashlib.sha256(
+            historical_prompt.encode("utf-8")
+        ).hexdigest(),
+    )
+    graph = build_graph(fake_services, InMemorySaver())
+    config = _config("thread-prime-history")
+
+    await graph.ainvoke(
+        _input("run-prime-history", "thread-prime-history", planning_prompt),
+        config=config,
+    )
+    await graph.ainvoke(
+        Command(resume={"action": "reject", "feedback": "重新规划"}),
+        config=config,
+    )
+
+    assert fake_services.planner.system_prompts == [
+        historical_prompt,
+        historical_prompt,
+    ]
+
+
+async def test_graph_fails_closed_on_tampered_prompt_snapshot(
+    fake_services: GraphServices,
+):
+    prompt_text = "可信的历史快照"
+    planning_prompt = PlanningPromptSnapshot(
+        owner_user_id="prime-local",
+        source="prime",
+        version=0,
+        prompt_text=prompt_text,
+        prompt_sha256=hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+    )
+    state = _input("run-tampered-prompt", "thread-tampered-prompt", planning_prompt)
+    state["planning_prompt"]["prompt_text"] = "篡改后文本"
+    graph = build_graph(fake_services, InMemorySaver())
+
+    with pytest.raises(AgentError):
+        await graph.ainvoke(state, config=_config("thread-tampered-prompt"))
+
+    assert fake_services.planner.plan_calls == 0
+
+
+async def test_local_prime_fails_closed_for_legacy_planner_without_exact_replay(
+    fake_services: GraphServices,
+):
+    legacy_planner = _LegacySystemPromptPlanner(fake_services.planner)
+    services = replace(fake_services, planner=legacy_planner)
+    graph = build_graph(services, InMemorySaver())
+
+    with pytest.raises(AgentError) as raised:
+        await graph.ainvoke(
+            _input("run-legacy-planner", "thread-legacy-planner"),
+            config=_config("thread-legacy-planner"),
+        )
+
+    assert raised.value.detail.category == ErrorCategory.VALIDATION
+    assert legacy_planner.plan_calls == 0
 
 
 async def test_graph_pauses_before_any_generation(fake_services: GraphServices):

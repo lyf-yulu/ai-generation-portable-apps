@@ -38,6 +38,7 @@ class RequirementPlanner(Protocol):
         descriptions: list[VisionDescription],
         feedback: str | None,
         system_prompt: str | None = None,
+        exact_system_prompt: str | None = None,
     ) -> TaskPlan:
         raise NotImplementedError
 

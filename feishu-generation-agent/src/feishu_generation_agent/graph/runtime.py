@@ -271,26 +271,25 @@ class GraphRuntime:
             if run is None or run["status"] not in self._RECOVERABLE_STATUSES:
                 return
             try:
+                snapshot = await self.graph.aget_state(
+                    self._config(run["thread_id"])
+                )
+                state = dict(snapshot.values or {})
+                if (
+                    not state
+                    or self._planning_prompt_from_state(state) is None
+                ):
+                    await self._fail_missing_planning_prompt(run_id)
+                    return
                 if run["status"] == "delivering":
                     await self._retry_delivery_locked(
                         run_id, run["thread_id"]
                     )
                     return
-                snapshot = await self.graph.aget_state(
-                    self._config(run["thread_id"])
+                await self.repository.update_run_status(run_id, "running")
+                result = await self.graph.ainvoke(
+                    None, config=self._config(run["thread_id"])
                 )
-                state = dict(snapshot.values or {})
-                if state:
-                    if self._planning_prompt_from_state(state) is None:
-                        await self._fail_missing_planning_prompt(run_id)
-                        return
-                    await self.repository.update_run_status(run_id, "running")
-                    result = await self.graph.ainvoke(
-                        None, config=self._config(run["thread_id"])
-                    )
-                else:
-                    await self._fail_missing_planning_prompt(run_id)
-                    return
                 final_status = (
                     "waiting_approval"
                     if self._has_interrupt(result)
@@ -328,16 +327,22 @@ class GraphRuntime:
         lock = self._run_locks.setdefault(run_id, asyncio.Lock())
         if lock.locked():
             raise RunConflict("运行正在处理中，请稍后重试")
-        run = await self.repository.get_run(run_id)
-        if run is None:
-            raise RunNotFound("运行不存在")
-        if run["status"] != "delivery_failed":
-            raise RunConflict("只有交付失败的运行可以重试交付")
-        await self.repository.update_run_status(run_id, "delivering")
-        self._start_background(
-            self._retry_delivery_worker(run_id, run["thread_id"]),
-            name=f"delivery-retry-{run_id}",
-        )
+        async with lock:
+            run = await self.repository.get_run(run_id)
+            if run is None:
+                raise RunNotFound("运行不存在")
+            if run["status"] != "delivery_failed":
+                raise RunConflict("只有交付失败的运行可以重试交付")
+            if not await self._checkpoint_has_valid_planning_prompt(
+                run["thread_id"]
+            ):
+                await self._fail_missing_planning_prompt(run_id)
+                raise RunValidationError("运行缺少有效提示词快照")
+            await self.repository.update_run_status(run_id, "delivering")
+            self._start_background(
+                self._retry_delivery_worker(run_id, run["thread_id"]),
+                name=f"delivery-retry-{run_id}",
+            )
 
     async def _retry_delivery_worker(self, run_id: str, thread_id: str) -> None:
         lock = self._run_locks.setdefault(run_id, asyncio.Lock())
@@ -347,6 +352,9 @@ class GraphRuntime:
     async def _retry_delivery_locked(
         self, run_id: str, thread_id: str
     ) -> None:
+        if not await self._checkpoint_has_valid_planning_prompt(thread_id):
+            await self._fail_missing_planning_prompt(run_id)
+            return
         try:
             if self.delivery_writer is None:
                 raise RunConflict("交付重试未配置")
@@ -450,6 +458,17 @@ class GraphRuntime:
             )
         except ValidationError:
             return None
+
+    async def _checkpoint_has_valid_planning_prompt(
+        self,
+        thread_id: str,
+    ) -> bool:
+        snapshot = await self.graph.aget_state(self._config(thread_id))
+        state = dict(snapshot.values or {})
+        return (
+            bool(state)
+            and self._planning_prompt_from_state(state) is not None
+        )
 
     async def _fail_missing_planning_prompt(self, run_id: str) -> None:
         await self.repository.append_event(

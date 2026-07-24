@@ -413,8 +413,14 @@ class _TwoTaskPlanner:
     def __init__(self, tasks: list[dict[str, Any]]) -> None:
         self.tasks = tasks
 
-    async def plan(self, document, descriptions, feedback):
-        del document, descriptions, feedback
+    async def plan(
+        self,
+        document,
+        descriptions,
+        feedback,
+        exact_system_prompt=None,
+    ):
+        del document, descriptions, feedback, exact_system_prompt
         return TaskPlan(tasks=self.tasks, document_summary="two selectable tasks")
 
     async def audit(self, document, plan):

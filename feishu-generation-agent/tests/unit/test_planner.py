@@ -1,4 +1,5 @@
 import copy
+import asyncio
 import hashlib
 import json
 from pathlib import Path
@@ -7,6 +8,9 @@ from typing import Any
 
 import httpx
 import pytest
+from langchain_core.runnables.config import ensure_config, set_config_context
+from langsmith import tracing_context
+from langsmith.utils import tracing_is_enabled
 
 from feishu_generation_agent.domain.document import (
     DocumentBlock,
@@ -450,15 +454,30 @@ class FakeDeepSeekModel:
         self.calls = 0
         self.bind_calls: list[dict[str, Any]] = []
         self.requests: list[list[dict[str, Any]]] = []
+        self.configs: list[dict[str, Any]] = []
+        self.tracing_enabled: list[bool | str] = []
         self.api_key = "fictional-deepseek-key-must-not-leak"
 
     def bind(self, **kwargs: Any) -> "FakeDeepSeekModel":
         self.bind_calls.append(kwargs)
         return self
 
-    async def ainvoke(self, messages: list[dict[str, Any]]) -> object:
+    async def ainvoke(
+        self,
+        messages: list[dict[str, Any]],
+        config: dict[str, Any] | None = None,
+    ) -> object:
         self.calls += 1
         self.requests.append(copy.deepcopy(messages))
+        resolved_config = ensure_config(config)
+        self.configs.append(resolved_config)
+        self.tracing_enabled.append(tracing_is_enabled())
+        callbacks = resolved_config.get("callbacks")
+        if isinstance(callbacks, list):
+            for callback in callbacks:
+                recorder = getattr(callback, "record_model_input", None)
+                if recorder is not None:
+                    recorder(messages)
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -565,6 +584,22 @@ async def test_default_and_portal_planner_system_prompts_are_composed_safely(
     assert composed.endswith(portal_prompt)
 
 
+async def test_exact_system_prompt_override_replays_checkpoint_verbatim(
+    narrative_document: NormalizedDocument,
+    vision_descriptions: list[VisionDescription],
+):
+    historical_prime = "历史 Prime 快照：必须逐字复用"
+    model = FakeDeepSeekModel([_plan_json(_video_task())])
+
+    await DeepSeekPlanner(model).plan(
+        narrative_document,
+        vision_descriptions,
+        exact_system_prompt=historical_prime,
+    )
+
+    assert model.requests[0][0]["content"] == historical_prime
+
+
 async def test_portal_prompt_is_not_exposed_in_planner_error_or_logs(
     narrative_document: NormalizedDocument,
     vision_descriptions: list[VisionDescription],
@@ -589,6 +624,48 @@ async def test_portal_prompt_is_not_exposed_in_planner_error_or_logs(
     )
     assert secret_prompt not in serialized
     assert secret_prompt not in caplog.text
+
+
+async def test_planner_and_audit_inputs_do_not_enter_inherited_tracing_callbacks(
+    narrative_document: NormalizedDocument,
+    vision_descriptions: list[VisionDescription],
+):
+    secret_prompt = "私有业务系统提示词：禁止进入任何追踪记录"
+    audit_json = json.dumps(
+        {"issues": [], "corrections_required": False},
+        ensure_ascii=False,
+    )
+    model = FakeDeepSeekModel([_plan_json(_video_task()), audit_json])
+    planner = DeepSeekPlanner(model)
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.inputs: list[list[dict[str, Any]]] = []
+
+        def record_model_input(self, messages: list[dict[str, Any]]) -> None:
+            self.inputs.append(copy.deepcopy(messages))
+
+    recorder = _Recorder()
+    with tracing_context(enabled=True):
+        with set_config_context({"callbacks": [recorder]}) as context:
+            plan_task = context.run(
+                asyncio.create_task,
+                planner.plan(
+                    narrative_document,
+                    vision_descriptions,
+                    system_prompt=secret_prompt,
+                ),
+            )
+            plan = await plan_task
+            audit_task = context.run(
+                asyncio.create_task,
+                planner.audit(narrative_document, plan),
+            )
+            await audit_task
+
+    assert recorder.inputs == []
+    assert model.tracing_enabled == [False, False]
+    assert [config.get("callbacks") for config in model.configs] == [[], []]
 
 
 async def test_planning_prompt_does_not_send_download_error_detail(

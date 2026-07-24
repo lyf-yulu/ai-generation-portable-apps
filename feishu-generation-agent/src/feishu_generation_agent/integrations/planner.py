@@ -3,6 +3,7 @@ import re
 from typing import Any, Callable
 
 import httpx
+from langsmith import tracing_context
 from pydantic import BaseModel, ValidationError
 
 from feishu_generation_agent.domain.document import (
@@ -446,12 +447,16 @@ class DeepSeekPlanner:
         visions: list[VisionDescription],
         feedback: str | None = None,
         system_prompt: str | None = None,
+        exact_system_prompt: str | None = None,
     ) -> TaskPlan:
-        effective_system_prompt = (
-            planner_system_prompt()
-            if system_prompt is None
-            else f"{_PORTAL_PLANNER_CONTRACT}{system_prompt}"
-        )
+        if exact_system_prompt is not None:
+            effective_system_prompt = exact_system_prompt
+        else:
+            effective_system_prompt = (
+                planner_system_prompt()
+                if system_prompt is None
+                else f"{_PORTAL_PLANNER_CONTRACT}{system_prompt}"
+            )
         messages = [
             {"role": "system", "content": effective_system_prompt},
             {
@@ -597,7 +602,11 @@ class DeepSeekPlanner:
             model_error: AgentError | None = None
             response: object | None = None
             try:
-                response = await self._model.ainvoke(request_messages)
+                with tracing_context(enabled=False, parent=False):
+                    response = await self._model.ainvoke(
+                        request_messages,
+                        config={"callbacks": []},
+                    )
             except Exception as exc:
                 model_error = self._model_error(document_id, operation, exc)
             if model_error is not None:
