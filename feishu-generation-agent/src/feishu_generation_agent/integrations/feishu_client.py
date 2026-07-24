@@ -916,9 +916,13 @@ class FeishuClient:
 
     @staticmethod
     def _redact_text(value: str, sensitive_values: tuple[str, ...]) -> str:
-        for sensitive_value in sensitive_values:
-            if sensitive_value:
-                value = value.replace(sensitive_value, "[redacted]")
+        unique_values = {item for item in sensitive_values if item}
+        for sensitive_value in sorted(
+            unique_values,
+            key=len,
+            reverse=True,
+        ):
+            value = value.replace(sensitive_value, "[redacted]")
         return value
 
     @staticmethod

@@ -264,7 +264,7 @@ class FeishuSheetExporter:
         if not isinstance(ref, EmbeddedSheetRef):
             raise TypeError("ref must be an EmbeddedSheetRef")
         _validate_api_token(ref.spreadsheet_token, "spreadsheet token")
-        _validate_source_sheet_id(ref.sheet_id)
+        _validate_target_sheet_id(ref.sheet_id)
         deadline = monotonic() + EXPORT_TIMEOUT_SECONDS
         try:
             async with asyncio.timeout(EXPORT_TIMEOUT_SECONDS):
@@ -282,6 +282,7 @@ class FeishuSheetExporter:
             "/open-apis/drive/v1/export_tasks",
             json_body={
                 "file_extension": "xlsx",
+                "sub_id": ref.sheet_id,
                 "token": ref.spreadsheet_token,
                 "type": "sheet",
             },
@@ -326,7 +327,7 @@ class FeishuSheetExporter:
                 )
                 return extract_sheet_xlsx(
                     content,
-                    source_sheet_id=ref.sheet_id,
+                    target_sheet_id=ref.sheet_id,
                 )
             if job_status not in {1, 2}:
                 raise _document_error(
@@ -342,9 +343,9 @@ class FeishuSheetExporter:
 def extract_sheet_xlsx(
     content: bytes,
     *,
-    source_sheet_id: str,
+    target_sheet_id: str,
 ) -> ExtractedSheet:
-    _validate_source_sheet_id(source_sheet_id)
+    _validate_target_sheet_id(target_sheet_id)
     if not isinstance(content, bytes):
         raise TypeError("xlsx content must be bytes")
     if len(content) > MAX_XLSX_COMPRESSED_BYTES:
@@ -380,7 +381,7 @@ def extract_sheet_xlsx(
                 drawing_paths=set(),
                 anchor_count=0,
             )
-            worksheet_count = 0
+            worksheets: list[tuple[str, str]] = []
             worksheet_paths: set[str] = set()
 
             sheets = workbook.find(f"{{{_SPREADSHEET}}}sheets")
@@ -409,37 +410,50 @@ def extract_sheet_xlsx(
                         "duplicate worksheet target rejected",
                     )
                 worksheet_paths.add(worksheet_path)
-                worksheet = _parse_xml(
-                    _read_member(archive, worksheet_path, MAX_XML_BYTES)
-                )
-                _require_xml_root(
-                    worksheet,
-                    f"{{{_SPREADSHEET}}}worksheet",
-                    "worksheet",
-                )
-                worksheet_count += 1
-                text_lines.extend(
-                    _worksheet_text(
-                        worksheet,
-                        worksheet_name=worksheet_name,
-                        source_sheet_id=source_sheet_id,
-                        shared_strings=shared_strings,
-                        state=text_state,
-                    )
-                )
-                _worksheet_images(
-                    archive,
-                    worksheet,
-                    worksheet_path=worksheet_path,
-                    worksheet_name=worksheet_name,
-                    source_sheet_id=source_sheet_id,
-                    state=image_state,
-                )
-            if worksheet_count == 0:
+                worksheets.append((worksheet_name, worksheet_path))
+            if not worksheets:
                 raise _document_error(
-                    "飞书电子表格没有可读取的工作表",
-                    "xlsx workbook has no valid worksheets",
+                    "飞书电子表格没有可读取的目标工作表",
+                    (
+                        "xlsx workbook has no valid worksheets for target "
+                        f"sheet {target_sheet_id}"
+                    ),
                 )
+            if len(worksheets) != 1:
+                raise _document_error(
+                    "飞书电子表格目标工作表导出结果不唯一",
+                    (
+                        "xlsx worksheet count must be exactly one for target "
+                        f"sheet {target_sheet_id}: {len(worksheets)}"
+                    ),
+                )
+
+            worksheet_name, worksheet_path = worksheets[0]
+            worksheet = _parse_xml(
+                _read_member(archive, worksheet_path, MAX_XML_BYTES)
+            )
+            _require_xml_root(
+                worksheet,
+                f"{{{_SPREADSHEET}}}worksheet",
+                "worksheet",
+            )
+            text_lines.extend(
+                _worksheet_text(
+                    worksheet,
+                    worksheet_name=worksheet_name,
+                    source_sheet_id=target_sheet_id,
+                    shared_strings=shared_strings,
+                    state=text_state,
+                )
+            )
+            _worksheet_images(
+                archive,
+                worksheet,
+                worksheet_path=worksheet_path,
+                worksheet_name=worksheet_name,
+                source_sheet_id=target_sheet_id,
+                state=image_state,
+            )
     except AgentError:
         raise
     except (BadZipFile, KeyError, ElementTree.ParseError, ValueError) as exc:
@@ -733,7 +747,21 @@ def _worksheet_images(
                 continue
             image_relationship_id = _relationship_attribute(blip, "embed")
             if not image_relationship_id:
-                continue
+                raise _document_error(
+                    "飞书电子表格图片关系无效",
+                    "image relationship id is missing",
+                )
+            if anchor_node.tag not in {
+                f"{{{_DRAWING}}}oneCellAnchor",
+                f"{{{_DRAWING}}}twoCellAnchor",
+            }:
+                raise _document_error(
+                    "飞书电子表格图片锚点类型不受支持",
+                    "image anchor type is unsupported",
+                )
+            start = anchor_node.find(f"{{{_DRAWING}}}from")
+            row = _required_anchor_integer(start, "row")
+            column = _required_anchor_integer(start, "col")
             media_path = _relationship_target(
                 drawing_relationships,
                 relationship_id=image_relationship_id,
@@ -762,9 +790,6 @@ def _worksheet_images(
                 media_part = (media, sha256)
                 state.media_by_path[media_path] = media_part
             media, sha256 = media_part
-            start = anchor_node.find(f"{{{_DRAWING}}}from")
-            row = _integer_child(start, "row")
-            column = _integer_child(start, "col")
             anchor = SheetImageAnchor(
                 row=row,
                 column=column,
@@ -784,11 +809,22 @@ def _worksheet_images(
             record.anchors.append(anchor)
 
 
-def _integer_child(parent: ElementTree.Element | None, name: str) -> int:
+def _required_anchor_integer(
+    parent: ElementTree.Element | None,
+    name: str,
+) -> int:
     if parent is None:
-        return 0
+        raise _document_error(
+            "飞书电子表格图片锚点位置不完整",
+            "image anchor position is incomplete",
+        )
     child = parent.find(f"{{{_DRAWING}}}{name}")
-    return int(child.text) if child is not None and child.text is not None else 0
+    if child is None or child.text is None:
+        raise _document_error(
+            "飞书电子表格图片锚点位置不完整",
+            "image anchor position is incomplete",
+        )
+    return int(child.text)
 
 
 def _parse_xml(content: bytes) -> ElementTree.Element:
@@ -888,13 +924,13 @@ def _consume_xml_events(
     return root, depth, node_count
 
 
-def _validate_source_sheet_id(source_sheet_id: str) -> None:
+def _validate_target_sheet_id(target_sheet_id: str) -> None:
     if (
-        not isinstance(source_sheet_id, str)
-        or len(source_sheet_id) > MAX_BLOCK_TOKEN_LENGTH
-        or not _is_safe_token_component(source_sheet_id)
+        not isinstance(target_sheet_id, str)
+        or len(target_sheet_id) > MAX_BLOCK_TOKEN_LENGTH
+        or not _is_safe_token_component(target_sheet_id)
     ):
-        raise ValueError("invalid source sheet id")
+        raise ValueError("invalid target sheet id")
 
 
 def _validate_api_token(value: str, label: str) -> None:

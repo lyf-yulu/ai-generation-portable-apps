@@ -58,7 +58,6 @@ def _xlsx_members() -> dict[str, bytes]:
             <workbook xmlns="{_NS_SPREADSHEET}" xmlns:r="{_NS_REL}">
               <sheets>
                 <sheet name="分镜" sheetId="17" r:id="rIdStory"/>
-                <sheet name="角色" sheetId="42" r:id="rIdCharacters"/>
               </sheets>
             </workbook>
         """.encode(),
@@ -66,8 +65,6 @@ def _xlsx_members() -> dict[str, bytes]:
             <Relationships xmlns="{_NS_PACKAGE_REL}">
               <Relationship Id="rIdStory" Type="{_NS_REL}/worksheet"
                             Target="worksheets/story-board.xml"/>
-              <Relationship Id="rIdCharacters" Type="{_NS_REL}/worksheet"
-                            Target="worksheets/character-board.xml"/>
               <Relationship Id="rIdStrings" Type="{_NS_REL}/sharedStrings"
                             Target="strings/custom-shared.xml"/>
             </Relationships>
@@ -82,6 +79,7 @@ def _xlsx_members() -> dict[str, bytes]:
             <worksheet xmlns="{_NS_SPREADSHEET}" xmlns:r="{_NS_REL}">
               <sheetData>
                 <row r="2"><c r="B2" t="s"><v>0</v></c></row>
+                <row r="4"><c r="C4" t="s"><v>1</v></c></row>
               </sheetData>
               <drawing r:id="rIdStoryDrawing"/>
             </worksheet>
@@ -90,20 +88,6 @@ def _xlsx_members() -> dict[str, bytes]:
             <Relationships xmlns="{_NS_PACKAGE_REL}">
               <Relationship Id="rIdStoryDrawing" Type="{_NS_REL}/drawing"
                             Target="../drawings/story-art.xml"/>
-            </Relationships>
-        """.encode(),
-        "xl/worksheets/character-board.xml": f"""
-            <worksheet xmlns="{_NS_SPREADSHEET}" xmlns:r="{_NS_REL}">
-              <sheetData>
-                <row r="4"><c r="C4" t="s"><v>1</v></c></row>
-              </sheetData>
-              <drawing r:id="rIdCharacterDrawing"/>
-            </worksheet>
-        """.encode(),
-        "xl/worksheets/_rels/character-board.xml.rels": f"""
-            <Relationships xmlns="{_NS_PACKAGE_REL}">
-              <Relationship Id="rIdCharacterDrawing" Type="{_NS_REL}/drawing"
-                            Target="../drawings/character-art.xml"/>
             </Relationships>
         """.encode(),
         "xl/drawings/story-art.xml": f"""
@@ -117,6 +101,10 @@ def _xlsx_members() -> dict[str, bytes]:
                 <xdr:from><xdr:col>4</xdr:col><xdr:row>6</xdr:row></xdr:from>
                 <xdr:pic><xdr:blipFill><a:blip r:embed="rIdReference"/></xdr:blipFill></xdr:pic>
               </xdr:oneCellAnchor>
+              <xdr:oneCellAnchor>
+                <xdr:from><xdr:col>3</xdr:col><xdr:row>8</xdr:row></xdr:from>
+                <xdr:pic><xdr:blipFill><a:blip r:embed="rIdHeroCopy"/></xdr:blipFill></xdr:pic>
+              </xdr:oneCellAnchor>
             </xdr:wsDr>
         """.encode(),
         "xl/drawings/_rels/story-art.xml.rels": f"""
@@ -125,19 +113,6 @@ def _xlsx_members() -> dict[str, bytes]:
                             Target="../media/hero.png"/>
               <Relationship Id="rIdReference" Type="{_NS_REL}/image"
                             Target="../media/reference.png"/>
-            </Relationships>
-        """.encode(),
-        "xl/drawings/character-art.xml": f"""
-            <xdr:wsDr xmlns:xdr="{_NS_DRAWING}" xmlns:a="{_NS_DRAWING_MAIN}"
-                      xmlns:r="{_NS_REL}">
-              <xdr:absoluteAnchor>
-                <xdr:pos x="0" y="0"/>
-                <xdr:pic><xdr:blipFill><a:blip r:embed="rIdHeroCopy"/></xdr:blipFill></xdr:pic>
-              </xdr:absoluteAnchor>
-            </xdr:wsDr>
-        """.encode(),
-        "xl/drawings/_rels/character-art.xml.rels": f"""
-            <Relationships xmlns="{_NS_PACKAGE_REL}">
               <Relationship Id="rIdHeroCopy" Type="{_NS_REL}/image"
                             Target="../media/hero-copy.png"/>
             </Relationships>
@@ -198,7 +173,7 @@ def _corrupt_first_zip_payload(content: bytes) -> bytes:
 
 def _assert_document_error(content: bytes, *, detail: str) -> None:
     with pytest.raises(AgentError) as raised:
-        extract_sheet_xlsx(content, source_sheet_id="NuBUx5")
+        extract_sheet_xlsx(content, target_sheet_id="NuBUx5")
 
     assert raised.value.detail.category is ErrorCategory.DOCUMENT
     assert raised.value.detail.retryable is False
@@ -221,6 +196,15 @@ def _assert_canaries_absent_from_exception_chain(
         for linked in (current.__cause__, current.__context__):
             if linked is not None:
                 pending.append(linked)
+
+
+def test_client_redacts_overlapping_sensitive_values_longest_first() -> None:
+    redacted = FeishuClient._redact_text(
+        "short-token-long and short-token",
+        ("short-token", "short-token-long", "short-token"),
+    )
+
+    assert redacted == "[redacted] and [redacted]"
 
 
 def test_parse_sheet_block_token_splits_on_final_delimiter() -> None:
@@ -250,16 +234,16 @@ def test_parse_sheet_block_token_rejects_unsafe_values(raw: str) -> None:
         parse_sheet_block_token(raw)
 
 
-def test_extract_sheet_xlsx_reads_all_related_worksheets_and_preserves_sources() -> None:
+def test_extract_sheet_xlsx_reads_single_exported_worksheet() -> None:
     extracted = extract_sheet_xlsx(
         _make_xlsx(),
-        source_sheet_id="NuBUx5",
+        target_sheet_id="NuBUx5",
     )
 
     assert isinstance(extracted, ExtractedSheet)
     assert extracted.text_lines == (
         "[sheet:NuBUx5 worksheet:分镜 cell:B2] 镜头一",
-        "[sheet:NuBUx5 worksheet:角色 cell:C4] 人物保持一致",
+        "[sheet:NuBUx5 worksheet:分镜 cell:C4] 人物保持一致",
     )
     assert len(extracted.images) == 2
     assert [image.content for image in extracted.images] == [
@@ -277,13 +261,47 @@ def test_extract_sheet_xlsx_reads_all_related_worksheets_and_preserves_sources()
             source_sheet_id="NuBUx5",
         ),
         SheetImageAnchor(
-            row=0,
-            column=0,
+            row=8,
+            column=3,
             media_name="hero-copy.png",
             sha256=extracted.images[0].sha256,
-            worksheet_name="角色",
+            worksheet_name="分镜",
             source_sheet_id="NuBUx5",
         ),
+    )
+
+
+def test_extract_sheet_xlsx_rejects_multiple_valid_worksheets() -> None:
+    members = _xlsx_members()
+    members["xl/workbook.xml"] = f"""
+        <workbook xmlns="{_NS_SPREADSHEET}" xmlns:r="{_NS_REL}">
+          <sheets>
+            <sheet name="分镜" sheetId="17" r:id="rIdStory"/>
+            <sheet name="角色" sheetId="42" r:id="rIdCharacters"/>
+          </sheets>
+        </workbook>
+    """.encode()
+    members["xl/_rels/workbook.xml.rels"] = f"""
+        <Relationships xmlns="{_NS_PACKAGE_REL}">
+          <Relationship Id="rIdStory" Type="{_NS_REL}/worksheet"
+                        Target="worksheets/story-board.xml"/>
+          <Relationship Id="rIdCharacters" Type="{_NS_REL}/worksheet"
+                        Target="worksheets/character-board.xml"/>
+          <Relationship Id="rIdStrings" Type="{_NS_REL}/sharedStrings"
+                        Target="strings/custom-shared.xml"/>
+        </Relationships>
+    """.encode()
+    members["xl/worksheets/character-board.xml"] = f"""
+        <worksheet xmlns="{_NS_SPREADSHEET}">
+          <sheetData>
+            <row r="1"><c r="A1" t="s"><v>1</v></c></row>
+          </sheetData>
+        </worksheet>
+    """.encode()
+
+    _assert_document_error(
+        _make_xlsx(members),
+        detail="worksheet count must be exactly one",
     )
 
 
@@ -443,8 +461,6 @@ def test_extract_sheet_xlsx_accepts_strict_relationship_types() -> None:
         <Relationships xmlns="{_NS_PACKAGE_REL}">
           <Relationship Id="rIdStory" Type="{_NS_STRICT_REL}/worksheet"
                         Target="worksheets/story-board.xml"/>
-          <Relationship Id="rIdCharacters" Type="{_NS_STRICT_REL}/worksheet"
-                        Target="worksheets/character-board.xml"/>
           <Relationship Id="rIdStrings" Type="{_NS_STRICT_REL}/sharedStrings"
                         Target="strings/custom-shared.xml"/>
         </Relationships>
@@ -453,14 +469,13 @@ def test_extract_sheet_xlsx_accepts_strict_relationship_types() -> None:
         <workbook xmlns="{_NS_SPREADSHEET}" xmlns:r="{_NS_STRICT_REL}">
           <sheets>
             <sheet name="分镜" sheetId="17" r:id="rIdStory"/>
-            <sheet name="角色" sheetId="42" r:id="rIdCharacters"/>
           </sheets>
         </workbook>
     """.encode()
 
     extracted = extract_sheet_xlsx(
         _make_xlsx(members),
-        source_sheet_id="NuBUx5",
+        target_sheet_id="NuBUx5",
     )
 
     assert len(extracted.text_lines) == 2
@@ -569,7 +584,7 @@ def test_extract_sheet_xlsx_safely_ignores_known_microsoft_extension_relationshi
 
     extracted = extract_sheet_xlsx(
         _make_xlsx(members),
-        source_sheet_id="NuBUx5",
+        target_sheet_id="NuBUx5",
     )
 
     assert len(extracted.text_lines) == 2
@@ -605,7 +620,7 @@ def test_extract_sheet_xlsx_ignores_unrelated_external_hyperlinks() -> None:
 
     extracted = extract_sheet_xlsx(
         _make_xlsx(members),
-        source_sheet_id="NuBUx5",
+        target_sheet_id="NuBUx5",
     )
 
     assert len(extracted.images) == 2
@@ -619,7 +634,6 @@ def test_extract_sheet_xlsx_skips_non_worksheet_sheet_relations() -> None:
           <sheets>
             <sheet name="分镜" sheetId="17" r:id="rIdStory"/>
             <sheet name="图表" sheetId="23" r:id="rIdChart"/>
-            <sheet name="角色" sheetId="42" r:id="rIdCharacters"/>
           </sheets>
         </workbook>
     """.encode()
@@ -629,8 +643,6 @@ def test_extract_sheet_xlsx_skips_non_worksheet_sheet_relations() -> None:
                         Target="worksheets/story-board.xml"/>
           <Relationship Id="rIdChart" Type="{_NS_REL}/chartsheet"
                         Target="chartsheets/overview.xml"/>
-          <Relationship Id="rIdCharacters" Type="{_NS_REL}/worksheet"
-                        Target="worksheets/character-board.xml"/>
           <Relationship Id="rIdStrings" Type="{_NS_REL}/sharedStrings"
                         Target="strings/custom-shared.xml"/>
         </Relationships>
@@ -642,12 +654,12 @@ def test_extract_sheet_xlsx_skips_non_worksheet_sheet_relations() -> None:
 
     extracted = extract_sheet_xlsx(
         _make_xlsx(members),
-        source_sheet_id="NuBUx5",
+        target_sheet_id="NuBUx5",
     )
 
     assert extracted.text_lines == (
         "[sheet:NuBUx5 worksheet:分镜 cell:B2] 镜头一",
-        "[sheet:NuBUx5 worksheet:角色 cell:C4] 人物保持一致",
+        "[sheet:NuBUx5 worksheet:分镜 cell:C4] 人物保持一致",
     )
 
 
@@ -661,12 +673,14 @@ def test_extract_sheet_xlsx_resolves_media_outside_default_directory() -> None:
                         Target="../../custom/assets/hero.bin"/>
           <Relationship Id="rIdReference" Type="{_NS_REL}/image"
                         Target="../media/reference.png"/>
+          <Relationship Id="rIdHeroCopy" Type="{_NS_REL}/image"
+                        Target="../media/hero-copy.png"/>
         </Relationships>
     """.encode()
 
     extracted = extract_sheet_xlsx(
         _make_xlsx(members),
-        source_sheet_id="NuBUx5",
+        target_sheet_id="NuBUx5",
     )
 
     assert extracted.images[0].media_name == "hero.bin"
@@ -721,6 +735,74 @@ def test_extract_sheet_xlsx_rejects_drawing_missing_relationship_id() -> None:
     _assert_document_error(
         _make_xlsx(members),
         detail="drawing relationship id is missing",
+    )
+
+
+def test_extract_sheet_xlsx_rejects_blip_missing_embed_relationship() -> None:
+    members = _xlsx_members()
+    members["xl/drawings/story-art.xml"] = f"""
+        <xdr:wsDr xmlns:xdr="{_NS_DRAWING}" xmlns:a="{_NS_DRAWING_MAIN}"
+                  xmlns:r="{_NS_REL}">
+          <xdr:oneCellAnchor>
+            <xdr:from><xdr:col>1</xdr:col><xdr:row>2</xdr:row></xdr:from>
+            <xdr:pic><xdr:blipFill><a:blip/></xdr:blipFill></xdr:pic>
+          </xdr:oneCellAnchor>
+        </xdr:wsDr>
+    """.encode()
+
+    _assert_document_error(
+        _make_xlsx(members),
+        detail="image relationship id is missing",
+    )
+
+
+def test_extract_sheet_xlsx_rejects_absolute_image_anchor() -> None:
+    members = _xlsx_members()
+    members["xl/drawings/story-art.xml"] = f"""
+        <xdr:wsDr xmlns:xdr="{_NS_DRAWING}" xmlns:a="{_NS_DRAWING_MAIN}"
+                  xmlns:r="{_NS_REL}">
+          <xdr:absoluteAnchor>
+            <xdr:pos x="0" y="0"/>
+            <xdr:pic>
+              <xdr:blipFill><a:blip r:embed="rIdHero"/></xdr:blipFill>
+            </xdr:pic>
+          </xdr:absoluteAnchor>
+        </xdr:wsDr>
+    """.encode()
+
+    _assert_document_error(
+        _make_xlsx(members),
+        detail="image anchor type is unsupported",
+    )
+
+
+@pytest.mark.parametrize(
+    "from_xml",
+    [
+        "",
+        "<xdr:from><xdr:col>1</xdr:col></xdr:from>",
+        "<xdr:from><xdr:row>2</xdr:row></xdr:from>",
+    ],
+)
+def test_extract_sheet_xlsx_rejects_incomplete_image_anchor_position(
+    from_xml: str,
+) -> None:
+    members = _xlsx_members()
+    members["xl/drawings/story-art.xml"] = f"""
+        <xdr:wsDr xmlns:xdr="{_NS_DRAWING}" xmlns:a="{_NS_DRAWING_MAIN}"
+                  xmlns:r="{_NS_REL}">
+          <xdr:oneCellAnchor>
+            {from_xml}
+            <xdr:pic>
+              <xdr:blipFill><a:blip r:embed="rIdHero"/></xdr:blipFill>
+            </xdr:pic>
+          </xdr:oneCellAnchor>
+        </xdr:wsDr>
+    """.encode()
+
+    _assert_document_error(
+        _make_xlsx(members),
+        detail="image anchor position is incomplete",
     )
 
 
@@ -852,7 +934,7 @@ def test_extract_sheet_xlsx_accepts_maximum_excel_cell_reference() -> None:
 
     extracted = extract_sheet_xlsx(
         _make_xlsx(members),
-        source_sheet_id="NuBUx5",
+        target_sheet_id="NuBUx5",
     )
 
     assert extracted.text_lines[0] == (
@@ -933,12 +1015,12 @@ def test_extract_sheet_xlsx_rejects_excessive_image_anchors(
     _assert_document_error(_make_xlsx(), detail="image anchor count limit")
 
 
-@pytest.mark.parametrize("source_sheet_id", ["", "../NuBUx5", "NuB\\Ux5"])
-def test_extract_sheet_xlsx_rejects_unsafe_source_namespace(
-    source_sheet_id: str,
+@pytest.mark.parametrize("target_sheet_id", ["", "../NuBUx5", "NuB\\Ux5"])
+def test_extract_sheet_xlsx_rejects_unsafe_target_sheet_id(
+    target_sheet_id: str,
 ) -> None:
-    with pytest.raises(ValueError, match="source sheet id"):
-        extract_sheet_xlsx(_make_xlsx(), source_sheet_id=source_sheet_id)
+    with pytest.raises(ValueError, match="target sheet id"):
+        extract_sheet_xlsx(_make_xlsx(), target_sheet_id=target_sheet_id)
 
 
 async def test_client_download_export_file_uses_authenticated_drive_path() -> None:
@@ -1320,6 +1402,7 @@ async def test_exporter_creates_polls_and_downloads_xlsx(
     )
     assert json.loads(create_request.content) == {
         "file_extension": "xlsx",
+        "sub_id": "NuBUx5",
         "token": "C7tUs3k3fhoiybtWxzvcqN7Nn3b",
         "type": "sheet",
     }
