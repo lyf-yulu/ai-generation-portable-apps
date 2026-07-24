@@ -1086,6 +1086,79 @@ def test_validator_accepts_chinese_prompt_with_requested_english_dialogue_brand_
     assert validate_plan(raw_plan, narrative_document, 4) == []
 
 
+@pytest.mark.parametrize("generate_audio", [None, False])
+def test_validator_requires_audio_for_video_when_document_requests_it(
+    narrative_document: NormalizedDocument,
+    generate_audio: bool | None,
+):
+    blocks = [
+        block.model_copy(
+            update={
+                "text": (
+                    "女孩说：\"Wait, what's this?\"；"
+                    "音效：清脆提示音；Upbeat electronic BGM starts。"
+                )
+            }
+        )
+        if block.block_id == "story-1"
+        else block
+        for block in narrative_document.blocks
+    ]
+    document = narrative_document.model_copy(
+        update={
+            "blocks": blocks,
+            "text_view": (
+                "[block:story-1] 女孩说：\"Wait, what's this?\"；"
+                "音效：清脆提示音；Upbeat electronic BGM starts。\n"
+                "[block:image-1] [image:asset-1]"
+            ),
+        }
+    )
+    task = _video_task()
+    task["generate_audio"] = generate_audio
+
+    issues = validate_plan(
+        json.loads(_plan_json(task)),
+        document,
+        4,
+    )
+
+    assert (
+        "tasks[0].generate_audio: "
+        "文档明确要求对白、音效、配音、环境音或音乐时必须为 true"
+    ) in issues
+
+
+def test_validator_does_not_treat_explicit_silence_as_audio_intent(
+    narrative_document: NormalizedDocument,
+):
+    blocks = [
+        block.model_copy(
+            update={"text": "视频保持静音，无需配音，不要音效，无背景音乐。"}
+        )
+        if block.block_id == "story-1"
+        else block
+        for block in narrative_document.blocks
+    ]
+    document = narrative_document.model_copy(
+        update={
+            "blocks": blocks,
+            "text_view": (
+                "[block:story-1] 视频保持静音，无需配音，不要音效，"
+                "无背景音乐。\n[block:image-1] [image:asset-1]"
+            ),
+        }
+    )
+    task = _video_task()
+    task["generate_audio"] = False
+
+    assert validate_plan(
+        json.loads(_plan_json(task)),
+        document,
+        4,
+    ) == []
+
+
 def test_validator_rejects_frame_mode_without_exactly_two_frame_roles(
     narrative_document: NormalizedDocument,
 ):
@@ -1552,3 +1625,41 @@ async def test_audit_uses_independent_prompt_and_does_not_rewrite_plan(
         ensure_ascii=False,
         separators=(",", ":"),
     ) in model.requests[1][1]["content"]
+
+
+async def test_audit_repairs_goal_rejecting_supplier_limit_language(
+    narrative_document: NormalizedDocument,
+    vision_descriptions: list[VisionDescription],
+):
+    plan_json = _plan_json(_video_task())
+    rejecting_audit = json.dumps(
+        {
+            "issues": ["供应商无法保证尾帧一致，也做不到使用全部参考图。"],
+            "corrections_required": True,
+        },
+        ensure_ascii=False,
+    )
+    actionable_audit = json.dumps(
+        {
+            "issues": [
+                "实施策略：使用多参考模式纳入全部参考图，并在提示词中强化尾帧构图约束。"
+            ],
+            "corrections_required": True,
+        },
+        ensure_ascii=False,
+    )
+    model = FakeDeepSeekModel([plan_json, rejecting_audit, actionable_audit])
+    planner = DeepSeekPlanner(model, max_output_count=4)
+    plan = await planner.plan(narrative_document, vision_descriptions)
+
+    report = await planner.audit(narrative_document, plan)
+
+    assert report.issues == [
+        "实施策略：使用多参考模式纳入全部参考图，并在提示词中强化尾帧构图约束。"
+    ]
+    assert model.calls == 3
+    repair_prompt = model.requests[2][-1]["content"]
+    assert "审计措辞" in repair_prompt
+    audit_system = model.requests[1][0]["content"]
+    assert "不要否定或质疑需求目标" in audit_system
+    assert "实施策略" in audit_system

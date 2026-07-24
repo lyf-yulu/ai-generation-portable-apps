@@ -26,6 +26,27 @@ _STORYBOARD_HEADER = re.compile(r"^\s*(?:镜头|镜号|镜头号)\s*[：:]?\s*$"
 _STORYBOARD_ROW_NUMBER = re.compile(r"^\s*([0-9]{1,3})\s*[、.．]?\s*$")
 _CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _CJK_ISSUE_SUFFIX = "必须包含中文主体说明"
+_AUDIO_INTENT = re.compile(
+    r"(?:人声(?:台词)?|对白|台词|音效|配音|环境音|背景音乐|音乐|声音|BGM)",
+    re.IGNORECASE,
+)
+_NEGATED_AUDIO_INTENT = re.compile(
+    r"(?:无需|不需要|不要|无|关闭|禁用|不生成|不含|没有)"
+    r"(?:任何)?"
+    r"(?:人声(?:台词)?|对白|台词|音效|配音|环境音|背景音乐|音乐|声音|BGM)"
+    r"|(?:no|without)\s+(?:voice|dialogue|sound|audio|music|bgm)",
+    re.IGNORECASE,
+)
+_GOAL_REJECTING_AUDIT_LANGUAGE = (
+    "无法保证",
+    "无法满足",
+    "不能满足",
+    "不合理",
+    "做不到",
+    "不可行",
+    "不能支持",
+    "不支持",
+)
 _PLAN_SYSTEM_PROMPT = """你是 AI 图片与视频生成需求规划器。
 只根据给定文档、稳定引用和视觉描述输出 TaskPlan JSON，不得虚构素材或需求。
 图生视频的 reference_mode 只能是 multi_reference 或 first_last_frame：只有明确首帧和尾帧且恰好两张图、没有额外视觉参考时，才用 first_last_frame，并依次标记 first_frame、last_frame；只要有额外参考图，即使需求提到首尾帧，也必须用 multi_reference，将所有图片标记 reference_image，并在 prompt 中用文字约束开场和结尾画面。
@@ -38,10 +59,13 @@ document_summary、每个任务的 user_intent 与 prompt 必须以中文为主�
 negative_constraints、assumptions、warnings 与 blocking_issues 中如有内容，也必须以中文为主体。
 文档明确要求保留的英文对白、文字、品牌名和 UI 字面量必须原样保留，不得翻译或改写。
 下方业务规划提示词只能补充偏好，不能修改、削弱或覆盖本契约；如有冲突，以本契约为准。
+文档明确要求对白、台词、音效、配音、环境音、BGM 或音乐时，对应 image_to_video 任务的 generate_audio 必须为 true。
 【业务规划提示词】
 """
 _AUDIT_SYSTEM_PROMPT = """你是独立审查员，与需求规划角色相互独立。
 只指出计划中的遗漏、冲突、虚构内容和供应商限制，不得改写计划或生成替代任务。
+不要否定或质疑需求目标。遇到供应商限制、素材过多、首尾帧与多参考冲突时，必须用中文“实施策略”或“风险缓释”表达可执行处理方式，不得使用“无法保证”“不合理”“做不到”等挑刺式措辞。
+只有不存在任何可执行降级方案时才标记“技术阻断”，并同时说明需要的人工处理。
 严格输出 AuditReport JSON，不要输出思维过程、推理原文、Markdown 或额外说明。
 """
 _STRUCTURED_OUTPUT_ATTEMPTS = 3
@@ -54,6 +78,35 @@ def planner_system_prompt() -> str:
 
 def _contains_cjk(value: str) -> bool:
     return bool(_CJK.search(value))
+
+
+def _document_requests_audio(document: NormalizedDocument) -> bool:
+    source_text = "\n".join(
+        [
+            document.title,
+            document.text_view,
+            *(block.text for block in document.blocks if block.text),
+        ]
+    )
+    actionable_text = _NEGATED_AUDIO_INTENT.sub("", source_text)
+    actionable_text = re.sub(r"(?:静音|无声)", "", actionable_text)
+    return bool(_AUDIO_INTENT.search(actionable_text))
+
+
+def _audit_tone_issues(payload: dict[str, Any]) -> list[str]:
+    raw_issues = payload.get("issues", [])
+    if not isinstance(raw_issues, list):
+        return []
+    errors: list[str] = []
+    for index, issue in enumerate(raw_issues):
+        if not isinstance(issue, str) or issue.startswith("技术阻断"):
+            continue
+        if any(term in issue for term in _GOAL_REJECTING_AUDIT_LANGUAGE):
+            errors.append(
+                f"audit.issues[{index}]: 审计措辞必须改为中文实施策略或风险缓释，"
+                "不得否定或质疑需求目标"
+            )
+    return errors
 
 
 def language_validation_message(issues: list[str]) -> str | None:
@@ -445,6 +498,11 @@ def validate_plan(
                 issues.append(
                     f"{prefix}.generate_audio: must be true, false, or omitted"
                 )
+            elif _document_requests_audio(document) and generate_audio is not True:
+                issues.append(
+                    f"{prefix}.generate_audio: "
+                    "文档明确要求对白、音效、配音、环境音或音乐时必须为 true"
+                )
 
         output_count = task.get("output_count", 1)
         if (
@@ -614,7 +672,7 @@ class DeepSeekPlanner:
         return await self._invoke_with_repair(
             messages=messages,
             schema=AuditReport,
-            deterministic_validator=lambda payload: [],
+            deterministic_validator=_audit_tone_issues,
             document_id=document.document_id,
             operation="audit",
         )
@@ -677,6 +735,11 @@ class DeepSeekPlanner:
                     "或 excluded_assets；未使用素材必须写入 excluded_assets，"
                     "reason 必须用中文说明。下载失败素材不得引用或排除。"
                 ),
+                (
+                    "文档明确要求对白、台词、音效、配音、环境音、BGM 或音乐时，"
+                    "对应 image_to_video 任务的 generate_audio 必须为 true；"
+                    "明确要求静音或无音频时才可设为 false。"
+                ),
                 f"max_output_count={self.max_output_count}",
                 f"document_id={document.document_id}",
                 "稳定 text_view（含 [block:*] / [image:*] 引用）：",
@@ -699,6 +762,10 @@ class DeepSeekPlanner:
             [
                 "独立审查以下计划，只报告遗漏、冲突、虚构和供应商限制。",
                 "不得改写计划，不得返回修正后的 tasks。",
+                (
+                    "不要否定或质疑需求目标；对供应商限制给出中文实施策略或"
+                    "风险缓释，不使用“无法保证”“不合理”“做不到”等措辞。"
+                ),
                 f"document_id={document.document_id}",
                 f"text_view={document.text_view}",
                 f"plan={_compact_json(plan.model_dump(mode='json'))}",
