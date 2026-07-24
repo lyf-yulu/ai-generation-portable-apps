@@ -99,7 +99,13 @@ class FeishuClient:
                     "飞书接口返回了无法解析的响应",
                     f"{method} {path}: HTTP {response.status_code}, invalid JSON",
                 )
-            self._raise_for_api_error(response, payload, method, path)
+            self._raise_for_api_error(
+                response,
+                payload,
+                method,
+                path,
+                sensitive_values=(token,),
+            )
             return payload
         raise AssertionError("request retry loop exhausted")
 
@@ -158,12 +164,92 @@ class FeishuClient:
                 token = await self._refresh_after_auth_failure(token)
                 continue
             if response.status_code >= 400 or self._api_code(payload) != 0:
-                self._raise_for_api_error(response, payload, "GET", path)
+                self._raise_for_api_error(
+                    response,
+                    payload,
+                    "GET",
+                    path,
+                    sensitive_values=(token,),
+                )
             return (
                 response.content,
                 response.headers.get("Content-Type", "application/octet-stream"),
             )
         raise AssertionError("download retry loop exhausted")
+
+    async def download_export_file(
+        self,
+        file_token: str,
+        *,
+        max_bytes: int,
+    ) -> bytes:
+        self._validate_path_token(file_token, "file token")
+        if (
+            not isinstance(max_bytes, int)
+            or isinstance(max_bytes, bool)
+            or max_bytes <= 0
+        ):
+            raise ValueError("max_bytes must be a positive integer")
+        path = (
+            "/open-apis/drive/v1/export_tasks/file/"
+            f"{file_token}/download"
+        )
+        token = await self.tenant_token()
+        for attempt in range(2):
+            response = await self._send_stream("GET", path, token)
+            refresh_token = False
+            try:
+                content_type = response.headers.get("Content-Type", "").lower()
+                if response.status_code >= 400 or "json" in content_type:
+                    payload_content = await self._read_stream_limited(
+                        response,
+                        min(max_bytes, 1024 * 1024),
+                    )
+                    payload_response = httpx.Response(
+                        response.status_code,
+                        content=payload_content,
+                        headers=response.headers,
+                        request=response.request,
+                    )
+                    payload = self._optional_response_json(payload_response)
+                    if (
+                        self._authentication_failed(response, payload)
+                        and attempt == 0
+                    ):
+                        refresh_token = True
+                    elif response.status_code >= 400 or self._api_code(payload) != 0:
+                        self._raise_for_api_error(
+                            response,
+                            payload,
+                            "GET",
+                            path,
+                            sensitive_values=(token,),
+                        )
+                    else:
+                        raise self._document_error(
+                            "飞书电子表格导出下载响应无效",
+                            "export download returned JSON instead of XLSX",
+                        )
+                else:
+                    declared_size = response.headers.get("Content-Length")
+                    if declared_size is not None:
+                        try:
+                            if int(declared_size) > max_bytes:
+                                raise self._document_error(
+                                    "飞书电子表格导出文件过大",
+                                    "export download size limit exceeded",
+                                )
+                        except ValueError:
+                            pass
+                    return await self._read_stream_limited(response, max_bytes)
+            except httpx.HTTPError as exc:
+                raise self._transport_error("GET", path, exc) from exc
+            finally:
+                await response.aclose()
+            if refresh_token:
+                token = await self._refresh_after_auth_failure(token)
+                continue
+        raise AssertionError("export download retry loop exhausted")
 
     async def create_document(self, title: str) -> str:
         body: dict[str, str] = {"title": title}
@@ -491,7 +577,13 @@ class FeishuClient:
             if self._authentication_failed(response, payload) and attempt == 0:
                 token = await self._refresh_after_auth_failure(token)
                 continue
-            self._raise_for_api_error(response, payload, "POST", path)
+            self._raise_for_api_error(
+                response,
+                payload,
+                "POST",
+                path,
+                sensitive_values=(token,),
+            )
             return payload
         raise AssertionError("multipart request retry loop exhausted")
 
@@ -625,12 +717,45 @@ class FeishuClient:
         except httpx.HTTPError as exc:
             raise self._transport_error(method, path, exc) from exc
 
+    async def _send_stream(
+        self,
+        method: str,
+        path: str,
+        token: str,
+    ) -> httpx.Response:
+        request = self._http_client.build_request(
+            method,
+            path,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        try:
+            return await self._http_client.send(request, stream=True)
+        except httpx.HTTPError as exc:
+            raise self._transport_error(method, path, exc) from exc
+
+    @staticmethod
+    async def _read_stream_limited(
+        response: httpx.Response,
+        max_bytes: int,
+    ) -> bytes:
+        content = bytearray()
+        async for chunk in response.aiter_bytes():
+            if len(content) + len(chunk) > max_bytes:
+                raise FeishuClient._document_error(
+                    "飞书电子表格导出文件过大",
+                    "export download size limit exceeded",
+                )
+            content.extend(chunk)
+        return bytes(content)
+
     def _raise_for_api_error(
         self,
         response: httpx.Response,
         payload: dict,
         method: str,
         path: str,
+        *,
+        sensitive_values: tuple[str, ...] = (),
     ) -> None:
         code = self._api_code(payload)
         if response.status_code < 400 and code == 0:
@@ -653,7 +778,11 @@ class FeishuClient:
                 category=category,
                 message=message,
                 technical_detail=self._technical_detail(
-                    method, path, response.status_code, payload
+                    method,
+                    path,
+                    response.status_code,
+                    payload,
+                    sensitive_values=sensitive_values,
                 ),
                 retryable=retryable,
             )
@@ -699,10 +828,32 @@ class FeishuClient:
         path: str,
         status: int,
         payload: dict,
+        *,
+        sensitive_values: tuple[str, ...] = (),
     ) -> str:
         code = payload.get("code")
         message = payload.get("msg") or payload.get("message") or ""
-        return f"{method} {path}: HTTP {status}, code={code}, msg={message}"
+        if not isinstance(message, str):
+            message = ""
+        detail = f"{method} {path}: HTTP {status}, code={code}, msg={message}"
+        for sensitive_value in sensitive_values:
+            if sensitive_value:
+                detail = detail.replace(sensitive_value, "[redacted]")
+        return detail
+
+    @staticmethod
+    def _validate_path_token(value: str, label: str) -> None:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 256
+            or not all(
+                character.isascii()
+                and (character.isalnum() or character in {"-", "_"})
+                for character in value
+            )
+        ):
+            raise ValueError(f"invalid {label}")
 
     @staticmethod
     def _document_error(message: str, detail: str) -> AgentError:
