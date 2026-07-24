@@ -27,6 +27,7 @@ from feishu_generation_agent.domain.errors import (
     ErrorCategory,
     ErrorDetail,
 )
+from feishu_generation_agent.domain.plan import ApprovalDecision
 from feishu_generation_agent.graph.builder import build_graph
 from feishu_generation_agent.graph.nodes import GraphServices
 from feishu_generation_agent.graph.runtime import (
@@ -727,7 +728,43 @@ async def test_clone_run_for_approval_reuses_approved_draft_without_generation(
         cloned = await _wait_for_status(client, cloned_run_id, "waiting_approval")
 
     assert cloned_run_id == "rerun-1"
-    assert cloned["approval"]["tasks"] == original["approval"]["tasks"]
+    assert cloned["approval"]["tasks"] == [original["approval"]["tasks"][0]]
+    assert cloned["approval"]["selected_task_ids"] == ["task-1"]
+    assert graph.resume_calls == 0
+
+
+async def test_clone_prefers_approved_plan_when_approved_tasks_are_missing(
+    tmp_path: Path,
+) -> None:
+    async with _environment(tmp_path) as (client, runtime, graph, _repository):
+        created = await client.post(
+            "/api/runs",
+            json={"source_url": "https://tenant.feishu.cn/docx/prefer-approved"},
+        )
+        original_run_id = created.json()["run_id"]
+        original = await _wait_for_status(
+            client, original_run_id, "waiting_approval"
+        )
+        approved = {
+            "tasks": [copy.deepcopy(original["approval"]["tasks"][0])],
+            "document_summary": original["approval"]["document_summary"],
+            "excluded_assets": [],
+        }
+        source_state = graph.states[original["thread_id"]]
+        source_state["approved_plan"] = approved
+        source_state["approved_tasks"] = []
+
+        cloned_run_id = await runtime.clone_run_for_approval(
+            original_run_id,
+            RequirementRequest(source_url=original["source_url"]),
+            run_id="rerun-prefer-approved",
+            thread_id="rerun-prefer-approved-thread",
+        )
+        cloned = await _wait_for_status(
+            client, cloned_run_id, "waiting_approval"
+        )
+
+    assert cloned["approval"]["tasks"] == approved["tasks"]
     assert cloned["approval"]["selected_task_ids"] == ["task-1"]
     assert graph.resume_calls == 0
 
@@ -819,6 +856,199 @@ async def test_clone_run_for_approval_initializes_a_real_langgraph_checkpoint(
     assert cloned["status"] == "waiting_approval"
     assert cloned["approval"]["tasks"] == original["approval"]["tasks"]
     assert fake_services.planner.plan_calls == 1
+
+
+async def _complete_run_with_approval_edits(
+    runtime: GraphRuntime,
+    graph: Any,
+    services: GraphServices,
+    *,
+    run_id: str,
+    thread_id: str,
+) -> dict[str, Any]:
+    source_url = "https://tenant.feishu.cn/docx/clone-approved-source"
+    await runtime.start_run(
+        RequirementRequest(source_url=source_url),
+        run_id=run_id,
+        thread_id=thread_id,
+    )
+    for _ in range(100):
+        source = await runtime.get_run_view(run_id)
+        if source["status"] == "waiting_approval":
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("source run did not reach approval")
+
+    uploaded = await runtime.add_reference(
+        run_id,
+        task_id="task-video",
+        role="reference_image",
+        order=2,
+        filename="second-reference.png",
+        content=_png_bytes((80, 170, 120)),
+    )
+    edited_view = await runtime.get_run_view(run_id)
+    edited_task = copy.deepcopy(edited_view["approval"]["tasks"][0])
+    edited_task.update(
+        prompt="纸船在雨夜河面缓慢漂流，镜头持续向前推进。",
+        aspect_ratio="9:16",
+        duration=5,
+        resolution="1080p",
+        reference_images=[
+            {
+                "asset_id": uploaded["asset_id"],
+                "role": "reference_image",
+                "order": 1,
+            }
+        ],
+    )
+    await runtime.resume_run(
+        run_id,
+        ApprovalDecision(
+            action="approve",
+            selected_task_ids=["task-video"],
+            tasks=[edited_task],
+        ),
+    )
+    source = await runtime.get_run_view(run_id)
+    assert source["status"] == "succeeded"
+    snapshot = await graph.aget_state(
+        {"configurable": {"thread_id": source["thread_id"]}}
+    )
+    approved = copy.deepcopy(snapshot.values["approved_plan"])
+    assert approved["tasks"][0]["prompt"] == edited_task["prompt"]
+    assert (
+        approved["tasks"][0]["reference_images"]
+        == edited_task["reference_images"]
+    )
+    assert approved["tasks"][0]["aspect_ratio"] == "9:16"
+    assert approved["tasks"][0]["duration"] == 5
+    assert approved["tasks"][0]["resolution"] == "1080p"
+    assert approved["excluded_assets"] == [
+        {"asset_id": "asset-1", "reason": "用户在审批中移除"}
+    ]
+    assert services.video_generator.submit_calls == 1
+    return approved
+
+
+async def _assert_cloned_approval_matches(
+    runtime: GraphRuntime,
+    graph: Any,
+    services: GraphServices,
+    approved: dict[str, Any],
+    *,
+    source_run_id: str,
+    clone_run_id: str,
+    clone_thread_id: str,
+) -> None:
+    image_submit_calls = services.image_generator.submit_calls
+    submit_calls = services.video_generator.submit_calls
+    delivery_calls = services.delivery_writer.deliver_calls
+    planner_calls = services.planner.plan_calls
+
+    await runtime.clone_run_for_approval(
+        source_run_id,
+        RequirementRequest(
+            source_url="https://tenant.feishu.cn/docx/clone-approved-source"
+        ),
+        run_id=clone_run_id,
+        thread_id=clone_thread_id,
+    )
+    cloned = await runtime.get_run_view(clone_run_id)
+    snapshot = await graph.aget_state(
+        {"configurable": {"thread_id": clone_thread_id}}
+    )
+    clone_state = snapshot.values
+
+    assert cloned["status"] == "waiting_approval"
+    assert {
+        "tasks": cloned["approval"]["tasks"],
+        "document_summary": cloned["approval"]["document_summary"],
+        "excluded_assets": cloned["approval"]["excluded_assets"],
+    } == approved
+    assert clone_state["draft_plan"] == approved
+    assert clone_state["task_plan"] == approved
+    assert clone_state["approved_tasks"] == approved["tasks"]
+    assert clone_state["approved_plan"] is None
+    assert clone_state["approval_decision"] is None
+    assert clone_state["approval_revision"] is None
+    assert clone_state["execution_records"] == []
+    assert clone_state["artifacts"] == []
+    assert clone_state["delivery_record"] is None
+    assert services.image_generator.submit_calls == image_submit_calls
+    assert services.video_generator.submit_calls == submit_calls
+    assert services.delivery_writer.deliver_calls == delivery_calls
+    assert services.planner.plan_calls == planner_calls
+
+
+async def test_clone_uses_complete_approved_plan_without_generation(
+    fake_services: GraphServices,
+) -> None:
+    graph = build_graph(fake_services, InMemorySaver())
+    runtime = GraphRuntime(
+        graph=graph,
+        repository=fake_services.repository,
+        file_store=fake_services.file_store,
+        settings=fake_services.settings,
+        delivery_writer=fake_services.delivery_writer,
+    )
+    try:
+        approved = await _complete_run_with_approval_edits(
+            runtime,
+            graph,
+            fake_services,
+            run_id="clone-approved-original",
+            thread_id="clone-approved-original-thread",
+        )
+        await _assert_cloned_approval_matches(
+            runtime,
+            graph,
+            fake_services,
+            approved,
+            source_run_id="clone-approved-original",
+            clone_run_id="clone-approved-new",
+            clone_thread_id="clone-approved-new-thread",
+        )
+    finally:
+        await runtime.close()
+
+
+async def test_clone_rebuilds_complete_plan_from_legacy_checkpoint(
+    fake_services: GraphServices,
+) -> None:
+    graph = build_graph(fake_services, InMemorySaver())
+    runtime = GraphRuntime(
+        graph=graph,
+        repository=fake_services.repository,
+        file_store=fake_services.file_store,
+        settings=fake_services.settings,
+        delivery_writer=fake_services.delivery_writer,
+    )
+    try:
+        approved = await _complete_run_with_approval_edits(
+            runtime,
+            graph,
+            fake_services,
+            run_id="clone-legacy-original",
+            thread_id="clone-legacy-original-thread",
+        )
+        await graph.aupdate_state(
+            {"configurable": {"thread_id": "clone-legacy-original-thread"}},
+            {"approved_plan": None},
+            as_node="deliver_to_feishu",
+        )
+        await _assert_cloned_approval_matches(
+            runtime,
+            graph,
+            fake_services,
+            approved,
+            source_run_id="clone-legacy-original",
+            clone_run_id="clone-legacy-new",
+            clone_thread_id="clone-legacy-new-thread",
+        )
+    finally:
+        await runtime.close()
 
 
 async def test_runtime_graph_calls_do_not_trace_full_prompt_snapshot(

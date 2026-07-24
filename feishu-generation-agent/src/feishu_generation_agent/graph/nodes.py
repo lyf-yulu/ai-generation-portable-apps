@@ -211,7 +211,7 @@ def _draft_plan(state: AgentState) -> Any:
     return plan if plan is not None else state.get("task_plan")
 
 
-def _approved_plan(
+def approved_plan_from_state(
     state: AgentState,
     *,
     max_output_count: int,
@@ -624,7 +624,7 @@ async def revalidate_approval(
             decision.selected_task_ids,
             services.settings.max_output_count,
         )
-        checkpoint_plan = _approved_plan(
+        checkpoint_plan = approved_plan_from_state(
             state,
             max_output_count=services.settings.max_output_count,
         )
@@ -1370,7 +1370,7 @@ async def execute_selected_tasks(
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
-        plan = _approved_plan(
+        plan = approved_plan_from_state(
             state,
             max_output_count=services.settings.max_output_count,
         )
@@ -1489,7 +1489,7 @@ async def deliver_to_feishu(
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
-        plan = _approved_plan(
+        plan = approved_plan_from_state(
             state,
             max_output_count=services.settings.max_output_count,
         )

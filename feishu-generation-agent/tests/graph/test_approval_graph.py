@@ -25,8 +25,8 @@ from feishu_generation_agent.domain.plan import AuditReport, TaskPlan
 from feishu_generation_agent.graph.builder import build_graph
 from feishu_generation_agent.graph.nodes import (
     GraphServices,
-    _approved_plan,
     analyze_images,
+    approved_plan_from_state,
 )
 from feishu_generation_agent.graph.state import AgentState
 from feishu_generation_agent.integrations.planner import DeepSeekPlanner
@@ -912,7 +912,7 @@ def test_legacy_approved_checkpoint_reconciles_stale_exclusions():
         }
     )
 
-    restored = _approved_plan(
+    restored = approved_plan_from_state(
         {
             "draft_plan": draft.model_dump(mode="json"),
             "approved_tasks": [approved_task],

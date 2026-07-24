@@ -35,6 +35,8 @@ from feishu_generation_agent.integrations.planner import (
 from feishu_generation_agent.storage.files import FileStore
 from feishu_generation_agent.storage.repository import Repository
 
+from .nodes import approved_plan_from_state
+
 
 class RunNotFound(LookupError):
     pass
@@ -200,11 +202,19 @@ class GraphRuntime:
             source_state = dict(snapshot.values or {})
             if self._planning_prompt_from_state(source_state) is None:
                 raise RunValidationError("原运行缺少有效提示词快照")
-            if not isinstance(source_state.get("draft_plan") or source_state.get("task_plan"), dict):
-                raise RunValidationError("原运行没有可重跑的审批计划")
-            approved_tasks = source_state.get("approved_tasks")
-            if not isinstance(approved_tasks, list) or not approved_tasks:
+            try:
+                approved_plan = approved_plan_from_state(
+                    source_state,
+                    max_output_count=self.settings.max_output_count,
+                )
+            except (TypeError, ValueError):
+                raise RunValidationError("原运行没有可重跑的审批计划") from None
+            if not approved_plan.tasks:
                 raise RunValidationError("原运行没有已批准任务")
+            approved_plan_json = approved_plan.model_dump(mode="json")
+            approved_tasks = [
+                task.model_dump(mode="json") for task in approved_plan.tasks
+            ]
 
             state = deepcopy(source_state)
             state.update(
@@ -212,6 +222,8 @@ class GraphRuntime:
                 thread_id=thread_id,
                 source_url=request.source_url,
                 status="waiting_approval",
+                draft_plan=deepcopy(approved_plan_json),
+                task_plan=deepcopy(approved_plan_json),
                 approval_decision=None,
                 approval_revision=None,
                 approved_tasks=deepcopy(approved_tasks),
