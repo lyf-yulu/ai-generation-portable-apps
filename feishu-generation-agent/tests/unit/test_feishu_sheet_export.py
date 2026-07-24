@@ -305,6 +305,51 @@ def test_extract_sheet_xlsx_rejects_multiple_valid_worksheets() -> None:
     )
 
 
+def test_extract_sheet_xlsx_selects_target_named_worksheet_from_full_export() -> None:
+    members = _xlsx_members()
+    members["xl/workbook.xml"] = f"""
+        <workbook xmlns="{_NS_SPREADSHEET}" xmlns:r="{_NS_REL}">
+          <sheets>
+            <sheet name="NuBUx5" sheetId="17" r:id="rIdStory"/>
+            <sheet name="其他子表" sheetId="42" r:id="rIdCharacters"/>
+          </sheets>
+        </workbook>
+    """.encode()
+    members["xl/_rels/workbook.xml.rels"] = f"""
+        <Relationships xmlns="{_NS_PACKAGE_REL}">
+          <Relationship Id="rIdStory" Type="{_NS_REL}/worksheet"
+                        Target="worksheets/story-board.xml"/>
+          <Relationship Id="rIdCharacters" Type="{_NS_REL}/worksheet"
+                        Target="worksheets/character-board.xml"/>
+          <Relationship Id="rIdStrings" Type="{_NS_REL}/sharedStrings"
+                        Target="strings/custom-shared.xml"/>
+        </Relationships>
+    """.encode()
+    members["xl/worksheets/character-board.xml"] = f"""
+        <worksheet xmlns="{_NS_SPREADSHEET}">
+          <sheetData>
+            <row r="1"><c r="A1" t="s"><v>1</v></c></row>
+          </sheetData>
+        </worksheet>
+    """.encode()
+
+    extracted = extract_sheet_xlsx(
+        _make_xlsx(members),
+        target_sheet_id="NuBUx5",
+    )
+
+    assert extracted.text_lines == (
+        "[sheet:NuBUx5 worksheet:NuBUx5 cell:B2] 镜头一",
+        "[sheet:NuBUx5 worksheet:NuBUx5 cell:C4] 人物保持一致",
+    )
+    assert len(extracted.images) == 2
+    assert {
+        anchor.worksheet_name
+        for image in extracted.images
+        for anchor in image.anchors
+    } == {"NuBUx5"}
+
+
 def test_xlsx_resource_limit_constants_are_positive_and_bounded() -> None:
     assert 0 < MAX_XLSX_COMPRESSED_BYTES < MAX_XLSX_UNCOMPRESSED_BYTES
     assert 0 < MAX_XLSX_ENTRY_COUNT <= MAX_XML_NODES

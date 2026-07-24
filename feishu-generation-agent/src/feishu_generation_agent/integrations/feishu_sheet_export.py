@@ -420,13 +420,20 @@ def extract_sheet_xlsx(
                     ),
                 )
             if len(worksheets) != 1:
-                raise _document_error(
-                    "飞书电子表格目标工作表导出结果不唯一",
-                    (
-                        "xlsx worksheet count must be exactly one for target "
-                        f"sheet {target_sheet_id}: {len(worksheets)}"
-                    ),
-                )
+                target_worksheets = [
+                    worksheet
+                    for worksheet in worksheets
+                    if worksheet[0] == target_sheet_id
+                ]
+                if len(target_worksheets) != 1:
+                    raise _document_error(
+                        "飞书电子表格目标工作表导出结果不唯一",
+                        (
+                            "xlsx worksheet count must be exactly one for target "
+                            f"sheet {target_sheet_id}: {len(worksheets)}"
+                        ),
+                    )
+                worksheets = target_worksheets
 
             worksheet_name, worksheet_path = worksheets[0]
             worksheet = _parse_xml(
