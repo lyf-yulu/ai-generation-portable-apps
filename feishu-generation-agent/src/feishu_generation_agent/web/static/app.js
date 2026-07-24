@@ -7,6 +7,7 @@
   if (!BitableState) throw new Error("多维表格状态模块加载失败");
   const ReferenceUploadState = globalThis.ReferenceUploadState;
   if (!ReferenceUploadState) throw new Error("参考图片上传状态模块加载失败");
+  const ApiPaths = globalThis.ApiPaths;
 
   const state = {
     runId: null,
@@ -73,8 +74,15 @@
     errorMessage.hidden = true;
   }
 
+  function agentUrl(path) {
+    if (/^(?:https?:|blob:)/i.test(path)) return path;
+    return ApiPaths
+      ? ApiPaths.apiUrl(globalThis.location?.pathname || "/", path)
+      : path;
+  }
+
   async function api(url, options = {}) {
-    const response = await fetch(url, options);
+    const response = await fetch(agentUrl(url), options);
     const contentType = response.headers.get("content-type") || "";
     const payload = contentType.includes("application/json")
       ? await response.json()
@@ -541,7 +549,7 @@
       image.controls = true;
       image.preload = "metadata";
     }
-    if (asset?.preview_url) image.src = asset.preview_url;
+    if (asset?.preview_url) image.src = agentUrl(asset.preview_url);
 
     const descriptionText = description
       ? [description.subjects?.join("、"), description.scene, description.probable_role]

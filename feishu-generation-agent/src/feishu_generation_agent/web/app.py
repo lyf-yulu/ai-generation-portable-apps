@@ -189,7 +189,8 @@ def create_app(
     @app.middleware("http")
     async def prevent_static_asset_caching(request: Request, call_next):
         response = await call_next(request)
-        if request.url.path.startswith("/static/"):
+        # Portal forwards static assets after stripping its Agent mount prefix.
+        if request.scope["path"].startswith("/static/"):
             response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         return response
 
