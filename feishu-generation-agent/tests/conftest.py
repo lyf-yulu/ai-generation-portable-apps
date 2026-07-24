@@ -82,15 +82,18 @@ class FakeGraphPlanner:
         self.plan_calls = 0
         self.audit_calls = 0
         self.feedback: list[str | None] = []
+        self.system_prompts: list[str | None] = []
 
     async def plan(
         self,
         document: NormalizedDocument,
         descriptions: list[VisionDescription],
         feedback: str | None,
+        system_prompt: str | None = None,
     ) -> TaskPlan:
         self.plan_calls += 1
         self.feedback.append(feedback)
+        self.system_prompts.append(system_prompt)
         assert document.document_id == "doc-graph"
         assert [description.asset_id for description in descriptions] == [
             "asset-1"

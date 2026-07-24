@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,11 +10,14 @@ from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain import (
     BitableLocation,
     BitableTaskSummary,
+    PlanningPromptSnapshot,
     RequirementRequest,
     TableTaskStatus,
+    build_planning_prompt_snapshot,
 )
 from feishu_generation_agent.graph.runtime import GraphRuntime, RunConflict
 from feishu_generation_agent.integrations.feishu_bitable import BitableSchema
+from feishu_generation_agent.integrations.planner import planner_system_prompt
 from feishu_generation_agent.storage.bitable_tasks import (
     BitableTaskStore,
     TaskAlreadyClaimed,
@@ -226,9 +230,36 @@ async def test_claim_reserves_before_runtime_start_with_local_identity(
             source_url="https://tenant.feishu.cn/docx/docrec-1",
             trigger_type="bitable",
             reply_context={},
+            planning_prompt=request.planning_prompt,
         )
+        assert request.planning_prompt is not None
+        assert request.planning_prompt.owner_user_id == "prime-local"
+        assert request.planning_prompt.source == "prime"
+        assert request.planning_prompt.version == 0
     finally:
         await service.close()
+
+
+@pytest.mark.asyncio
+async def test_claim_passes_caller_prompt_snapshot_unchanged(
+    tmp_path: Path,
+) -> None:
+    runtime = _FakeRuntime()
+    service, _ = await _service(tmp_path, runtime=runtime)
+    prompt_text = "MVP 个人版本 v2"
+    planning_prompt = PlanningPromptSnapshot(
+        owner_user_id="user-a",
+        source="personal",
+        version=2,
+        prompt_text=prompt_text,
+        prompt_sha256=hashlib.sha256(prompt_text.encode()).hexdigest(),
+    )
+    try:
+        await service.claim("rec-1", planning_prompt=planning_prompt)
+    finally:
+        await service.close()
+
+    assert runtime.started[0][0].planning_prompt == planning_prompt
 
 
 @pytest.mark.asyncio
@@ -390,10 +421,20 @@ async def test_retry_delivery_rejects_non_delivery_failure(tmp_path: Path) -> No
 class _StartGraph:
     def __init__(self) -> None:
         self.calls: list[tuple[dict, dict]] = []
+        self.state: dict = {}
 
     async def ainvoke(self, value, *, config):
         self.calls.append((value, config))
-        return {**value, "status": "waiting_approval", "__interrupt__": [object()]}
+        self.state = {
+            **value,
+            "status": "waiting_approval",
+            "__interrupt__": [object()],
+        }
+        return self.state
+
+    async def aget_state(self, config):
+        del config
+        return SimpleNamespace(values=self.state)
 
 
 @pytest.mark.asyncio
@@ -422,6 +463,12 @@ async def test_runtime_accepts_reserved_ids_and_repeat_start_is_idempotent(
     request = RequirementRequest(
         source_url="https://tenant.feishu.cn/docx/doc-reserved",
         trigger_type="bitable",
+        planning_prompt=build_planning_prompt_snapshot(
+            owner_user_id="prime-local",
+            source="prime",
+            version=0,
+            prompt_text=planner_system_prompt(),
+        ),
     )
     try:
         first = await runtime.start_run(

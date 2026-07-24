@@ -539,6 +539,58 @@ async def test_planning_input_contains_stable_document_and_rules(
     assert "保留蓝色" in user_prompt
 
 
+async def test_default_and_portal_planner_system_prompts_are_composed_safely(
+    narrative_document: NormalizedDocument,
+    vision_descriptions: list[VisionDescription],
+):
+    portal_prompt = "个人业务偏好：优先保持角色一致。"
+    default_model = FakeDeepSeekModel([_plan_json(_video_task())])
+    portal_model = FakeDeepSeekModel([_plan_json(_video_task())])
+
+    await DeepSeekPlanner(default_model).plan(
+        narrative_document, vision_descriptions
+    )
+    await DeepSeekPlanner(portal_model).plan(
+        narrative_document,
+        vision_descriptions,
+        system_prompt=portal_prompt,
+    )
+
+    assert default_model.requests[0][0]["content"] == planner_system_prompt()
+    composed = portal_model.requests[0][0]["content"]
+    assert composed != planner_system_prompt()
+    assert "不可编辑" in composed
+    assert "冲突" in composed
+    assert composed.index("不可编辑") < composed.index(portal_prompt)
+    assert composed.endswith(portal_prompt)
+
+
+async def test_portal_prompt_is_not_exposed_in_planner_error_or_logs(
+    narrative_document: NormalizedDocument,
+    vision_descriptions: list[VisionDescription],
+    caplog: pytest.LogCaptureFixture,
+):
+    secret_prompt = "绝不允许泄漏的个人完整提示词标记"
+    model = FakeDeepSeekModel(
+        [
+            RateLimitFailure("fictional-secret-rate-limit"),
+        ]
+    )
+
+    with pytest.raises(AgentError) as raised:
+        await DeepSeekPlanner(model).plan(
+            narrative_document,
+            vision_descriptions,
+            system_prompt=secret_prompt,
+        )
+
+    serialized = json.dumps(
+        raised.value.detail.model_dump(mode="json"), ensure_ascii=False
+    )
+    assert secret_prompt not in serialized
+    assert secret_prompt not in caplog.text
+
+
 async def test_planning_prompt_does_not_send_download_error_detail(
     narrative_document: NormalizedDocument,
     vision_descriptions: list[VisionDescription],

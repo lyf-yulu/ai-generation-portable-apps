@@ -6,12 +6,15 @@ from typing import Any
 from uuid import uuid4
 
 from langgraph.types import Command
+from pydantic import ValidationError
 
 from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain.document import (
     MediaAsset,
     NormalizedDocument,
+    PlanningPromptSnapshot,
     RequirementRequest,
+    build_planning_prompt_snapshot,
 )
 from feishu_generation_agent.domain.errors import AgentError
 from feishu_generation_agent.ports import DeliveryWriter
@@ -21,7 +24,10 @@ from feishu_generation_agent.domain.plan import (
     ImageReference,
     TaskPlan,
 )
-from feishu_generation_agent.integrations.planner import validate_plan
+from feishu_generation_agent.integrations.planner import (
+    planner_system_prompt,
+    validate_plan,
+)
 from feishu_generation_agent.storage.files import FileStore
 from feishu_generation_agent.storage.repository import Repository
 
@@ -85,6 +91,7 @@ class GraphRuntime:
     ) -> str:
         if self._closed:
             raise RunConflict("运行时正在关闭")
+        reserved_ids = run_id is not None and thread_id is not None
         run_id = run_id or str(uuid4())
         thread_id = thread_id or str(uuid4())
         async with self._start_lock:
@@ -95,19 +102,52 @@ class GraphRuntime:
                     or existing["source_url"] != request.source_url
                 ):
                     raise RunConflict("预留的运行 ID 与现有运行不一致")
+                snapshot = await self.graph.aget_state(
+                    self._config(thread_id)
+                )
+                state = dict(snapshot.values or {})
+                if state and self._planning_prompt_from_state(state) is None:
+                    await self._fail_missing_planning_prompt(run_id)
+                    return run_id
+                if not state and request.planning_prompt is None:
+                    await self._fail_missing_planning_prompt(run_id)
+                    return run_id
                 approval_name = f"approval-run-{run_id}"
                 if (
                     existing["status"] in {"created", "running"}
                     and not self._has_background(approval_name)
                 ):
-                    snapshot = await self.graph.aget_state(
-                        self._config(thread_id)
-                    )
-                    if not dict(snapshot.values or {}):
+                    if not state:
                         self._start_background(
                             self._run_to_approval(run_id, thread_id, request),
                             name=approval_name,
                         )
+                return run_id
+            if (
+                reserved_ids
+                and request.trigger_type != "local_link"
+                and request.planning_prompt is None
+            ):
+                snapshot = await self.graph.aget_state(
+                    self._config(thread_id)
+                )
+                state = dict(snapshot.values or {})
+                planning_prompt = self._planning_prompt_from_state(state)
+                if planning_prompt is None:
+                    raise RunConflict("无法恢复运行：提示词快照不存在")
+                if (
+                    state.get("run_id") != run_id
+                    or state.get("thread_id") != thread_id
+                    or state.get("source_url") != request.source_url
+                ):
+                    raise RunConflict("恢复运行与 checkpoint 不一致")
+                await self.repository.create_run(
+                    run_id,
+                    thread_id,
+                    request.source_url,
+                    status=self._safe_status(state.get("status"), "failed"),
+                    owner_user_id=planning_prompt.owner_user_id,
+                )
                 return run_id
             await self.repository.create_run(
                 run_id,
@@ -115,6 +155,17 @@ class GraphRuntime:
                 request.source_url,
                 status="created",
             )
+            if request.planning_prompt is None:
+                request = request.model_copy(
+                    update={
+                        "planning_prompt": build_planning_prompt_snapshot(
+                            owner_user_id="prime-local",
+                            source="prime",
+                            version=0,
+                            prompt_text=planner_system_prompt(),
+                        )
+                    }
+                )
             self._start_background(
                 self._run_to_approval(run_id, thread_id, request),
                 name=f"approval-run-{run_id}",
@@ -143,6 +194,8 @@ class GraphRuntime:
                 raise RunConflict("重跑运行 ID 已存在")
             snapshot = await self.graph.aget_state(self._config(source["thread_id"]))
             source_state = dict(snapshot.values or {})
+            if self._planning_prompt_from_state(source_state) is None:
+                raise RunValidationError("原运行缺少有效提示词快照")
             if not isinstance(source_state.get("draft_plan") or source_state.get("task_plan"), dict):
                 raise RunValidationError("原运行没有可重跑的审批计划")
             approved_tasks = source_state.get("approved_tasks")
@@ -227,23 +280,17 @@ class GraphRuntime:
                     self._config(run["thread_id"])
                 )
                 state = dict(snapshot.values or {})
-                await self.repository.update_run_status(run_id, "running")
                 if state:
+                    if self._planning_prompt_from_state(state) is None:
+                        await self._fail_missing_planning_prompt(run_id)
+                        return
+                    await self.repository.update_run_status(run_id, "running")
                     result = await self.graph.ainvoke(
                         None, config=self._config(run["thread_id"])
                     )
                 else:
-                    result = await self.graph.ainvoke(
-                        {
-                            "run_id": run_id,
-                            "thread_id": run["thread_id"],
-                            "source_url": run["source_url"],
-                            "trigger_type": "local_link",
-                            "reply_context": {},
-                            "status": "created",
-                        },
-                        config=self._config(run["thread_id"]),
-                    )
+                    await self._fail_missing_planning_prompt(run_id)
+                    return
                 final_status = (
                     "waiting_approval"
                     if self._has_interrupt(result)
@@ -367,6 +414,11 @@ class GraphRuntime:
                     "requester_open_id": request.requester_open_id,
                     "trigger_type": request.trigger_type,
                     "reply_context": request.reply_context,
+                    "planning_prompt": (
+                        request.planning_prompt.model_dump(mode="json")
+                        if request.planning_prompt is not None
+                        else None
+                    ),
                     "status": "created",
                 },
                 config=self._config(thread_id),
@@ -387,6 +439,26 @@ class GraphRuntime:
                 "Workflow background execution failed",
             )
             await self.repository.update_run_status(run_id, "failed")
+
+    @staticmethod
+    def _planning_prompt_from_state(
+        state: dict[str, Any],
+    ) -> PlanningPromptSnapshot | None:
+        try:
+            return PlanningPromptSnapshot.model_validate(
+                state.get("planning_prompt")
+            )
+        except ValidationError:
+            return None
+
+    async def _fail_missing_planning_prompt(self, run_id: str) -> None:
+        await self.repository.append_event(
+            run_id,
+            "planning_prompt",
+            "failed",
+            "Planning prompt snapshot unavailable",
+        )
+        await self.repository.update_run_status(run_id, "failed")
 
     async def get_run_view(self, run_id: str) -> dict[str, Any]:
         run = await self.repository.get_run(run_id)
@@ -500,6 +572,9 @@ class GraphRuntime:
                 self._config(run["thread_id"])
             )
             state = dict(snapshot.values or {})
+            if self._planning_prompt_from_state(state) is None:
+                await self._fail_missing_planning_prompt(run_id)
+                raise RunValidationError("运行缺少有效提示词快照")
             self._validate_decision(state, decision)
             await self.repository.update_run_status(run_id, "resuming")
             try:

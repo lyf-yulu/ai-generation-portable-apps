@@ -1,3 +1,4 @@
+import hashlib
 import json
 from dataclasses import dataclass, fields, replace
 from typing import Any
@@ -8,6 +9,7 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.types import Command
 
 from feishu_generation_agent.domain.errors import AgentError, ErrorCategory
+from feishu_generation_agent.domain.document import PlanningPromptSnapshot
 from feishu_generation_agent.graph.builder import build_graph
 from feishu_generation_agent.graph.nodes import GraphServices
 from feishu_generation_agent.graph.state import AgentState
@@ -18,6 +20,7 @@ _FORMAL_STATE_KEYS = {
     "run_id",
     "thread_id",
     "source_url",
+    "planning_prompt",
     "source_type",
     "source_token",
     "document_id",
@@ -97,13 +100,20 @@ class _FailingDeliveryWriter:
         raise RuntimeError("fictional delivery outage")
 
 
-def _input(run_id: str, thread_id: str) -> AgentState:
-    return {
+def _input(
+    run_id: str,
+    thread_id: str,
+    planning_prompt: PlanningPromptSnapshot | None = None,
+) -> AgentState:
+    state: AgentState = {
         "run_id": run_id,
         "thread_id": thread_id,
         "source_url": "https://fiction.feishu.cn/docx/doc-graph",
         "status": "created",
     }
+    if planning_prompt is not None:
+        state["planning_prompt"] = planning_prompt.model_dump(mode="json")
+    return state
 
 
 def _config(thread_id: str) -> dict[str, dict[str, str]]:
@@ -129,6 +139,7 @@ def test_agent_state_and_graph_services_contracts_are_stable():
         "run_id",
         "thread_id",
         "source_url",
+        "planning_prompt",
         "status",
         "requester_open_id",
         "trigger_type",
@@ -164,6 +175,72 @@ def test_agent_state_and_graph_services_contracts_are_stable():
             "portrait_video_generator",
             "production_task_store",
         ]
+
+
+def test_planning_prompt_snapshot_rejects_text_hash_mismatch() -> None:
+    with pytest.raises(ValueError):
+        PlanningPromptSnapshot(
+            owner_user_id="user-a",
+            source="personal",
+            version=2,
+            prompt_text="个人版本 v2",
+            prompt_sha256="0" * 64,
+        )
+
+
+async def test_personal_prompt_snapshot_is_checkpointed_and_reused_for_replan(
+    fake_services: GraphServices,
+):
+    prompt_text = "个人版本 v2：保持角色造型一致"
+    planning_prompt = PlanningPromptSnapshot(
+        owner_user_id="user-a",
+        source="personal",
+        version=2,
+        prompt_text=prompt_text,
+        prompt_sha256=hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+    )
+    graph = build_graph(fake_services, InMemorySaver())
+    config = _config("thread-personal-v2")
+
+    await graph.ainvoke(
+        _input("run-personal-v2", "thread-personal-v2", planning_prompt),
+        config=config,
+    )
+    snapshot = await graph.aget_state(config)
+    result = await graph.ainvoke(
+        Command(resume={"action": "reject", "feedback": "改成暖色"}),
+        config=config,
+    )
+
+    assert snapshot.values["planning_prompt"] == planning_prompt.model_dump(
+        mode="json"
+    )
+    assert result["planning_prompt"] == planning_prompt.model_dump(mode="json")
+    assert fake_services.planner.system_prompts == [prompt_text, prompt_text]
+
+
+async def test_direct_graph_run_snapshots_exact_prime_prompt(
+    fake_services: GraphServices,
+):
+    graph = build_graph(fake_services, InMemorySaver())
+    config = _config("thread-prime-snapshot")
+
+    await graph.ainvoke(
+        _input("run-prime-snapshot", "thread-prime-snapshot"),
+        config=config,
+    )
+    snapshot = await graph.aget_state(config)
+    planning_prompt = PlanningPromptSnapshot.model_validate(
+        snapshot.values["planning_prompt"]
+    )
+
+    assert planning_prompt.owner_user_id == "prime-local"
+    assert planning_prompt.source == "prime"
+    assert planning_prompt.version == 0
+    assert planning_prompt.prompt_sha256 == (
+        "5dd2463a9bfddb3bc9e55c3a93148f7316f1259a6eaf70644a610b386a9c6ce4"
+    )
+    assert fake_services.planner.system_prompts == [None]
 
 
 async def test_graph_pauses_before_any_generation(fake_services: GraphServices):
@@ -598,3 +675,42 @@ async def test_sqlite_checkpoint_resumes_after_saver_lifecycle(
     assert resume_services.video_generator.poll_calls == 0
     assert resume_services.delivery_writer.deliver_calls == 1
     assert await resume_services.repository.count_operations() == 1
+
+
+async def test_sqlite_checkpoint_restores_personal_prompt_for_replanning(
+    fake_services: GraphServices,
+):
+    settings = fake_services.settings
+    thread_id = "thread-prompt-durable"
+    config = _config(thread_id)
+    prompt_text = "领取时的个人版本 v2"
+    planning_prompt = PlanningPromptSnapshot(
+        owner_user_id="user-a",
+        source="personal",
+        version=2,
+        prompt_text=prompt_text,
+        prompt_sha256=hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+    )
+
+    async with open_checkpointer(settings) as first_checkpointer:
+        graph = build_graph(fake_services, first_checkpointer)
+        await graph.ainvoke(
+            _input("run-prompt-durable", thread_id, planning_prompt),
+            config=config,
+        )
+
+    async with open_checkpointer(settings) as second_checkpointer:
+        restored_graph = build_graph(fake_services, second_checkpointer)
+        result = await restored_graph.ainvoke(
+            Command(
+                resume={"action": "reject", "feedback": "重启后重新规划"}
+            ),
+            config=config,
+        )
+        restored = await restored_graph.aget_state(config)
+
+    assert result["planning_prompt"] == planning_prompt.model_dump(mode="json")
+    assert restored.values["planning_prompt"] == planning_prompt.model_dump(
+        mode="json"
+    )
+    assert fake_services.planner.system_prompts == [prompt_text, prompt_text]

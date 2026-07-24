@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from inspect import Parameter, signature
+import logging
 import os
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator, Literal
@@ -29,6 +30,10 @@ from feishu_generation_agent.bootstrap import (
 )
 from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain.bitable import TableTaskStatus
+from feishu_generation_agent.domain.document import (
+    PlanningPromptSnapshot,
+    build_planning_prompt_snapshot,
+)
 from feishu_generation_agent.domain.errors import AgentError, ErrorCategory
 from feishu_generation_agent.graph.nodes import GraphServices
 from feishu_generation_agent.graph.runtime import (
@@ -58,6 +63,7 @@ from feishu_generation_agent.web.schemas import (
 
 ProductionCategory = Literal["animation", "portrait"]
 _MAX_IDENTITY_LENGTH = 255
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +104,7 @@ def require_portal_identity(request: Request) -> RequestIdentity:
 def _validate_portal_user_id(value: str) -> None:
     if (
         not value
+        or value == "prime-local"
         or value != value.strip()
         or len(value) > _MAX_IDENTITY_LENGTH
         or any(ord(character) < 32 or ord(character) == 127 for character in value)
@@ -417,6 +424,20 @@ def create_app(
             return {}
         return {"owner_user_id": owner_user_id}
 
+    def planning_prompt_argument(
+        callable_object: Any,
+        planning_prompt: PlanningPromptSnapshot,
+    ) -> dict[str, PlanningPromptSnapshot]:
+        try:
+            parameter = signature(callable_object).parameters.get(
+                "planning_prompt"
+            )
+        except (TypeError, ValueError):
+            parameter = None
+        if parameter is None or parameter.kind is Parameter.POSITIONAL_ONLY:
+            return {}
+        return {"planning_prompt": planning_prompt}
+
     async def filter_bindings_by_runtime_owner(
         active_runtime: Any,
         bindings: list[Any],
@@ -475,6 +496,35 @@ def create_app(
             version=0,
             source="prime",
         )
+
+    async def effective_planning_prompt(
+        request: Request,
+        identity: RequestIdentity,
+    ) -> PlanningPromptSnapshot:
+        profile = None
+        if identity.is_portal:
+            profile = await get_planner_prompt_store(request).get(
+                identity.owner_user_id
+            )
+        snapshot = build_planning_prompt_snapshot(
+            owner_user_id=identity.owner_user_id,
+            source="personal" if profile is not None else "prime",
+            version=profile.version if profile is not None else 0,
+            prompt_text=(
+                profile.prompt_text
+                if profile is not None
+                else planner_system_prompt()
+            ),
+        )
+        _LOGGER.info(
+            "Planning prompt snapshot owner_user_id=%s source=%s "
+            "version=%d sha256=%s",
+            snapshot.owner_user_id,
+            snapshot.source,
+            snapshot.version,
+            snapshot.prompt_sha256,
+        )
+        return snapshot
 
     @app.get("/api/planner-prompt", response_model=PlannerPromptResponse)
     async def get_planner_prompt(request: Request) -> PlannerPromptResponse:
@@ -649,6 +699,9 @@ def create_app(
     ) -> BitableClaimResponse:
         active = get_bitable_service(request)
         identity = current_identity(request)
+        planning_prompt = await effective_planning_prompt(
+            request, identity
+        )
         try:
             runtime_for_owner = get_runtime(request)
             with runtime_owner_scope(
@@ -658,6 +711,9 @@ def create_app(
                     record_id,
                     category,
                     **owner_argument(active.claim, identity.owner_user_id),
+                    **planning_prompt_argument(
+                        active.claim, planning_prompt
+                    ),
                 )
         except Exception as exc:
             raise_bitable_error(exc)
@@ -717,8 +773,12 @@ def create_app(
     async def create_run(payload: CreateRunRequest, request: Request) -> dict[str, str]:
         active = get_runtime(request)
         identity = current_identity(request)
+        planning_prompt = await effective_planning_prompt(request, identity)
+        domain_request = payload.to_domain().model_copy(
+            update={"planning_prompt": planning_prompt}
+        )
         with runtime_owner_scope(active, identity.owner_user_id):
-            run_id = await active.start_run(payload.to_domain())
+            run_id = await active.start_run(domain_request)
         return {"run_id": run_id}
 
     @app.get("/api/runs/{run_id}")

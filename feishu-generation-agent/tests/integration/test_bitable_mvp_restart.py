@@ -7,8 +7,10 @@ import pytest
 from feishu_generation_agent.bitable.mvp_service import BitableMvpService
 from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain import BitableLocation, TableTaskStatus
-from feishu_generation_agent.graph.runtime import GraphRuntime
+from feishu_generation_agent.domain.document import build_planning_prompt_snapshot
+from feishu_generation_agent.graph.runtime import GraphRuntime, RunConflict
 from feishu_generation_agent.integrations.feishu_bitable import BitableSchema
+from feishu_generation_agent.integrations.planner import planner_system_prompt
 from feishu_generation_agent.storage.bitable_tasks import BitableTaskStore
 from feishu_generation_agent.storage.files import FileStore
 from feishu_generation_agent.storage.repository import Repository
@@ -90,6 +92,15 @@ def _location() -> BitableLocation:
     )
 
 
+def _prime_prompt() -> dict:
+    return build_planning_prompt_snapshot(
+        owner_user_id="prime-local",
+        source="prime",
+        version=0,
+        prompt_text=planner_system_prompt(),
+    ).model_dump(mode="json")
+
+
 async def _claim(store: BitableTaskStore, run_id: str, thread_id: str):
     return await store.claim(
         app_token="appTABLE",
@@ -154,6 +165,7 @@ async def test_waiting_approval_restart_preserves_gate_and_fingerprint(
         "thread_id": "thread-approval",
         "source_url": "https://tenant.feishu.cn/docx/doc-run-approval",
         "status": "waiting_approval",
+        "planning_prompt": _prime_prompt(),
         "draft_plan": {
             "document_summary": "纸船",
             "tasks": [{"task_id": "task-1", "prompt": "雨中纸船"}],
@@ -195,7 +207,127 @@ async def test_waiting_approval_restart_preserves_gate_and_fingerprint(
 
 
 @pytest.mark.asyncio
-async def test_restart_before_first_checkpoint_reuses_bitable_request(
+async def test_waiting_approval_without_prompt_snapshot_fails_closed(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    initial_repository = await Repository.open(settings.business_db_path)
+    initial_store = await BitableTaskStore.open(
+        settings.data_dir / "bitable.sqlite3"
+    )
+    await _claim(initial_store, "run-legacy-approval", "thread-legacy-approval")
+    await initial_repository.create_run(
+        "run-legacy-approval",
+        "thread-legacy-approval",
+        "https://tenant.feishu.cn/docx/doc-run-legacy-approval",
+        status="waiting_approval",
+    )
+    await initial_store.close()
+    await initial_repository.close()
+
+    graph = _RestartGraph()
+    graph.states["thread-legacy-approval"] = {
+        "run_id": "run-legacy-approval",
+        "thread_id": "thread-legacy-approval",
+        "source_url": "https://tenant.feishu.cn/docx/doc-run-legacy-approval",
+        "status": "waiting_approval",
+        "draft_plan": {
+            "document_summary": "旧任务",
+            "tasks": [{"task_id": "task-1"}],
+        },
+    }
+    service, runtime, repository, store = await _restarted_service(
+        settings, graph
+    )
+    try:
+        await service.resume_incomplete()
+        run = await repository.get_run("run-legacy-approval")
+    finally:
+        await service.close()
+        await runtime.close()
+        await repository.close()
+
+    assert run is not None
+    assert run["status"] == "failed"
+    assert graph.initial_calls == []
+
+
+@pytest.mark.asyncio
+async def test_missing_repository_row_is_restored_only_from_checkpoint_snapshot(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    store = await BitableTaskStore.open(settings.data_dir / "bitable.sqlite3")
+    await _claim(store, "run-checkpoint-only", "thread-checkpoint-only")
+    await store.close()
+    personal_text = "checkpoint 中的个人 v2"
+    personal_prompt = build_planning_prompt_snapshot(
+        owner_user_id="user-a",
+        source="personal",
+        version=2,
+        prompt_text=personal_text,
+    ).model_dump(mode="json")
+    graph = _RestartGraph()
+    graph.states["thread-checkpoint-only"] = {
+        "run_id": "run-checkpoint-only",
+        "thread_id": "thread-checkpoint-only",
+        "source_url": "https://tenant.feishu.cn/docx/doc-run-checkpoint-only",
+        "status": "waiting_approval",
+        "planning_prompt": personal_prompt,
+        "draft_plan": {
+            "document_summary": "恢复任务",
+            "tasks": [{"task_id": "task-1"}],
+        },
+        "draft_revision": 2,
+    }
+    service, runtime, repository, store = await _restarted_service(
+        settings, graph
+    )
+    try:
+        await service.resume_incomplete()
+        run = await repository.get_run(
+            "run-checkpoint-only", owner_user_id="user-a"
+        )
+    finally:
+        await service.close()
+        await runtime.close()
+        await repository.close()
+
+    assert run is not None
+    assert run["status"] == "waiting_approval"
+    assert graph.initial_calls == []
+    assert graph.states["thread-checkpoint-only"]["planning_prompt"] == (
+        personal_prompt
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_repository_and_checkpoint_does_not_create_prime_run(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    store = await BitableTaskStore.open(settings.data_dir / "bitable.sqlite3")
+    await _claim(store, "run-lost-state", "thread-lost-state")
+    await store.close()
+    graph = _RestartGraph()
+    service, runtime, repository, store = await _restarted_service(
+        settings, graph
+    )
+    try:
+        with pytest.raises(RunConflict, match="提示词快照"):
+            await service.resume_incomplete()
+        run = await repository.get_run("run-lost-state")
+    finally:
+        await service.close()
+        await runtime.close()
+        await repository.close()
+
+    assert run is None
+    assert graph.initial_calls == []
+
+
+@pytest.mark.asyncio
+async def test_restart_before_first_checkpoint_fails_closed_without_snapshot(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -217,21 +349,17 @@ async def test_restart_before_first_checkpoint_reuses_bitable_request(
     service, runtime, repository, store = await _restarted_service(settings, graph)
     try:
         await service.resume_incomplete()
-        for _ in range(100):
-            run = await repository.get_run("run-before-checkpoint")
-            if run is not None and run["status"] == "waiting_approval":
-                break
-            await asyncio.sleep(0.01)
-        else:
-            raise AssertionError("run did not recover to approval")
+        run = await repository.get_run("run-before-checkpoint")
+        events = await repository.list_events("run-before-checkpoint")
 
-        assert len(graph.initial_calls) == 1
-        assert graph.initial_calls[0]["trigger_type"] == "bitable"
-        assert graph.initial_calls[0]["reply_context"] == {}
+        assert run is not None
+        assert run["status"] == "failed"
+        assert graph.initial_calls == []
         assert graph.submit_calls == 0
         assert graph.poll_calls == 0
-        binding = await service.sync_once("run-before-checkpoint")
-        assert binding.status is TableTaskStatus.WAITING_APPROVAL
+        assert events[-1]["node"] == "planning_prompt"
+        assert events[-1]["status"] == "failed"
+        assert "个人版本" not in events[-1]["summary"]
     finally:
         await service.close()
         await runtime.close()
@@ -266,6 +394,7 @@ async def test_provider_submitted_restart_polls_without_second_submit(
         "thread_id": "thread-provider",
         "source_url": "https://tenant.feishu.cn/docx/doc-run-provider",
         "status": "waiting_provider",
+        "planning_prompt": _prime_prompt(),
         "execution_records": [
             {
                 "task_id": "task-1",

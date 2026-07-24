@@ -37,6 +37,7 @@ class RequirementPlanner(Protocol):
         document: NormalizedDocument,
         descriptions: list[VisionDescription],
         feedback: str | None,
+        system_prompt: str | None = None,
     ) -> TaskPlan:
         raise NotImplementedError
 

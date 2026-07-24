@@ -17,7 +17,11 @@ from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain.document import RequirementRequest
 from feishu_generation_agent.graph.builder import build_graph
 from feishu_generation_agent.graph.nodes import GraphServices
-from feishu_generation_agent.graph.runtime import GraphRuntime, RunNotFound
+from feishu_generation_agent.graph.runtime import (
+    GraphRuntime,
+    RunNotFound,
+    RunValidationError,
+)
 from feishu_generation_agent.storage.files import FileStore
 from feishu_generation_agent.storage.planner_prompts import PlannerPromptStore
 from feishu_generation_agent.storage.repository import Repository
@@ -229,6 +233,9 @@ async def _environment(tmp_path: Path, *, bitable_service=None):
     image_path = settings.data_dir / "source.png"
     image_path.write_bytes(b"fake-source-image")
     repository = await Repository.open(settings.business_db_path)
+    prompt_store = await PlannerPromptStore.open(
+        tmp_path / "environment-planner-prompts.sqlite3"
+    )
     file_store = FileStore(
         settings.data_dir,
         settings.outputs_dir,
@@ -241,7 +248,11 @@ async def _environment(tmp_path: Path, *, bitable_service=None):
         file_store=file_store,
         settings=settings,
     )
-    app = create_app(runtime=runtime, bitable_service=bitable_service)
+    app = create_app(
+        runtime=runtime,
+        bitable_service=bitable_service,
+        planner_prompt_store=prompt_store,
+    )
     transport = httpx.ASGITransport(app=app)
     try:
         async with app.router.lifespan_context(app):
@@ -251,6 +262,7 @@ async def _environment(tmp_path: Path, *, bitable_service=None):
             ) as client:
                 yield client, runtime, graph, repository
     finally:
+        await prompt_store.close()
         await repository.close()
 
 
@@ -272,6 +284,17 @@ async def _prompt_environment(tmp_path: Path, *, expose_store: bool = False):
 
 _USER_A_HEADERS = {"X-Portal-User-Id": "user-a", "X-Username": "%E7%94%B2"}
 _USER_B_HEADERS = {"X-Portal-User-Id": "user-b", "X-Username": "%E4%B9%99"}
+
+
+async def test_portal_reserved_prime_identity_is_rejected(tmp_path: Path) -> None:
+    async with _prompt_environment(tmp_path) as client:
+        response = await client.get(
+            "/api/planner-prompt",
+            headers={"X-Portal-User-Id": "prime-local"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Portal 用户身份无效"
 
 
 async def test_direct_local_planner_prompt_is_read_only_prime(tmp_path: Path) -> None:
@@ -656,6 +679,31 @@ async def test_clone_run_for_approval_reuses_approved_draft_without_generation(
     assert cloned["approval"]["tasks"] == original["approval"]["tasks"]
     assert cloned["approval"]["selected_task_ids"] == ["task-1"]
     assert graph.resume_calls == 0
+
+
+async def test_clone_run_fails_closed_without_source_prompt_snapshot(
+    tmp_path: Path,
+) -> None:
+    async with _environment(tmp_path) as (client, runtime, graph, _repository):
+        created = await client.post(
+            "/api/runs",
+            json={"source_url": "https://tenant.feishu.cn/docx/source"},
+        )
+        original_run_id = created.json()["run_id"]
+        original = await _wait_for_status(
+            client, original_run_id, "waiting_approval"
+        )
+        state = graph.states[original["thread_id"]]
+        state["approved_tasks"] = [original["approval"]["tasks"][0]]
+        state.pop("planning_prompt")
+
+        with pytest.raises(RunValidationError, match="提示词快照"):
+            await runtime.clone_run_for_approval(
+                original_run_id,
+                RequirementRequest(source_url=original["source_url"]),
+                run_id="rerun-no-prompt",
+                thread_id="rerun-no-prompt-thread",
+            )
 
 
 async def test_clone_run_for_approval_requires_a_previously_approved_task(

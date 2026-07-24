@@ -5,7 +5,9 @@ import pytest
 
 from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain.artifact import DeliveryRecord
+from feishu_generation_agent.domain.document import build_planning_prompt_snapshot
 from feishu_generation_agent.graph.runtime import GraphRuntime, RunNotFound
+from feishu_generation_agent.integrations.planner import planner_system_prompt
 from feishu_generation_agent.storage.files import FileStore
 from feishu_generation_agent.storage.repository import Repository
 
@@ -67,6 +69,15 @@ class _RetryDeliveryWriter:
         )
 
 
+def _prime_prompt() -> dict:
+    return build_planning_prompt_snapshot(
+        owner_user_id="prime-local",
+        source="prime",
+        version=0,
+        prompt_text=planner_system_prompt(),
+    ).model_dump(mode="json")
+
+
 async def _runtime(tmp_path: Path, graph: _RecoveryGraph, delivery_writer=None):
     settings = Settings(
         data_dir=tmp_path / "data",
@@ -99,6 +110,7 @@ async def test_restart_reuses_checkpoint_and_polls_without_resubmit(
         "run_id": "run-recovery",
         "thread_id": "thread-recovery",
         "status": "waiting_provider",
+        "planning_prompt": _prime_prompt(),
     }
     runtime, repository, _ = await _runtime(tmp_path, graph)
     await repository.create_run(
@@ -115,6 +127,36 @@ async def test_restart_reuses_checkpoint_and_polls_without_resubmit(
     assert graph.resume_calls == 1
     assert graph.submit_calls == 0
     assert graph.poll_calls == 1
+    await runtime.close()
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_fails_closed_when_checkpoint_has_no_prompt_snapshot(
+    tmp_path: Path,
+) -> None:
+    graph = _RecoveryGraph()
+    graph.states["thread-legacy"] = {
+        "run_id": "run-legacy",
+        "thread_id": "thread-legacy",
+        "status": "waiting_provider",
+    }
+    runtime, repository, _ = await _runtime(tmp_path, graph)
+    await repository.create_run(
+        "run-legacy",
+        "thread-legacy",
+        "https://acme.feishu.cn/docx/doccn123",
+        status="waiting_provider",
+    )
+
+    await runtime.resume_pending_runs()
+    final = await runtime.wait_for_terminal("run-legacy", timeout=1)
+
+    assert final["status"] == "failed"
+    assert graph.resume_calls == 0
+    events = await repository.list_events("run-legacy")
+    assert events[-1]["node"] == "planning_prompt"
+    assert events[-1]["status"] == "failed"
     await runtime.close()
     await repository.close()
 

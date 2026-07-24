@@ -1,4 +1,5 @@
 import asyncio
+from inspect import Parameter, signature
 import json
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -16,8 +17,10 @@ from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain.document import (
     MediaAsset,
     NormalizedDocument,
+    PlanningPromptSnapshot,
     RequirementRequest,
     VisionDescription,
+    build_planning_prompt_snapshot,
 )
 from feishu_generation_agent.domain.errors import (
     AgentError,
@@ -36,7 +39,10 @@ from feishu_generation_agent.domain.artifact import (
     ExecutionRecord,
     ProviderSubmission,
 )
-from feishu_generation_agent.integrations.planner import validate_plan
+from feishu_generation_agent.integrations.planner import (
+    planner_system_prompt,
+    validate_plan,
+)
 from feishu_generation_agent.ports import (
     DeliveryWriter,
     DocumentSource,
@@ -202,6 +208,40 @@ def _document_revision(state: AgentState) -> Any:
     return revision if revision is not None else state.get("source_revision")
 
 
+def _planning_prompt(state: AgentState) -> PlanningPromptSnapshot:
+    value = state.get("planning_prompt")
+    if value is not None:
+        return PlanningPromptSnapshot.model_validate(value)
+    return build_planning_prompt_snapshot(
+        owner_user_id="prime-local",
+        source="prime",
+        version=0,
+        prompt_text=planner_system_prompt(),
+    )
+
+
+def _planner_prompt_argument(
+    planner: RequirementPlanner,
+    planning_prompt: PlanningPromptSnapshot,
+) -> dict[str, str | None]:
+    try:
+        parameter = signature(planner.plan).parameters.get("system_prompt")
+    except (TypeError, ValueError):
+        parameter = None
+    if parameter is None or parameter.kind is Parameter.POSITIONAL_ONLY:
+        return {}
+    return {
+        "system_prompt": (
+            None
+            if (
+                planning_prompt.owner_user_id == "prime-local"
+                and planning_prompt.source == "prime"
+            )
+            else planning_prompt.prompt_text
+        )
+    }
+
+
 async def ingest_source(
     state: AgentState,
     config: RunnableConfig,
@@ -213,11 +253,13 @@ async def ingest_source(
         source_url = state.get("source_url")
         if not isinstance(source_url, str) or not source_url:
             raise _validation_error("A source URL is required")
+        planning_prompt = _planning_prompt(state)
         request = RequirementRequest(
             source_url=source_url,
             requester_open_id=state.get("requester_open_id"),
             trigger_type=state.get("trigger_type", "local_link"),
             reply_context=state.get("reply_context", {}),
+            planning_prompt=planning_prompt,
         )
         document = _document_for_checkpoint(
             await services.document_source.ingest(request)
@@ -226,6 +268,7 @@ async def ingest_source(
         return {
             "status": "running",
             "requirement_request": _json_model(request),
+            "planning_prompt": _json_model(planning_prompt),
             "source_document": document_json,
             "source_type": document.source_type.value,
             "source_token": document.source_token,
@@ -308,10 +351,12 @@ async def plan_requirements(
             VisionDescription.model_validate(item)
             for item in state.get("vision_descriptions", [])
         ]
+        planning_prompt = _planning_prompt(state)
         plan = await services.planner.plan(
             document,
             descriptions,
             state.get("planner_feedback"),
+            **_planner_prompt_argument(services.planner, planning_prompt),
         )
         plan_json = _json_model(plan)
         return {"draft_plan": plan_json, "task_plan": plan_json}

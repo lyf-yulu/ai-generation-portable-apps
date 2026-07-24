@@ -1,9 +1,12 @@
+import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 
 from feishu_generation_agent.config import Settings
 from feishu_generation_agent.domain.bitable import TableTaskStatus
+from feishu_generation_agent.domain.document import PlanningPromptSnapshot
 from feishu_generation_agent.domain.production_bitable import (
     ProductionSourceSnapshot,
     ProductionTaskSummary,
@@ -27,6 +30,7 @@ class _Runtime:
             checkpoint_db_path=tmp_path / "checkpoints.sqlite3",
         )
         self.resume_calls: list[str] = []
+        self.start_requests = []
 
     async def close(self) -> None:
         pass
@@ -34,6 +38,10 @@ class _Runtime:
     async def resume_run(self, run_id, decision) -> None:
         del decision
         self.resume_calls.append(run_id)
+
+    async def start_run(self, request) -> str:
+        self.start_requests.append(request)
+        return f"run-{len(self.start_requests)}"
 
 
 class _ProductionService:
@@ -45,6 +53,7 @@ class _ProductionService:
         self.scan_categories: list[str] = []
         self.claim_categories: list[tuple[str, str]] = []
         self.owner_calls: list[tuple[str, str]] = []
+        self.planning_prompts: list[PlanningPromptSnapshot] = []
         self.run_owners = {
             "run-no-maker": "prime-local",
             "run-old": "prime-local",
@@ -92,9 +101,12 @@ class _ProductionService:
         category: str = "animation",
         *,
         owner_user_id: str = "prime-local",
+        planning_prompt: PlanningPromptSnapshot | None = None,
     ) -> str:
         self.claim_categories.append((record_id, category))
         self.owner_calls.append(("claim", owner_user_id))
+        assert planning_prompt is not None
+        self.planning_prompts.append(planning_prompt)
         self.run_owners["run-no-maker"] = owner_user_id
         if category == "portrait":
             assert record_id == "rec-portrait"
@@ -173,6 +185,138 @@ class _ProductionService:
 
     async def close(self) -> None:
         pass
+
+
+class _PromptStore:
+    def __init__(self, prompt_text: str, version: int) -> None:
+        self.profile = SimpleNamespace(
+            prompt_text=prompt_text,
+            version=version,
+        )
+        self.get_calls: list[str] = []
+
+    async def get(self, portal_user_id: str):
+        self.get_calls.append(portal_user_id)
+        return self.profile
+
+
+async def test_claim_snapshots_profile_once_and_new_claim_uses_new_version(
+    tmp_path,
+    caplog,
+) -> None:
+    caplog.set_level(logging.INFO)
+    runtime = _Runtime(tmp_path)
+    production = _ProductionService()
+    prompt_store = _PromptStore("个人版本 v2", 2)
+    app = create_app(
+        runtime=runtime,
+        bitable_service=production,
+        planner_prompt_store=prompt_store,
+    )
+    transport = httpx.ASGITransport(app=app)
+    headers = {"X-Portal-User-Id": "user-a"}
+
+    async with app.router.lifespan_context(app), httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        first = await client.post(
+            "/api/bitable/tasks/rec-no-maker/claim", headers=headers
+        )
+        prompt_store.profile = SimpleNamespace(
+            prompt_text="个人版本 v3",
+            version=3,
+        )
+        second = await client.post(
+            "/api/bitable/tasks/rec-no-maker/claim", headers=headers
+        )
+        production.run_owners["run-old"] = "user-a"
+        before_rerun = list(prompt_store.get_calls)
+        rerun = await client.post(
+            "/api/bitable/runs/run-old/rerun", headers=headers
+        )
+
+    assert first.status_code == second.status_code == 202
+    assert rerun.status_code == 202
+    assert [item.prompt_text for item in production.planning_prompts] == [
+        "个人版本 v2",
+        "个人版本 v3",
+    ]
+    assert [item.version for item in production.planning_prompts] == [2, 3]
+    assert all(
+        item.owner_user_id == "user-a"
+        and item.source == "personal"
+        for item in production.planning_prompts
+    )
+    assert prompt_store.get_calls == before_rerun == ["user-a", "user-a"]
+    assert "个人版本 v2" not in caplog.text
+    assert "个人版本 v3" not in caplog.text
+    assert "owner_user_id=user-a" in caplog.text
+    assert "source=personal" in caplog.text
+    assert "version=2" in caplog.text
+    assert production.planning_prompts[0].prompt_sha256 in caplog.text
+
+
+async def test_local_and_portal_direct_run_creation_have_explicit_snapshots(
+    tmp_path,
+) -> None:
+    runtime = _Runtime(tmp_path)
+    prompt_store = _PromptStore("个人规划提示词", 4)
+    app = create_app(runtime=runtime, planner_prompt_store=prompt_store)
+    transport = httpx.ASGITransport(app=app)
+    payload = {"source_url": "https://tenant.feishu.cn/docx/docA"}
+
+    async with app.router.lifespan_context(app), httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        local = await client.post("/api/runs", json=payload)
+        portal = await client.post(
+            "/api/runs",
+            json=payload,
+            headers={"X-Portal-User-Id": "user-a"},
+        )
+
+    assert local.status_code == portal.status_code == 202
+    local_prompt = runtime.start_requests[0].planning_prompt
+    portal_prompt = runtime.start_requests[1].planning_prompt
+    assert local_prompt is not None
+    assert local_prompt.owner_user_id == "prime-local"
+    assert local_prompt.source == "prime"
+    assert local_prompt.version == 0
+    assert local_prompt.prompt_sha256 == (
+        "5dd2463a9bfddb3bc9e55c3a93148f7316f1259a6eaf70644a610b386a9c6ce4"
+    )
+    assert portal_prompt is not None
+    assert portal_prompt.owner_user_id == "user-a"
+    assert portal_prompt.source == "personal"
+    assert portal_prompt.version == 4
+    assert portal_prompt.prompt_text == "个人规划提示词"
+
+
+async def test_portal_creation_fails_when_prompt_store_is_unavailable(
+    tmp_path,
+) -> None:
+    runtime = _Runtime(tmp_path)
+    production = _ProductionService()
+    app = create_app(runtime=runtime, bitable_service=production)
+    transport = httpx.ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app), httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        response = await client.post(
+            "/api/runs",
+            json={"source_url": "https://tenant.feishu.cn/docx/docA"},
+            headers={"X-Portal-User-Id": "user-a"},
+        )
+        claim = await client.post(
+            "/api/bitable/tasks/rec-no-maker/claim",
+            headers={"X-Portal-User-Id": "user-a"},
+        )
+
+    assert response.status_code == 503
+    assert claim.status_code == 503
+    assert runtime.start_requests == []
+    assert production.planning_prompts == []
 
 
 async def test_scan_exposes_animation_type_and_allows_approval_without_maker(tmp_path) -> None:

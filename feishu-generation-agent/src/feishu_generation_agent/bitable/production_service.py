@@ -5,13 +5,18 @@ from typing import Any
 from uuid import uuid4
 
 from feishu_generation_agent.domain.bitable import BitableLocation, TableTaskStatus
-from feishu_generation_agent.domain.document import RequirementRequest
+from feishu_generation_agent.domain.document import (
+    PlanningPromptSnapshot,
+    RequirementRequest,
+    build_planning_prompt_snapshot,
+)
 from feishu_generation_agent.domain.production_bitable import ProductionTaskSummary
 from feishu_generation_agent.graph.runtime import (
     RunConflict,
     RunNotFound,
     RunValidationError,
 )
+from feishu_generation_agent.integrations.planner import planner_system_prompt
 from feishu_generation_agent.storage.production_tasks import ProductionTaskStore
 
 
@@ -92,6 +97,7 @@ class ProductionBitableService:
         category: str = "animation",
         *,
         owner_user_id: str = "prime-local",
+        planning_prompt: PlanningPromptSnapshot | None = None,
     ) -> str:
         source = await self._prepared_source(category)
         task = next(
@@ -109,11 +115,19 @@ class ProductionBitableService:
             thread_id=str(uuid4()),
             owner_user_id=owner_user_id,
         )
+        if planning_prompt is None:
+            planning_prompt = build_planning_prompt_snapshot(
+                owner_user_id=owner_user_id,
+                source="prime",
+                version=0,
+                prompt_text=planner_system_prompt(),
+            )
         with self._runtime_owner_scope(owner_user_id):
             return await self._runtime.start_run(
                 RequirementRequest(
                     source_url=binding.source_url,
                     trigger_type="production_bitable",
+                    planning_prompt=planning_prompt,
                 ),
                 run_id=binding.run_id,
                 thread_id=binding.thread_id,

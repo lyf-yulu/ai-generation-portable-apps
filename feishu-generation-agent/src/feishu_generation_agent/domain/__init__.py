@@ -15,9 +15,11 @@ from feishu_generation_agent.domain.document import (
     DocumentBlock,
     MediaAsset,
     NormalizedDocument,
+    PlanningPromptSnapshot,
     RequirementRequest,
     SourceType,
     VisionDescription,
+    build_planning_prompt_snapshot,
 )
 from feishu_generation_agent.domain.errors import (
     AgentError,
@@ -60,6 +62,7 @@ __all__ = [
     "ReferenceMode",
     "MediaAsset",
     "NormalizedDocument",
+    "PlanningPromptSnapshot",
     "ProviderResult",
     "ProviderSubmission",
     "ProductionBinding",
@@ -74,4 +77,5 @@ __all__ = [
     "TableTaskStatus",
     "TaskType",
     "VisionDescription",
+    "build_planning_prompt_snapshot",
 ]
