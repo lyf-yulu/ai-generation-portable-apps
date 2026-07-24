@@ -564,7 +564,7 @@ async def test_ingest_docx_preserves_hierarchy_and_stable_references(
     )
 
 
-async def test_ingest_merges_full_embedded_workbook_at_sheet_block_order(
+async def test_ingest_merges_target_sheet_export_at_sheet_block_order(
     file_store: FileStore,
 ):
     fixture = _fixture("feishu_docx_blocks.json")
@@ -575,18 +575,18 @@ async def test_ingest_merges_full_embedded_workbook_at_sheet_block_order(
         ExtractedSheet(
             text_lines=(
                 "[sheet:NuBUx5 worksheet:分镜 cell:B2] 镜头一",
-                "[sheet:NuBUx5 worksheet:角色 cell:C4] 人物保持一致",
+                "[sheet:NuBUx5 worksheet:分镜 cell:C4] 人物保持一致",
             ),
             images=(
                 _sheet_image(
                     hero,
                     media_name="hero.png",
-                    anchors=(("分镜", 1, 2), ("角色", 7, 4)),
+                    anchors=(("分镜", 1, 2), ("分镜", 7, 4)),
                 ),
                 _sheet_image(
                     reference,
                     media_name="reference.png",
-                    anchors=(("角色", 9, 6),),
+                    anchors=(("分镜", 9, 6),),
                 ),
             ),
         )
@@ -608,13 +608,13 @@ async def test_ingest_merges_full_embedded_workbook_at_sheet_block_order(
         block for block in first.blocks if block.block_id == "fiction-sheet"
     )
     assert sheet_block.block_type == "sheet"
-    assert "[sheet:NuBUx5 worksheet:角色 cell:C4]" in sheet_block.text
+    assert "[sheet:NuBUx5 worksheet:分镜 cell:C4]" in sheet_block.text
     assert first.text_view.index("cell:B2") < first.text_view.index(
         "[image:image-1]"
     )
     assert "worksheet:分镜 anchor:R2C3" in first.text_view
-    assert "worksheet:角色 anchor:R8C5" in first.text_view
-    assert "worksheet:角色 anchor:R10C7" in first.text_view
+    assert "worksheet:分镜 anchor:R8C5" in first.text_view
+    assert "worksheet:分镜 anchor:R10C7" in first.text_view
     assert exporter.refs == [
         EmbeddedSheetRef(
             spreadsheet_token="C7tUs3k3fhoiybtWxzvcqN7Nn3b",
