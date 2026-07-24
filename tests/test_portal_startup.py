@@ -75,18 +75,69 @@ class PortalStartupTests(unittest.TestCase):
         start_app.assert_not_called()
         kill_port.assert_not_called()
 
-    def test_shutdown_never_signals_an_external_app(self):
+    def test_shutdown_never_registers_or_signals_an_external_app(self):
         module = load_portal_module()
         manager = module.AppManager()
         managed_proc = mock.Mock(pid=12345)
-        managed_proc.poll.return_value = 0
+        managed_proc.poll.return_value = None
         external_proc = mock.Mock(pid=8765)
-        manager.processes["managed-demo"] = managed_proc
+        external_proc.poll.return_value = None
+        configs = self._app_configs()
+
+        def fake_start_app(name, _config):
+            manager.processes[name] = external_proc if name == "external-agent" else managed_proc
+
+        with mock.patch.object(module, "APPS", configs), \
+             mock.patch.object(manager, "start_app", side_effect=fake_start_app), \
+             mock.patch.object(manager, "_tcp_probe", return_value=True), \
+             mock.patch.object(module.threading, "Thread"):
+            manager.start_all()
 
         manager.shutdown()
 
+        self.assertNotIn("external-agent", manager.processes)
         external_proc.terminate.assert_not_called()
         external_proc.kill.assert_not_called()
+
+    def test_platform_activity_skips_unmanaged_apps(self):
+        module = load_portal_module()
+        handler = object.__new__(module.Handler)
+        handler._json = mock.Mock()
+        configs = self._app_configs()
+        connections = []
+        requests = []
+
+        class FakeResponse:
+            status = 200
+
+            @staticmethod
+            def read():
+                return b'{"records": []}'
+
+        class FakeConnection:
+            def __init__(self, host, port, timeout):
+                connections.append((host, port, timeout))
+                self.port = port
+
+            def request(self, method, path):
+                requests.append((self.port, method, path))
+
+            @staticmethod
+            def getresponse():
+                return FakeResponse()
+
+            @staticmethod
+            def close():
+                pass
+
+        with mock.patch.object(module, "APPS", configs), \
+             mock.patch.object(module.auth, "has_permission", return_value=True), \
+             mock.patch.object(module.http.client, "HTTPConnection", FakeConnection):
+            handler._platform_activity({"role": "admin"})
+
+        self.assertEqual(connections, [("127.0.0.1", 18787, 5)])
+        self.assertEqual(requests, [(18787, "GET", "/api/activity")])
+        handler._json.assert_called_once_with(200, {"ok": True, "activity": []})
 
     def test_main_does_not_start_subapps_when_portal_bind_fails(self):
         module = load_portal_module()

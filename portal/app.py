@@ -1871,6 +1871,8 @@ class Handler(SimpleHTTPRequestHandler):
             return
         merged = []
         for name, config in APPS.items():
+            if not config["spec"].managed:
+                continue
             try:
                 conn = http.client.HTTPConnection("127.0.0.1", config["port"], timeout=5)
                 conn.request("GET", "/api/activity")
