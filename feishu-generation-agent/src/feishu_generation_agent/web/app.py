@@ -1,7 +1,9 @@
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 import os
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
+from urllib.parse import unquote_to_bytes
 
 from fastapi import (
     FastAPI,
@@ -37,6 +39,7 @@ from feishu_generation_agent.integrations.bitable_delivery import (
     BitableResultConflict,
 )
 from feishu_generation_agent.integrations.feishu_bitable import BitableSchemaError
+from feishu_generation_agent.integrations.planner import planner_system_prompt
 from feishu_generation_agent.storage.bitable_tasks import TaskAlreadyClaimed
 from feishu_generation_agent.storage.production_tasks import ProductionTaskAlreadyClaimed
 from feishu_generation_agent.storage.checkpoints import open_checkpointer
@@ -46,10 +49,71 @@ from feishu_generation_agent.web.schemas import (
     BitableRetryResponse,
     CreateRunRequest,
     DecisionRequest,
+    PlannerPromptResponse,
+    PlannerPromptUpdate,
     ReferenceListRequest,
 )
 
 ProductionCategory = Literal["animation", "portrait"]
+_MAX_IDENTITY_LENGTH = 255
+
+
+@dataclass(frozen=True, slots=True)
+class RequestIdentity:
+    owner_user_id: str
+    portal_user_id: str | None
+    username: str
+    is_portal: bool
+
+
+def current_identity(request: Request) -> RequestIdentity:
+    portal_user_id = request.headers.get("X-Portal-User-Id")
+    if portal_user_id is None:
+        return RequestIdentity(
+            owner_user_id="prime-local",
+            portal_user_id=None,
+            username="",
+            is_portal=False,
+        )
+
+    _validate_portal_user_id(portal_user_id)
+    username = _decode_username(request.headers.get("X-Username", ""))
+    return RequestIdentity(
+        owner_user_id=portal_user_id,
+        portal_user_id=portal_user_id,
+        username=username,
+        is_portal=True,
+    )
+
+
+def _validate_portal_user_id(value: str) -> None:
+    if (
+        not value
+        or value != value.strip()
+        or len(value) > _MAX_IDENTITY_LENGTH
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise HTTPException(status_code=400, detail="Portal 用户身份无效")
+
+
+def _decode_username(value: str) -> str:
+    for index, character in enumerate(value):
+        if character == "%" and (
+            index + 2 >= len(value)
+            or value[index + 1] not in "0123456789abcdefABCDEF"
+            or value[index + 2] not in "0123456789abcdefABCDEF"
+        ):
+            raise HTTPException(status_code=400, detail="Portal 用户名编码无效")
+    try:
+        decoded = unquote_to_bytes(value).decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Portal 用户名编码无效") from exc
+    if (
+        len(decoded) > _MAX_IDENTITY_LENGTH
+        or any(ord(character) < 32 or ord(character) == 127 for character in decoded)
+    ):
+        raise HTTPException(status_code=400, detail="Portal 用户名无效")
+    return decoded
 
 
 def create_app(
@@ -315,6 +379,71 @@ def create_app(
                 detail="多维表格服务尚未配置",
             )
         return active
+
+    def get_planner_prompt_store(request: Request) -> PlannerPromptStore:
+        active = getattr(request.app.state, "planner_prompt_store", None)
+        if active is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="提示词存储尚未配置",
+            )
+        return active
+
+    def planner_prompt_response(
+        identity: RequestIdentity,
+        profile: Any | None = None,
+    ) -> PlannerPromptResponse:
+        if profile is not None:
+            return PlannerPromptResponse(
+                mode="personal",
+                editable=True,
+                prompt_text=profile.prompt_text,
+                version=profile.version,
+                source="personal",
+            )
+        return PlannerPromptResponse(
+            mode="prime",
+            editable=identity.is_portal,
+            prompt_text=planner_system_prompt(),
+            version=0,
+            source="prime",
+        )
+
+    @app.get("/api/planner-prompt", response_model=PlannerPromptResponse)
+    async def get_planner_prompt(request: Request) -> PlannerPromptResponse:
+        identity = current_identity(request)
+        if not identity.is_portal:
+            return planner_prompt_response(identity)
+        profile = await get_planner_prompt_store(request).get(
+            identity.owner_user_id
+        )
+        return planner_prompt_response(identity, profile)
+
+    @app.put("/api/planner-prompt", response_model=PlannerPromptResponse)
+    async def update_planner_prompt(
+        payload: PlannerPromptUpdate,
+        request: Request,
+    ) -> PlannerPromptResponse:
+        identity = current_identity(request)
+        if not identity.is_portal:
+            raise HTTPException(status_code=403, detail="本地 Prime 提示词不可修改")
+        try:
+            profile = await get_planner_prompt_store(request).save(
+                portal_user_id=identity.owner_user_id,
+                username=identity.username,
+                prompt_text=payload.prompt_text,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="提示词无效") from exc
+        return planner_prompt_response(identity, profile)
+
+    @app.delete("/api/planner-prompt", response_model=PlannerPromptResponse)
+    async def delete_planner_prompt(request: Request) -> PlannerPromptResponse:
+        identity = current_identity(request)
+        if not identity.is_portal:
+            raise HTTPException(status_code=403, detail="本地 Prime 提示词不可删除")
+        await get_planner_prompt_store(request).delete(identity.owner_user_id)
+        return planner_prompt_response(identity)
 
     def raise_bitable_error(exc: Exception) -> None:
         if (

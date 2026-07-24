@@ -19,8 +19,10 @@ from feishu_generation_agent.graph.builder import build_graph
 from feishu_generation_agent.graph.nodes import GraphServices
 from feishu_generation_agent.graph.runtime import GraphRuntime
 from feishu_generation_agent.storage.files import FileStore
+from feishu_generation_agent.storage.planner_prompts import PlannerPromptStore
 from feishu_generation_agent.storage.repository import Repository
 from feishu_generation_agent.web.app import create_app
+from feishu_generation_agent.integrations.planner import planner_system_prompt
 from feishu_generation_agent.cli import smoke
 
 
@@ -250,6 +252,153 @@ async def _environment(tmp_path: Path):
                 yield client, runtime, graph, repository
     finally:
         await repository.close()
+
+
+@asynccontextmanager
+async def _prompt_environment(tmp_path: Path, *, expose_store: bool = False):
+    store = await PlannerPromptStore.open(tmp_path / "planner-prompts.sqlite3")
+    app = create_app(planner_prompt_store=store)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                yield (client, store) if expose_store else client
+    finally:
+        await store.close()
+
+
+_USER_A_HEADERS = {"X-Portal-User-Id": "user-a", "X-Username": "%E7%94%B2"}
+_USER_B_HEADERS = {"X-Portal-User-Id": "user-b", "X-Username": "%E4%B9%99"}
+
+
+async def test_direct_local_planner_prompt_is_read_only_prime(tmp_path: Path) -> None:
+    async with _prompt_environment(tmp_path) as client:
+        response = await client.get("/api/planner-prompt")
+        put_response = await client.put(
+            "/api/planner-prompt", json={"prompt_text": "不应保存"}
+        )
+        delete_response = await client.delete("/api/planner-prompt")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "mode": "prime",
+        "editable": False,
+        "prompt_text": planner_system_prompt(),
+        "version": 0,
+        "source": "prime",
+    }
+    assert put_response.status_code == 403
+    assert delete_response.status_code == 403
+
+
+async def test_portal_planner_prompt_isolated_by_header_identity(tmp_path: Path) -> None:
+    first_prompt = "优先保持人物造型一致，并按镜头拆分任务。"
+    second_prompt = "让镜头运动、光线和节奏保持连续。"
+    async with _prompt_environment(tmp_path) as client:
+        inherited = await client.get("/api/planner-prompt", headers=_USER_A_HEADERS)
+        saved_first = await client.put(
+            "/api/planner-prompt",
+            headers=_USER_A_HEADERS,
+            json={"prompt_text": first_prompt},
+        )
+        saved_second = await client.put(
+            "/api/planner-prompt",
+            headers=_USER_A_HEADERS,
+            json={"prompt_text": second_prompt},
+        )
+        user_b = await client.get("/api/planner-prompt", headers=_USER_B_HEADERS)
+        deleted = await client.delete(
+            "/api/planner-prompt", headers=_USER_A_HEADERS
+        )
+        user_b_after_delete = await client.get(
+            "/api/planner-prompt", headers=_USER_B_HEADERS
+        )
+
+    assert inherited.json() == {
+        "mode": "prime",
+        "editable": True,
+        "prompt_text": planner_system_prompt(),
+        "version": 0,
+        "source": "prime",
+    }
+    assert saved_first.json() == {
+        "mode": "personal",
+        "editable": True,
+        "prompt_text": first_prompt,
+        "version": 1,
+        "source": "personal",
+    }
+    assert saved_second.json() == {
+        "mode": "personal",
+        "editable": True,
+        "prompt_text": second_prompt,
+        "version": 2,
+        "source": "personal",
+    }
+    assert user_b.json() == {
+        "mode": "prime",
+        "editable": True,
+        "prompt_text": planner_system_prompt(),
+        "version": 0,
+        "source": "prime",
+    }
+    assert deleted.json() == inherited.json()
+    assert user_b_after_delete.json() == user_b.json()
+
+
+async def test_planner_prompt_uses_only_portal_header_user_id(tmp_path: Path) -> None:
+    prompt = "只应保存给请求头中的用户。"
+    async with _prompt_environment(tmp_path, expose_store=True) as (client, store):
+        saved = await client.put(
+            "/api/planner-prompt?portal_user_id=user-b",
+            headers=_USER_A_HEADERS,
+            json={"prompt_text": prompt, "portal_user_id": "user-b"},
+        )
+        user_a = await client.get("/api/planner-prompt", headers=_USER_A_HEADERS)
+        user_b = await client.get("/api/planner-prompt", headers=_USER_B_HEADERS)
+        profile = await store.get("user-a")
+
+    assert saved.status_code == 200
+    assert user_a.json()["prompt_text"] == prompt
+    assert user_b.json()["source"] == "prime"
+    assert "user-a" not in user_a.text
+    assert "user-b" not in user_a.text
+    assert profile is not None
+    assert profile.username == "甲"
+
+
+@pytest.mark.parametrize("prompt_text", [" \t\n", "文" * 20_001])
+async def test_planner_prompt_rejects_blank_and_overlong_values(
+    tmp_path: Path, prompt_text: str
+) -> None:
+    async with _prompt_environment(tmp_path) as client:
+        response = await client.put(
+            "/api/planner-prompt",
+            headers=_USER_A_HEADERS,
+            json={"prompt_text": prompt_text},
+        )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"X-Portal-User-Id": " ", "X-Username": "%E7%94%B2"},
+        {"X-Portal-User-Id": "user-a", "X-Username": "%ZZ"},
+        {"X-Portal-User-Id": "user-a" * 100, "X-Username": "%E7%94%B2"},
+    ],
+)
+async def test_planner_prompt_rejects_malformed_or_overlong_identity(
+    tmp_path: Path, headers: dict[str, str]
+) -> None:
+    async with _prompt_environment(tmp_path) as client:
+        response = await client.get("/api/planner-prompt", headers=headers)
+
+    assert response.status_code == 400
 
 
 async def _wait_for_status(

@@ -35,6 +35,11 @@ _AUDIT_SYSTEM_PROMPT = """你是独立审查员，与需求规划角色相互独
 _STRUCTURED_OUTPUT_ATTEMPTS = 3
 
 
+def planner_system_prompt() -> str:
+    """Return the immutable built-in planner instruction set."""
+    return _PLAN_SYSTEM_PROMPT
+
+
 def _compact_json(value: Any) -> str:
     return json.dumps(
         value,
@@ -436,7 +441,7 @@ class DeepSeekPlanner:
         feedback: str | None = None,
     ) -> TaskPlan:
         messages = [
-            {"role": "system", "content": _PLAN_SYSTEM_PROMPT},
+            {"role": "system", "content": planner_system_prompt()},
             {
                 "role": "user",
                 "content": self._planning_prompt(document, visions, feedback),

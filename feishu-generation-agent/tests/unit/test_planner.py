@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,8 +19,17 @@ from feishu_generation_agent.domain.errors import AgentError, ErrorCategory
 from feishu_generation_agent.domain.plan import AuditReport, TaskPlan
 from feishu_generation_agent.integrations.planner import (
     DeepSeekPlanner,
+    planner_system_prompt,
     validate_plan,
 )
+
+
+def test_planner_system_prompt_prime_hash_is_frozen() -> None:
+    prime = planner_system_prompt()
+
+    assert hashlib.sha256(prime.encode("utf-8")).hexdigest() == (
+        "5dd2463a9bfddb3bc9e55c3a93148f7316f1259a6eaf70644a610b386a9c6ce4"
+    )
 
 
 def _asset(
