@@ -50,6 +50,7 @@ from feishu_generation_agent.storage.bitable_tasks import BitableTaskStore
 from feishu_generation_agent.storage.production_tasks import ProductionTaskStore
 from feishu_generation_agent.storage.portrait_assets import PortraitAssetStore
 from feishu_generation_agent.storage.provider_results import ProviderResultStore
+from feishu_generation_agent.storage.planner_prompts import PlannerPromptStore
 from feishu_generation_agent.storage.repository import Repository
 
 
@@ -163,6 +164,7 @@ class ApplicationServices:
     graph: GraphServices
     bitable_factory: BitableServiceFactory | ProductionBitableServiceFactory | None
     legacy_delivery_configured: bool
+    planner_prompt_store: PlannerPromptStore
 
 
 @asynccontextmanager
@@ -202,6 +204,7 @@ async def _open_application_services(
         settings.require(*CAPABILITY_FIELDS["legacy_delivery"])
     settings.ensure_paths()
     repository = await Repository.open(settings.business_db_path)
+    planner_prompt_store = await PlannerPromptStore.open(settings.business_db_path)
     provider_http = httpx.AsyncClient(trust_env=False)
     downloader = SafeResultDownloader(
         max_bytes=settings.max_download_bytes,
@@ -383,6 +386,7 @@ async def _open_application_services(
             graph=services,
             bitable_factory=bitable_factory,
             legacy_delivery_configured=legacy_configured,
+            planner_prompt_store=planner_prompt_store,
         )
     finally:
         if bitable_factory is not None:
@@ -394,4 +398,5 @@ async def _open_application_services(
         await feishu.close()
         await downloader.aclose()
         await provider_http.aclose()
+        await planner_prompt_store.close()
         await repository.close()

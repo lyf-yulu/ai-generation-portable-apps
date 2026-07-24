@@ -40,6 +40,7 @@ from feishu_generation_agent.integrations.feishu_bitable import BitableSchemaErr
 from feishu_generation_agent.storage.bitable_tasks import TaskAlreadyClaimed
 from feishu_generation_agent.storage.production_tasks import ProductionTaskAlreadyClaimed
 from feishu_generation_agent.storage.checkpoints import open_checkpointer
+from feishu_generation_agent.storage.planner_prompts import PlannerPromptStore
 from feishu_generation_agent.web.schemas import (
     BitableClaimResponse,
     BitableRetryResponse,
@@ -57,6 +58,7 @@ def create_app(
     services: GraphServices | None = None,
     settings: Settings | None = None,
     bitable_service: BitableMvpService | Any | None = None,
+    planner_prompt_store: PlannerPromptStore | None = None,
 ) -> FastAPI:
     if sum(value is not None for value in (runtime, services, settings)) > 1:
         raise ValueError("runtime, services and settings are mutually exclusive")
@@ -121,24 +123,28 @@ def create_app(
                 async with activated_services(services) as active:
                     app.state.runtime = active
                     app.state.bitable_service = bitable_service
+                    app.state.planner_prompt_store = planner_prompt_store
                     try:
                         yield
                     finally:
                         if bitable_service is not None:
                             await bitable_service.close()
                         app.state.bitable_service = None
+                        app.state.planner_prompt_store = None
                         app.state.runtime = None
             return
 
         if runtime is not None:
             app.state.runtime = runtime
             app.state.bitable_service = bitable_service
+            app.state.planner_prompt_store = planner_prompt_store
             try:
                 yield
             finally:
                 if bitable_service is not None:
                     await bitable_service.close()
                 app.state.bitable_service = None
+                app.state.planner_prompt_store = None
                 await runtime.close()
                 app.state.runtime = None
             return
@@ -157,6 +163,10 @@ def create_app(
                             else None
                         )
                         app.state.bitable_service = active_bitable
+                        app.state.planner_prompt_store = (
+                            planner_prompt_store
+                            or getattr(application, "planner_prompt_store", None)
+                        )
                         try:
                             if active_bitable is not None:
                                 try:
@@ -172,16 +182,19 @@ def create_app(
                             if active_bitable is not None:
                                 await active_bitable.close()
                             app.state.bitable_service = None
+                            app.state.planner_prompt_store = None
                             app.state.runtime = None
             return
 
         async with tracing_environment(local_settings):
             app.state.runtime = None
             app.state.bitable_service = None
+            app.state.planner_prompt_store = planner_prompt_store
             try:
                 yield
             finally:
                 app.state.bitable_service = None
+                app.state.planner_prompt_store = None
                 app.state.runtime = None
 
     app = FastAPI(title="本地飞书生成任务 Agent", lifespan=lifespan)
