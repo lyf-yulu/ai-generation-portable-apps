@@ -211,6 +211,44 @@ async def test_save_returns_its_own_committed_profile_during_competing_write(
         await second.close()
 
 
+async def test_cancelled_save_rolls_back_begin_immediate_and_releases_write_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "business.sqlite3"
+    first = await PlannerPromptStore.open(path)
+    second = await PlannerPromptStore.open(path)
+    begin_committed = asyncio.Event()
+    try:
+        original_execute = first._connection.execute
+
+        async def pause_after_begin(statement: str, *args, **kwargs):
+            result = await original_execute(statement, *args, **kwargs)
+            if statement == "BEGIN IMMEDIATE":
+                begin_committed.set()
+                await asyncio.Event().wait()
+            return result
+
+        monkeypatch.setattr(first._connection, "execute", pause_after_begin)
+        task = asyncio.create_task(
+            first.save(portal_user_id="user-a", username="甲", prompt_text=PROMPT)
+        )
+        await begin_committed.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        profile = await second.save(
+            portal_user_id="user-a",
+            username="乙",
+            prompt_text="写锁已释放后另一连接可以保存。",
+        )
+
+        assert profile.version == 1
+    finally:
+        await first.close()
+        await second.close()
+
+
 async def test_user_profiles_are_independent_and_delete_only_removes_requested_user(
     tmp_path: Path,
 ) -> None:

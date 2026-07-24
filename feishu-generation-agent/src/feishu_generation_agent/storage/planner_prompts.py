@@ -72,8 +72,8 @@ class PlannerPromptStore:
 
         updated_at = _utc_now()
         async with self._lock:
-            await self._connection.execute("BEGIN IMMEDIATE")
             try:
+                await self._connection.execute("BEGIN IMMEDIATE")
                 cursor = await self._connection.execute(
                     """SELECT version, created_at FROM planner_prompt_profiles
                     WHERE portal_user_id = ?""",
@@ -121,7 +121,7 @@ class PlannerPromptStore:
                     created_at=created_at,
                     updated_at=updated_at,
                 )
-            except Exception:
+            except BaseException:
                 await self._connection.rollback()
                 raise
         return profile
