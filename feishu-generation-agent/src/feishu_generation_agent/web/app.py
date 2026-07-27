@@ -17,7 +17,7 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
@@ -64,6 +64,20 @@ from feishu_generation_agent.web.schemas import (
 ProductionCategory = Literal["animation", "portrait"]
 _MAX_IDENTITY_LENGTH = 255
 _LOGGER = logging.getLogger(__name__)
+_WORKSPACE_STYLESHEET_LINK = (
+    '<link rel="stylesheet" href="static/styles.css">'
+)
+
+
+def _render_workspace_html(static_dir: Path) -> str:
+    html = (static_dir / "index.html").read_text("utf-8")
+    if html.count(_WORKSPACE_STYLESHEET_LINK) != 1:
+        raise RuntimeError(
+            "workspace stylesheet link must appear exactly once"
+        )
+    styles = (static_dir / "styles.css").read_text("utf-8")
+    inline = f"<style data-agent-inline-styles>\n{styles}\n</style>"
+    return html.replace(_WORKSPACE_STYLESHEET_LINK, inline)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1009,7 +1023,12 @@ def create_app(
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     @app.get("/", include_in_schema=False)
-    async def workspace() -> FileResponse:
-        return FileResponse(static_dir / "index.html", media_type="text/html")
+    async def workspace() -> HTMLResponse:
+        return HTMLResponse(
+            _render_workspace_html(static_dir),
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+            },
+        )
 
     return app

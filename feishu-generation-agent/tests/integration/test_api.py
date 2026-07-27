@@ -2520,6 +2520,10 @@ async def test_static_review_workspace_is_served_and_uses_safe_dom_updates():
     assert script.status_code == 200
     assert review_state.status_code == 200
     assert styles.status_code == 200
+    assert '<style data-agent-inline-styles>' in page.text
+    assert '<link rel="stylesheet" href="static/styles.css">' not in page.text
+    assert "--paper: #f7f8f4" in page.text
+    assert styles.headers["content-type"].startswith("text/css")
     for text in (
         "节点轨迹",
         "当前节点",
