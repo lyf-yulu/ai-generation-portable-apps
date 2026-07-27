@@ -32,7 +32,7 @@ def test_planner_system_prompt_prime_hash_is_frozen() -> None:
     prime = planner_system_prompt()
 
     assert hashlib.sha256(prime.encode("utf-8")).hexdigest() == (
-        "5dd2463a9bfddb3bc9e55c3a93148f7316f1259a6eaf70644a610b386a9c6ce4"
+        "fc009b4bb8351502a9412b88a5554a8567a9aa9a633eba588fb673b513f16db1"
     )
 
 
@@ -578,6 +578,47 @@ async def test_planning_input_contains_stable_document_and_rules(
     assert "每个下载成功的素材" in user_prompt
     assert "excluded_assets" in user_prompt
     assert "保留蓝色" in user_prompt
+    combined_contract = request[0]["content"] + "\n" + user_prompt
+    for required in (
+        "@图片N",
+        "逐张读取",
+        "每个镜头",
+        "不得机械平均分配",
+        "镜头 1",
+        "禁止绝对秒数",
+        "画质",
+        "水印",
+        "Logo",
+    ):
+        assert required in combined_contract
+
+
+async def test_planner_repairs_hotpot_reference_bindings(
+    storyboard_document: NormalizedDocument,
+    vision_descriptions: list[VisionDescription],
+) -> None:
+    sources = [f"shot-{index}" for index in range(1, 5)]
+    invalid = _video_task(source_block_ids=sources)
+    invalid["prompt"] = (
+        "0-3秒：展示空锅。3-8秒：食材入锅。"
+        "8-12秒：俯拍成品。"
+    )
+    repaired = _video_task(source_block_ids=sources)
+    model = FakeDeepSeekModel(
+        [_plan_json(invalid), _plan_json(repaired)]
+    )
+
+    plan = await DeepSeekPlanner(model).plan(
+        storyboard_document,
+        vision_descriptions,
+    )
+
+    assert model.calls == 2
+    repair_prompt = model.requests[1][-1]["content"]
+    assert "@图片1" in repair_prompt
+    assert "镜头 1" in repair_prompt
+    assert "绝对秒数" in repair_prompt
+    assert plan.tasks[0].prompt == repaired["prompt"]
 
 
 async def test_default_and_portal_planner_system_prompts_are_composed_safely(
