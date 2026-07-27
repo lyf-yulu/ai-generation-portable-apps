@@ -2080,6 +2080,73 @@ async def test_replacing_and_uploading_reference_updates_coverage_atomically(
         }
 
 
+async def test_unlink_reference_renumbers_survivors_and_prompt(
+    tmp_path: Path,
+) -> None:
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime
+        run_id = (
+            await client.post(
+                "/api/runs",
+                json={
+                    "source_url": (
+                        "https://acme.feishu.cn/docx/reference-renumber"
+                    )
+                },
+            )
+        ).json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        run = await repository.get_run(run_id)
+        assert run is not None
+        state = graph.states[run["thread_id"]]
+        second_path = tmp_path / "data" / "second-reference.png"
+        third_path = tmp_path / "data" / "third-reference.png"
+        second_path.write_bytes(_png_bytes((180, 80, 40)))
+        third_path.write_bytes(_png_bytes((80, 180, 40)))
+        assets = [
+            state["media_assets"][0],
+            _source_asset(second_path, "asset-2"),
+            _source_asset(third_path, "asset-3"),
+        ]
+        state["media_assets"] = assets
+        state["draft_plan"]["tasks"][0]["reference_images"] = [
+            {
+                "asset_id": f"asset-{index}",
+                "role": "reference_image",
+                "order": index,
+            }
+            for index in range(1, 4)
+        ]
+        state["draft_plan"]["tasks"][0]["prompt"] = (
+            "@图片1 中的锅；@图片2 中的碗；@图片3 中的桌面"
+        )
+        state["task_plan"] = copy.deepcopy(state["draft_plan"])
+        state["normalized_document"] = _normalized_document(assets)
+
+        removed = await client.delete(
+            f"/api/runs/{run_id}/tasks/task-1/references/asset-2"
+        )
+
+        assert removed.status_code == 200
+        view = (await client.get(f"/api/runs/{run_id}")).json()
+        approval_task = view["approval"]["tasks"][0]
+        assert approval_task["reference_images"] == [
+            {
+                "asset_id": "asset-1",
+                "role": "reference_image",
+                "order": 1,
+            },
+            {
+                "asset_id": "asset-3",
+                "role": "reference_image",
+                "order": 2,
+            },
+        ]
+        assert approval_task["prompt"] == (
+            "@图片1 中的锅；碗；@图片2 中的桌面"
+        )
+
+
 async def test_approval_with_uncovered_asset_returns_422_before_execution(
     tmp_path: Path,
 ):

@@ -33,6 +33,10 @@ from feishu_generation_agent.domain.plan import (
     TaskPlan,
     reconcile_task_asset_coverage,
 )
+from feishu_generation_agent.domain.reference_contract import (
+    canonicalize_references,
+    remap_prompt_references,
+)
 from feishu_generation_agent.integrations.planner import (
     language_validation_message,
     planner_system_prompt,
@@ -842,14 +846,27 @@ class GraphRuntime:
             )
             if replace_index is None:
                 references.append(reference)
+                prompt_references = None
             else:
                 references[replace_index] = reference
+                prompt_references = list(task.reference_images)
+                prompt_references[replace_index] = reference.model_copy(
+                    update={
+                        "role": task.reference_images[replace_index].role,
+                        "order": task.reference_images[replace_index].order,
+                    }
+                )
             assets = [
                 MediaAsset.model_validate(item)
                 for item in state.get("media_assets", [])
             ]
             assets.append(asset)
-            updated_task = self._task_with_references(task, references, assets)
+            updated_task = self._task_with_references(
+                task,
+                references,
+                assets,
+                prompt_references=prompt_references,
+            )
             updated_plan = self._replace_task(plan, task_index, updated_task)
             await self._persist_draft(run, state, updated_plan, assets)
             return {
@@ -984,16 +1001,32 @@ class GraphRuntime:
         assets: list[MediaAsset],
         *,
         reference_mode: str | None = None,
+        prompt_references: list[ImageReference] | None = None,
     ) -> GenerationTask:
         try:
+            canonical_references = canonicalize_references(references)
+            mime_types = {
+                asset.asset_id: asset.mime_type for asset in assets
+            }
+            prompt = remap_prompt_references(
+                task.prompt,
+                (
+                    task.reference_images
+                    if prompt_references is None
+                    else prompt_references
+                ),
+                canonical_references,
+                mime_types,
+            )
             updated = GenerationTask.model_validate(
                 task.model_dump(mode="json")
                 | {
                     "reference_images": [
                         reference.model_dump(mode="json")
-                        for reference in references
+                        for reference in canonical_references
                     ],
                     "reference_mode": reference_mode or task.reference_mode,
+                    "prompt": prompt,
                 }
             )
             self._validate_references(
