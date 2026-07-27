@@ -363,6 +363,15 @@
     return canSaveReferences(state, taskId) ? "save_then_proceed" : "blocked";
   }
 
+  function shouldRefreshTaskEditor(
+    previousState,
+    nextState,
+    hasRenderedTasks,
+  ) {
+    if (!hasRenderedTasks) return true;
+    return previousState?.serverIdentity !== nextState?.serverIdentity;
+  }
+
   return {
     CONFLICT_MESSAGE,
     beginApprovalSubmit,
@@ -383,6 +392,7 @@
     patchTask,
     referenceMutationDirective,
     selectedTaskIds,
+    shouldRefreshTaskEditor,
     coverageLabel,
     setReferenceMode,
     setTaskSelected,

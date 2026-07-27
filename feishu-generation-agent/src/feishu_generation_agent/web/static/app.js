@@ -938,7 +938,7 @@
     return card;
   }
 
-  function render(view) {
+  function render(view, { refreshTasks = true } = {}) {
     state.view = view;
     byId("status-badge").textContent = view.status;
     byId("run-status").textContent = view.status;
@@ -995,7 +995,9 @@
       : "";
     visionIssueBox.hidden = visionIssues.length === 0;
     renderCoverage(view);
-    taskList.replaceChildren(...(view.approval.tasks || []).map(renderTask));
+    if (refreshTasks) {
+      taskList.replaceChildren(...(view.approval.tasks || []).map(renderTask));
+    }
     updateActionAvailability();
   }
 
@@ -1003,10 +1005,17 @@
     if (!state.runId || (state.busy && !force)) return;
     try {
       const serverView = await api(`/api/runs/${state.runId}`);
-      state.review = resetDraft
+      const previousReview = state.review;
+      const nextReview = resetDraft
         ? ReviewState.mergeServerView(ReviewState.createReviewState(), serverView)
         : ReviewState.mergeServerView(state.review, serverView);
-      render(ReviewState.draftView(state.review));
+      const refreshTasks = resetDraft || ReviewState.shouldRefreshTaskEditor(
+        previousReview,
+        nextReview,
+        taskList.childElementCount > 0,
+      );
+      state.review = nextReview;
+      render(ReviewState.draftView(state.review), { refreshTasks });
       if (TERMINAL_RUN_STATUSES.has(serverView.status)) {
         stopPolling();
         pollingNote.textContent = "任务已结束，可开始下一任务或重跑。";

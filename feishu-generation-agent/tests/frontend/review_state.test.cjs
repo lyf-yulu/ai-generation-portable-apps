@@ -45,6 +45,48 @@ function view({
   };
 }
 
+test("task editor refreshes only when the effective server plan changes", () => {
+  const empty = ReviewState.createReviewState();
+  const initial = ReviewState.mergeServerView(empty, view());
+  const same = ReviewState.mergeServerView(initial, view());
+  const changed = ReviewState.mergeServerView(
+    same,
+    view({ revision: 8, taskOnePrompt: "new server prompt" }),
+  );
+
+  assert.equal(
+    ReviewState.shouldRefreshTaskEditor(empty, initial, false),
+    true,
+  );
+  assert.equal(
+    ReviewState.shouldRefreshTaskEditor(initial, same, true),
+    false,
+  );
+  assert.equal(
+    ReviewState.shouldRefreshTaskEditor(same, changed, true),
+    true,
+  );
+});
+
+test("dirty conflict does not replace the current task editor", () => {
+  let current = ReviewState.mergeServerView(
+    ReviewState.createReviewState(),
+    view(),
+  );
+  current = ReviewState.patchTask(current, "task-1", {
+    prompt: "local edit",
+  });
+  const conflicted = ReviewState.mergeServerView(
+    current,
+    view({ revision: 8, taskOnePrompt: "server edit" }),
+  );
+
+  assert.equal(
+    ReviewState.shouldRefreshTaskEditor(current, conflicted, true),
+    false,
+  );
+});
+
 test("same-revision polls preserve local selection and every editable task field", () => {
   const original = view();
   let state = ReviewState.createReviewState();
