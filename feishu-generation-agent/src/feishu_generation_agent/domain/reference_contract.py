@@ -14,6 +14,24 @@ _SHOT_MARKER = re.compile(r"镜头\s*(\d+)\s*[：:]")
 _ABSOLUTE_SECONDS = re.compile(
     r"\d+(?:\.\d+)?\s*[-–—~～至到]\s*\d+(?:\.\d+)?\s*秒"
 )
+_GENERIC_BINDING_ONLY = re.compile(
+    r"(?:"
+    r"镜头|总体|以|为|把|当作|调用|读取|根据|结合|进行|"
+    r"生成|制作|创作|完成|参考|使用|采用|作为|用作|用于|"
+    r"展示|呈现|保持|沿用|提供|控制|决定|"
+    r"高清|高画质|超清|清晰|稳定|流畅|不变形|"
+    r"无水印|水印|无|有|"
+    r"主要|核心|辅助|重要|关键|最终|整体|统一|唯一|优先|一致|"
+    r"画面|内容|效果|作品|主体|素材|图片|视频|音频|"
+    r"场景|风格|构图|动作|运镜|声音|相关|对应|图|中|的"
+    r")+"
+)
+_CONCRETE_BINDING_SUFFIX = re.compile(
+    r"^\s*(?:"
+    r"中\s*的|中|的|作为|用作|用于|展示|呈现|保持|沿用|"
+    r"提供|控制|决定|参考|[（(]"
+    r")\s*(?P<description>.*)$"
+)
 
 
 class ReferenceRemapError(ValueError):
@@ -141,12 +159,7 @@ def validate_seedance_prompt(
                 f"Seedance prompt 缺少素材引用 {token}"
             )
             continue
-        semantic_pattern = re.compile(
-            rf"{re.escape(token)}\s*"
-            r"(?:中\s*的|中的|的|[（(])\s*"
-            r"[^，。；;\n]{2,}"
-        )
-        if semantic_pattern.search(prompt) is None:
+        if not _has_concrete_reference_binding(prompt, token):
             issues.append(
                 f"Seedance prompt 中 {token} 必须绑定具体主体、场景、动作、"
                 "运镜或声音"
@@ -276,6 +289,35 @@ def _reference_mentioned(
         pattern.search(prompt) is not None
         for pattern, _ in _reference_patterns(media_type, index)
     )
+
+
+def _has_concrete_reference_binding(prompt: str, token: str) -> bool:
+    separators = "，。；;\n"
+    token_pattern = re.compile(r"@(图片|视频|音频)\d+")
+    for occurrence in re.finditer(re.escape(token), prompt):
+        ends = [
+            position
+            for separator in separators
+            if (position := prompt.find(separator, occurrence.end())) >= 0
+        ]
+        end = min(ends, default=len(prompt))
+        suffix = prompt[occurrence.end() : end]
+        binding = _CONCRETE_BINDING_SUFFIX.match(suffix)
+        if binding is None:
+            continue
+        without_tokens = token_pattern.sub(
+            "",
+            binding.group("description"),
+        )
+        cjk_text = "".join(
+            re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", without_tokens)
+        )
+        if (
+            len(cjk_text) >= 2
+            and _GENERIC_BINDING_ONLY.fullmatch(cjk_text) is None
+        ):
+            return True
+    return False
 
 
 def _media_type(mime_type: str) -> str:

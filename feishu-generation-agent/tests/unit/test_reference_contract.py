@@ -274,6 +274,148 @@ def test_seedance_prompt_rejects_tokens_only_listed_before_shots() -> None:
     assert any("@图片1" in issue and "实际镜头" in issue for issue in issues)
 
 
+def test_seedance_prompt_accepts_equivalent_concrete_binding_phrases() -> None:
+    prompt = (
+        "镜头 1：使用 @图片1 作为黄铜毛毡空锅的造型参考。\n"
+        "镜头 2：参考 @图片2 展示绿色青菜和红色肥牛落入锅中。\n"
+        "高清，物体稳定不变形，不要生成水印，不要生成 Logo。"
+    )
+
+    assert validate_seedance_prompt(
+        _video_task(prompt),
+        {
+            "image-pot": "image/png",
+            "image-food": "image/png",
+        },
+        require_storyboard=True,
+    ) == []
+
+
+def test_seedance_prompt_rejects_generic_generation_and_quality_phrases() -> None:
+    prompt = (
+        "镜头 1：根据 @图片1 生成视频，保持高清稳定不变形。\n"
+        "镜头 2：结合 @图片2 完成制作，无水印，无 Logo。"
+    )
+
+    issues = validate_seedance_prompt(
+        _video_task(prompt),
+        {
+            "image-pot": "image/png",
+            "image-food": "image/png",
+        },
+        require_storyboard=True,
+    )
+
+    assert any("@图片1" in issue and "具体" in issue for issue in issues)
+    assert any("@图片2" in issue and "具体" in issue for issue in issues)
+
+
+def test_seedance_prompt_rejects_reference_only_action_templates() -> None:
+    for phrase in (
+        "以 @图片1 为参考",
+        "把 @图片1 当作参考",
+        "调用 @图片1",
+        "读取 @图片1",
+    ):
+        issues = validate_seedance_prompt(
+            _video_task(
+                f"{phrase}，根据 @图片2 生成视频。",
+            ),
+            {
+                "image-pot": "image/png",
+                "image-food": "image/png",
+            },
+            require_storyboard=False,
+        )
+
+        assert any("@图片1" in issue and "具体" in issue for issue in issues)
+
+
+def test_seedance_prompt_ignores_generic_words_before_reference_token() -> None:
+    for phrase in (
+        "请使用 @图片1",
+        "仅参考 @图片1",
+        "只参考 @图片1",
+        "直接使用 @图片1",
+        "选择 @图片1",
+        "引用 @图片1",
+        "通过 @图片1 生成",
+    ):
+        issues = validate_seedance_prompt(
+            _video_task(
+                f"{phrase}，根据 @图片2 生成视频。",
+            ),
+            {
+                "image-pot": "image/png",
+                "image-food": "image/png",
+            },
+            require_storyboard=False,
+        )
+
+        assert any("@图片1" in issue and "具体" in issue for issue in issues)
+
+
+def test_seedance_prompt_rejects_generic_suffix_templates() -> None:
+    for phrase in (
+        "用 @图片1 来生成视频",
+        "@图片1 请作为参考",
+        "@图片1 优先使用",
+        "@图片1 为准",
+        "@图片1 进行处理",
+    ):
+        issues = validate_seedance_prompt(
+            _video_task(
+                f"{phrase}，根据 @图片2 生成视频。",
+            ),
+            {
+                "image-pot": "image/png",
+                "image-food": "image/png",
+            },
+            require_storyboard=False,
+        )
+
+        assert any("@图片1" in issue and "具体" in issue for issue in issues)
+
+
+def test_seedance_prompt_rejects_generic_reference_descriptions() -> None:
+    for phrase in (
+        "@图片1 作为主要参考",
+        "@图片1 作为核心素材",
+        "@图片1 用于最终生成",
+        "@图片1 用作辅助参考图",
+        "@图片1 保持一致",
+        "@图片1 作为重要参考",
+    ):
+        issues = validate_seedance_prompt(
+            _video_task(
+                f"{phrase}，参考 @图片2 中的绿色青菜。",
+            ),
+            {
+                "image-pot": "image/png",
+                "image-food": "image/png",
+            },
+            require_storyboard=False,
+        )
+
+        assert any("@图片1" in issue and "具体" in issue for issue in issues)
+
+
+def test_seedance_prompt_preserves_concrete_nouns_containing_generic_words() -> None:
+    prompt = (
+        "参考 @图片1 中的视频制作人；"
+        "参考 @图片2 中的稳定器。"
+    )
+
+    assert validate_seedance_prompt(
+        _video_task(prompt),
+        {
+            "image-pot": "image/png",
+            "image-food": "image/png",
+        },
+        require_storyboard=False,
+    ) == []
+
+
 def test_seedance_prompt_requires_unique_continuous_shot_numbers() -> None:
     prompt = (
         "参考 @图片1 中的黄铜毛毡空锅；"

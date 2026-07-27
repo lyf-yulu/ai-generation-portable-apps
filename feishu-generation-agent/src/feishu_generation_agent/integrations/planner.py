@@ -329,6 +329,18 @@ def _storyboard_requirements(
     return requirements
 
 
+def _normalize_generated_plan_payload(payload: dict[str, Any]) -> None:
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, list):
+        return
+    for task in tasks:
+        if (
+            isinstance(task, dict)
+            and task.get("task_type") == "image_to_video"
+        ):
+            task["image_size"] = None
+
+
 def validate_plan(
     plan: TaskPlan | dict[str, Any],
     document: NormalizedDocument,
@@ -759,6 +771,7 @@ class DeepSeekPlanner:
         ]
 
         def validate_payload(payload: dict[str, Any]) -> list[str]:
+            _normalize_generated_plan_payload(payload)
             return validate_plan(
                 payload,
                 document,

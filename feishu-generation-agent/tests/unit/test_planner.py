@@ -621,6 +621,27 @@ async def test_planner_repairs_hotpot_reference_bindings(
     assert plan.tasks[0].prompt == repaired["prompt"]
 
 
+async def test_planner_removes_video_only_image_size_without_model_retry(
+    narrative_document: NormalizedDocument,
+    vision_descriptions: list[VisionDescription],
+) -> None:
+    task = _video_task()
+    task["image_size"] = "4K"
+    task["prompt"] = (
+        "使用 @图片1 作为蓝色纸船的造型参考，"
+        "生成纸船沿河漂流的连续画面。"
+    )
+    model = FakeDeepSeekModel([_plan_json(task)])
+
+    plan = await DeepSeekPlanner(model).plan(
+        narrative_document,
+        vision_descriptions,
+    )
+
+    assert model.calls == 1
+    assert plan.tasks[0].image_size is None
+
+
 async def test_default_and_portal_planner_system_prompts_are_composed_safely(
     narrative_document: NormalizedDocument,
     vision_descriptions: list[VisionDescription],
