@@ -1,5 +1,6 @@
 from collections.abc import Mapping
 import re
+from typing import Any
 
 from feishu_generation_agent.domain.plan import ImageReference
 
@@ -9,6 +10,10 @@ _MEDIA_LABELS = {
     "video": ("视频", "参考视频", "个参考视频"),
     "audio": ("音频", "参考音频", "个参考音频"),
 }
+_SHOT_MARKER = re.compile(r"镜头\s*(\d+)\s*[：:]")
+_ABSOLUTE_SECONDS = re.compile(
+    r"\d+(?:\.\d+)?\s*[-–—~～至到]\s*\d+(?:\.\d+)?\s*秒"
+)
 
 
 def canonicalize_references(
@@ -79,6 +84,111 @@ def remap_prompt_references(
         )
         rewritten = rewritten.replace(placeholder, "")
     return rewritten
+
+
+def validate_seedance_prompt(
+    task: Mapping[str, Any],
+    mime_types: Mapping[str, str],
+    *,
+    require_storyboard: bool,
+) -> list[str]:
+    prompt = task.get("prompt")
+    if not isinstance(prompt, str):
+        return ["Seedance prompt 必须是字符串"]
+    raw_references = task.get("reference_images")
+    if not isinstance(raw_references, list):
+        return ["Seedance reference_images 必须是列表"]
+    try:
+        references = [
+            ImageReference.model_validate(reference)
+            for reference in raw_references
+        ]
+    except Exception:
+        return ["Seedance reference_images 无法解析"]
+
+    issues: list[str] = []
+    ordered = sorted(references, key=lambda item: item.order)
+    if [reference.order for reference in ordered] != list(
+        range(1, len(ordered) + 1)
+    ):
+        issues.append("Seedance 参考素材 order 必须按 1…N 连续排列")
+    try:
+        tokens = reference_tokens(ordered, mime_types)
+    except ValueError as exc:
+        issues.append(str(exc))
+        return issues
+
+    for asset_id, token in tokens.items():
+        if re.search(
+            rf"(?<![\w-]){re.escape(asset_id)}(?![\w-])",
+            prompt,
+        ):
+            issues.append(
+                f"Seedance prompt 不得包含内部素材 ID {asset_id}"
+            )
+        if token not in prompt:
+            issues.append(
+                f"Seedance prompt 缺少素材引用 {token}"
+            )
+            continue
+        semantic_pattern = re.compile(
+            rf"{re.escape(token)}\s*"
+            r"(?:中\s*的|中的|的|[（(])\s*"
+            r"[^，。；;\n]{2,}"
+        )
+        if semantic_pattern.search(prompt) is None:
+            issues.append(
+                f"Seedance prompt 中 {token} 必须绑定具体主体、场景、动作、"
+                "运镜或声音"
+            )
+
+    if _ABSOLUTE_SECONDS.search(prompt):
+        issues.append(
+            "Seedance 多分镜 prompt 禁止绝对秒数，必须使用镜头 1/2/3 顺序"
+        )
+
+    if not require_storyboard:
+        return issues
+
+    matches = list(_SHOT_MARKER.finditer(prompt))
+    if len(matches) < 2:
+        issues.append(
+            "Seedance 多分镜 prompt 必须包含镜头 1、镜头 2 等顺序分镜"
+        )
+        return issues
+
+    shot_segments: list[tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(prompt)
+        )
+        shot_segments.append((match.group(1), prompt[match.start():end]))
+
+    token_values = set(tokens.values())
+    tokens_used_in_shots: set[str] = set()
+    for shot_number, segment in shot_segments:
+        used = {token for token in token_values if token in segment}
+        if not used:
+            issues.append(
+                f"镜头 {shot_number} 缺少明确的 Seedance 参考素材绑定"
+            )
+        tokens_used_in_shots.update(used)
+    for token in sorted(token_values - tokens_used_in_shots):
+        issues.append(
+            f"{token} 只被罗列但没有用于任何实际镜头"
+        )
+
+    if not any(
+        keyword in prompt for keyword in ("稳定", "不变形", "连贯")
+    ):
+        issues.append("Seedance 多分镜 prompt 缺少画面稳定性约束")
+    if "水印" not in prompt:
+        issues.append("Seedance 多分镜 prompt 缺少无水印约束")
+    if "logo" not in prompt.lower():
+        issues.append("Seedance 多分镜 prompt 缺少无 Logo 约束")
+    return issues
 
 
 def _reference_positions(

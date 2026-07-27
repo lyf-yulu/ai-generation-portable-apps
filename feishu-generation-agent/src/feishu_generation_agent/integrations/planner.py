@@ -16,6 +16,9 @@ from feishu_generation_agent.domain.errors import (
     ErrorDetail,
 )
 from feishu_generation_agent.domain.plan import AuditReport, TaskPlan
+from feishu_generation_agent.domain.reference_contract import (
+    validate_seedance_prompt,
+)
 
 
 _ALLOWED_TASK_TYPES = {"image_to_image", "image_to_video"}
@@ -349,7 +352,9 @@ def validate_plan(
     task_ids: set[str] = set()
     referenced_asset_ids: set[str] = set()
     total_output_count = 0
-    task_sources: list[tuple[str, str | None, set[str]]] = []
+    task_sources: list[
+        tuple[str, str | None, set[str], dict[str, Any]]
+    ] = []
 
     for index, task in enumerate(tasks):
         prefix = f"tasks[{index}]"
@@ -402,6 +407,7 @@ def validate_plan(
                 display_id,
                 task_type if isinstance(task_type, str) else None,
                 valid_source_ids,
+                task,
             )
         )
 
@@ -640,6 +646,7 @@ def validate_plan(
             f"plan.asset_coverage: uncovered successful asset {asset_id}"
         )
 
+    storyboard_task_names: set[str] = set()
     for table_id, required_ids in storyboard_requirements.items():
         relevant_ids = {table_id, *required_ids}
         relevant_tasks = [
@@ -647,6 +654,7 @@ def validate_plan(
             for task in task_sources
             if task[2].intersection(relevant_ids)
         ]
+        storyboard_task_names.update(task[0] for task in relevant_tasks)
         if len(relevant_tasks) != 1:
             issues.append(
                 f"storyboard table {table_id}: exactly one image_to_video task "
@@ -655,7 +663,7 @@ def validate_plan(
             )
             continue
 
-        task_name, task_type, source_ids = relevant_tasks[0]
+        task_name, task_type, source_ids, _ = relevant_tasks[0]
         if task_type != "image_to_video":
             issues.append(
                 f"storyboard table {table_id}: task {task_name} must be "
@@ -671,6 +679,20 @@ def validate_plan(
                 f"storyboard table {table_id}: task {task_name} missing "
                 f"source_block_ids {missing_ids!r}"
             )
+
+    mime_types = {
+        asset_id: asset.mime_type for asset_id, asset in assets.items()
+    }
+    for task_name, task_type, _, raw_task in task_sources:
+        if task_type != "image_to_video":
+            continue
+        issues.extend(
+            validate_seedance_prompt(
+                raw_task,
+                mime_types,
+                require_storyboard=task_name in storyboard_task_names,
+            )
+        )
 
     return issues
 

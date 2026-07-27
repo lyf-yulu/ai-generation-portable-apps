@@ -404,13 +404,35 @@ def _video_task(
     asset_id: str = "asset-1",
     output_count: int = 1,
 ) -> dict[str, Any]:
+    sources = source_block_ids or ["story-1"]
+    storyboard_sources = [
+        block_id for block_id in sources if block_id.startswith("shot-")
+    ]
+    if len(storyboard_sources) >= 2:
+        prompt = "\n".join(
+            [
+                "参考 @图片1 中的蓝色纸船。",
+                *[
+                    f"镜头 {index}：固定镜头展示 @图片1 中的蓝色纸船。"
+                    for index, _ in enumerate(storyboard_sources, start=1)
+                ],
+                (
+                    "高清，纸船稳定不变形、运动连贯，"
+                    "不要生成水印，不要生成 Logo。"
+                ),
+            ]
+        )
+    else:
+        prompt = (
+            "参考 @图片1 中的蓝色纸船，生成纸船从近景漂向远处的画面。"
+        )
     return {
         "task_id": task_id,
         "task_type": "image_to_video",
         "title": "纸船漂流短片",
-        "source_block_ids": source_block_ids or ["story-1"],
+        "source_block_ids": sources,
         "user_intent": "生成连续的纸船漂流视频",
-        "prompt": "纸船从近景漂向远处",
+        "prompt": prompt,
         "reference_images": [
             {"asset_id": asset_id, "role": "reference_image", "order": 1}
         ],
@@ -499,9 +521,6 @@ async def test_storyboard_rows_become_one_video_task(
 ):
     task = _video_task(
         source_block_ids=[f"shot-{index}" for index in range(1, 5)]
-    )
-    task["prompt"] = "；".join(
-        f"镜头 {index}：纸船经过场景 {index}" for index in range(1, 5)
     )
     model = FakeDeepSeekModel([_plan_json(task)])
     planner = DeepSeekPlanner(model, max_output_count=4)
@@ -911,6 +930,10 @@ def test_validator_requires_exact_successful_asset_coverage(
         {"asset_id": "asset-1", "role": "reference_image", "order": 1},
         {"asset_id": "asset-2", "role": "reference_image", "order": 2},
     ]
+    task["prompt"] = (
+        "参考 @图片1 中的蓝色纸船和 @图片2 中的绿色河岸，"
+        "生成连续漂流画面。"
+    )
     valid = {
         "tasks": [task],
         "document_summary": "测试生成需求",
@@ -1009,6 +1032,12 @@ def test_validator_keeps_existing_multimodal_reference_support(
         {"asset_id": "audio-1", "role": "reference_audio", "order": 3},
     ]
     task["reference_mode"] = "multi_reference"
+    task["generate_audio"] = True
+    task["prompt"] = (
+        "参考 @图片1 中的蓝色纸船主体，"
+        "参考 @视频1 中的平稳跟拍运镜，"
+        "参考 @音频1 中的轻柔流水声音，生成连续漂流画面。"
+    )
     raw = {
         "tasks": [task],
         "document_summary": "测试多模态生成需求",
@@ -1079,7 +1108,8 @@ def test_validator_accepts_chinese_prompt_with_requested_english_dialogue_brand_
 ):
     raw_plan = json.loads(_plan_json(_video_task()))
     raw_plan["tasks"][0]["prompt"] = (
-        "近景镜头中，角色说：\"Don't move.\"；画面保留 Coca-Cola 品牌，"
+        "参考 @图片1 中的蓝色纸船；近景镜头中，角色说："
+        "\"Don't move.\"；画面保留 Coca-Cola 品牌，"
         "并在 UI 上显示 Start 按钮。"
     )
     raw_plan["tasks"][0]["generate_audio"] = True
@@ -1445,6 +1475,53 @@ def test_validator_accepts_one_video_covering_every_storyboard_row(
     assert validate_plan(
         json.loads(_plan_json(task)), storyboard_document, 4
     ) == []
+
+
+def test_validator_rejects_hotpot_storyboard_without_understood_references(
+    storyboard_document: NormalizedDocument,
+):
+    task = _video_task(
+        source_block_ids=[f"shot-{index}" for index in range(1, 5)]
+    )
+    task["prompt"] = (
+        "0-3秒：展示空锅。3-8秒：食材入锅。"
+        "8-12秒：俯拍成品。"
+    )
+
+    issues = validate_plan(
+        json.loads(_plan_json(task)), storyboard_document, 4
+    )
+
+    assert any("@图片1" in issue for issue in issues)
+    assert any("镜头 1" in issue for issue in issues)
+    assert any("绝对秒数" in issue for issue in issues)
+
+
+def test_validator_rejects_noncontinuous_reference_order(
+    narrative_document: NormalizedDocument,
+    tmp_path: Path,
+):
+    second = _asset(tmp_path, "asset-2", "image-2")
+    document = narrative_document.model_copy(
+        update={
+            "media_assets": [
+                *narrative_document.media_assets,
+                second,
+            ]
+        }
+    )
+    task = _video_task()
+    task["reference_images"].append(
+        {"asset_id": "asset-2", "role": "reference_image", "order": 3}
+    )
+    task["prompt"] = (
+        "参考 @图片1 中的蓝色纸船和 @图片2 中的绿色河岸，"
+        "生成连续漂流画面。"
+    )
+
+    issues = validate_plan(json.loads(_plan_json(task)), document, 4)
+
+    assert any("1…N" in issue for issue in issues)
 
 
 def test_validator_rejects_one_video_missing_storyboard_rows(
