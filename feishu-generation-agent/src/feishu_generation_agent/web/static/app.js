@@ -500,9 +500,10 @@
     return wrapper;
   }
 
-  function textArea(value, onInput, rows = 3) {
+  function textArea(value, onInput, rows = 3, className = "") {
     const control = document.createElement("textarea");
     control.rows = rows;
+    control.className = className;
     control.value = value || "";
     control.addEventListener("input", () => onInput(control.value));
     return control;
@@ -887,14 +888,14 @@
     grid.append(
       field("提示词", textArea(task.prompt, (value) => {
         updateTask(task.task_id, { prompt: value });
-      }, 5), true),
+      }, 10, "task-prompt-editor"), true),
       field(
         "负面约束",
         textArea((task.negative_constraints || []).join("\n"), (value) => {
           updateTask(task.task_id, {
             negative_constraints: value.split("\n").map((item) => item.trim()).filter(Boolean),
           });
-        }),
+        }, 5, "task-negative-editor"),
         true,
       ),
       field("画面比例", textInput(task.aspect_ratio, (value) => {

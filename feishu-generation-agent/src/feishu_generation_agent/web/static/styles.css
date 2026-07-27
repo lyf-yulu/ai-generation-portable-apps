@@ -258,6 +258,13 @@ button {
 .task-type { color: var(--muted); font-size: .75rem; }
 .task-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .75rem; margin-top: .85rem; }
 .field-wide { grid-column: 1 / -1; }
+.task-grid textarea {
+  overflow-y: auto;
+  resize: vertical;
+  line-height: 1.5;
+}
+.task-prompt-editor { min-height: 18rem; }
+.task-negative-editor { min-height: 10rem; }
 .task-notes { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .7rem; }
 .note { border-radius: 999px; padding: .25rem .5rem; font-size: .72rem; background: #eef1ef; }
 .note.blocking { color: #7d241e; background: #fdeae8; }
