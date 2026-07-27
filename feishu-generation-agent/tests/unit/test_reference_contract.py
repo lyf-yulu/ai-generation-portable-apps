@@ -437,6 +437,23 @@ def test_seedance_prompt_requires_unique_continuous_shot_numbers() -> None:
     assert any("镜头编号" in issue and "1…N" in issue for issue in issues)
 
 
+def test_seedance_prompt_accepts_parenthesized_shot_duration_labels() -> None:
+    prompt = (
+        "镜头1（约2秒）：展示 @图片1 中的黄铜毛毡空锅。\n"
+        "镜头2（约4秒）：展示 @图片2 中的绿色青菜和红色肥牛。\n"
+        "高清，物体稳定不变形，不要生成水印，不要生成 Logo。"
+    )
+
+    assert validate_seedance_prompt(
+        _video_task(prompt),
+        {
+            "image-pot": "image/png",
+            "image-food": "image/png",
+        },
+        require_storyboard=True,
+    ) == []
+
+
 def test_seedance_prompt_accepts_understood_references_in_every_shot() -> None:
     prompt = (
         "参考 @图片1 中的黄铜毛毡空锅；"

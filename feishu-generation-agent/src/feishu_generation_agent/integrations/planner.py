@@ -15,8 +15,15 @@ from feishu_generation_agent.domain.errors import (
     ErrorCategory,
     ErrorDetail,
 )
-from feishu_generation_agent.domain.plan import AuditReport, TaskPlan
+from feishu_generation_agent.domain.plan import (
+    AuditReport,
+    ImageReference,
+    TaskPlan,
+)
 from feishu_generation_agent.domain.reference_contract import (
+    canonicalize_references,
+    has_multiple_shot_markers,
+    remap_asset_id_tokens,
     validate_seedance_prompt,
 )
 
@@ -329,16 +336,77 @@ def _storyboard_requirements(
     return requirements
 
 
-def _normalize_generated_plan_payload(payload: dict[str, Any]) -> None:
+def _normalize_generated_plan_payload(
+    payload: dict[str, Any],
+    document: NormalizedDocument,
+) -> list[str]:
+    issues: list[str] = []
     tasks = payload.get("tasks")
     if not isinstance(tasks, list):
-        return
-    for task in tasks:
-        if (
-            isinstance(task, dict)
-            and task.get("task_type") == "image_to_video"
-        ):
+        return issues
+    valid_block_ids = {block.block_id for block in document.blocks}
+    mime_types = {
+        asset.asset_id: asset.mime_type
+        for asset in document.media_assets
+    }
+    document_asset_order = {
+        asset.asset_id: index
+        for index, asset in enumerate(document.media_assets)
+    }
+    for task_index, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            continue
+        source_block_ids = task.get("source_block_ids")
+        if isinstance(source_block_ids, list):
+            task["source_block_ids"] = [
+                block_id
+                for block_id in source_block_ids
+                if isinstance(block_id, str)
+                and block_id in valid_block_ids
+            ]
+        if task.get("task_type") == "image_to_video":
             task["image_size"] = None
+        raw_references = task.get("reference_images")
+        prompt = task.get("prompt")
+        if not isinstance(raw_references, list) or not isinstance(prompt, str):
+            continue
+        try:
+            references = canonicalize_references(
+                [
+                    ImageReference.model_validate(reference)
+                    for reference in raw_references
+                ]
+            )
+            selected_asset_ids = [
+                reference.asset_id for reference in references
+            ]
+            if all(
+                asset_id in document_asset_order
+                for asset_id in selected_asset_ids
+            ):
+                expected_asset_ids = sorted(
+                    selected_asset_ids,
+                    key=document_asset_order.__getitem__,
+                )
+                if selected_asset_ids != expected_asset_ids:
+                    issues.append(
+                        f"tasks[{task_index}].reference_images: "
+                        "必须按文档素材顺序排列，期望 "
+                        f"{expected_asset_ids!r}"
+                    )
+                    continue
+            task["prompt"] = remap_asset_id_tokens(
+                prompt,
+                references,
+                mime_types,
+            )
+            task["reference_images"] = [
+                reference.model_dump(mode="json")
+                for reference in references
+            ]
+        except (TypeError, ValueError):
+            continue
+    return issues
 
 
 def validate_plan(
@@ -713,7 +781,7 @@ def validate_plan(
             user_intent = raw_task.get("user_intent")
             narrative_multishot = (
                 isinstance(prompt, str)
-                and len(re.findall(r"镜头\s*\d+\s*[：:]", prompt)) >= 2
+                and has_multiple_shot_markers(prompt)
             ) or (
                 isinstance(user_intent, str)
                 and any(
@@ -771,13 +839,19 @@ class DeepSeekPlanner:
         ]
 
         def validate_payload(payload: dict[str, Any]) -> list[str]:
-            _normalize_generated_plan_payload(payload)
-            return validate_plan(
+            normalization_issues = _normalize_generated_plan_payload(
                 payload,
                 document,
-                self.max_output_count,
-                enforce_seedance_prompt_contract=True,
             )
+            return [
+                *normalization_issues,
+                *validate_plan(
+                    payload,
+                    document,
+                    self.max_output_count,
+                    enforce_seedance_prompt_contract=True,
+                ),
+            ]
 
         result = await self._invoke_with_repair(
             messages=messages,

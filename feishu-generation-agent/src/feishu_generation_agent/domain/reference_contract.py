@@ -10,7 +10,11 @@ _MEDIA_LABELS = {
     "video": ("视频", "参考视频", "个参考视频"),
     "audio": ("音频", "参考音频", "个参考音频"),
 }
-_SHOT_MARKER = re.compile(r"镜头\s*(\d+)\s*[：:]")
+_SHOT_MARKER = re.compile(
+    r"镜头\s*(\d+)"
+    r"(?:\s*[（(][^）)\n]{1,20}[）)])?"
+    r"\s*[：:]"
+)
 _ABSOLUTE_SECONDS = re.compile(
     r"\d+(?:\.\d+)?\s*[-–—~～至到]\s*\d+(?:\.\d+)?\s*秒"
 )
@@ -112,6 +116,60 @@ def remap_prompt_references(
         )
         rewritten = rewritten.replace(placeholder, "")
     return rewritten
+
+
+def remap_asset_id_tokens(
+    prompt: str,
+    references: list[ImageReference],
+    mime_types: Mapping[str, str],
+) -> str:
+    canonical_tokens = reference_tokens(references, mime_types)
+    media_groups: dict[str, list[tuple[str, int, str]]] = {
+        "image": [],
+        "video": [],
+        "audio": [],
+    }
+    for asset_id, canonical_token in canonical_tokens.items():
+        media_type = _media_type(mime_types.get(asset_id, ""))
+        match = re.fullmatch(rf"{media_type}-(\d+)", asset_id)
+        if match is None:
+            continue
+        media_groups[media_type].append(
+            (asset_id, int(match.group(1)), canonical_token)
+        )
+
+    rewritten = prompt
+    replacements: list[tuple[str, str]] = []
+    for media_type, items in media_groups.items():
+        label = _MEDIA_LABELS[media_type][0]
+        count = len(items)
+        uses_asset_numbering = any(
+            asset_index > count
+            and re.search(
+                rf"@{label}{asset_index}(?!\d)",
+                prompt,
+            )
+            is not None
+            for _, asset_index, _ in items
+        )
+        if not uses_asset_numbering:
+            continue
+        for offset, (_, asset_index, canonical_token) in enumerate(items):
+            placeholder = f"\ufff0ASSETREF{media_type}{offset}\ufff1"
+            rewritten = re.sub(
+                rf"@{label}{asset_index}(?!\d)",
+                placeholder,
+                rewritten,
+            )
+            replacements.append((placeholder, canonical_token))
+
+    for placeholder, canonical_token in replacements:
+        rewritten = rewritten.replace(placeholder, canonical_token)
+    return rewritten
+
+
+def has_multiple_shot_markers(prompt: str) -> bool:
+    return len(_SHOT_MARKER.findall(prompt)) >= 2
 
 
 def validate_seedance_prompt(

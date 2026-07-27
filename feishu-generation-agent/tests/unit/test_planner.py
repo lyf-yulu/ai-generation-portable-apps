@@ -23,6 +23,7 @@ from feishu_generation_agent.domain.errors import AgentError, ErrorCategory
 from feishu_generation_agent.domain.plan import AuditReport, TaskPlan
 from feishu_generation_agent.integrations.planner import (
     DeepSeekPlanner,
+    _normalize_generated_plan_payload,
     planner_system_prompt,
     validate_plan,
 )
@@ -640,6 +641,65 @@ async def test_planner_removes_video_only_image_size_without_model_retry(
 
     assert model.calls == 1
     assert plan.tasks[0].image_size is None
+
+
+def test_generated_plan_normalization_filters_unknown_sources_and_remaps_asset_tokens(
+    narrative_document: NormalizedDocument,
+) -> None:
+    image_six = narrative_document.media_assets[0].model_copy(
+        update={"asset_id": "image-6"}
+    )
+    document = narrative_document.model_copy(
+        update={"media_assets": [image_six]}
+    )
+    task = _video_task(asset_id="image-6")
+    task["source_block_ids"] = [
+        "story-1",
+        "sheet:fake worksheet:fake cell:A1",
+    ]
+    task["prompt"] = (
+        "参考 @图片6 中的蓝色纸船，生成连续漂流画面。"
+    )
+    payload = json.loads(_plan_json(task))
+
+    issues = _normalize_generated_plan_payload(payload, document)
+
+    assert issues == []
+    normalized = payload["tasks"][0]
+    assert normalized["source_block_ids"] == ["story-1"]
+    assert normalized["prompt"] == (
+        "参考 @图片1 中的蓝色纸船，生成连续漂流画面。"
+    )
+    assert normalized["reference_images"] == [
+        {"asset_id": "image-6", "role": "reference_image", "order": 1}
+    ]
+
+
+def test_generated_plan_normalization_rejects_ambiguous_reference_order(
+    narrative_document: NormalizedDocument,
+) -> None:
+    image_one = narrative_document.media_assets[0].model_copy(
+        update={"asset_id": "image-1"}
+    )
+    image_two = narrative_document.media_assets[0].model_copy(
+        update={"asset_id": "image-2"}
+    )
+    document = narrative_document.model_copy(
+        update={"media_assets": [image_one, image_two]}
+    )
+    task = _video_task(asset_id="image-2")
+    task["reference_images"] = [
+        {"asset_id": "image-2", "role": "reference_image", "order": 1},
+        {"asset_id": "image-1", "role": "reference_image", "order": 2},
+    ]
+    task["prompt"] = (
+        "参考 @图片2 中的红色纸船；参考 @图片1 中的蓝色河流。"
+    )
+    payload = json.loads(_plan_json(task))
+
+    issues = _normalize_generated_plan_payload(payload, document)
+
+    assert any("文档素材顺序" in issue for issue in issues)
 
 
 async def test_default_and_portal_planner_system_prompts_are_composed_safely(
@@ -1619,6 +1679,28 @@ def test_strict_validator_enforces_shot_bindings_for_narrative_multishot(
         "参考 @图片1 中的蓝色纸船。\n"
         "镜头 1：展示纸船。\n"
         "镜头 2：纸船驶向远方。\n"
+        "画面稳定不变形，无水印，无 Logo。"
+    )
+
+    issues = validate_plan(
+        json.loads(_plan_json(task)),
+        narrative_document,
+        4,
+        enforce_seedance_prompt_contract=True,
+    )
+
+    assert any("镜头 1" in issue and "素材" in issue for issue in issues)
+    assert any("镜头 2" in issue and "素材" in issue for issue in issues)
+
+
+def test_strict_validator_detects_parenthesized_narrative_shots(
+    narrative_document: NormalizedDocument,
+):
+    task = _video_task()
+    task["prompt"] = (
+        "参考 @图片1 中的蓝色纸船。\n"
+        "镜头1（约2秒）：展示纸船。\n"
+        "镜头2（约4秒）：纸船驶向远方。\n"
         "画面稳定不变形，无水印，无 Logo。"
     )
 
