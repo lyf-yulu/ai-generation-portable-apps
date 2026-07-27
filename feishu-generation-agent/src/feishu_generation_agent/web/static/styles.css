@@ -277,6 +277,50 @@ button {
 .reference-description { color: var(--muted); font-size: .76rem; line-height: 1.4; }
 .reference-actions { display: flex; flex-wrap: wrap; gap: .35rem; }
 .reference-role { color: var(--muted); font-size: .82rem; font-weight: 700; }
+.reference-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.reference-replace-label {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+}
+.reference-replace-label.is-disabled {
+  pointer-events: none;
+  cursor: wait;
+  opacity: .48;
+}
+.reference-mutation-feedback {
+  grid-column: 2 / -1;
+  margin: 0;
+  color: var(--muted);
+  font-size: .76rem;
+}
+.reference-mutation-feedback.is-uploading,
+.reference-mutation-feedback.is-deleting {
+  color: var(--warning);
+  font-weight: 700;
+}
+.reference-mutation-feedback.is-error {
+  color: var(--danger);
+  font-weight: 700;
+}
+.reference-section-feedback {
+  margin: .45rem 0 0;
+  color: var(--muted);
+  font-size: .78rem;
+}
+.reference-section-feedback.is-success {
+  color: var(--brand-dark);
+  font-weight: 700;
+}
 .upload-row { display: grid; grid-template-columns: minmax(160px, 1fr) 80px auto; gap: .55rem; margin-top: .7rem; }
 .upload-feedback { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: .78rem; }
 .upload-feedback.is-selected { color: var(--brand-dark); }
