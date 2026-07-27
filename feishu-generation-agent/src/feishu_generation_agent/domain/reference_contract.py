@@ -1,6 +1,6 @@
 from collections.abc import Mapping
 import re
-from typing import Any
+from typing import Any, Callable
 
 from feishu_generation_agent.domain.plan import ImageReference
 
@@ -45,11 +45,15 @@ def remap_prompt_references(
     old_references: list[ImageReference],
     new_references: list[ImageReference],
     mime_types: Mapping[str, str],
+    *,
+    replacement_asset_ids: Mapping[str, str] | None = None,
 ) -> str:
     old_positions = {
         asset_id: (media_type, media_index)
-        for asset_id, media_type, media_index in _reference_positions(
-            old_references, mime_types
+        for asset_id, media_type, media_index in _old_reference_positions(
+            old_references,
+            mime_types,
+            prompt,
         )
     }
     new_positions = {
@@ -60,6 +64,7 @@ def remap_prompt_references(
     }
     rewritten = prompt
     placeholders: list[tuple[str, str | None]] = []
+    replacements = replacement_asset_ids or {}
     for asset_offset, (asset_id, position) in enumerate(old_positions.items()):
         media_type, old_index = position
         for style_offset, (pattern, renderer) in enumerate(
@@ -68,8 +73,9 @@ def remap_prompt_references(
             placeholder = f"\ufff0REF{asset_offset}_{style_offset}\ufff1"
             rewritten = pattern.sub(placeholder, rewritten)
             replacement = None
-            if asset_id in new_positions:
-                new_media_type, new_index = new_positions[asset_id]
+            target_asset_id = replacements.get(asset_id, asset_id)
+            if target_asset_id in new_positions:
+                new_media_type, new_index = new_positions[target_asset_id]
                 replacement = renderer(new_media_type, new_index)
             placeholders.append((placeholder, replacement))
 
@@ -206,6 +212,60 @@ def _reference_positions(
     return positions
 
 
+def _old_reference_positions(
+    references: list[ImageReference],
+    mime_types: Mapping[str, str],
+    prompt: str,
+) -> list[tuple[str, str, int]]:
+    sequential = _reference_positions(references, mime_types)
+    orders = sorted(reference.order for reference in references)
+    if orders == list(range(1, len(orders) + 1)):
+        return sequential
+
+    by_asset_id = {reference.asset_id: reference for reference in references}
+    positions: list[tuple[str, str, int]] = []
+    for asset_id, media_type, sequential_index in sequential:
+        visible_index = by_asset_id[asset_id].order
+        if visible_index == sequential_index:
+            positions.append((asset_id, media_type, sequential_index))
+            continue
+        sequential_used = _reference_mentioned(
+            prompt,
+            media_type,
+            sequential_index,
+        )
+        visible_used = _reference_mentioned(
+            prompt,
+            media_type,
+            visible_index,
+        )
+        if sequential_used and visible_used:
+            raise ValueError(
+                "ambiguous legacy reference numbering; "
+                f"both {_MEDIA_LABELS[media_type][0]}{sequential_index} and "
+                f"{_MEDIA_LABELS[media_type][0]}{visible_index} are present"
+            )
+        positions.append(
+            (
+                asset_id,
+                media_type,
+                visible_index if visible_used else sequential_index,
+            )
+        )
+    return positions
+
+
+def _reference_mentioned(
+    prompt: str,
+    media_type: str,
+    index: int,
+) -> bool:
+    return any(
+        pattern.search(prompt) is not None
+        for pattern, _ in _reference_patterns(media_type, index)
+    )
+
+
 def _media_type(mime_type: str) -> str:
     for candidate in ("image", "video", "audio"):
         if mime_type.startswith(f"{candidate}/"):
@@ -216,7 +276,7 @@ def _media_type(mime_type: str) -> str:
 def _reference_patterns(
     media_type: str,
     index: int,
-) -> list[tuple[re.Pattern[str], object]]:
+) -> list[tuple[re.Pattern[str], Callable[[str, int], str]]]:
     plain, reference, ordinal = _MEDIA_LABELS[media_type]
     boundary = r"(?!\d)"
     return [

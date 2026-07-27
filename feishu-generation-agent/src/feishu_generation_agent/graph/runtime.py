@@ -846,16 +846,11 @@ class GraphRuntime:
             )
             if replace_index is None:
                 references.append(reference)
-                prompt_references = None
+                replacement_asset_ids = None
             else:
+                replaced_asset_id = references[replace_index].asset_id
                 references[replace_index] = reference
-                prompt_references = list(task.reference_images)
-                prompt_references[replace_index] = reference.model_copy(
-                    update={
-                        "role": task.reference_images[replace_index].role,
-                        "order": task.reference_images[replace_index].order,
-                    }
-                )
+                replacement_asset_ids = {replaced_asset_id: asset_id}
             assets = [
                 MediaAsset.model_validate(item)
                 for item in state.get("media_assets", [])
@@ -865,7 +860,7 @@ class GraphRuntime:
                 task,
                 references,
                 assets,
-                prompt_references=prompt_references,
+                replacement_asset_ids=replacement_asset_ids,
             )
             updated_plan = self._replace_task(plan, task_index, updated_task)
             await self._persist_draft(run, state, updated_plan, assets)
@@ -1001,7 +996,7 @@ class GraphRuntime:
         assets: list[MediaAsset],
         *,
         reference_mode: str | None = None,
-        prompt_references: list[ImageReference] | None = None,
+        replacement_asset_ids: dict[str, str] | None = None,
     ) -> GenerationTask:
         try:
             canonical_references = canonicalize_references(references)
@@ -1010,13 +1005,10 @@ class GraphRuntime:
             }
             prompt = remap_prompt_references(
                 task.prompt,
-                (
-                    task.reference_images
-                    if prompt_references is None
-                    else prompt_references
-                ),
+                task.reference_images,
                 canonical_references,
                 mime_types,
+                replacement_asset_ids=replacement_asset_ids,
             )
             updated = GenerationTask.model_validate(
                 task.model_dump(mode="json")

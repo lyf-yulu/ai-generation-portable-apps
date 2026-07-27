@@ -114,6 +114,77 @@ def test_remap_prompt_references_avoids_cascading_number_replacement() -> None:
     assert result == "参考图2的桌面延续到第3张参考图中的成品"
 
 
+def test_remap_prompt_references_migrates_legacy_gap_by_visible_order() -> None:
+    old = [
+        _reference("asset-a", 1),
+        _reference("asset-c", 3),
+    ]
+    new = canonicalize_references(old)
+    mime_types = {
+        "asset-a": "image/png",
+        "asset-c": "image/png",
+    }
+
+    result = remap_prompt_references(
+        "@图片1 中的锅；@图片3 中的桌面",
+        old,
+        new,
+        mime_types,
+    )
+
+    assert result == "@图片1 中的锅；@图片2 中的桌面"
+
+
+def test_remap_prompt_references_rejects_ambiguous_legacy_gap() -> None:
+    old = [
+        _reference("asset-a", 1),
+        _reference("asset-c", 3),
+    ]
+    new = canonicalize_references(old)
+    mime_types = {
+        "asset-a": "image/png",
+        "asset-c": "image/png",
+    }
+
+    try:
+        remap_prompt_references(
+            "@图片1 中的锅；@图片2 中的食材；@图片3 中的桌面",
+            old,
+            new,
+            mime_types,
+        )
+    except ValueError as exc:
+        assert "ambiguous" in str(exc)
+    else:
+        raise AssertionError("ambiguous legacy reference gap must be rejected")
+
+
+def test_remap_prompt_references_supports_cross_media_replacement() -> None:
+    old = [
+        _reference("image-a", 1),
+        _reference("image-b", 2),
+    ]
+    new = [
+        _reference("video-a", 1, "reference_video"),
+        _reference("image-b", 2),
+    ]
+    mime_types = {
+        "image-a": "image/png",
+        "image-b": "image/png",
+        "video-a": "video/mp4",
+    }
+
+    result = remap_prompt_references(
+        "@图片1 中的开场动作；@图片2 中的角色造型",
+        old,
+        new,
+        mime_types,
+        replacement_asset_ids={"image-a": "video-a"},
+    )
+
+    assert result == "@视频1 中的开场动作；@图片1 中的角色造型"
+
+
 def _video_task(
     prompt: str,
     references: list[ImageReference] | None = None,

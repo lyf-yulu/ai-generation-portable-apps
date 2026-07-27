@@ -1589,6 +1589,29 @@ def test_validator_keeps_legacy_seedance_prompt_compatible_by_default(
     ) == []
 
 
+def test_strict_validator_enforces_shot_bindings_for_narrative_multishot(
+    narrative_document: NormalizedDocument,
+):
+    task = _video_task()
+    task["user_intent"] = "生成一个包含多个镜头的纸船短片"
+    task["prompt"] = (
+        "参考 @图片1 中的蓝色纸船。\n"
+        "镜头 1：展示纸船。\n"
+        "镜头 2：纸船驶向远方。\n"
+        "画面稳定不变形，无水印，无 Logo。"
+    )
+
+    issues = validate_plan(
+        json.loads(_plan_json(task)),
+        narrative_document,
+        4,
+        enforce_seedance_prompt_contract=True,
+    )
+
+    assert any("镜头 1" in issue and "素材" in issue for issue in issues)
+    assert any("镜头 2" in issue and "素材" in issue for issue in issues)
+
+
 def test_validator_rejects_one_video_missing_storyboard_rows(
     storyboard_document: NormalizedDocument,
 ):

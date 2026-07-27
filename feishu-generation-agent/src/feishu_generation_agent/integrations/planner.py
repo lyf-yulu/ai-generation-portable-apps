@@ -697,11 +697,26 @@ def validate_plan(
         for task_name, task_type, _, raw_task in task_sources:
             if task_type != "image_to_video":
                 continue
+            prompt = raw_task.get("prompt")
+            user_intent = raw_task.get("user_intent")
+            narrative_multishot = (
+                isinstance(prompt, str)
+                and len(re.findall(r"镜头\s*\d+\s*[：:]", prompt)) >= 2
+            ) or (
+                isinstance(user_intent, str)
+                and any(
+                    keyword in user_intent
+                    for keyword in ("分镜", "多镜头", "多个镜头")
+                )
+            )
             issues.extend(
                 validate_seedance_prompt(
                     raw_task,
                     mime_types,
-                    require_storyboard=task_name in storyboard_task_names,
+                    require_storyboard=(
+                        task_name in storyboard_task_names
+                        or narrative_multishot
+                    ),
                 )
             )
 
