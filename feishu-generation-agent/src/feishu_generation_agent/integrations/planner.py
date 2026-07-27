@@ -333,6 +333,8 @@ def validate_plan(
     plan: TaskPlan | dict[str, Any],
     document: NormalizedDocument,
     max_output_count: int,
+    *,
+    enforce_seedance_prompt_contract: bool = False,
 ) -> list[str]:
     payload: Any
     if isinstance(plan, TaskPlan):
@@ -688,19 +690,20 @@ def validate_plan(
                 f"source_block_ids {missing_ids!r}"
             )
 
-    mime_types = {
-        asset_id: asset.mime_type for asset_id, asset in assets.items()
-    }
-    for task_name, task_type, _, raw_task in task_sources:
-        if task_type != "image_to_video":
-            continue
-        issues.extend(
-            validate_seedance_prompt(
-                raw_task,
-                mime_types,
-                require_storyboard=task_name in storyboard_task_names,
+    if enforce_seedance_prompt_contract:
+        mime_types = {
+            asset_id: asset.mime_type for asset_id, asset in assets.items()
+        }
+        for task_name, task_type, _, raw_task in task_sources:
+            if task_type != "image_to_video":
+                continue
+            issues.extend(
+                validate_seedance_prompt(
+                    raw_task,
+                    mime_types,
+                    require_storyboard=task_name in storyboard_task_names,
+                )
             )
-        )
 
     return issues
 
@@ -741,7 +744,12 @@ class DeepSeekPlanner:
         ]
 
         def validate_payload(payload: dict[str, Any]) -> list[str]:
-            return validate_plan(payload, document, self.max_output_count)
+            return validate_plan(
+                payload,
+                document,
+                self.max_output_count,
+                enforce_seedance_prompt_contract=True,
+            )
 
         result = await self._invoke_with_repair(
             messages=messages,

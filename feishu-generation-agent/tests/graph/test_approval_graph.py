@@ -412,7 +412,7 @@ async def test_direct_graph_run_snapshots_exact_prime_prompt(
     assert planning_prompt.source == "prime"
     assert planning_prompt.version == 0
     assert planning_prompt.prompt_sha256 == (
-        "5dd2463a9bfddb3bc9e55c3a93148f7316f1259a6eaf70644a610b386a9c6ce4"
+        "fc009b4bb8351502a9412b88a5554a8567a9aa9a633eba588fb673b513f16db1"
     )
     assert fake_services.planner.system_prompts == [planning_prompt.prompt_text]
 

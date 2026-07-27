@@ -1530,7 +1530,10 @@ def test_validator_rejects_hotpot_storyboard_without_understood_references(
     )
 
     issues = validate_plan(
-        json.loads(_plan_json(task)), storyboard_document, 4
+        json.loads(_plan_json(task)),
+        storyboard_document,
+        4,
+        enforce_seedance_prompt_contract=True,
     )
 
     assert any("@图片1" in issue for issue in issues)
@@ -1560,9 +1563,30 @@ def test_validator_rejects_noncontinuous_reference_order(
         "生成连续漂流画面。"
     )
 
-    issues = validate_plan(json.loads(_plan_json(task)), document, 4)
+    issues = validate_plan(
+        json.loads(_plan_json(task)),
+        document,
+        4,
+        enforce_seedance_prompt_contract=True,
+    )
 
     assert any("1…N" in issue for issue in issues)
+
+
+def test_validator_keeps_legacy_seedance_prompt_compatible_by_default(
+    storyboard_document: NormalizedDocument,
+):
+    task = _video_task(
+        source_block_ids=[f"shot-{index}" for index in range(1, 5)]
+    )
+    task["prompt"] = (
+        "0-3秒：展示空锅。3-8秒：食材入锅。"
+        "8-12秒：俯拍成品。"
+    )
+
+    assert validate_plan(
+        json.loads(_plan_json(task)), storyboard_document, 4
+    ) == []
 
 
 def test_validator_rejects_one_video_missing_storyboard_rows(
