@@ -34,6 +34,7 @@ from feishu_generation_agent.domain.plan import (
     reconcile_task_asset_coverage,
 )
 from feishu_generation_agent.domain.reference_contract import (
+    ReferenceRemapError,
     canonicalize_references,
     remap_prompt_references,
 )
@@ -1030,6 +1031,8 @@ class GraphRuntime:
             return updated
         except RunValidationError:
             raise
+        except ReferenceRemapError as exc:
+            raise RunValidationError(str(exc)) from None
         except Exception as exc:
             message = str(exc)
             if "reference_images" in message:

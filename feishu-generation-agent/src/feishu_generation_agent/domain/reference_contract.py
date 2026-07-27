@@ -16,6 +16,10 @@ _ABSOLUTE_SECONDS = re.compile(
 )
 
 
+class ReferenceRemapError(ValueError):
+    pass
+
+
 def canonicalize_references(
     references: list[ImageReference],
 ) -> list[ImageReference]:
@@ -162,6 +166,9 @@ def validate_seedance_prompt(
             "Seedance 多分镜 prompt 必须包含镜头 1、镜头 2 等顺序分镜"
         )
         return issues
+    shot_numbers = [int(match.group(1)) for match in matches]
+    if shot_numbers != list(range(1, len(shot_numbers) + 1)):
+        issues.append("Seedance 镜头编号必须唯一并按 1…N 连续排列")
 
     shot_segments: list[tuple[str, str]] = []
     for index, match in enumerate(matches):
@@ -221,6 +228,11 @@ def _old_reference_positions(
     orders = sorted(reference.order for reference in references)
     if orders == list(range(1, len(orders) + 1)):
         return sequential
+    if len({media_type for _, media_type, _ in sequential}) > 1:
+        raise ReferenceRemapError(
+            "旧任务的混合媒体参考编号存在断档，无法安全判断素材身份；"
+            "请重新规划任务或重新添加参考素材"
+        )
 
     by_asset_id = {reference.asset_id: reference for reference in references}
     positions: list[tuple[str, str, int]] = []
@@ -240,7 +252,7 @@ def _old_reference_positions(
             visible_index,
         )
         if sequential_used and visible_used:
-            raise ValueError(
+            raise ReferenceRemapError(
                 "ambiguous legacy reference numbering; "
                 f"both {_MEDIA_LABELS[media_type][0]}{sequential_index} and "
                 f"{_MEDIA_LABELS[media_type][0]}{visible_index} are present"

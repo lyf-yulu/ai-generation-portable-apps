@@ -159,6 +159,33 @@ def test_remap_prompt_references_rejects_ambiguous_legacy_gap() -> None:
         raise AssertionError("ambiguous legacy reference gap must be rejected")
 
 
+def test_remap_prompt_references_rejects_mixed_media_legacy_gap() -> None:
+    old = [
+        _reference("image-a", 1),
+        _reference("video-b", 3, "reference_video"),
+        _reference("image-c", 4),
+    ]
+    new = canonicalize_references(old)
+    mime_types = {
+        "image-a": "image/png",
+        "video-b": "video/mp4",
+        "image-c": "image/png",
+    }
+
+    try:
+        remap_prompt_references(
+            "@图片1 中的锅；@视频1 中的旧动作；"
+            "@视频2 中的新动作；@图片2 中的桌面",
+            old,
+            new,
+            mime_types,
+        )
+    except ValueError as exc:
+        assert "混合媒体" in str(exc)
+    else:
+        raise AssertionError("mixed-media legacy gap must be rejected")
+
+
 def test_remap_prompt_references_supports_cross_media_replacement() -> None:
     old = [
         _reference("image-a", 1),
@@ -245,6 +272,27 @@ def test_seedance_prompt_rejects_tokens_only_listed_before_shots() -> None:
     assert any("镜头 1" in issue and "素材" in issue for issue in issues)
     assert any("镜头 2" in issue and "素材" in issue for issue in issues)
     assert any("@图片1" in issue and "实际镜头" in issue for issue in issues)
+
+
+def test_seedance_prompt_requires_unique_continuous_shot_numbers() -> None:
+    prompt = (
+        "参考 @图片1 中的黄铜毛毡空锅；"
+        "参考 @图片2 中的毛毡食材盘。\n"
+        "镜头 1：展示 @图片1 中的黄铜毛毡空锅。\n"
+        "镜头 1：展示 @图片2 中的毛毡食材盘。\n"
+        "高清，物体稳定不变形，不要生成水印，不要生成 Logo。"
+    )
+
+    issues = validate_seedance_prompt(
+        _video_task(prompt),
+        {
+            "image-pot": "image/png",
+            "image-food": "image/png",
+        },
+        require_storyboard=True,
+    )
+
+    assert any("镜头编号" in issue and "1…N" in issue for issue in issues)
 
 
 def test_seedance_prompt_accepts_understood_references_in_every_shot() -> None:
