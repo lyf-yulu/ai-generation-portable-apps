@@ -9,6 +9,7 @@ const vm = require("node:vm");
 const STATIC = join(__dirname, "../../src/feishu_generation_agent/web/static");
 const BitableState = require(join(STATIC, "bitable-state.js"));
 const ReferenceUploadState = require(join(STATIC, "reference-upload-state.js"));
+const ReferenceMutationState = require(join(STATIC, "reference-mutation-state.js"));
 const ReviewState = require(join(STATIC, "review-state.js"));
 
 class FakeNode {
@@ -78,6 +79,7 @@ async function loadApp(fetch, { pathname = "/feishu-generation-agent/" } = {}) {
   getNode("portrait-category-tab").dataset.category = "portrait";
   const context = {
     BitableState,
+    ReferenceMutationState,
     ReferenceUploadState,
     ReviewState,
     document: {

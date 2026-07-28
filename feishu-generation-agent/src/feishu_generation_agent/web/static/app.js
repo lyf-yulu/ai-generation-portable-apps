@@ -7,6 +7,8 @@
   if (!BitableState) throw new Error("多维表格状态模块加载失败");
   const ReferenceUploadState = globalThis.ReferenceUploadState;
   if (!ReferenceUploadState) throw new Error("参考图片上传状态模块加载失败");
+  const ReferenceMutationState = globalThis.ReferenceMutationState;
+  if (!ReferenceMutationState) throw new Error("参考素材操作状态模块加载失败");
   const PlannerPromptState = globalThis.PlannerPromptState;
   const ApiPaths = globalThis.ApiPaths;
 
@@ -20,6 +22,7 @@
     bitable: BitableState.createState(),
     review: ReviewState.createReviewState(),
     referenceUploads: ReferenceUploadState.createState(),
+    referenceMutations: ReferenceMutationState.createState(),
     plannerPrompt: PlannerPromptState?.createPlannerPromptState?.() || null,
   };
   const byId = (id) => document.getElementById(id);
@@ -365,6 +368,7 @@
       state.runMode = "bitable";
       state.review = ReviewState.createReviewState();
       state.referenceUploads = ReferenceUploadState.createState();
+      state.referenceMutations = ReferenceMutationState.createState();
       await poll(true);
       startPolling();
       document.querySelector(".workspace")?.scrollIntoView({ behavior: "smooth" });
@@ -584,7 +588,7 @@
   }
 
   async function uploadReference(task, file, role, order, replacesAssetId = null) {
-    if (!await prepareReferenceMutation(task)) return;
+    if (!await prepareReferenceMutation(task)) return false;
     if (!file) {
       showError(new Error("请选择图片文件"));
       return false;
@@ -603,7 +607,7 @@
   }
 
   async function unlinkReference(task, assetId) {
-    if (!await prepareReferenceMutation(task)) return;
+    if (!await prepareReferenceMutation(task)) return false;
     return mutate(
       `/api/runs/${state.runId}/tasks/${encodeURIComponent(task.task_id)}/references/${encodeURIComponent(assetId)}`,
       { method: "DELETE" },
@@ -680,24 +684,127 @@
     const replaceInput = document.createElement("input");
     replaceInput.type = "file";
     replaceInput.accept = "image/*,video/mp4,video/webm,audio/mpeg,audio/wav,audio/ogg,audio/aac";
-    replaceInput.hidden = true;
-    const replace = element("button", "quiet-button", "替换");
-    replace.type = "button";
-    replace.addEventListener("click", () => replaceInput.click());
-    replaceInput.addEventListener("change", () => {
-      uploadReference(
+    replaceInput.id = `reference-file-${task.task_id}-${reference.asset_id}`;
+    replaceInput.className = "reference-file-input";
+    const replace = element(
+      "label",
+      "quiet-button reference-replace-label",
+      "替换",
+    );
+    replace.htmlFor = replaceInput.id;
+    const remove = element(
+      "button",
+      "quiet-button reference-delete-button",
+      "删除",
+    );
+    remove.type = "button";
+    const feedback = ReferenceMutationState.rowFeedback(
+      state.referenceMutations,
+      task.task_id,
+      reference.asset_id,
+    );
+    const mutationFeedback = element(
+      "p",
+      `reference-mutation-feedback${feedback ? ` is-${feedback.phase}` : ""}`,
+      feedback?.message || "",
+    );
+    mutationFeedback.setAttribute("aria-live", "polite");
+
+    function showRowFeedback(nextFeedback) {
+      mutationFeedback.className = (
+        `reference-mutation-feedback${nextFeedback ? ` is-${nextFeedback.phase}` : ""}`
+      );
+      mutationFeedback.textContent = nextFeedback?.message || "";
+      const busy = ReferenceMutationState.isBusy(
+        state.referenceMutations,
+        task.task_id,
+        reference.asset_id,
+      );
+      replaceInput.disabled = busy;
+      replace.className = (
+        `quiet-button reference-replace-label${busy ? " is-disabled" : ""}`
+      );
+      remove.disabled = busy;
+      remove.textContent = nextFeedback?.phase === "deleting" ? "删除中…" : "删除";
+    }
+
+    replaceInput.addEventListener("change", async () => {
+      const file = replaceInput.files[0];
+      if (!file || ReferenceMutationState.isBusy(
+        state.referenceMutations,
+        task.task_id,
+        reference.asset_id,
+      )) return;
+      state.referenceMutations = ReferenceMutationState.start(
+        state.referenceMutations,
+        task.task_id,
+        reference.asset_id,
+        "replace",
+        file.name,
+      );
+      showRowFeedback(ReferenceMutationState.rowFeedback(
+        state.referenceMutations,
+        task.task_id,
+        reference.asset_id,
+      ));
+      const succeeded = await uploadReference(
         task,
-        replaceInput.files[0],
+        file,
         reference.role,
         Number(order.value),
         reference.asset_id,
       );
+      state.referenceMutations = succeeded
+        ? ReferenceMutationState.succeed(
+          state.referenceMutations,
+          task.task_id,
+          reference.asset_id,
+          "参考素材已替换",
+        )
+        : ReferenceMutationState.fail(
+          state.referenceMutations,
+          task.task_id,
+          reference.asset_id,
+          errorMessage.textContent || "参考素材替换失败，请重试",
+        );
+      render(ReviewState.draftView(state.review));
     });
-    const remove = element("button", "quiet-button", "删除");
-    remove.type = "button";
-    remove.addEventListener("click", () => unlinkReference(task, reference.asset_id));
+    remove.addEventListener("click", async () => {
+      if (ReferenceMutationState.isBusy(
+        state.referenceMutations,
+        task.task_id,
+        reference.asset_id,
+      )) return;
+      state.referenceMutations = ReferenceMutationState.start(
+        state.referenceMutations,
+        task.task_id,
+        reference.asset_id,
+        "delete",
+      );
+      showRowFeedback(ReferenceMutationState.rowFeedback(
+        state.referenceMutations,
+        task.task_id,
+        reference.asset_id,
+      ));
+      const succeeded = await unlinkReference(task, reference.asset_id);
+      state.referenceMutations = succeeded
+        ? ReferenceMutationState.succeed(
+          state.referenceMutations,
+          task.task_id,
+          reference.asset_id,
+          "参考素材已删除并重新编号",
+        )
+        : ReferenceMutationState.fail(
+          state.referenceMutations,
+          task.task_id,
+          reference.asset_id,
+          errorMessage.textContent || "参考素材删除失败，请重试",
+        );
+      render(ReviewState.draftView(state.review));
+    });
     actions.append(replaceInput, replace, remove);
-    row.append(image, descriptionNode, role, order, actions);
+    row.append(image, descriptionNode, role, order, actions, mutationFeedback);
+    showRowFeedback(feedback);
     return row;
   }
 
@@ -735,7 +842,17 @@
         ? "首尾帧模式仅提交两张图片：首帧和尾帧。"
         : "多参考模式支持图片、视频和音频；首尾效果请在提示词中描述。",
     );
-    section.append(heading, modeHint, list);
+    const sectionFeedback = ReferenceMutationState.taskFeedback(
+      state.referenceMutations,
+      task.task_id,
+    );
+    const mutationFeedback = element(
+      "p",
+      `reference-section-feedback${sectionFeedback ? ` is-${sectionFeedback.phase}` : ""}`,
+      sectionFeedback?.message || "",
+    );
+    mutationFeedback.setAttribute("aria-live", "polite");
+    section.append(heading, modeHint, list, mutationFeedback);
     if (referenceMode === "multi_reference") {
       const upload = element("div", "upload-row");
       const fileInput = document.createElement("input");
@@ -1038,6 +1155,7 @@
       state.runId = runId;
       state.runMode = "bitable";
       state.review = ReviewState.createReviewState();
+      state.referenceMutations = ReferenceMutationState.createState();
       await poll(true);
       document.querySelector(".workspace")?.scrollIntoView({ behavior: "smooth" });
     } catch (error) {
@@ -1054,6 +1172,7 @@
     state.view = null;
     state.review = ReviewState.createReviewState();
     state.referenceUploads = ReferenceUploadState.createState();
+    state.referenceMutations = ReferenceMutationState.createState();
     state.bitable = BitableState.resetRunContext(state.bitable);
     byId("status-badge").textContent = "尚未创建";
     byId("run-status").textContent = "—";
@@ -1092,6 +1211,7 @@
       state.runMode = "bitable";
       state.review = ReviewState.createReviewState();
       state.referenceUploads = ReferenceUploadState.createState();
+      state.referenceMutations = ReferenceMutationState.createState();
       await poll(true);
       startPolling();
       document.querySelector(".workspace")?.scrollIntoView({ behavior: "smooth" });

@@ -12,6 +12,9 @@ const BitableState = require(
 const ReferenceUploadState = require(
   "../../src/feishu_generation_agent/web/static/reference-upload-state.js"
 );
+const ReferenceMutationState = require(
+  "../../src/feishu_generation_agent/web/static/reference-mutation-state.js"
+);
 const ReviewState = require(
   "../../src/feishu_generation_agent/web/static/review-state.js"
 );
@@ -101,6 +104,7 @@ async function loadApp(fetch) {
   };
   const context = {
     BitableState,
+    ReferenceMutationState,
     ReferenceUploadState,
     ReviewState,
     document,
