@@ -327,6 +327,7 @@ function SeedanceApp() {
     jobsLimit: 20,
     activityCounts: null,
     activityDetail: null,
+    historyTasks: [],
 
     // Standalone-specific fields
     customModel: '',
@@ -694,6 +695,23 @@ function SeedanceApp() {
       this.loadActivity();
     },
 
+    switchHistoryTab() {
+      this.wsTab = 'history';
+      this.loadHistory();
+    },
+
+    async loadHistory() {
+      try {
+        const res = await this.api('/api/history?limit=50');
+        if (res.ok) {
+          const data = await res.json();
+          this.historyTasks = data.tasks || [];
+        }
+      } catch (e) {
+        console.error('Failed to load history:', e);
+      }
+    },
+
     // ============================================================
     // OUTPUT DIRECTORY
     // ============================================================
@@ -885,11 +903,31 @@ function SeedanceApp() {
               + '</div>'
             ).join('')
           : '<div style="color:#697386;font-size:11px">等待服务器响应...</div>';
+
+        // 友好错误提示：识别错误类型，显示用户友好的消息
+        let errorHint = '';
+        if (job.errors && job.errors.length > 0) {
+          const firstError = job.errors[0];
+          if (firstError.includes('[auth_failed]') || firstError.includes('401')) {
+            errorHint = '❌ API Key 无效或已过期，请检查配置';
+          } else if (firstError.includes('[rate_limited]') || firstError.includes('429')) {
+            errorHint = '⏱️ 请求过于频繁，已自动重试多次仍失败，请稍后再试';
+          } else if (firstError.includes('[permission_denied]') || firstError.includes('403')) {
+            errorHint = '🚫 权限不足或配额已用完，请联系管理员';
+          } else if (firstError.includes('[server_error]') || firstError.includes('5')) {
+            errorHint = '⚠️ API 服务暂时不可用，已自动重试失败，请稍后重试';
+          } else if (firstError.includes('[network_error]')) {
+            errorHint = '🌐 网络连接失败，请检查网络或 API 地址';
+          } else {
+            errorHint = escHtml(firstError);
+          }
+        }
+
         resultsEl.innerHTML =
           '<article class="result" style="border-color:#4f46e5;background:#101828;color:#e2e8f0;grid-column:1/-1">'
           + '<div class="meta" style="color:#818cf8;font-weight:600;margin-bottom:6px">'
           + escHtml(job.status) + ' · ' + (job.done || 0) + '/' + (job.total || 0)
-          + (job.errors?.[0] ? ' ' + escHtml(job.errors[0]) : '')
+          + (errorHint ? '<br><span style="color:#fca5a5;font-size:12px;font-weight:400">' + errorHint + '</span>' : '')
           + '</div>'
           + eventsHtml
           + '</article>';

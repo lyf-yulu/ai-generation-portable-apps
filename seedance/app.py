@@ -42,6 +42,45 @@ FILES_MAP_PATH = STATE_DIR / "download_files.json"
 SKILL_PATH = ROOT / "SKILL.md"
 DEEPSEEK_KEY_PATH = STATE_DIR / "deepseek.key"
 SECRETS_PATH = STATE_DIR / "secrets.json"
+TASK_HISTORY_FILE = STATE_DIR / "task_history.jsonl"
+
+
+# ============================================================
+# STRUCTURED ERRORS
+# ============================================================
+
+class APIError(Exception):
+    """结构化 API 错误，携带 HTTP 状态码和是否可重试标志"""
+    def __init__(self, status_code: int, message: str, raw_response: str = ""):
+        self.status_code = status_code
+        self.message = message
+        self.raw_response = raw_response
+        super().__init__(f"HTTP {status_code}: {message}")
+
+    @property
+    def is_retryable(self) -> bool:
+        """判断是否值得重试（429 限流、408 超时、5xx 服务端错误）"""
+        return self.status_code in (408, 429, 500, 502, 503, 504)
+
+    @property
+    def error_category(self) -> str:
+        """错误分类，方便前端展示友好提示"""
+        if self.status_code == 401:
+            return "auth_failed"
+        elif self.status_code == 403:
+            return "permission_denied"
+        elif self.status_code == 429:
+            return "rate_limited"
+        elif 400 <= self.status_code < 500:
+            return "client_error"
+        elif 500 <= self.status_code < 600:
+            return "server_error"
+        return "unknown"
+
+
+class NetworkError(Exception):
+    """网络连接失败，通常可重试"""
+    pass
 
 
 def _safe_join_or_root(base: Path, rel: str) -> str:
@@ -496,6 +535,70 @@ def save_files_map() -> None:
         _atomic_write(FILES_MAP_PATH, json.dumps(data, ensure_ascii=False, indent=2))
     except Exception:
         pass
+
+
+TASK_HISTORY_LOCK = threading.Lock()
+
+
+def append_task_to_history(job_id: str, job_data: dict[str, Any]) -> None:
+    """追加任务到历史文件（JSONL 格式，每行一个 JSON 对象）"""
+    try:
+        # 只保存关键字段，不保存 events（太长）
+        record = {
+            "job_id": job_id,
+            "username": job_data.get("username", ""),
+            "workspace_id": job_data.get("workspace_id", ""),
+            "provider": job_data.get("provider", ""),
+            "model": job_data.get("model", ""),
+            "prompt": (job_data.get("prompt") or "")[:200],  # 截断长提示词
+            "status": job_data.get("status", ""),
+            "total": job_data.get("total", 0),
+            "done": job_data.get("done", 0),
+            "errors_count": len(job_data.get("errors", [])),
+            "results_count": len(job_data.get("results", [])),
+            "created_at": job_data.get("created_at", ""),
+            "started_at": job_data.get("started_at"),
+            "finished_at": job_data.get("finished_at"),
+            "duration_seconds": (
+                job_data.get("finished_at", 0) - job_data.get("started_at", 0)
+                if job_data.get("finished_at") and job_data.get("started_at")
+                else None
+            ),
+        }
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with TASK_HISTORY_LOCK:
+            with TASK_HISTORY_FILE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        # 持久化失败不影响任务执行
+        print(f"Warning: failed to append task history: {e}", flush=True)
+
+
+def load_task_history(username: str = "", limit: int = 100) -> list[dict[str, Any]]:
+    """从历史文件加载任务列表（按时间倒序）"""
+    try:
+        if not TASK_HISTORY_FILE.exists():
+            return []
+
+        tasks = []
+        with TASK_HISTORY_LOCK:
+            with TASK_HISTORY_FILE.open("r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        task = json.loads(line.strip())
+                        if username and task.get("username") != username:
+                            continue  # 按用户过滤
+                        tasks.append(task)
+                    except json.JSONDecodeError:
+                        continue  # 跳过损坏的行
+
+        # 按 finished_at 或 created_at 倒序
+        tasks.sort(key=lambda t: t.get("finished_at") or t.get("created_at") or "", reverse=True)
+        return tasks[:limit]
+
+    except Exception as e:
+        print(f"Warning: failed to load task history: {e}", flush=True)
+        return []
 
 
 def _atomic_write(path: Path, content: str):
@@ -1203,22 +1306,56 @@ def normalize_status(value: str | None) -> str:
     return status
 
 
-def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | None = None, timeout: int = 600) -> dict[str, Any]:
+def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | None = None, timeout: int = 600, max_retries: int = 6) -> dict[str, Any]:
+    """
+    发送 JSON 请求，自动重试瞬态错误。
+
+    重试策略：
+    - 429/5xx: 最多重试 6 次，指数退避（1s, 2s, 4s, 8s, 16s, 32s）
+    - 网络超时/连接失败: 最多重试 6 次
+    - 4xx（除 408/429）: 不重试，立即抛出
+    """
     headers = {"Authorization": f"Bearer {api_key}"}
     data = None
     if body is not None:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code}: {raw}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError(f"API 请求超时或连接失败 ({exc.__class__.__name__}: {exc})") from exc
+
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                return json.loads(raw) if raw else {}
+
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            error = APIError(exc.code, raw, raw)
+
+            # 4xx 非瞬态错误（除了 408/429），立即失败
+            if not error.is_retryable:
+                raise error
+
+            # 429/5xx 可重试错误
+            last_error = error
+            if attempt < max_retries - 1:
+                backoff = min(2 ** attempt, 32)  # 最多等 32 秒
+                time.sleep(backoff)
+                continue
+            raise error  # 最后一次重试也失败，抛出
+
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # 网络错误，可重试
+            last_error = NetworkError(f"连接失败 ({exc.__class__.__name__}: {exc})")
+            if attempt < max_retries - 1:
+                backoff = min(2 ** attempt, 32)
+                time.sleep(backoff)
+                continue
+            raise RuntimeError(f"API 请求失败，已重试 {max_retries} 次: {last_error}") from exc
+
+    # 不应该走到这里
+    raise last_error or RuntimeError("Unknown error in request_json")
 
 
 def _public_base_url(handler: SimpleHTTPRequestHandler) -> str | None:
@@ -1945,6 +2082,19 @@ def run_job(job_id: str, form_values: dict[str, Any], form_files: dict[str, tupl
                     with JOBS_LOCK:
                         JOBS[job_id]["results"].append(result)
                         JOBS[job_id]["done"] += 1
+                except APIError as exc:
+                    # 结构化 API 错误，记录错误类型方便前端展示
+                    error_msg = f"[{exc.error_category}] {exc.message}"
+                    with JOBS_LOCK:
+                        JOBS[job_id]["errors"].append(error_msg)
+                        JOBS[job_id]["done"] += 1
+                    add_event(job_id, f"API Error [{exc.error_category}]: {exc.message[:200]}")
+                except NetworkError as exc:
+                    error_msg = f"[network_error] {exc}"
+                    with JOBS_LOCK:
+                        JOBS[job_id]["errors"].append(error_msg)
+                        JOBS[job_id]["done"] += 1
+                    add_event(job_id, f"Network Error: {exc}")
                 except Exception as exc:
                     with JOBS_LOCK:
                         JOBS[job_id]["errors"].append(str(exc))
@@ -1957,6 +2107,10 @@ def run_job(job_id: str, form_values: dict[str, Any], form_files: dict[str, tupl
         set_job(job_id, status=final_status, finished_at=time.time())
         final_job["status"] = final_status
         update_activity(activity_id, status=final_status, result=final_job, finished_at=time.time())
+
+        # 新增：持久化任务历史
+        append_task_to_history(job_id, final_job)
+
         add_event(job_id, "Finished")
         report_final_to_portal(job_id, final_status)
     except Exception as exc:
@@ -1964,6 +2118,10 @@ def run_job(job_id: str, form_values: dict[str, Any], form_files: dict[str, tupl
         with JOBS_LOCK:
             final_job = json.loads(json.dumps(JOBS.get(job_id, {})))
         update_activity(activity_id, status="failed", error=str(exc), result=final_job, finished_at=time.time())
+
+        # 新增：即使失败也要记录
+        append_task_to_history(job_id, final_job)
+
         add_event(job_id, f"Fatal: {exc}")
         report_final_to_portal(job_id, "failed")
 
@@ -2087,6 +2245,14 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path == "/api/activity":
             sees_all, username = _view_scope(self)
             json_response(self, 200, activity_list(show_all=sees_all, username=username))
+            return
+        if self.path == "/api/history":
+            # 查询历史任务
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self._raw_path).query)
+            username = query.get("username", [""])[0]
+            limit = int(query.get("limit", ["100"])[0])
+            tasks = load_task_history(username=username, limit=limit)
+            json_response(self, 200, {"ok": True, "tasks": tasks})
             return
         if self.path.startswith("/api/activity/"):
             activity_id = self.path.rsplit("/", 1)[-1]
