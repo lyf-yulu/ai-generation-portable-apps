@@ -653,8 +653,29 @@ function NanoBananaApp() {
       var eventsList = (job.events || []).slice(-8).map(function (e) {
         return '<div style="font-size:11px;color:#d1e0ff;padding:2px 0"><span style="color:#697386">' + escHtml(e.time) + '</span> ' + escHtml(e.message) + '</div>';
       }).join('');
+
+      // 友好错误提示：识别错误类型，显示用户友好的消息
+      var errorHint = '';
+      if (job.errors && job.errors.length > 0) {
+        var firstError = job.errors[0];
+        if (firstError.indexOf('[auth_failed]') >= 0 || firstError.indexOf('401') >= 0) {
+          errorHint = '❌ API Key 无效或已过期，请检查配置';
+        } else if (firstError.indexOf('[rate_limited]') >= 0 || firstError.indexOf('429') >= 0) {
+          errorHint = '⏱️ 请求过于频繁，已自动重试多次仍失败，请稍后再试';
+        } else if (firstError.indexOf('[permission_denied]') >= 0 || firstError.indexOf('403') >= 0) {
+          errorHint = '🚫 权限不足或配额已用完，请联系管理员';
+        } else if (firstError.indexOf('[server_error]') >= 0) {
+          errorHint = '⚠️ API 服务暂时不可用，已自动重试失败，请稍后重试';
+        } else if (firstError.indexOf('[network_error]') >= 0) {
+          errorHint = '🌐 网络连接失败，请检查网络或 API 地址';
+        } else {
+          errorHint = escHtml(firstError);
+        }
+      }
+
       resultsEl.innerHTML = '<article class="result" style="border-color:#4f46e5;background:#101828;color:#e2e8f0;grid-column:1/-1">' +
-        '<div class="meta" style="color:#818cf8;font-weight:600;margin-bottom:6px">' + escHtml(job.status) + ' · ' + (job.done || 0) + '/' + (job.total || 0) + ' ' + escHtml((job.errors && job.errors[0]) || '') + '</div>' +
+        '<div class="meta" style="color:#818cf8;font-weight:600;margin-bottom:6px">' + escHtml(job.status) + ' · ' + (job.done || 0) + '/' + (job.total || 0) +
+        (errorHint ? '<br><span style="color:#fca5a5;font-size:12px;font-weight:400">' + errorHint + '</span>' : '') + '</div>' +
         (eventsList || '<div style="color:#697386;font-size:11px">等待服务器响应...</div>') +
         '</article>';
       for (var ri = 0; ri < (job.results || []).length; ri++) {

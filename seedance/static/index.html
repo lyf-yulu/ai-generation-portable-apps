@@ -163,7 +163,6 @@
           <div class="sub-tabs" style="margin-bottom:10px">
             <button type="button" class="tabBtn" :class="{ isActive: wsTab === 'jobs' }" @click="switchJobsTab()">任务</button>
             <button type="button" class="tabBtn" :class="{ isActive: wsTab === 'activity' }" @click="switchActivityTab()">活动</button>
-            <button type="button" class="tabBtn" :class="{ isActive: wsTab === 'history' }" @click="switchHistoryTab()">历史</button>
           </div>
           <div v-show="wsTab==='jobs'">
             <!-- Active polling display (during job execution) -->
@@ -231,29 +230,6 @@
               <pre style="font-size:11px;max-height:200px">{{ JSON.stringify(activityDetail.restore?.values || activityDetail.request, null, 2) }}</pre>
               <h3 style="margin:8px 0 4px;font-size:13px" v-if="activityDetail.result">结果</h3>
               <pre v-if="activityDetail.result" style="font-size:11px;max-height:150px">{{ JSON.stringify(activityDetail.result, null, 2) }}</pre>
-            </div>
-          </div>
-
-          <!-- 历史任务 Tab -->
-          <div v-show="wsTab==='history'">
-            <div class="resultHeader">
-              <h2>历史任务</h2>
-              <button @click="loadHistory()" style="font-size:11px;padding:3px 10px;margin-left:8px;cursor:pointer">刷新</button>
-            </div>
-            <div v-if="historyTasks.length===0" style="color:#697386;font-size:12px;padding:12px 0">暂无历史记录</div>
-            <div v-for="t in historyTasks" :key="t.job_id" style="border:1px solid #e2e8f0;border-radius:8px;padding:10px;margin-bottom:10px">
-              <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-                <span :class="'tag tag-'+t.status">{{ t.status }}</span>
-                <span style="font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ t.prompt }}</span>
-                <span v-if="t.username" style="font-size:11px;color:#697386;white-space:nowrap">@{{ t.username }}</span>
-                <span style="font-size:11px;color:#697386;white-space:nowrap">{{ t.created_at }}</span>
-              </div>
-              <div style="font-size:11px;color:#697386">
-                <span v-if="t.duration_seconds">耗时: {{ Math.round(t.duration_seconds) }}s</span>
-                <span v-if="t.duration_seconds"> · </span>
-                完成: {{ t.results_count }}/{{ t.total }}
-                <span v-if="t.errors_count > 0"> · 错误: {{ t.errors_count }}</span>
-              </div>
             </div>
           </div>
         </div>

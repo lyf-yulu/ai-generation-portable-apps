@@ -40,6 +40,44 @@ ARCHIVE_DIR = _DATA_BASE / "archives"
 PROVIDERS_PATH = ROOT / "providers.json"
 
 
+# ============================================================
+# STRUCTURED ERRORS
+# ============================================================
+
+class APIError(Exception):
+    """结构化 API 错误，携带 HTTP 状态码和是否可重试标志"""
+    def __init__(self, status_code: int, message: str, raw_response: str = ""):
+        self.status_code = status_code
+        self.message = message
+        self.raw_response = raw_response
+        super().__init__(f"HTTP {status_code}: {message}")
+
+    @property
+    def is_retryable(self) -> bool:
+        """判断是否值得重试（429 限流、408 超时、5xx 服务端错误）"""
+        return self.status_code in (408, 429, 500, 502, 503, 504)
+
+    @property
+    def error_category(self) -> str:
+        """错误分类，方便前端展示友好提示"""
+        if self.status_code == 401:
+            return "auth_failed"
+        elif self.status_code == 403:
+            return "permission_denied"
+        elif self.status_code == 429:
+            return "rate_limited"
+        elif 400 <= self.status_code < 500:
+            return "client_error"
+        elif 500 <= self.status_code < 600:
+            return "server_error"
+        return "unknown"
+
+
+class NetworkError(Exception):
+    """网络连接失败，通常可重试"""
+    pass
+
+
 def _safe_join_or_root(base: Path, rel: str) -> str:
     """Join base/rel and reject any result outside base (path-traversal guard).
 
@@ -571,22 +609,56 @@ def mask_key(key: str) -> str:
     return f"{key[:5]}...{key[-4:]}" if key and len(key) > 12 else ("***" if key else "")
 
 
-def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | None = None, timeout: int = 900) -> dict[str, Any]:
+def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | None = None, timeout: int = 900, max_retries: int = 6) -> dict[str, Any]:
+    """
+    发送 JSON 请求，自动重试瞬态错误。
+
+    重试策略：
+    - 429/5xx: 最多重试 6 次，指数退避（1s, 2s, 4s, 8s, 16s, 32s）
+    - 网络超时/连接失败: 最多重试 6 次
+    - 4xx（除 408/429）: 不重试，立即抛出
+    """
     headers = {"Authorization": f"Bearer {api_key}"}
     data = None
     if body is not None:
         headers["Content-Type"] = "application/json"
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code}: {raw}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError(f"API 请求超时或连接失败 ({exc.__class__.__name__}: {exc})") from exc
+
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                return json.loads(raw) if raw else {}
+
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            error = APIError(exc.code, raw, raw)
+
+            # 4xx 非瞬态错误（除了 408/429），立即失败
+            if not error.is_retryable:
+                raise error
+
+            # 429/5xx 可重试错误
+            last_error = error
+            if attempt < max_retries - 1:
+                backoff = min(2 ** attempt, 32)  # 最多等 32 秒
+                time.sleep(backoff)
+                continue
+            raise error  # 最后一次重试也失败，抛出
+
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # 网络错误，可重试
+            last_error = NetworkError(f"连接失败 ({exc.__class__.__name__}: {exc})")
+            if attempt < max_retries - 1:
+                backoff = min(2 ** attempt, 32)
+                time.sleep(backoff)
+                continue
+            raise RuntimeError(f"API 请求失败，已重试 {max_retries} 次: {last_error}") from exc
+
+    # 不应该走到这里
+    raise last_error or RuntimeError("Unknown error in request_json")
 
 
 def request_gemini_generate(url: str, api_key: str, payload: dict[str, Any], timeout: int = 900) -> dict[str, Any]:
@@ -1564,6 +1636,19 @@ def run_job(job_id: str, values: dict[str, Any], files: dict[str, tuple[str, byt
                     with LOCK:
                         JOBS[job_id]["results"].append(result)
                         JOBS[job_id]["done"] += 1
+                except APIError as exc:
+                    # 结构化 API 错误，记录错误类型方便前端展示
+                    error_msg = f"[{exc.error_category}] {exc.message}"
+                    with LOCK:
+                        JOBS[job_id]["errors"].append(error_msg)
+                        JOBS[job_id]["done"] += 1
+                    add_event(job_id, f"API Error [{exc.error_category}]: {exc.message[:200]}")
+                except NetworkError as exc:
+                    error_msg = f"[network_error] {exc}"
+                    with LOCK:
+                        JOBS[job_id]["errors"].append(error_msg)
+                        JOBS[job_id]["done"] += 1
+                    add_event(job_id, f"Network Error: {exc}")
                 except Exception as exc:
                     with LOCK:
                         JOBS[job_id]["errors"].append(str(exc))

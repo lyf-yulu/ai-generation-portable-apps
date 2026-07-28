@@ -42,7 +42,6 @@ FILES_MAP_PATH = STATE_DIR / "download_files.json"
 SKILL_PATH = ROOT / "SKILL.md"
 DEEPSEEK_KEY_PATH = STATE_DIR / "deepseek.key"
 SECRETS_PATH = STATE_DIR / "secrets.json"
-TASK_HISTORY_FILE = STATE_DIR / "task_history.jsonl"
 
 
 # ============================================================
@@ -535,70 +534,6 @@ def save_files_map() -> None:
         _atomic_write(FILES_MAP_PATH, json.dumps(data, ensure_ascii=False, indent=2))
     except Exception:
         pass
-
-
-TASK_HISTORY_LOCK = threading.Lock()
-
-
-def append_task_to_history(job_id: str, job_data: dict[str, Any]) -> None:
-    """追加任务到历史文件（JSONL 格式，每行一个 JSON 对象）"""
-    try:
-        # 只保存关键字段，不保存 events（太长）
-        record = {
-            "job_id": job_id,
-            "username": job_data.get("username", ""),
-            "workspace_id": job_data.get("workspace_id", ""),
-            "provider": job_data.get("provider", ""),
-            "model": job_data.get("model", ""),
-            "prompt": (job_data.get("prompt") or "")[:200],  # 截断长提示词
-            "status": job_data.get("status", ""),
-            "total": job_data.get("total", 0),
-            "done": job_data.get("done", 0),
-            "errors_count": len(job_data.get("errors", [])),
-            "results_count": len(job_data.get("results", [])),
-            "created_at": job_data.get("created_at", ""),
-            "started_at": job_data.get("started_at"),
-            "finished_at": job_data.get("finished_at"),
-            "duration_seconds": (
-                job_data.get("finished_at", 0) - job_data.get("started_at", 0)
-                if job_data.get("finished_at") and job_data.get("started_at")
-                else None
-            ),
-        }
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        with TASK_HISTORY_LOCK:
-            with TASK_HISTORY_FILE.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception as e:
-        # 持久化失败不影响任务执行
-        print(f"Warning: failed to append task history: {e}", flush=True)
-
-
-def load_task_history(username: str = "", limit: int = 100) -> list[dict[str, Any]]:
-    """从历史文件加载任务列表（按时间倒序）"""
-    try:
-        if not TASK_HISTORY_FILE.exists():
-            return []
-
-        tasks = []
-        with TASK_HISTORY_LOCK:
-            with TASK_HISTORY_FILE.open("r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        task = json.loads(line.strip())
-                        if username and task.get("username") != username:
-                            continue  # 按用户过滤
-                        tasks.append(task)
-                    except json.JSONDecodeError:
-                        continue  # 跳过损坏的行
-
-        # 按 finished_at 或 created_at 倒序
-        tasks.sort(key=lambda t: t.get("finished_at") or t.get("created_at") or "", reverse=True)
-        return tasks[:limit]
-
-    except Exception as e:
-        print(f"Warning: failed to load task history: {e}", flush=True)
-        return []
 
 
 def _atomic_write(path: Path, content: str):
@@ -2107,10 +2042,6 @@ def run_job(job_id: str, form_values: dict[str, Any], form_files: dict[str, tupl
         set_job(job_id, status=final_status, finished_at=time.time())
         final_job["status"] = final_status
         update_activity(activity_id, status=final_status, result=final_job, finished_at=time.time())
-
-        # 新增：持久化任务历史
-        append_task_to_history(job_id, final_job)
-
         add_event(job_id, "Finished")
         report_final_to_portal(job_id, final_status)
     except Exception as exc:
@@ -2118,10 +2049,6 @@ def run_job(job_id: str, form_values: dict[str, Any], form_files: dict[str, tupl
         with JOBS_LOCK:
             final_job = json.loads(json.dumps(JOBS.get(job_id, {})))
         update_activity(activity_id, status="failed", error=str(exc), result=final_job, finished_at=time.time())
-
-        # 新增：即使失败也要记录
-        append_task_to_history(job_id, final_job)
-
         add_event(job_id, f"Fatal: {exc}")
         report_final_to_portal(job_id, "failed")
 
@@ -2245,14 +2172,6 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path == "/api/activity":
             sees_all, username = _view_scope(self)
             json_response(self, 200, activity_list(show_all=sees_all, username=username))
-            return
-        if self.path == "/api/history":
-            # 查询历史任务
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(self._raw_path).query)
-            username = query.get("username", [""])[0]
-            limit = int(query.get("limit", ["100"])[0])
-            tasks = load_task_history(username=username, limit=limit)
-            json_response(self, 200, {"ok": True, "tasks": tasks})
             return
         if self.path.startswith("/api/activity/"):
             activity_id = self.path.rsplit("/", 1)[-1]

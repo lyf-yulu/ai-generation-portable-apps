@@ -656,8 +656,68 @@ def _openapi_v4_sign(ak, sk, method, host, uri, query, headers, payload):
 PROJECT_NAME = "Seedance2.0"
 
 
+# ============================================================
+# 重试策略
+# ============================================================
+# volcengine 的 HTTP 调用（openapi_call / ark_v3_call）不抛异常，而是返回
+# {"error": "HTTP 5xx", ...} 字典。这里用一个通用包装器：当返回的错误码属于
+# 瞬态错误（429/5xx）时自动重试，指数退避（1s→32s，最多 6 次）。
+# 4xx 客户端错误（除 408/429）不重试，直接返回。
+
+_RETRYABLE_HTTP_CODES = (408, 429, 500, 502, 503, 504)
+
+
+def _extract_http_code(result: dict) -> int | None:
+    """从 {"error": "HTTP 503", ...} 里提取状态码；非 HTTP 错误返回 None。"""
+    if not isinstance(result, dict):
+        return None
+    err = str(result.get("error") or "")
+    m = re.match(r"HTTP (\d+)", err)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _call_with_retry(fn, *, label: str, max_retries: int = 6):
+    """
+    调用 fn()（返回结果字典），对瞬态错误自动重试。
+
+    - 返回 {"error": "HTTP 429/5xx"} 或网络错误（error 存在但无 HTTP 码）→ 重试
+    - 返回 {"error": "HTTP 4xx"}（非 408/429）→ 立即返回，不重试
+    - 成功（无 error 字段）→ 立即返回
+    """
+    last_result = None
+    for attempt in range(max_retries):
+        result = fn()
+        last_result = result
+        if not isinstance(result, dict) or not result.get("error"):
+            return result  # 成功
+        code = _extract_http_code(result)
+        # 有明确 HTTP 码但不可重试 → 立即返回
+        if code is not None and code not in _RETRYABLE_HTTP_CODES:
+            return result
+        # 可重试（429/5xx 或无 HTTP 码的网络错误）
+        if attempt < max_retries - 1:
+            backoff = min(2 ** attempt, 32)
+            print(f"  [retry] {label} attempt {attempt+1}/{max_retries} failed ({result.get('error')}), retrying in {backoff}s", flush=True)
+            time.sleep(backoff)
+            continue
+    return last_result
+
+
 def openapi_call(action, body, ak=None, sk=None, timeout=120):
-    """Call Volcengine OpenAPI (Asset API) with AK/SK SigV4 signing."""
+    """Call Volcengine OpenAPI (Asset API) with AK/SK SigV4 signing.
+
+    自动重试瞬态错误（429/5xx/网络错误，指数退避 1s→32s，最多 6 次）。
+    """
+    return _call_with_retry(
+        lambda: _openapi_call_once(action, body, ak=ak, sk=sk, timeout=timeout),
+        label=f"openapi:{action}",
+    )
+
+
+def _openapi_call_once(action, body, ak=None, sk=None, timeout=120):
+    """Single OpenAPI call attempt (no retry)."""
     ak = ak or ACCESS_KEY
     sk = sk or SECRET_KEY
     if not ak or not sk:
@@ -709,7 +769,18 @@ def openapi_result(response):
 # === Ark API v3 calls (Bearer token) for video generation ===
 
 def ark_v3_call(method, path, body=None, timeout=120, api_key=None):
-    """Call Ark API v3 (video generation, files) with Bearer token."""
+    """Call Ark API v3 (video generation, files) with Bearer token.
+
+    自动重试瞬态错误（429/5xx/网络错误，指数退避 1s→32s，最多 6 次）。
+    """
+    return _call_with_retry(
+        lambda: _ark_v3_call_once(method, path, body=body, timeout=timeout, api_key=api_key),
+        label=f"ark_v3:{method} {path}",
+    )
+
+
+def _ark_v3_call_once(method, path, body=None, timeout=120, api_key=None):
+    """Single Ark v3 call attempt (no retry)."""
     url = f"{ARK_BASE_URL}{path}"
     data = json.dumps(body).encode("utf-8") if body else None
     headers = {"Authorization": f"Bearer {api_key or API_KEY}"}

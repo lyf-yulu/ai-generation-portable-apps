@@ -473,7 +473,7 @@
             <span v-if="formatRuntime(j)" style="font-size:11px;color:#475569;margin-right:6px">{{ formatRuntime(j) }}</span>
             <span style="font-size:11px;color:#64748b">{{ j.created_at }}</span>
           </div>
-          <div v-if="j.errors && j.errors.length" style="font-size:11px;color:#dc2626;margin-top:4px">{{ j.errors.join('; ') }}</div>
+          <div v-if="j.errors && j.errors.length" style="font-size:11px;color:#dc2626;margin-top:4px">{{ friendlyErrors(j.errors) }}</div>
           <div v-for="r in (j.results||[]).filter(x => x.download_url)" class="row" style="align-items:center;margin-top:6px;padding-top:6px;border-top:1px solid #f1f5f9">
             <video :src="appPath + r.download_url" controls style="width:120px;height:68px;border-radius:4px;object-fit:cover;flex-shrink:0"></video>
             <span style="font-size:11px;color:#64748b;flex:1;margin-left:8px">{{ r.filename || 'video' }}</span>

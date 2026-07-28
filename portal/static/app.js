@@ -1598,6 +1598,19 @@ function VolcenginePortraitApp() {
       return '';
     },
 
+    // 把 errors 数组转成用户友好的提示文案。兼容两种格式：
+    // seedance/nano-banana 的 "[rate_limited] ..." 前缀，以及 volcengine 的裸 "HTTP 429" 码。
+    friendlyErrors(errors) {
+      if (!errors || !errors.length) return '';
+      const first = String(errors[0]);
+      if (first.includes('[auth_failed]') || first.includes('401')) return '❌ API Key 无效或已过期，请检查配置';
+      if (first.includes('[rate_limited]') || first.includes('429')) return '⏱️ 请求过于频繁，已自动重试多次仍失败，请稍后再试';
+      if (first.includes('[permission_denied]') || first.includes('403')) return '🚫 权限不足或配额已用完，请联系管理员';
+      if (first.includes('[server_error]') || /HTTP 5\d\d/.test(first)) return '⚠️ API 服务暂时不可用，已自动重试失败，请稍后重试';
+      if (first.includes('[network_error]')) return '🌐 网络连接失败，请检查网络或 API 地址';
+      return errors.join('; ');
+    },
+
     // === Groups ===
     async createGroup() {
       this.creatingGroup = true;

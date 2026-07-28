@@ -1,5 +1,17 @@
 # 错误处理工程化 + 任务持久化 改进方案
 
+> **⚠️ 实施结论更新（2026-07-28）**
+>
+> - **P0 错误处理工程化：已实施**。APIError/NetworkError 分类 + request_json 自动重试
+>   （429/5xx/网络错误，指数退避 1s→32s，最多 6 次）+ 前端友好提示。
+>   已覆盖 seedance、nano-banana、volcengine-portrait（后者用返回值判错的重试包装器）、
+>   portal 前端（friendlyErrors）。dreamina 已有 CLI 层重试（ExceedConcurrencyLimit），跳过。
+> - **P1 任务持久化：已否决并回退**。原方案的 task_history.jsonl 与现有
+>   `activity_log.json`（seedance/nb 保留 100 条、dreamina 500 条，均跨重启保留，
+>   且带完整参数/可恢复/前端「活动」Tab）**功能大面积重复**。dreamina 更是早已有
+>   `/api/history` 端点。故撤销 JSONL 持久化，下方 P1 章节仅作历史存档，不再实施。
+>   若未来需要「保留超过 N 条」，正确做法是调大各应用的 `ACTIVITY_LIMIT`，而非另起一套。
+
 ## 当前现状分析
 
 ### 错误处理现状

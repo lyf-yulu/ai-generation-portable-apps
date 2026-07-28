@@ -327,7 +327,6 @@ function SeedanceApp() {
     jobsLimit: 20,
     activityCounts: null,
     activityDetail: null,
-    historyTasks: [],
 
     // Standalone-specific fields
     customModel: '',
@@ -693,23 +692,6 @@ function SeedanceApp() {
     switchActivityTab() {
       this.wsTab = 'activity';
       this.loadActivity();
-    },
-
-    switchHistoryTab() {
-      this.wsTab = 'history';
-      this.loadHistory();
-    },
-
-    async loadHistory() {
-      try {
-        const res = await this.api('/api/history?limit=50');
-        if (res.ok) {
-          const data = await res.json();
-          this.historyTasks = data.tasks || [];
-        }
-      } catch (e) {
-        console.error('Failed to load history:', e);
-      }
     },
 
     // ============================================================
