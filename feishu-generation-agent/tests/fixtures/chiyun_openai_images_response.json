@@ -1,0 +1,9 @@
+{
+  "created": 1785382785,
+  "model": "gpt-image-2",
+  "size": "1024x1024",
+  "data": [
+    {"b64_json": "ZmljdGlvbmFsLW9wZW5haS1yZXN1bHQ="},
+    {"b64_json": "ZmljdGlvbmFsLW9wZW5haS1yZXN1bHQtMg=="}
+  ]
+}

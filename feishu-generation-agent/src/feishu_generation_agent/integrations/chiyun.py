@@ -38,6 +38,13 @@ from feishu_generation_agent.storage.provider_results import (
 _IMAGE_MIME_TYPES = frozenset(
     {"image/gif", "image/jpeg", "image/png", "image/webp"}
 )
+# 模型名前缀 → OpenAI 风格接口（/v1/images/edits）。其余走 Gemini 风格
+# （/v1beta/models/{model}:generateContent）。中转站 chiyun 同时挂了两种范式。
+_OPENAI_MODEL_PREFIXES = ("gpt-image", "dall-e")
+# OpenAI gpt-image 固定输出 PNG，响应体不带 mime 字段，落盘时固定按此 mime。
+_OPENAI_RESULT_MIME = "image/png"
+# gpt-image 支持的离散尺寸；按 aspectRatio 归类，无法判定时回退 "auto"。
+_OPENAI_SIZES = ("1024x1024", "1024x1536", "1536x1024")
 _LOGGER = logging.getLogger(__name__)
 _DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 _DEFAULT_MAX_RESULT_BYTES = 32 * 1024 * 1024
@@ -145,6 +152,14 @@ class ChiyunImageGenerator:
         self._max_input_bytes = max_input_bytes
         self._max_total_input_bytes = max_total_input_bytes
         self._timeout = httpx.Timeout(120, connect=10)
+        # OpenAI 图像编辑实测可达 ~80s，output_count 大时更慢；放宽到 180s，仍有界。
+        self._openai_timeout = httpx.Timeout(180, connect=10)
+        # 按模型名判定接口范式：gpt-image-* / dall-e-* → OpenAI，其余 → Gemini。
+        self._api_style = (
+            "openai"
+            if self._model.lower().startswith(_OPENAI_MODEL_PREFIXES)
+            else "gemini"
+        )
         self._result_store = result_store
         self._result_downloader = result_downloader
 
@@ -165,35 +180,12 @@ class ChiyunImageGenerator:
                 "cause=invalid_submission_id",
             )
         asset_contents = self._validate_assets(task, assets)
-        parts: list[dict[str, Any]] = [{"text": self._prompt(task)}]
-        for asset, content in zip(assets, asset_contents, strict=True):
-            parts.append(
-                {
-                    "inline_data": {
-                        "mime_type": asset.mime_type,
-                        "data": base64.b64encode(content).decode("ascii"),
-                    }
-                }
-            )
-        payload = {
-            "contents": [{"parts": parts}],
-            "generationConfig": {
-                "imageConfig": {
-                    "aspectRatio": task.aspect_ratio,
-                    "imageSize": task.image_size,
-                }
-            },
-        }
-        model_path = quote(self._model, safe="")
-        body = await self._request_json(
-            "POST",
-            f"{self._base_url}/v1beta/models/{model_path}:generateContent",
-            json_body=payload,
-            operation="generate",
-        )
-        if body is None:
-            raise AssertionError("generate endpoint cannot be unsupported")
-        results = self._result_items(body)
+        # 按接口范式分流；两条分支都产出 list[_PendingResult]，之后共用同一段
+        # 数量校验 / 下载 / 落盘 / 返回逻辑，保证 ProviderSubmission 契约不变。
+        if self._api_style == "openai":
+            results = await self._submit_openai(task, assets, asset_contents)
+        else:
+            results = await self._submit_gemini(task, assets, asset_contents)
         if not results:
             raise self._provider_error(
                 "Chiyun 未返回图片结果",
@@ -243,6 +235,81 @@ class ChiyunImageGenerator:
             result_items=provider_results,
         )
 
+    async def _submit_gemini(
+        self,
+        task: GenerationTask,
+        assets: list[MediaAsset],
+        asset_contents: list[bytes],
+    ) -> list[_PendingResult]:
+        parts: list[dict[str, Any]] = [{"text": self._prompt(task)}]
+        for asset, content in zip(assets, asset_contents, strict=True):
+            parts.append(
+                {
+                    "inline_data": {
+                        "mime_type": asset.mime_type,
+                        "data": base64.b64encode(content).decode("ascii"),
+                    }
+                }
+            )
+        payload = {
+            "contents": [{"parts": parts}],
+            "generationConfig": {
+                "imageConfig": {
+                    "aspectRatio": task.aspect_ratio,
+                    "imageSize": task.image_size,
+                }
+            },
+        }
+        model_path = quote(self._model, safe="")
+        body = await self._request_json(
+            "POST",
+            f"{self._base_url}/v1beta/models/{model_path}:generateContent",
+            json_body=payload,
+            operation="generate",
+        )
+        if body is None:
+            raise AssertionError("generate endpoint cannot be unsupported")
+        return self._result_items(body)
+
+    async def _submit_openai(
+        self,
+        task: GenerationTask,
+        assets: list[MediaAsset],
+        asset_contents: list[bytes],
+    ) -> list[_PendingResult]:
+        # OpenAI 图生图走 /v1/images/edits（multipart），把全部参考图作为
+        # image[] 逐张上传；纯文生图的 /v1/images/generations 不接受参考图，
+        # 不满足飞书 Agent「图生图 + 至少一张参考图」的强制约束。
+        data = {
+            "model": self._model,
+            "prompt": self._prompt(task),
+            "n": str(task.output_count),
+            "size": self._openai_size(task.aspect_ratio, task.image_size),
+        }
+        files: list[tuple[str, tuple[str, bytes, str]]] = []
+        for index, (asset, content) in enumerate(
+            zip(assets, asset_contents, strict=True)
+        ):
+            extension = asset.mime_type.split("/")[-1] or "png"
+            files.append(
+                (
+                    "image[]",
+                    (f"reference-{index:03d}.{extension}", content, asset.mime_type),
+                )
+            )
+        body = await self._request_json(
+            "POST",
+            f"{self._base_url}/v1/images/edits",
+            json_body=None,
+            operation="generate",
+            data=data,
+            files=files,
+            timeout=self._openai_timeout,
+        )
+        if body is None:
+            raise AssertionError("edits endpoint cannot be unsupported")
+        return self._openai_result_items(body)
+
     async def poll(
         self,
         submission: ProviderSubmission,
@@ -273,9 +340,14 @@ class ChiyunImageGenerator:
         )
 
     async def probe_models(self) -> ModelProbeResult:
+        # 按风格选只读模型列表端点：OpenAI /v1/models（返回 {data:[...]}）、
+        # Gemini /v1beta/models（返回 {models:[...]}）。都不计费。
+        list_path = (
+            "/v1/models" if self._api_style == "openai" else "/v1beta/models"
+        )
         payload = await self._request_json(
             "GET",
-            f"{self._base_url}/v1beta/models",
+            f"{self._base_url}{list_path}",
             json_body=None,
             operation="probe_models",
             unsupported_statuses=frozenset({404, 405, 501}),
@@ -283,6 +355,8 @@ class ChiyunImageGenerator:
         if payload is None:
             return self._unsupported_probe()
         models = payload.get("models")
+        if not isinstance(models, list):
+            models = payload.get("data")
         if not isinstance(models, list):
             return self._unsupported_probe()
         model_ids: list[str] = []
@@ -315,18 +389,30 @@ class ChiyunImageGenerator:
         json_body: dict[str, Any] | None,
         operation: str,
         unsupported_statuses: frozenset[int] = frozenset(),
+        data: dict[str, str] | None = None,
+        files: list[tuple[str, tuple[str, bytes, str]]] | None = None,
+        timeout: httpx.Timeout | None = None,
     ) -> dict[str, Any] | None:
+        # data/files 用于 multipart（OpenAI /v1/images/edits）；与 json_body 互斥。
+        # 全部安全护栏（响应大小上限、流式累积、超时、错误分类）两条路径共用。
+        request_kwargs: dict[str, Any] = {
+            "headers": {
+                "Authorization": (
+                    "Bearer " + self._api_key.get_secret_value()
+                )
+            },
+            "timeout": timeout if timeout is not None else self._timeout,
+        }
+        if files is not None:
+            request_kwargs["data"] = data or {}
+            request_kwargs["files"] = files
+        else:
+            request_kwargs["json"] = json_body
         try:
             async with self._http_client.stream(
                 method,
                 url,
-                headers={
-                    "Authorization": (
-                        "Bearer " + self._api_key.get_secret_value()
-                    )
-                },
-                json=json_body,
-                timeout=self._timeout,
+                **request_kwargs,
             ) as response:
                 if response.status_code in unsupported_statuses:
                     return None
@@ -594,6 +680,83 @@ class ChiyunImageGenerator:
         if task.output_count > 1:
             lines.append(f"请生成 {task.output_count} 张结果图片。")
         return "\n\n".join(lines)
+
+    @staticmethod
+    def _openai_size(aspect_ratio: str, image_size: str | None) -> str:
+        # image_size 已是 WxH（如 1024x1024）→ 直接用；否则按 aspectRatio 归到
+        # gpt-image 支持的离散尺寸；无法判定回退 "auto" 让服务端决定，避免 400。
+        if isinstance(image_size, str):
+            candidate = image_size.strip().lower().replace("×", "x")
+            if candidate in {size.lower() for size in _OPENAI_SIZES}:
+                return candidate
+        ratio = (aspect_ratio or "").strip()
+        if ratio in {"1:1", "auto", ""}:
+            return "1024x1024" if ratio == "1:1" else "auto"
+        parts = ratio.split(":")
+        if len(parts) == 2:
+            try:
+                width, height = float(parts[0]), float(parts[1])
+            except ValueError:
+                return "auto"
+            if width > 0 and height > 0:
+                if width > height:
+                    return "1536x1024"
+                if height > width:
+                    return "1024x1536"
+                return "1024x1024"
+        return "auto"
+
+    def _openai_result_items(
+        self, payload: dict[str, Any]
+    ) -> list[_PendingResult]:
+        data = payload.get("data")
+        if not isinstance(data, list):
+            raise self._provider_error(
+                "Chiyun 返回的数据结构无效",
+                "operation=generate; cause=invalid_data",
+            )
+        results: list[_PendingResult] = []
+        for item in data:
+            if not isinstance(item, dict):
+                raise self._provider_error(
+                    "Chiyun 返回的数据结构无效",
+                    "operation=generate; cause=invalid_data_item",
+                )
+            b64 = item.get("b64_json")
+            if isinstance(b64, str) and b64 and not b64.startswith("data:"):
+                padded = b64 + "=" * (-len(b64) % 4)
+                try:
+                    decoded = base64.b64decode(padded, validate=True)
+                except (binascii.Error, ValueError):
+                    raise self._invalid_result("invalid_base64") from None
+                if not decoded:
+                    raise self._invalid_result("empty_decoded_result")
+                if len(decoded) > self._max_result_bytes:
+                    raise self._invalid_result("decoded_result_too_large")
+                results.append(
+                    _PendingResult(mime_type=_OPENAI_RESULT_MIME, data=decoded)
+                )
+                continue
+            # b64 缺失时兜底走 url（复用现有安全下载器，强制 https）。
+            url = item.get("url")
+            if isinstance(url, str):
+                try:
+                    parsed = urlsplit(url)
+                except (TypeError, ValueError):
+                    raise self._invalid_result("unsafe_url") from None
+                if (
+                    parsed.scheme != "https"
+                    or not parsed.hostname
+                    or parsed.username is not None
+                    or parsed.password is not None
+                ):
+                    raise self._invalid_result("unsafe_url")
+                results.append(
+                    _PendingResult(mime_type=_OPENAI_RESULT_MIME, url=url)
+                )
+                continue
+            raise self._invalid_result("missing_openai_image")
+        return results
 
     def _result_items(self, payload: dict[str, Any]) -> list[_PendingResult]:
         results: list[_PendingResult] = []

@@ -1460,3 +1460,265 @@ async def test_probe_models_classifies_connection_error_as_retryable(
     assert caught.value.detail.retryable is True
     assert len(requests) == 1
     assert requests[0].method == "GET"
+
+
+# ============================================================
+# OpenAI 风格（gpt-image-2）图生图分支：走 /v1/images/edits（multipart）
+# ============================================================
+
+
+def _openai_fixture_payload() -> dict[str, Any]:
+    fixture = (
+        Path(__file__).parents[1]
+        / "fixtures"
+        / "chiyun_openai_images_response.json"
+    )
+    return json.loads(fixture.read_text(encoding="utf-8"))
+
+
+def _multipart_field_values(body: bytes, name: str) -> list[str]:
+    # 极简 multipart 解析：够单测断言用，不追求通用性。
+    values: list[str] = []
+    marker = f'name="{name}"'.encode()
+    for section in body.split(b"--"):
+        if marker not in section:
+            continue
+        # 头与体之间是空行（\r\n\r\n）
+        parts = section.split(b"\r\n\r\n", 1)
+        if len(parts) != 2:
+            continue
+        value = parts[1].rsplit(b"\r\n", 1)[0]
+        values.append(value.decode("utf-8", "replace"))
+    return values
+
+
+@pytest.mark.asyncio
+async def test_openai_submit_uses_images_edits_multipart(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_openai_fixture_payload())
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond)
+    ) as client:
+        generator = ChiyunImageGenerator(
+            client,
+            base_url="https://fictional-chiyun.test",
+            api_key="fixture-key-never-sent-externally",
+            model="gpt-image-2",
+            staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
+        )
+        assets = [
+            _asset(tmp_path, "asset-blue"),
+            _asset(tmp_path, "asset-green", JPEG_1X1, "image/jpeg"),
+        ]
+        submission = await generator.submit(_task(output_count=2), assets)
+
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.method == "POST"
+    assert request.url.raw_path == b"/v1/images/edits"
+    assert request.headers["content-type"].startswith("multipart/form-data")
+    assert request.headers["authorization"] == (
+        "Bearer fixture-key-never-sent-externally"
+    )
+    body = request.content
+    # 全部参考图都作为 image[] 上传
+    assert body.count(b'name="image[]"') == 2
+    assert _multipart_field_values(body, "model") == ["gpt-image-2"]
+    assert _multipart_field_values(body, "n") == ["2"]
+    # 9:16（竖版）→ 1024x1536
+    assert _multipart_field_values(body, "size") == ["1024x1536"]
+    # 参考图原始字节确实进了 body
+    assert PNG_1X1 in body
+    assert JPEG_1X1 in body
+
+    # 返回契约与 Gemini 分支一致
+    assert submission.provider == "chiyun"
+    assert submission.status == "succeeded"
+    assert len(submission.provider_task_id) == 32
+    assert len(submission.result_items) == 2
+    assert submission.result_items[0].mime_type == "image/png"
+    assert submission.result_items[0].local_path is not None
+    assert (
+        submission.result_items[0].local_path.read_bytes()
+        == b"fictional-openai-result"
+    )
+
+
+@pytest.mark.asyncio
+async def test_openai_submit_honors_submission_id(tmp_path: Path) -> None:
+    submission_id = "a" * 32
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_openai_fixture_payload())
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond)
+    ) as client:
+        generator = ChiyunImageGenerator(
+            client,
+            base_url="https://fictional-chiyun.test",
+            api_key="fixture-key",
+            model="gpt-image-2",
+            staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
+        )
+        submission = await generator.submit(
+            _task(output_count=2),
+            [_asset(tmp_path, "asset-blue"), _asset(tmp_path, "asset-green")],
+            submission_id=submission_id,
+        )
+
+    # nodes.py 要求 chiyun 的 provider_task_id == 传入的 submission_id
+    assert submission.provider_task_id == submission_id
+
+
+@pytest.mark.asyncio
+async def test_openai_submit_rejects_fewer_results_than_output_count(
+    tmp_path: Path,
+) -> None:
+    payload = {"data": [{"b64_json": "ZmljdGlvbmFsLW9wZW5haS1yZXN1bHQ="}]}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond)
+    ) as client:
+        generator = ChiyunImageGenerator(
+            client,
+            base_url="https://fictional-chiyun.test",
+            api_key="fixture-key",
+            model="gpt-image-2",
+            staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
+        )
+        with pytest.raises(AgentError) as caught:
+            await generator.submit(
+                _task(output_count=2),
+                [_asset(tmp_path, "asset-blue"), _asset(tmp_path, "asset-green")],
+            )
+
+    assert caught.value.detail.category == ErrorCategory.PROVIDER_TERMINAL
+    assert "result_count_mismatch" in caught.value.detail.technical_detail
+
+
+@pytest.mark.asyncio
+async def test_openai_submit_rejects_invalid_base64(tmp_path: Path) -> None:
+    payload = {"data": [{"b64_json": "!!!not-base64!!!"}]}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond)
+    ) as client:
+        generator = ChiyunImageGenerator(
+            client,
+            base_url="https://fictional-chiyun.test",
+            api_key="fixture-key",
+            model="gpt-image-2",
+            staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
+        )
+        with pytest.raises(AgentError) as caught:
+            await generator.submit(
+                _task(output_count=1),
+                [_asset(tmp_path, "asset-blue"), _asset(tmp_path, "asset-green")],
+            )
+
+    assert caught.value.detail.category == ErrorCategory.PROVIDER_TERMINAL
+
+
+@pytest.mark.parametrize(
+    ("status_code", "category", "retryable"),
+    [
+        (401, ErrorCategory.PERMISSION, False),
+        (429, ErrorCategory.TRANSIENT, True),
+        (503, ErrorCategory.TRANSIENT, True),
+        (400, ErrorCategory.PROVIDER_TERMINAL, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_openai_submit_classifies_http_errors(
+    tmp_path: Path,
+    status_code: int,
+    category: ErrorCategory,
+    retryable: bool,
+) -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, text="raw-body-should-not-leak")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond)
+    ) as client:
+        generator = ChiyunImageGenerator(
+            client,
+            base_url="https://fictional-chiyun.test",
+            api_key="fixture-key",
+            model="gpt-image-2",
+            staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
+        )
+        with pytest.raises(AgentError) as caught:
+            await generator.submit(
+                _task(output_count=1),
+                [_asset(tmp_path, "asset-blue"), _asset(tmp_path, "asset-green")],
+            )
+
+    assert caught.value.detail.category == category
+    assert caught.value.detail.retryable is retryable
+    assert "raw-body-should-not-leak" not in str(caught.value.detail)
+
+
+@pytest.mark.parametrize(
+    ("aspect_ratio", "image_size", "expected"),
+    [
+        ("1:1", "2K", "1024x1024"),
+        ("9:16", "2K", "1024x1536"),
+        ("16:9", "4K", "1536x1024"),
+        ("1:1", "1024x1024", "1024x1024"),
+        ("3:4", "1024x1536", "1024x1536"),
+        ("auto", "2K", "auto"),
+    ],
+)
+def test_openai_size_mapping(
+    aspect_ratio: str, image_size: str, expected: str
+) -> None:
+    assert ChiyunImageGenerator._openai_size(aspect_ratio, image_size) == expected
+
+
+@pytest.mark.asyncio
+async def test_gemini_model_still_uses_generate_content(tmp_path: Path) -> None:
+    # 回归保护：非 gpt-image 模型仍走 Gemini 路径，默认行为不变。
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_fixture_payload())
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond)
+    ) as client:
+        generator = ChiyunImageGenerator(
+            client,
+            base_url="https://fictional-chiyun.test",
+            api_key="fixture-key",
+            model="banana2-ssvip",
+            staging_dir=tmp_path / "staging",
+            result_downloader=INLINE_FIXTURE_DOWNLOADER,
+        )
+        submission = await generator.submit(
+            _task(output_count=2),
+            [_asset(tmp_path, "asset-blue"), _asset(tmp_path, "asset-green")],
+        )
+
+    assert len(requests) == 1
+    assert requests[0].url.raw_path == b"/v1beta/models/banana2-ssvip:generateContent"
+    assert requests[0].headers["content-type"] == "application/json"
+    assert submission.provider == "chiyun"
+    assert len(submission.result_items) == 2
