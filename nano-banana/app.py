@@ -1362,6 +1362,49 @@ def extract_gemini_images(result: dict[str, Any]) -> list[dict[str, str]]:
     return images
 
 
+# 常见图片格式的 base64 前缀(magic bytes 编码后的头),用来识别
+# chiyun gpt-image-2 直接把整张图当 base64 塞进 message.content 的情形。
+_B64_IMAGE_PREFIXES = (
+    "iVBORw0KGgo",  # PNG  (\x89PNG\r\n)
+    "/9j/",          # JPEG (\xff\xd8\xff)
+    "R0lGOD",        # GIF
+    "UklGR",         # WEBP (RIFF)
+    "Qk",            # BMP  (BM)
+    "SUkq", "TU0A",  # TIFF (II* / MM\x00)
+)
+
+
+def _looks_like_b64_image(s: str) -> bool:
+    """Heuristic: does this string look like a bare base64-encoded image?
+
+    chiyun 的 gpt-image-2 图生图会把整张 PNG 当一段裸 base64 放进
+    message.content(既不是 markdown 链接,也不是 b64_json 字段)。
+    用图片格式的 base64 头 + 长度门槛判定,避免把普通文字误当图片。"""
+    if not s or len(s) < 128:
+        return False
+    head = s.lstrip()[:16]
+    return head.startswith(_B64_IMAGE_PREFIXES)
+
+
+def _collect_string_content(content: str, images: list[dict[str, str]]) -> None:
+    """Pull image references out of a string content field, in priority order:
+    markdown/plain https URL → data:image data URL → bare base64 image."""
+    urls = re.findall(r"https?://[^)\s]+", content)
+    if urls:
+        for url in urls:
+            images.append({"url": url})
+        return
+    # data:image/png;base64,xxxx
+    m = re.search(r"data:image/[^;]+;base64,([A-Za-z0-9+/=\s]+)", content)
+    if m:
+        images.append({"b64_json": m.group(1).strip()})
+        return
+    # 裸 base64 整图(chiyun gpt-image-2 img2img 的实际返回形态)
+    stripped = content.strip()
+    if _looks_like_b64_image(stripped):
+        images.append({"b64_json": stripped})
+
+
 def extract_chat_completion_images(result: dict[str, Any]) -> list[dict[str, str]]:
     images: list[dict[str, str]] = []
     for choice in result.get("choices") or []:
@@ -1370,16 +1413,14 @@ def extract_chat_completion_images(result: dict[str, Any]) -> list[dict[str, str
         message = choice.get("message") or {}
         content = message.get("content")
         if isinstance(content, str):
-            for url in re.findall(r"https?://[^)\s]+", content):
-                images.append({"url": url})
+            _collect_string_content(content, images)
         elif isinstance(content, list):
             for part in content:
                 if not isinstance(part, dict):
                     continue
                 text = part.get("text")
                 if isinstance(text, str):
-                    for url in re.findall(r"https?://[^)\s]+", text):
-                        images.append({"url": url})
+                    _collect_string_content(text, images)
                 image_url = part.get("image_url")
                 if isinstance(image_url, dict) and image_url.get("url"):
                     images.append({"url": str(image_url["url"])})
@@ -1497,11 +1538,37 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
                 "messages": [{"role": "user", "content": content}],
                 "max_tokens": 256,
             }
-            result = request_chat_completion(f"{base_url}/v1/chat/completions", api_key, payload)
+            # chiyun 是多上游负载均衡:部分通道不支持 /v1/chat/completions,
+            # 会用 HTTP 200 包一个业务错误({code:404,msg:'No endpoint POST
+            # /v1/chat/completions'}),request_json 的 HTTP 层重试对此不触发。
+            # 这就是「并发2偶尔成一张、单发常失败」的真因——多打几次才命中
+            # 好通道。这里把「请求+解析」包成软错误重试,把碰运气变成确定成功。
+            # 图生图实测单次约 99s,超时给足 300s。
             task_id = f"chat_{uuid.uuid4().hex[:12]}"
-            items = extract_chat_completion_images(result)
+            items = []
+            last_result: Any = None
+            soft_attempts = 4
+            for soft_try in range(soft_attempts):
+                result = request_chat_completion(
+                    f"{base_url}/v1/chat/completions", api_key, payload, timeout=300)
+                last_result = result
+                # 业务层错误码(200 外壳里的 code!=200)→ 换通道重试
+                biz_code = result.get("code") if isinstance(result, dict) else None
+                if biz_code not in (None, 200, "200"):
+                    if soft_try < soft_attempts - 1:
+                        add_event(job_id, f"Run {index}: 通道返回 code={biz_code},重试 {soft_try + 1}/{soft_attempts - 1}")
+                        time.sleep(min(2 ** soft_try, 8))
+                        continue
+                    break
+                items = extract_chat_completion_images(result)
+                if items:
+                    break
+                # 200 且无 code 错误,但解析不出图 → 也换一路再试
+                if soft_try < soft_attempts - 1:
+                    add_event(job_id, f"Run {index}: 未解析到图片,重试 {soft_try + 1}/{soft_attempts - 1}")
+                    time.sleep(min(2 ** soft_try, 8))
             if not items:
-                raise RuntimeError(f"No image result found: {result}")
+                raise RuntimeError(f"No image result found: {last_result}")
             _ensure_output_dir(values, job_id)
             out_dir = resolve_output_dir(values.get("output_dir"))
             file_token_results = []
