@@ -1480,51 +1480,15 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
 
     seed_label = f", seed:{seed}" if seed > 0 else ""
     add_event(job_id, f"Run {index}: submitting {provider}/{common['model']}/{mode}{seed_label}")
-    if provider == "gemini":
+    # gpt-image-2 是 OpenAI 风格图像模型,必须走 /v1/images/generations
+    # (文生图) 或 /v1/images/edits (图生图,multipart),不能当对话模型发
+    # /v1/chat/completions —— chiyun 中转站上该端点不存在,会返回
+    # "404 No endpoint POST /v1/chat/completions" 然后报 "No image result
+    # found"。这里让它跳过 gemini 的 generateContent 分支,落到下面与
+    # t8star 共用的 /v1/images/* 同步出图路径(feishu-agent 的 chiyun 通道
+    # 已用同一范式实测通过)。
+    if provider == "gemini" and common["model"] != "gpt-image-2":
         image_count = 0
-        if common["model"] == "gpt-image-2":
-            content: list[dict[str, Any]] = [{"type": "text", "text": common["prompt"]}]
-            if mode != "text2img":
-                for i in range(1, 15):
-                    file_data = get_file_or_saved(form, f"image_{i}", ws_id)
-                    if not file_data:
-                        continue
-                    filename, blob = file_data
-                    content.append({"type": "image_url", "image_url": {"url": file_to_data_url(filename, blob)}})
-                    image_count += 1
-            payload = {
-                "model": common["model"],
-                "messages": [{"role": "user", "content": content}],
-                "max_tokens": 256,
-            }
-            result = request_chat_completion(f"{base_url}/v1/chat/completions", api_key, payload)
-            task_id = f"chat_{uuid.uuid4().hex[:12]}"
-            items = extract_chat_completion_images(result)
-            if not items:
-                raise RuntimeError(f"No image result found: {result}")
-            _ensure_output_dir(values, job_id)
-            out_dir = resolve_output_dir(values.get("output_dir"))
-            file_token_results = []
-            custom_name = values.get("output_name", "").strip()
-            if custom_name:
-                total = max(1, int(values.get("repeat_count") or 1), int(values.get("concurrency") or 1))
-                prefix = f"{custom_name}-{index}" if total > 1 else custom_name
-            else:
-                prefix = f"{time.strftime('%Y%m%d_%H%M%S')}_run{index}_{task_id}"
-            for i, item in enumerate(items, 1):
-                image_url, local_path = save_image_item(item, out_dir, prefix, i)
-                token = uuid.uuid4().hex
-                with LOCK:
-                    FILES[token] = Path(local_path)
-                file_token_results.append({
-                    "image_url": image_url,
-                    "download_url": f"/api/download/{token}",
-                    "filename": Path(local_path).name,
-                    "local_path": local_path,
-                })
-            add_event(job_id, f"Run {index}: saved {len(file_token_results)} image(s), input_images:{image_count}")
-            return {"index": index, "task_id": task_id, "status": "succeeded", "seed": seed or None, "images": file_token_results}
-
         parts: list[dict[str, Any]] = [{"text": common["prompt"]}]
         if mode != "text2img":
             for i in range(1, 15):
@@ -1579,11 +1543,17 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
         add_event(job_id, f"Run {index}: saved {len(file_token_results)} image(s), input_images:{image_count}")
         return {"index": index, "task_id": task_id, "status": "succeeded", "seed": seed or None, "images": file_token_results}
 
+    # t8star 的 /v1/images/* 支持 async 出图 + /v1/images/tasks/{id} 轮询;
+    # chiyun 的 gpt-image-2 是同步返回 {data:[{b64_json}]} 且没有 tasks 端点。
+    # 给 gpt-image-2 去掉 ?async=true,直接吃同步响应,避免它带着 task_id
+    # 去打不存在的 tasks 端点。下面 "not task_id and data → final" 的分支
+    # 正好接住同步结果。
+    async_suffix = "" if common["model"] == "gpt-image-2" else "?async=true"
     if mode == "text2img":
         payload = dict(common)
         if seed > 0:
             payload["seed"] = seed
-        result = request_json("POST", f"{base_url}/v1/images/generations?async=true", api_key, payload)
+        result = request_json("POST", f"{base_url}/v1/images/generations{async_suffix}", api_key, payload)
         image_count = 0
     else:
         files_payload = []
@@ -1596,7 +1566,7 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
             mime = mimetypes.guess_type(filename)[0] or "image/png"
             files_payload.append(("image", filename, blob, mime))
             image_count += 1
-        result = multipart_post(f"{base_url}/v1/images/edits?async=true", api_key, common, files_payload)
+        result = multipart_post(f"{base_url}/v1/images/edits{async_suffix}", api_key, common, files_payload)
 
     task_id = result.get("task_id") or result.get("id") or f"sync_{uuid.uuid4().hex[:12]}"
     add_event(job_id, f"Run {index}: task {task_id}, input_images:{image_count}")
