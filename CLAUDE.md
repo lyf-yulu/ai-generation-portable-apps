@@ -7,6 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ！！！核心：每次更新都要检查是否会影响统计功能的实现！！！！
 ！！！核心：每次更新都要检查是否会影响统计功能的实现！！！！
 
+！！！优先级：时间 >> token！！！用户要的是尽快修好、一次到位。宁可多花
+token 做 live 实测 / 并行探查 / 端到端验证把问题一锤定音，也不要为省 token
+靠猜测反复打补丁、反复让用户重启验证。定位生产问题时，能真实复现就真实复现
+（哪怕产生少量出图费用），不要用推断代替证据。
+
 ## 项目定位
 
 这是一个部署在**服务机**（用户本机 Mac）上的多子应用聚合平台，聚合 Seedance / Nano Banana / Dreamina / Volcengine Portrait 等 AI 生成能力，统一 Portal 前端 + 反向代理暴露给使用者。

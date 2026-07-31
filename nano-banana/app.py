@@ -1362,6 +1362,42 @@ def extract_gemini_images(result: dict[str, Any]) -> list[dict[str, str]]:
     return images
 
 
+# chiyun 上游对「参考图未通过内容审核」等确定性拒绝的返回特征。这类失败
+# 换多少次通道、重试多少次都必然同样结果,识别后应立即失败而非空耗重试。
+# 注意 gpt-image 的 chat/completions 通道会把审核拒绝错误地包装成
+# 404 "No endpoint POST /v1/chat/completions"(已由「同 key 换图即成」证实)。
+_DETERMINISTIC_REJECT_MARKERS = (
+    "no endpoint",
+    "content policy", "content_policy", "content-policy",
+    "safety", "moderation", "violat",  # violation/violates
+    "blocked", "rejected", "not allowed", "flagged",
+    "审核", "违规", "敏感", "policy",
+)
+
+
+def _is_deterministic_reject(code: Any, msg: str) -> bool:
+    """True 表示这是重试也无用的确定性拒绝(内容审核/端点缺失等)。"""
+    low = (msg or "").lower()
+    if any(mark in low for mark in _DETERMINISTIC_REJECT_MARKERS):
+        return True
+    # chiyun 对未过审图返回的典型伪 404,msg 里带 "No endpoint"
+    if str(code) == "404" and "endpoint" in low:
+        return True
+    return False
+
+
+def _friendly_reject_message(result: Any) -> str:
+    """把上游的原始错误翻译成用户能看懂的中文提示;保留简短原始摘要备查。"""
+    code = result.get("code") if isinstance(result, dict) else None
+    msg = str(result.get("msg") or "") if isinstance(result, dict) else ""
+    base = (
+        "生成失败:参考图可能未通过内容审核(涉及敏感/暴露/性暗示等),"
+        "或该图不被模型接受。请更换参考图或调整提示词后重试。"
+    )
+    detail = msg.strip() or (f"code={code}" if code is not None else "")
+    return f"{base}(上游返回:{detail[:120]})" if detail else base
+
+
 # 常见图片格式的 base64 前缀(magic bytes 编码后的头),用来识别
 # chiyun gpt-image-2 直接把整张图当 base64 塞进 message.content 的情形。
 _B64_IMAGE_PREFIXES = (
@@ -1552,8 +1588,19 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
                 result = request_chat_completion(
                     f"{base_url}/v1/chat/completions", api_key, payload, timeout=300)
                 last_result = result
-                # 业务层错误码(200 外壳里的 code!=200)→ 换通道重试
                 biz_code = result.get("code") if isinstance(result, dict) else None
+                biz_msg = str(result.get("msg") or "") if isinstance(result, dict) else ""
+
+                # 确定性拒绝:内容审核未过 / 端点缺失等,重试再多次也必然同样结果。
+                # 立即失败,不再空耗——实测这类失败原本要重试满 4 次、白等十几分钟。
+                # 说明:gpt-image 的 chat/completions 通道对「未通过审核的参考图」
+                # 会把审核拒绝错误地包装成 404 "No endpoint POST /v1/chat/completions"
+                # (已由「同一 key 换张图即成功」证实),文案极具误导性,这里翻译成人话。
+                if _is_deterministic_reject(biz_code, biz_msg):
+                    add_event(job_id, f"Run {index}: 生成被拒(code={biz_code}),疑似参考图未通过内容审核")
+                    raise RuntimeError(_friendly_reject_message(result))
+
+                # 其它业务错误码(如瞬时通道抖动)→ 换通道重试
                 if biz_code not in (None, 200, "200"):
                     if soft_try < soft_attempts - 1:
                         add_event(job_id, f"Run {index}: 通道返回 code={biz_code},重试 {soft_try + 1}/{soft_attempts - 1}")
@@ -1568,7 +1615,10 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
                     add_event(job_id, f"Run {index}: 未解析到图片,重试 {soft_try + 1}/{soft_attempts - 1}")
                     time.sleep(min(2 ** soft_try, 8))
             if not items:
-                raise RuntimeError(f"No image result found: {last_result}")
+                # 到这里说明重试用尽仍无图(非确定性拒绝)。给友好提示,原始
+                # 响应记进日志备查,不再把整坨 raw JSON 甩给用户。
+                print(f"[nano] gpt-image-2 no result after retries: {str(last_result)[:500]}", flush=True)
+                raise RuntimeError(_friendly_reject_message(last_result))
             _ensure_output_dir(values, job_id)
             out_dir = resolve_output_dir(values.get("output_dir"))
             file_token_results = []
