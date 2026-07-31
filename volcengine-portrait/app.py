@@ -1109,7 +1109,9 @@ def handle_virtual_assets_post(handler):
         "ProjectName": PROJECT_NAME,
     }
     if data_name := (form.getfirst("name") or "").strip():
-        create_body["Name"] = data_name
+        # Ark caps Name at 64 chars; a long filename otherwise trips
+        # InvalidParameter.Name (HTTP 400). Truncate instead of failing.
+        create_body["Name"] = data_name[:64]
 
     result = openapi_call("CreateAsset", create_body, ak=ak, sk=sk)
     if "error" in result:
@@ -1129,6 +1131,9 @@ def handle_virtual_assets_post(handler):
             "group_id": group_id,
             "status": "processing",
             "file_name": fname,
+            # Record the type so generation can route asset:// to the right
+            # content field (image_url/video_url/audio_url) without a GetAsset.
+            "asset_type": asset_type,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "raw": result,
         }
@@ -1691,6 +1696,47 @@ def run_virtual_job(job_id):
     report_final_to_portal(job_id, final_status)
 
 
+def _asset_type_for(asset_id, cache=None):
+    """Resolve a virtual-portrait asset's AssetType (Image/Video/Audio).
+
+    The generation payload must reference an asset in the field matching its
+    real type: a Video asset put into content[].image_url.url is rejected by Ark
+    with "the specified asset is not an image" (HTTP 400). asset:// references
+    only carry the ID, so we look the type up.
+
+    Source order: (1) per-job cache, (2) in-memory ASSETS cache if it recorded a
+    type, (3) authoritative GetAsset. Falls back to "Image" only when everything
+    is unavailable — matching the historic assumption so pure-image jobs keep
+    working even if the lookup fails."""
+    if cache is not None and asset_id in cache:
+        return cache[asset_id]
+    atype = ""
+    with ASSET_LOCK:
+        local = ASSETS.get(asset_id)
+        if isinstance(local, dict):
+            atype = (local.get("asset_type") or "").strip()
+    if not atype:
+        result = openapi_call("GetAsset", {"Id": asset_id, "ProjectName": PROJECT_NAME})
+        if "error" not in result:
+            atype = (openapi_result(result).get("AssetType") or "").strip()
+    atype = atype or "Image"
+    if cache is not None:
+        cache[asset_id] = atype
+    return atype
+
+
+def _asset_content_item(asset_id, cache=None):
+    """Build one content[] entry for an asset:// reference, routed to the
+    image_url / video_url / audio_url field that matches the asset's type."""
+    atype = _asset_type_for(asset_id, cache=cache).lower()
+    url = f"asset://{asset_id}"
+    if atype == "video":
+        return {"type": "video_url", "video_url": {"url": url}, "role": "reference_video"}
+    if atype == "audio":
+        return {"type": "audio_url", "audio_url": {"url": url}, "role": "reference_audio"}
+    return {"type": "image_url", "image_url": {"url": url}, "role": "reference_image"}
+
+
 def _run_virtual_job_impl(job_id, job):
     api_key = job.get("api_key")
     asset_id = job.get("asset_id", "")
@@ -1708,17 +1754,23 @@ def _run_virtual_job_impl(job_id, job):
         job["started_at"] = time.time()
         job["events"].append({"time": time.strftime("%H:%M:%S"), "message": "开始提交生成任务..."})
 
+    # Resolve each asset's real type once per job (image/video/audio) so a video
+    # or audio virtual-portrait asset is referenced in the matching content field
+    # instead of being force-fitted into image_url (which Ark rejects with
+    # "the specified asset is not an image").
+    asset_type_cache: dict[str, str] = {}
+
     for idx in range(repeat_count):
-        # Build content array: text prompt + reference images
+        # Build content array: text prompt + reference assets
         images = []
-        # 图1: asset_id (required)
-        images.append({"type": "image_url", "image_url": {"url": f"asset://{asset_id}"}, "role": "reference_image"})
+        # 图1: asset_id (required) — routed by its real AssetType
+        images.append(_asset_content_item(asset_id, cache=asset_type_cache))
 
         # 图2+：先按顺序加入所有 extra asset 资产，再加入上传的 extras。两者不再互斥。
         for aid in extra_asset_ids:
             if not aid or not isinstance(aid, str):
                 continue
-            images.append({"type": "image_url", "image_url": {"url": f"asset://{aid}"}, "role": "reference_image"})
+            images.append(_asset_content_item(aid, cache=asset_type_cache))
         for eiu in extra_image_urls:
             mt = (eiu.get("mime_type") or "image/png").lower()
             if mt.startswith("video/"):
