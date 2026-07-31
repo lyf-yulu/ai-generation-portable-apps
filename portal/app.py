@@ -971,7 +971,22 @@ class UsageTracker:
                         nested = data.get("job") if isinstance(data.get("job"), dict) else {}
                         status = data.get("status") or nested.get("status") or ""
                         if status in ("succeeded", "failed", "completed"):
-                            done = max(1, int(data.get("done") or nested.get("done") or 0))
+                            # `done` is the count of items the sub-app actually
+                            # produced (each successful item does JOBS[id]["done"] += 1),
+                            # independent of the final status: a partial success
+                            # (e.g. 3 of 4 images, final_status="failed") still
+                            # reports done=3, and those 3 were really generated and
+                            # billed. A pure failure reports done=0.
+                            #
+                            # We record the real `done` verbatim. Do NOT floor it to
+                            # max(1, ...) — that turned a 0-output failure into one
+                            # phantom image in by_user.images (the poll loop only sees
+                            # a job here when the sub-app's finalize_job callback failed
+                            # to land, so failures do reach this branch). We already
+                            # count and roll back the *job* separately in daily.jobs via
+                            # inc_daily_jobs/finalize_job; this branch is only for the
+                            # per-item images/seconds tally.
+                            done = int(data.get("done") or nested.get("done") or 0)
                             # Re-derive job_type from response when possible — dreamina
                             # retry endpoints may have been misclassified at register time.
                             # Only override if task_type carries explicit signal; otherwise
@@ -983,15 +998,20 @@ class UsageTracker:
                                 job_type = "video"
                             elif "text2image" in task_type or "image2image" in task_type:
                                 job_type = "image"
-                            if job_type == "video":
-                                # Prefer per-item duration the subapp reports directly.
-                                per_item = (int(data.get("duration") or 0)
-                                            or int(data.get("duration_seconds") or 0)
-                                            or int(nested.get("duration") or 0)
-                                            or int(job.get("duration_per_item") or 0))
-                                self._add_user_stat(job["date"], job["username"], job["app"], 0, done * per_item)
-                            else:
-                                self._add_user_stat(job["date"], job["username"], job["app"], done, 0)
+                            # done <= 0 means the job produced nothing (pure
+                            # failure). Skip the stat write entirely — no phantom
+                            # image, no meaningless 0-row — but still drop it from
+                            # pending below so we stop polling it.
+                            if done > 0:
+                                if job_type == "video":
+                                    # Prefer per-item duration the subapp reports directly.
+                                    per_item = (int(data.get("duration") or 0)
+                                                or int(data.get("duration_seconds") or 0)
+                                                or int(nested.get("duration") or 0)
+                                                or int(job.get("duration_per_item") or 0))
+                                    self._add_user_stat(job["date"], job["username"], job["app"], 0, done * per_item)
+                                else:
+                                    self._add_user_stat(job["date"], job["username"], job["app"], done, 0)
                             done_ids.append(job["job_id"])
                     conn.close()
                 except Exception:
@@ -1950,6 +1970,7 @@ class Handler(SimpleHTTPRequestHandler):
         if is_job and spec is not None:
             job_type = classify_job_type(spec, target_path)
 
+        conn = None
         try:
             body = None
             if method in {"POST", "PUT", "PATCH", "DELETE"}:
@@ -1959,7 +1980,13 @@ class Handler(SimpleHTTPRequestHandler):
 
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=300)
             headers: dict[str, str] = {}
+            # Range must be forwarded so <video> scrubbing / resumable downloads
+            # of 50-200MB media work: the browser sends Range, sub-apps' serve_file
+            # already answers 206 + Content-Range, and the response side streams
+            # headers through verbatim. Without forwarding the request Range, the
+            # sub-app always returns 200 full-body and seeking re-downloads the clip.
             for key in ("Content-Type", "Content-Length", "Accept", "Accept-Encoding",
+                        "Range", "If-Range",
                         "X-Workspace-Id", "X-Api-Key", "X-Access-Key", "X-Secret-Key"):
                 val = self.headers.get(key)
                 if val:
@@ -2073,8 +2100,6 @@ class Handler(SimpleHTTPRequestHandler):
                 self._cors_headers()
                 self.end_headers()
                 shutil.copyfileobj(resp, self.wfile, length=65536)
-
-            conn.close()
         except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
             pass
         except Exception as exc:
@@ -2083,6 +2108,16 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(502, {"ok": False, "error": f"proxy error: {msg}"})
             except (BrokenPipeError, ConnectionResetError, ssl.SSLError, OSError):
                 pass
+        finally:
+            # Always release the upstream connection. Previously conn.close() sat
+            # on the normal path only, so a client disconnect mid-copyfileobj
+            # (BrokenPipe) jumped to except and leaked the http.client socket to
+            # the sub-app — fds/connections accumulated over repeated aborts.
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     # ── Static file serving ───────────────────────────────────────────────────
 

@@ -244,6 +244,36 @@ JOBS: dict[str, dict[str, Any]] = {}
 LOCK = threading.Lock()
 STATE_LOCK = threading.Lock()
 ACCOUNTS_LOCK = threading.Lock()  # protects accounts.json read/write
+
+# JOBS is in-memory and used to be unbounded: every job stayed forever. We evict
+# *finished* jobs once JOBS exceeds MAX_JOBS. JOB_PRUNE_GRACE_SECONDS interlocks
+# with Portal's usage tracker (polls GET /api/jobs/<id> every 15s, credits
+# by_user.images only on a terminal status) — 600s >> the poll cycle guarantees
+# a finished job is counted before we evict it. dreamina's terminal statuses are
+# "completed"/"failed" and it stamps finished_epoch (float) at completion.
+MAX_JOBS = 500
+JOB_PRUNE_GRACE_SECONDS = 600
+_TERMINAL_JOB_STATUSES = ("completed", "failed", "succeeded")
+
+
+def _prune_jobs_locked() -> None:
+    """Evict old finished jobs when JOBS exceeds MAX_JOBS. Caller must hold LOCK.
+    Running/pending jobs are never touched; the grace window ensures Portal's
+    usage poller has already counted anything we evict."""
+    if len(JOBS) <= MAX_JOBS:
+        return
+    now = time.time()
+    evictable = [
+        (job.get("finished_epoch") or 0, jid)
+        for jid, job in JOBS.items()
+        if job.get("status") in _TERMINAL_JOB_STATUSES
+        and (now - (job.get("finished_epoch") or now)) > JOB_PRUNE_GRACE_SECONDS
+    ]
+    evictable.sort(key=lambda t: t[0])
+    for _, jid in evictable:
+        if len(JOBS) <= MAX_JOBS:
+            break
+        JOBS.pop(jid, None)
 LOGIN_PROC: subprocess.Popen | None = None
 LOGIN_LOCK = threading.Lock()
 EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
@@ -2331,6 +2361,7 @@ class Handler(SimpleHTTPRequestHandler):
 
         with LOCK:
             JOBS[job_id] = job
+            _prune_jobs_locked()
 
         prompt_text = str(fields.get("prompt") or "").strip()
         record_activity({
@@ -2512,6 +2543,7 @@ class Handler(SimpleHTTPRequestHandler):
         }
         with LOCK:
             JOBS[new_job_id] = new_job
+            _prune_jobs_locked()
         prompt_text = str(fields.get("prompt") or "").strip()
         record_activity({
             "id": new_activity_id,

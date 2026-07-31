@@ -495,6 +495,20 @@ TERMINAL_STATUSES = {"succeeded", "success", "failed", "fail", "failure", "cance
 JOBS: dict[str, dict[str, Any]] = {}
 FILES: dict[str, Path] = {}
 JOBS_LOCK = threading.Lock()
+
+# JOBS is in-memory and used to be unbounded: every job (with its results/events/
+# errors) stayed forever, so a service machine running for weeks only ever grew.
+# We now evict *finished* jobs once the dict exceeds MAX_JOBS.
+#
+# JOB_PRUNE_GRACE_SECONDS is the safety interlock for usage stats: Portal's
+# tracker polls GET /api/jobs/<id> every 15s and only credits by_user.images
+# once it observes a terminal status. Evicting a finished job too early would
+# hand Portal a 404 -> the job is never counted and is silently dropped at its
+# 7200s timeout (a stats *under*-count). 600s is far beyond the 15s poll cycle,
+# so anything we evict has certainly been counted already.
+MAX_JOBS = 500
+JOB_PRUNE_GRACE_SECONDS = 600
+_TERMINAL_JOB_STATUSES = ("succeeded", "failed", "completed")
 STATE_LOCK = threading.Lock()
 ACTIVITY_LIMIT = 100
 
@@ -1506,6 +1520,28 @@ def set_job(job_id: str, **updates: Any) -> None:
         JOBS[job_id].update(updates)
 
 
+def _prune_jobs_locked() -> None:
+    """Evict old finished jobs when JOBS exceeds MAX_JOBS. Caller must hold
+    JOBS_LOCK. Only terminal jobs past the grace window are candidates —
+    running/queued jobs are never touched, and the grace window guarantees
+    Portal's usage poller has already counted them (see MAX_JOBS comment)."""
+    if len(JOBS) <= MAX_JOBS:
+        return
+    now = time.time()
+    evictable = [
+        (job.get("finished_at") or 0, jid)
+        for jid, job in JOBS.items()
+        if job.get("status") in _TERMINAL_JOB_STATUSES
+        and (now - (job.get("finished_at") or now)) > JOB_PRUNE_GRACE_SECONDS
+    ]
+    # Oldest finished first; stop as soon as we are back under the cap.
+    evictable.sort(key=lambda t: t[0])
+    for _, jid in evictable:
+        if len(JOBS) <= MAX_JOBS:
+            break
+        JOBS.pop(jid, None)
+
+
 def add_event(job_id: str, message: str) -> None:
     with JOBS_LOCK:
         JOBS[job_id].setdefault("events", []).append({"time": time.strftime("%H:%M:%S"), "message": message})
@@ -1894,6 +1930,7 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
             "started_at": None,
             "finished_at": None,
         }
+        _prune_jobs_locked()
     response = job_id_response(job_id)
     record_activity({
         "id": activity_id,

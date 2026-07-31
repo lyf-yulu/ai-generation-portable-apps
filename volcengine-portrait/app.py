@@ -394,6 +394,35 @@ JOBS_LOCK = threading.Lock()
 GROUP_LOCK = threading.Lock()
 ASSET_LOCK = threading.Lock()
 FILES_LOCK = threading.Lock()
+
+# JOBS is in-memory and used to be unbounded. We evict *finished* jobs once JOBS
+# exceeds MAX_JOBS (this also drops the per-job api_key copy from memory sooner).
+# JOB_PRUNE_GRACE_SECONDS interlocks with Portal's usage tracker (polls
+# GET /api/jobs/<id> every 15s, credits by_user.images only on a terminal
+# status) — 600s >> the poll cycle guarantees a job is counted before eviction.
+MAX_JOBS = 500
+JOB_PRUNE_GRACE_SECONDS = 600
+_TERMINAL_JOB_STATUSES = ("succeeded", "failed", "completed")
+
+
+def _prune_jobs_locked() -> None:
+    """Evict old finished jobs when JOBS exceeds MAX_JOBS. Caller must hold
+    JOBS_LOCK. Running/queued jobs are never touched; the grace window ensures
+    Portal's usage poller has already counted anything we evict."""
+    if len(JOBS) <= MAX_JOBS:
+        return
+    now = time.time()
+    evictable = [
+        (job.get("finished_at") or 0, jid)
+        for jid, job in JOBS.items()
+        if job.get("status") in _TERMINAL_JOB_STATUSES
+        and (now - (job.get("finished_at") or now)) > JOB_PRUNE_GRACE_SECONDS
+    ]
+    evictable.sort(key=lambda t: t[0])
+    for _, jid in evictable:
+        if len(JOBS) <= MAX_JOBS:
+            break
+        JOBS.pop(jid, None)
 ACTIVITY_LOCK = threading.Lock()
 
 
@@ -1585,6 +1614,7 @@ def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
             "api_key": api_key,
             "output_dir": output_dir_str,
         }
+        _prune_jobs_locked()
     title = (prompt or "").strip()[:80] or f"{task_type} task"
     record_activity({
         "id": activity_id,

@@ -384,10 +384,15 @@ function DreaminaApp() {
     async saveDreaminaToClient(files) {
       try {
         let saved = 0;
+        let failed = 0;
         for (const f of files) {
           const url = '/dreamina/' + f.replace(/^\//, '');
           const filename = f.split('/').pop();
           const resp = await fetch(url);
+          // Guard resp.ok like _blobDownload does: without this a 404/500
+          // error page (HTML/JSON) gets written to disk as if it were the
+          // image/video, handing the user a corrupt file with no warning.
+          if (!resp.ok) { failed++; continue; }
           const blob = await resp.blob();
           const fh = await this.dirHandle.getFileHandle(filename, { create: true });
           const w = await fh.createWritable();
@@ -395,9 +400,12 @@ function DreaminaApp() {
           await w.close();
           saved++;
         }
-        if (saved) this.statusText = `已保存 ${saved} 个文件到 ${this.outputDir}`;
+        if (saved && failed) this.statusText = `已保存 ${saved} 个文件到 ${this.outputDir}，${failed} 个失败`;
+        else if (saved) this.statusText = `已保存 ${saved} 个文件到 ${this.outputDir}`;
+        else if (failed) this.statusText = `保存失败：${failed} 个文件无法下载`;
       } catch (e) {
         console.warn('saveDreaminaToClient failed:', e);
+        this.statusText = '保存到本地失败：' + (e && e.message ? e.message : e);
       }
     },
 
