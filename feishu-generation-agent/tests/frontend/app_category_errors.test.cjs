@@ -270,3 +270,57 @@ test("approval view distinguishes blocking document and nonblocking asset issues
   );
   assert.equal(app.getNode("vision-issues").hidden, false);
 });
+
+test("failed runs show the safe provider error in the review panel", async () => {
+  const runView = {
+    run_id: "run-provider-error",
+    thread_id: "thread-provider-error",
+    source_url: "https://acme.feishu.cn/docx/provider-error",
+    status: "failed",
+    events: [],
+    privacy: {},
+    execution_records: [{
+      task_id: "task-video",
+      provider: "seedance",
+      status: "submission_uncertain",
+      error: {
+        category: "provider_terminal_error",
+        message: "生成服务拒绝了请求",
+        retryable: false,
+        code: "submit_http_400",
+      },
+    }],
+    approval: {
+      document_title: "供应商错误测试",
+      revision: 1,
+      document_summary: "",
+      tasks: [],
+      media_assets: [],
+      excluded_assets: [],
+      coverage: {},
+      validation_issues: [],
+      ingest_issue_records: [],
+      vision_issues: [],
+    },
+  };
+  const app = await loadApp(async (url) => {
+    if (url === "/api/health") {
+      return jsonResponse(200, { modes: { bitable: true } });
+    }
+    if (url === "/api/bitable/recent-runs") return jsonResponse(200, []);
+    if (url === "/api/bitable/active-runs") {
+      return jsonResponse(200, [{ run_id: runView.run_id }]);
+    }
+    if (url === `/api/runs/${runView.run_id}`) {
+      return jsonResponse(200, runView);
+    }
+    if (url.startsWith("/api/bitable/tasks?")) return jsonResponse(200, []);
+    throw new Error(`unexpected request: ${url}`);
+  });
+
+  assert.equal(
+    app.getNode("execution-errors").textContent,
+    "生成失败：Seedance：生成服务拒绝了请求（submit_http_400）",
+  );
+  assert.equal(app.getNode("execution-errors").hidden, false);
+});

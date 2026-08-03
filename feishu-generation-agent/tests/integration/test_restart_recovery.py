@@ -215,7 +215,7 @@ async def test_retry_delivery_does_not_resume_generation(tmp_path: Path) -> None
     await runtime.retry_delivery("run-delivery")
     final = await runtime.wait_for_terminal("run-delivery", timeout=1)
 
-    assert final["status"] == "completed_with_errors"
+    assert final["status"] == "failed"
     assert writer.retry_calls == 1
     assert graph.resume_calls == 0
     assert graph.submit_calls == 0
@@ -323,7 +323,7 @@ async def test_restart_during_delivery_retry_continues_delivery_only(
     await runtime.resume_pending_runs()
     final = await runtime.wait_for_terminal("run-delivery", timeout=1)
 
-    assert final["status"] == "completed_with_errors"
+    assert final["status"] == "failed"
     assert writer.retry_calls == 1
     assert graph.resume_calls == 0
     assert graph.submit_calls == 0

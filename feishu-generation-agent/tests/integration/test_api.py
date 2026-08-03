@@ -545,6 +545,46 @@ async def test_run_view_exposes_safe_chinese_validation_field_paths(
     assert raw_prompt not in view.text
 
 
+async def test_run_view_exposes_safe_execution_errors(tmp_path: Path) -> None:
+    async with _environment(tmp_path) as (client, runtime, graph, repository):
+        del runtime, repository
+        created = await client.post(
+            "/api/runs",
+            json={"source_url": "https://tenant.feishu.cn/docx/provider-error"},
+        )
+        run_id = created.json()["run_id"]
+        await _wait_for_status(client, run_id, "waiting_approval")
+        thread_id = graph.states[next(iter(graph.states))]["thread_id"]
+        graph.states[thread_id].update(
+            status="failed",
+            execution_records=[
+                {
+                    "task_id": "task-1",
+                    "provider": "seedance",
+                    "provider_task_id": None,
+                    "status": "submission_uncertain",
+                    "error": {
+                        "category": "provider_terminal_error",
+                        "message": "生成服务拒绝了请求",
+                        "retryable": False,
+                        "code": "submit_http_400",
+                    },
+                }
+            ],
+        )
+        await graph.repository.update_run_status(run_id, "failed")
+
+        view = await client.get(f"/api/runs/{run_id}")
+
+    assert view.status_code == 200
+    assert view.json()["execution_records"][0]["error"] == {
+        "category": "provider_terminal_error",
+        "message": "生成服务拒绝了请求",
+        "retryable": False,
+        "code": "submit_http_400",
+    }
+
+
 async def test_run_and_reference_routes_hide_user_a_run_from_user_b(
     tmp_path: Path,
 ) -> None:

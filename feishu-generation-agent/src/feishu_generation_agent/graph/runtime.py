@@ -388,7 +388,7 @@ class GraphRuntime:
                 raise RunConflict("交付重试未配置")
             record = await self.delivery_writer.retry_delivery(run_id)
             artifacts = await self.repository.list_artifacts(run_id)
-            final_status = "succeeded" if artifacts else "completed_with_errors"
+            final_status = "succeeded" if artifacts else "failed"
             await self._graph_aupdate_state(
                 self._config(thread_id),
                 {
@@ -586,6 +586,7 @@ class GraphRuntime:
                 }
                 for operation in operations
             ],
+            "execution_records": state.get("execution_records", []),
             "artifacts": [
                 {
                     "artifact_id": artifact.artifact_id,

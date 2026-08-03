@@ -712,11 +712,66 @@ async def check_source_revision(
 
 def _execution_error(exc: BaseException) -> dict[str, object]:
     safe = _safe_error(exc).detail
-    return {
+    result: dict[str, object] = {
         "category": safe.category.value,
-        "message": safe.message,
+        "message": _safe_execution_message(safe.category),
         "retryable": safe.retryable,
     }
+    if isinstance(exc, AgentError):
+        code = _safe_execution_code(exc.detail.technical_detail)
+        if code is not None:
+            result["code"] = code
+    return result
+
+
+def _safe_execution_message(category: ErrorCategory) -> str:
+    return {
+        ErrorCategory.CONFIGURATION: "生成服务配置不完整",
+        ErrorCategory.PERMISSION: "生成服务凭证无效或权限不足",
+        ErrorCategory.DOCUMENT: "参考素材无法用于生成",
+        ErrorCategory.VALIDATION: "生成参数不符合供应商要求",
+        ErrorCategory.TRANSIENT: "生成服务暂时不可用，请稍后重试",
+        ErrorCategory.PROVIDER_TERMINAL: "生成服务拒绝了请求",
+        ErrorCategory.DELIVERY: "生成结果交付失败",
+    }[category]
+
+
+def _safe_execution_code(technical_detail: str) -> str | None:
+    fields: dict[str, str] = {}
+    for part in technical_detail.split(";"):
+        key, separator, value = part.strip().partition("=")
+        normalized = value.strip().lower().replace("-", "_")
+        if (
+            separator
+            and key.strip() in {"operation", "status", "cause"}
+            and normalized
+            and normalized.replace("_", "").isalnum()
+            and len(normalized) <= 48
+        ):
+            fields[key.strip()] = normalized
+    operation = fields.get("operation", "generation")
+    if "status" in fields:
+        return f"{operation}_http_{fields['status']}"
+    if "cause" in fields:
+        return f"{operation}_{fields['cause']}"
+    return None
+
+
+_OUTPUT_SLOT_MARKER = "::output:"
+
+
+def _execution_units(task: GenerationTask) -> list[GenerationTask]:
+    if task.task_type is not TaskType.IMAGE_TO_VIDEO or task.output_count == 1:
+        return [task]
+    return [
+        task.model_copy(
+            update={
+                "task_id": f"{task.task_id}{_OUTPUT_SLOT_MARKER}{index}",
+                "output_count": 1,
+            }
+        )
+        for index in range(1, task.output_count + 1)
+    ]
 
 
 def _provider_terminal_error(message: str) -> AgentError:
@@ -1401,21 +1456,31 @@ async def execute_selected_tasks(
                 language_validation_message(issues)
                 or "The approved plan is not valid"
             )
-        task_assets = [(task, _task_assets(task, document)) for task in plan.tasks]
-
         records: list[ExecutionRecord] = []
         artifacts: list[Artifact] = []
-        for task, assets in task_assets:
-            record, task_artifacts = await _execute_one_task(
-                services, run_id, task, assets
+        for task in plan.tasks:
+            assets = _task_assets(task, document)
+            unit_results = await asyncio.gather(
+                *(
+                    _execute_one_task(services, run_id, unit, assets)
+                    for unit in _execution_units(task)
+                )
             )
-            records.append(record)
-            artifacts.extend(task_artifacts)
+            for record, task_artifacts in unit_results:
+                records.append(record)
+                artifacts.extend(task_artifacts)
         all_succeeded = all(record.status == "succeeded" for record in records)
+        status = (
+            "verification_pending"
+            if all_succeeded
+            else "completed_with_errors"
+            if artifacts
+            else "failed"
+        )
         return {
             "execution_records": [_json_model(record) for record in records],
             "artifacts": [_json_model(artifact) for artifact in artifacts],
-            "status": "verification_pending" if all_succeeded else "completed_with_errors",
+            "status": status,
         }
 
     return await _run_node(
@@ -1441,12 +1506,17 @@ async def verify_and_download_artifacts(
             ExecutionRecord.model_validate(item)
             for item in state.get("execution_records", [])
         ]
+        plan_tasks = TaskPlan(
+            tasks=state.get("approved_tasks", []), document_summary=""
+        ).tasks
         tasks = {
-            task.task_id: task
-            for task in TaskPlan(
-                tasks=state.get("approved_tasks", []), document_summary=""
-            ).tasks
+            unit.task_id: unit
+            for task in plan_tasks
+            for unit in _execution_units(task)
         }
+        record_ids = [record.task_id for record in records]
+        if len(record_ids) != len(set(record_ids)) or set(record_ids) != set(tasks):
+            raise _provider_terminal_error("生成产物记录不一致")
         successful = {record.task_id: record for record in records
                       if record.status == "succeeded"}
         if any(artifact.task_id not in successful for artifact in artifacts):
@@ -1475,12 +1545,16 @@ async def verify_and_download_artifacts(
             ):
                 raise _provider_terminal_error("生成产物记录或文件校验失败")
             verified.extend(state_items)
-        status = state.get("status")
+        all_succeeded = len(successful) == len(records)
         return {
             "artifacts": [_json_model(artifact) for artifact in verified],
-            "status": "succeeded"
-            if status == "verification_pending"
-            else "completed_with_errors",
+            "status": (
+                "succeeded"
+                if all_succeeded
+                else "completed_with_errors"
+                if verified
+                else "failed"
+            ),
         }
 
     return await _run_node(
@@ -1534,6 +1608,6 @@ async def deliver_to_feishu(
     )
     return {
         "delivery_record": _json_model(record),
-        "status": "succeeded" if artifacts else "completed_with_errors",
+        "status": "succeeded" if artifacts else "failed",
         "last_error": None,
     }

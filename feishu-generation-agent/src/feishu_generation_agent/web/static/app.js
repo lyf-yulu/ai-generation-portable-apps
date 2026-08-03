@@ -1084,6 +1084,24 @@
     byId("langsmith-warning").hidden = !view.privacy?.langsmith_tracing;
     renderEvents(view.events);
 
+    const providerNames = {
+      seedance: "Seedance",
+      chiyun: "Chiyun",
+      volcengine_portrait: "真人视频",
+    };
+    const executionErrors = (view.execution_records || [])
+      .filter((record) => record?.error?.message)
+      .map((record) => {
+        const provider = providerNames[record.provider] || record.provider || "生成服务";
+        const code = record.error.code ? `（${record.error.code}）` : "";
+        return `${provider}：${record.error.message}${code}`;
+      });
+    const executionErrorBox = byId("execution-errors");
+    executionErrorBox.textContent = executionErrors.length
+      ? `生成失败：${executionErrors.join("；")}`
+      : "";
+    executionErrorBox.hidden = executionErrors.length === 0;
+
     const ingestIssueRecords = view.approval.ingest_issue_records || [];
     const blockingIngestIssues = ingestIssueRecords
       .filter((record) => record.severity === "blocking")

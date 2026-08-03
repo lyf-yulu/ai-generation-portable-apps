@@ -452,6 +452,29 @@ class _PerTaskVideoGenerator:
         raise AssertionError("immediate result must not poll")
 
 
+class _ConcurrentVideoGenerator(_PerTaskVideoGenerator):
+    def __init__(self, expected_starts: int) -> None:
+        super().__init__()
+        self.expected_starts = expected_starts
+        self.all_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def submit(self, task, assets, *, submission_id=None):
+        del assets
+        assert isinstance(submission_id, str)
+        self.submit_calls += 1
+        self.submitted_task_ids.append(task.task_id)
+        if self.submit_calls == self.expected_starts:
+            self.all_started.set()
+        await self.release.wait()
+        return _submission(
+            "seedance",
+            f"official-{task.task_id}",
+            "succeeded",
+            result=_video_result(),
+        )
+
+
 @pytest.mark.asyncio
 async def test_only_selected_task_runs_after_formal_approval(
     fake_services: GraphServices,
@@ -494,6 +517,45 @@ async def test_only_selected_task_runs_after_formal_approval(
 
 
 @pytest.mark.asyncio
+async def test_video_output_count_fans_out_to_one_seedance_job_per_output(
+    fake_services: GraphServices,
+) -> None:
+    video = _ConcurrentVideoGenerator(expected_starts=3)
+    services = replace(fake_services, video_generator=video)
+    state, config = await _waiting_state(
+        services, "run-video-fanout", "thread-video-fanout"
+    )
+    task = {
+        **state["draft_plan"]["tasks"][0],
+        "output_count": 3,
+    }
+    state["approved_tasks"] = [task]
+
+    execution = asyncio.create_task(
+        execute_selected_tasks(state, config, services=services)
+    )
+    await asyncio.wait_for(video.all_started.wait(), timeout=1)
+    video.release.set()
+    executed = await execution
+    verified = await verify_and_download_artifacts(
+        {**state, **executed}, config, services=services
+    )
+
+    assert video.submitted_task_ids == [
+        "task-video::output:1",
+        "task-video::output:2",
+        "task-video::output:3",
+    ]
+    assert [record["status"] for record in executed["execution_records"]] == [
+        "succeeded",
+        "succeeded",
+        "succeeded",
+    ]
+    assert len(verified["artifacts"]) == 3
+    assert verified["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
 async def test_preexisting_intent_is_uncertain_without_provider_calls(
     fake_services: GraphServices,
 ) -> None:
@@ -520,7 +582,7 @@ async def test_preexisting_intent_is_uncertain_without_provider_calls(
         config=config,
     )
 
-    assert result["status"] == "completed_with_errors"
+    assert result["status"] == "failed"
     assert result["execution_records"][0]["status"] == "intent_created"
     assert fake_services.delivery_writer.deliver_calls == 0
     assert result["delivery_record"] is None
@@ -621,7 +683,7 @@ async def test_seedance_submit_error_is_uncertain_and_never_retried(
         config=config,
     )
 
-    assert result["status"] == "completed_with_errors"
+    assert result["status"] == "failed"
     assert result["execution_records"][0]["status"] == "submission_uncertain"
     assert video.submit_calls == 1
     assert video.poll_calls == 0
@@ -663,7 +725,7 @@ async def test_local_submit_validation_failure_is_failed_without_delivery(
         config=config,
     )
 
-    assert result["status"] == "completed_with_errors"
+    assert result["status"] == "failed"
     assert result["execution_records"][0]["status"] == "failed"
     assert result["artifacts"] == []
     assert services.delivery_writer.deliver_calls == 0
@@ -908,11 +970,44 @@ async def test_exact_output_count_mismatch_fails_task_after_submission(
 
     assert result["execution_records"][0]["status"] == "failed"
     assert result["artifacts"] == []
+    assert result["status"] == "failed"
     operation = await services.repository.get_operation(
         "run-count-mismatch", "task-video", "submit"
     )
     assert operation is not None
     assert operation["phase"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_provider_rejection_exposes_only_safe_actionable_error(
+    fake_services: GraphServices,
+) -> None:
+    provider_error = AgentError(
+        ErrorDetail(
+            category=ErrorCategory.PROVIDER_TERMINAL,
+            message="Seedance 拒绝了请求",
+            technical_detail="operation=submit; status=400",
+            retryable=False,
+        )
+    )
+    video = _ScriptedGenerator("seedance", submit_error=provider_error)
+    services = replace(fake_services, video_generator=video)
+    state, config = await _waiting_state(
+        services, "run-safe-provider-error", "thread-safe-provider-error"
+    )
+    state["approved_tasks"] = state["draft_plan"]["tasks"]
+
+    result = await execute_selected_tasks(state, config, services=services)
+
+    error = result["execution_records"][0]["error"]
+    assert result["status"] == "failed"
+    assert error == {
+        "category": "provider_terminal_error",
+        "message": "生成服务拒绝了请求",
+        "retryable": False,
+        "code": "submit_http_400",
+    }
+    assert "technical_detail" not in error
 
 
 @pytest.mark.asyncio
@@ -1073,7 +1168,7 @@ async def test_failed_artifact_repair_does_not_break_final_verification(
         merged, config, services=failed_services
     )
 
-    assert verified["status"] == "completed_with_errors"
+    assert verified["status"] == "failed"
     assert verified["artifacts"] == []
     assert await services.repository.list_artifacts(run_id) == []
 
@@ -1198,7 +1293,7 @@ async def test_loser_verification_never_deletes_concurrent_winner_artifact(
         loser_state, config, services=fake_services
     )
 
-    assert verified["status"] == "completed_with_errors"
+    assert verified["status"] == "failed"
     persisted = await fake_services.repository.list_artifacts(run_id)
     assert len(persisted) == 1
     assert fake_services.file_store.verify_artifact(run_id, persisted[0])
