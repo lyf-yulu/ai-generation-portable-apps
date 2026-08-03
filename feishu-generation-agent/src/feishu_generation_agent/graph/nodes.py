@@ -743,13 +743,20 @@ def _safe_execution_code(technical_detail: str) -> str | None:
         normalized = value.strip().lower().replace("-", "_")
         if (
             separator
-            and key.strip() in {"operation", "status", "cause"}
+            and key.strip() in {
+                "operation",
+                "status",
+                "cause",
+                "provider_code",
+            }
             and normalized
-            and normalized.replace("_", "").isalnum()
+            and normalized.replace("_", "").replace(".", "").isalnum()
             and len(normalized) <= 48
         ):
             fields[key.strip()] = normalized
     operation = fields.get("operation", "generation")
+    if "provider_code" in fields:
+        return f"{operation}_{fields['provider_code']}"
     if "status" in fields:
         return f"{operation}_http_{fields['status']}"
     if "cause" in fields:

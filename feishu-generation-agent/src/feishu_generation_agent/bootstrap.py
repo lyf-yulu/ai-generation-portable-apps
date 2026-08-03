@@ -42,7 +42,10 @@ from feishu_generation_agent.integrations.safe_download import (
     SafeResultDownloader,
 )
 from feishu_generation_agent.integrations.seedance import SeedanceVideoGenerator
-from feishu_generation_agent.integrations.public_media import UguuPublicMediaHost
+from feishu_generation_agent.integrations.public_media import (
+    TosPublicMediaHost,
+    UguuPublicMediaHost,
+)
 from feishu_generation_agent.integrations.volcengine_portrait import (
     VolcengineAssetClient,
     VolcenginePortraitVideoGenerator,
@@ -226,6 +229,19 @@ async def _open_application_services(
             settings.data_dir / "provider-results",
             max_item_bytes=settings.max_download_bytes,
         )
+        animation_media_host = UguuPublicMediaHost(provider_http)
+        if (
+            settings.volcengine_access_key is not None
+            and settings.volcengine_secret_key is not None
+            and settings.tos_bucket
+        ):
+            animation_media_host = TosPublicMediaHost(
+                provider_http,
+                access_key=settings.volcengine_access_key.get_secret_value(),
+                secret_key=settings.volcengine_secret_key.get_secret_value(),
+                bucket=settings.tos_bucket,
+                region=settings.tos_region,
+            )
         portrait_generator = None
         if capability_is_configured(settings, "portrait_generation"):
             portrait_store = await PortraitAssetStore.open(
@@ -384,7 +400,7 @@ async def _open_application_services(
                 base_url=settings.ark_base_url,
                 api_key=settings.ark_api_key,
                 model=settings.seedance_model,
-                public_media_host=UguuPublicMediaHost(provider_http),
+                public_media_host=animation_media_host,
             ),
             portrait_video_generator=portrait_generator,
             production_task_store=production_store if production_bitable_configured else None,

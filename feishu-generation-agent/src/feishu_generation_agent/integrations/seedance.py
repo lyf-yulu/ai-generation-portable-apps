@@ -158,13 +158,25 @@ class SeedanceVideoGenerator:
             references, ordered_assets, contents, strict=True
         ):
             if asset.mime_type.startswith("image/"):
-                if self._image_url_resolver is None:
-                    encoded = base64.b64encode(content).decode("ascii")
-                    url = f"data:{asset.mime_type};base64,{encoded}"
-                else:
+                if self._image_url_resolver is not None:
                     url = await self._image_url_resolver(task, reference, asset, content)
                     if not isinstance(url, str) or not url.startswith("asset://"):
                         raise self._validation_error(task.task_id, "真人资产引用无效", "cause=invalid_asset_url")
+                elif self._public_media_host is not None:
+                    try:
+                        url = await self._public_media_host.upload(
+                            content, asset.local_path.name, asset.mime_type
+                        )
+                    except PublicMediaUploadError as exc:
+                        raise self._error(
+                            ErrorCategory.TRANSIENT,
+                            str(exc),
+                            "operation=public_media_upload",
+                            retryable=True,
+                        ) from None
+                else:
+                    encoded = base64.b64encode(content).decode("ascii")
+                    url = f"data:{asset.mime_type};base64,{encoded}"
                 request_content.append({"type": "image_url", "image_url": {"url": url}, "role": reference.role})
                 continue
             if self._public_media_host is None:
@@ -295,7 +307,12 @@ class SeedanceVideoGenerator:
                 follow_redirects=False,
             ) as response:
                 if not 200 <= response.status_code < 300:
-                    raise self._http_error(operation, response.status_code)
+                    provider_code = await self._safe_provider_error_code(response)
+                    raise self._http_error(
+                        operation,
+                        response.status_code,
+                        provider_code=provider_code,
+                    )
                 declared_size = response.headers.get("content-length")
                 if declared_size is not None:
                     try:
@@ -341,6 +358,33 @@ class SeedanceVideoGenerator:
                 f"operation={operation}; cause=non_object_json",
             )
         return payload
+
+    @staticmethod
+    async def _safe_provider_error_code(response: httpx.Response) -> str | None:
+        raw = bytearray()
+        async for chunk in response.aiter_bytes():
+            if len(raw) + len(chunk) > 65_536:
+                return None
+            raw.extend(chunk)
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        error = payload.get("error")
+        code = error.get("code") if isinstance(error, dict) else payload.get("code")
+        if (
+            not isinstance(code, str)
+            or not code
+            or len(code) > 80
+            or any(
+                character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+                for character in code
+            )
+        ):
+            return None
+        return code
 
     def _video_result(
         self,
@@ -896,7 +940,12 @@ class SeedanceVideoGenerator:
         )
 
     @staticmethod
-    def _http_error(operation: str, status_code: int) -> AgentError:
+    def _http_error(
+        operation: str,
+        status_code: int,
+        *,
+        provider_code: str | None = None,
+    ) -> AgentError:
         if status_code in {401, 403}:
             category = ErrorCategory.PERMISSION
             message = "Seedance 凭证无效或没有模型权限"
@@ -913,8 +962,14 @@ class SeedanceVideoGenerator:
             ErrorDetail(
                 category=category,
                 message=message,
-                technical_detail=(
-                    f"operation={operation}; status={status_code}"
+                technical_detail="; ".join(
+                    part
+                    for part in (
+                        f"operation={operation}",
+                        f"status={status_code}",
+                        f"provider_code={provider_code}" if provider_code else None,
+                    )
+                    if part is not None
                 ),
                 retryable=retryable,
             )

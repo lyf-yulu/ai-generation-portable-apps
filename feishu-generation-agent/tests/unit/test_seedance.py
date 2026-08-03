@@ -21,9 +21,18 @@ from feishu_generation_agent.integrations.seedance import SeedanceVideoGenerator
 
 
 class _FakePublicMediaHost:
+    def __init__(self) -> None:
+        self.uploads: list[tuple[str, str]] = []
+
     async def upload(self, content: bytes, filename: str, mime_type: str) -> str:
-        del content, filename
-        return f"https://public.example/reference.{ 'mp4' if mime_type.startswith('video/') else 'mp3' }"
+        del content
+        self.uploads.append((filename, mime_type))
+        extension = {
+            "image/png": "png",
+            "video/mp4": "mp4",
+            "audio/mpeg": "mp3",
+        }[mime_type]
+        return f"https://public.example/{filename}.{extension}"
 
 
 class _FailingPublicMediaHost:
@@ -85,7 +94,7 @@ def _assets(tmp_path: Path) -> list[MediaAsset]:
 
 
 @pytest.mark.asyncio
-async def test_submit_uses_public_urls_for_video_and_audio_references(tmp_path: Path) -> None:
+async def test_submit_uses_public_urls_for_every_reference(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
     def create(request: httpx.Request) -> httpx.Response:
@@ -102,16 +111,22 @@ async def test_submit_uses_public_urls_for_video_and_audio_references(tmp_path: 
         _asset(tmp_path, "asset-video", content=b"\x00\x00\x00\x18ftypisom", mime_type="video/mp4"),
         _asset(tmp_path, "asset-audio", content=b"ID3\x04\x00\x00\x00\x00\x00\x00", mime_type="audio/mpeg"),
     ]
+    media_host = _FakePublicMediaHost()
     async with httpx.AsyncClient(transport=httpx.MockTransport(create)) as client:
         generator = SeedanceVideoGenerator(
-            client, base_url="https://ark.fictional.test/api/v3", api_key="fictional-key", model="fictional-model", public_media_host=_FakePublicMediaHost(),
+            client, base_url="https://ark.fictional.test/api/v3", api_key="fictional-key", model="fictional-model", public_media_host=media_host,
         )
         await generator.submit(task, assets)
 
     content = json.loads(requests[0].content)["content"]
-    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
-    assert content[2] == {"type": "video_url", "video_url": {"url": "https://public.example/reference.mp4"}, "role": "reference_video"}
-    assert content[3] == {"type": "audio_url", "audio_url": {"url": "https://public.example/reference.mp3"}, "role": "reference_audio"}
+    assert content[1] == {"type": "image_url", "image_url": {"url": "https://public.example/asset-blue.png.png"}, "role": "reference_image"}
+    assert content[2] == {"type": "video_url", "video_url": {"url": "https://public.example/asset-video.png.mp4"}, "role": "reference_video"}
+    assert content[3] == {"type": "audio_url", "audio_url": {"url": "https://public.example/asset-audio.png.mp3"}, "role": "reference_audio"}
+    assert [mime_type for _, mime_type in media_host.uploads] == [
+        "image/png",
+        "video/mp4",
+        "audio/mpeg",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1379,6 +1394,31 @@ async def test_poll_maps_http_status_without_leaking_body_or_key(
     assert raw_secret not in str(caught.value.detail)
     assert key not in caplog.text
     assert raw_secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_submit_preserves_safe_provider_error_code_without_response_message(
+    tmp_path: Path,
+) -> None:
+    raw_secret = "private upstream detail must not leak"
+    generator, client = _generator_for_handler(
+        lambda request: httpx.Response(
+            400,
+            json={
+                "error": {
+                    "code": "InvalidParameter",
+                    "message": raw_secret,
+                }
+            },
+        )
+    )
+
+    async with client:
+        with pytest.raises(AgentError) as caught:
+            await generator.submit(_video_task(), _assets(tmp_path))
+
+    assert "provider_code=InvalidParameter" in caught.value.detail.technical_detail
+    assert raw_secret not in str(caught.value.detail)
 
 
 @pytest.mark.asyncio

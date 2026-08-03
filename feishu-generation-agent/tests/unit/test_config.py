@@ -39,6 +39,17 @@ def test_production_portrait_view_is_separately_configurable() -> None:
     assert settings.lark_production_portrait_view_id == "vewPortrait"
 
 
+def test_tos_reference_media_target_is_configurable() -> None:
+    settings = Settings(
+        _env_file=None,
+        tos_bucket="seedance-fixture",
+        tos_region="cn-beijing",
+    )
+
+    assert settings.tos_bucket == "seedance-fixture"
+    assert settings.tos_region == "cn-beijing"
+
+
 def test_env_example_documents_production_requirement_type_field() -> None:
     example = (Path(__file__).parents[2] / ".env.example").read_text()
 

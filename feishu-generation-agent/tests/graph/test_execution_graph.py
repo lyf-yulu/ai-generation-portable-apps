@@ -986,7 +986,10 @@ async def test_provider_rejection_exposes_only_safe_actionable_error(
         ErrorDetail(
             category=ErrorCategory.PROVIDER_TERMINAL,
             message="Seedance 拒绝了请求",
-            technical_detail="operation=submit; status=400",
+            technical_detail=(
+                "operation=submit; status=400; "
+                "provider_code=InvalidParameter.PolicyViolation"
+            ),
             retryable=False,
         )
     )
@@ -1005,7 +1008,7 @@ async def test_provider_rejection_exposes_only_safe_actionable_error(
         "category": "provider_terminal_error",
         "message": "生成服务拒绝了请求",
         "retryable": False,
-        "code": "submit_http_400",
+        "code": "submit_invalidparameter.policyviolation",
     }
     assert "technical_detail" not in error
 

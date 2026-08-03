@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     volcengine_access_key: SecretStr | None = None
     volcengine_secret_key: SecretStr | None = None
     volcengine_project_name: str = "Seedance2.0"
+    tos_bucket: str | None = None
+    tos_region: str = "cn-beijing"
     langsmith_tracing: bool = False
     langsmith_api_key: SecretStr | None = None
     langsmith_project: str = "feishu-generation-agent-local"
