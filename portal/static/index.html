@@ -7,26 +7,30 @@
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <div class="portal-bar">
-    <div class="portal-bar-left">
-      <span class="portal-title">AI Generation Portal</span>
-      <span class="portal-lan" id="lanInfo">detecting...</span>
+  <!-- 顶部两条栏包进统一 sticky 容器：整块一起吸顶，切换栏永远紧贴标题栏下方，
+       不再依赖写死的 top 偏移量（标题栏高度变化时也不会错位）。 -->
+  <div class="topbar-stack">
+    <div class="portal-bar">
+      <div class="portal-bar-left">
+        <span class="portal-title">AI Generation Portal</span>
+        <span class="portal-lan" id="lanInfo">detecting...</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:12px">
+        <div class="portal-bar-stats" id="barStats"></div>
+        <span id="userLabel" style="font-size:12px;color:#94a3b8"></span>
+        <button id="logoutBtn" style="display:none;font-size:12px;padding:3px 10px;background:#334155;color:#e2e8f0;border:1px solid #475569;border-radius:5px;cursor:pointer">退出</button>
+      </div>
     </div>
-    <div style="display:flex;align-items:center;gap:12px">
-      <div class="portal-bar-stats" id="barStats"></div>
-      <span id="userLabel" style="font-size:12px;color:#94a3b8"></span>
-      <button id="logoutBtn" style="display:none;font-size:12px;padding:3px 10px;background:#334155;color:#e2e8f0;border:1px solid #475569;border-radius:5px;cursor:pointer">退出</button>
-    </div>
-  </div>
 
-  <div class="app-tabs-bar">
-    <button class="app-tab active" data-tab="seedance">Seedance</button>
-    <button class="app-tab" data-tab="nb">Nano Banana</button>
-    <button class="app-tab" data-tab="feishu-generation-agent">飞书任务 Agent</button>
-    <button class="app-tab" data-tab="dreamina">Dreamina</button>
-    <button class="app-tab" data-tab="volcengine-portrait">人像生成</button>
-    <button class="app-tab" data-tab="keys">密钥库</button>
-    <button class="app-tab" data-tab="stats">统计</button>
+    <div class="app-tabs-bar">
+      <button class="app-tab active" data-tab="seedance">Seedance</button>
+      <button class="app-tab" data-tab="nb">Nano Banana</button>
+      <button class="app-tab" data-tab="feishu-generation-agent">飞书任务 Agent</button>
+      <button class="app-tab" data-tab="dreamina">Dreamina</button>
+      <button class="app-tab" data-tab="volcengine-portrait">人像生成</button>
+      <button class="app-tab" data-tab="keys">密钥库</button>
+      <button class="app-tab" data-tab="stats">统计</button>
+    </div>
   </div>
 
   <!-- SEEDANCE -->
