@@ -1630,6 +1630,7 @@ function VolcenginePortraitApp() {
         this.assetGroupId = res.group_id;
         this.uploadMsg = '组创建成功: ' + res.group_id;
         this.uploadError = false;
+        await this.loadGroups();
       } else {
         this.uploadMsg = (res?.error || '创建失败') + (res?.detail ? ' — ' + res.detail.slice(0, 120) : '');
         this.uploadError = true;
