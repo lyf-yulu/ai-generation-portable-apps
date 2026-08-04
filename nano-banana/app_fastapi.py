@@ -230,7 +230,7 @@ def api_config():
     key = legacy.load_default_key()
     return {
         "ok": config_error is None,
-        "providers": providers.get("providers", {}),
+        "providers": legacy.providers_for_client(providers),
         "default_provider": providers.get("default_provider"),
         "has_key": bool(key),
         "masked_key": legacy.mask_key(key) if key else "",
@@ -545,7 +545,8 @@ async def api_jobs_json(request: Request):
         return JSONResponse(status_code=400, content=legacy.api_error("invalid_request", str(exc)))
     try:
         values, files = legacy.values_files_from_json(payload)
-        api_key = str(values.get("api_key") or legacy.load_default_key()).strip()
+        provider = str(values.get("provider") or "t8star")
+        api_key = legacy.resolve_provider_api_key(provider, str(values.get("api_key") or ""))
         if not api_key and not payload.get("dry_run"):
             return JSONResponse(status_code=400, content=legacy.api_error("invalid_request", "API key is required"))
         if api_key:
@@ -581,7 +582,8 @@ async def api_jobs_json(request: Request):
 @app.post("/api/jobs")
 async def api_jobs_create(request: Request):
     values, files = await _parse_multipart(request)
-    api_key = (values.get("api_key") or "") or legacy.load_default_key()
+    provider = str(values.get("provider") or "t8star")
+    api_key = legacy.resolve_provider_api_key(provider, str(values.get("api_key") or ""))
     if not api_key:
         return JSONResponse(status_code=400, content=legacy.api_error("invalid_request", "API key is required"))
     # Drop keys pointing at file fields (already extracted).

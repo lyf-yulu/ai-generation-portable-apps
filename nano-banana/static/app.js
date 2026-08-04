@@ -280,6 +280,16 @@ function resolveMediaUrl(url) {
 var FALLBACK_PROVIDERS = {
   t8star: { label: 'T8Star Images API', base_url: 'https://ai.t8star.org', models: [{ id: 'nano-banana-2', label: 'nano-banana-2' }, { id: 'gemini-3.1-flash-image-preview', label: 'gemini-3.1-flash-image-preview' }, { id: 'gemini-3-pro-image-2k', label: 'gemini-3-pro-image-2k' }, { id: 'gemini-3-pro-image-4k', label: 'gemini-3-pro-image-4k' }] },
   gemini: { label: 'Chiyun', base_url: 'https://chiyun.work', models: [{ id: 'banana2-ssvip', label: 'banana2-ssvip' }, { id: 'nano-banana2[2K]-base', label: 'nano-banana2[2K]-base' }, { id: 'gpt-image-2', label: 'gpt-image-2' }] },
+  volcengine: {
+    label: '火山引擎官方 (Seedream)',
+    base_url: 'https://ark.cn-beijing.volces.com/api/v3',
+    company_key: true,
+    company_key_available: false,
+    image_size_options: ['1K', '1.5K', '2K'],
+    max_reference_images: 10,
+    supports_seed: false,
+    models: [{ id: 'doubao-seedream-5-0-pro-260628', label: 'Seedream 5.0 Pro' }],
+  },
 };
 
 // ============================================================
@@ -297,8 +307,15 @@ function NanoBananaApp() {
     provider: 't8star',
     models: [],
     baseUrl: 'https://ai.t8star.org',
+    baseUrlReadonly: false,
     providerHint: '',
     keyHint: '',
+    imageSizeOptions: ['1K', '2K', '4K'],
+    supportsSeed: true,
+    maxReferenceImages: 14,
+    _providerKeys: {},
+    _activeProvider: 't8star',
+    _personalKeyHint: '',
     outputDir: '',
     dirHandle: null,
     autoDownload: false,
@@ -455,16 +472,60 @@ function NanoBananaApp() {
         if (s && s.value !== defaultP) s.value = defaultP;
         if (data.providers[defaultP]) self.applyProvider(defaultP);
       }, 0);
-      this.keyHint = data.has_key ? '已检测到 key: ' + (data.masked_key || '') : '未检测到本地 key';
+      var activeCfg = this.providers[this.provider] || {};
+      if (!activeCfg.company_key) {
+        this._personalKeyHint = data.has_key ? '已检测到 key: ' + (data.masked_key || '') : '未检测到本地 key';
+        this.keyHint = this._personalKeyHint;
+      }
     },
 
     applyProvider(provider, skipDefaults) {
       var cfg = this.providers[provider];
       if (!cfg) return;
+      var keyInput = nbField('api_key');
+      var providerKeys = this.providerKeyBucket();
+      // v-model can update ``provider`` before @change invokes this method;
+      // keep an independent applied-provider pointer so the outgoing key is
+      // always saved under the provider it actually belonged to.
+      var previousProvider = this._activeProvider || this.provider;
+      var previousCfg = this.providers[previousProvider] || {};
+      if (!skipDefaults && keyInput && previousProvider && !previousCfg.company_key) {
+        providerKeys[previousProvider] = keyInput.value;
+      }
       this.provider = provider;
+      this._activeProvider = provider;
       this.baseUrl = cfg.base_url || '';
+      this.baseUrlReadonly = !!cfg.company_key;
       this.providerHint = cfg.hint || '';
       this.models = cfg.models || [];
+      this.imageSizeOptions = (cfg.image_size_options || ['1K', '2K', '4K']).slice();
+      this.supportsSeed = cfg.supports_seed !== false;
+      this.maxReferenceImages = Number(cfg.max_reference_images || 14);
+
+      if (keyInput) {
+        if (cfg.company_key) {
+          keyInput.value = '';
+          keyInput.readOnly = true;
+          keyInput.placeholder = cfg.company_key_available
+            ? '已使用官方密钥（服务器托管）'
+            : '官方密钥未配置';
+          this.keyHint = cfg.company_key_available
+            ? '已使用 Seedance 相同的火山方舟密钥（服务器托管）'
+            : '服务器尚未检测到火山方舟密钥，请联系维护者';
+        } else {
+          keyInput.readOnly = false;
+          keyInput.placeholder = '留空使用本地配置';
+          if (Object.prototype.hasOwnProperty.call(providerKeys, provider)) {
+            keyInput.value = providerKeys[provider];
+          }
+          this.keyHint = this._personalKeyHint;
+        }
+      }
+      var seedInput = nbField('seed');
+      var varySeedInput = nbField('vary_seed');
+      if (seedInput) seedInput.disabled = !this.supportsSeed;
+      if (varySeedInput) varySeedInput.disabled = !this.supportsSeed;
+      this.applyReferenceImageLimit();
       // When restoring a saved draft/preset the form already carries this tab's
       // own aspect_ratio / image_size / etc. Re-applying provider defaults here
       // (async, after applyPreset filled the fields) would clobber them back to
@@ -488,6 +549,23 @@ function NanoBananaApp() {
           } else el.value = v;
         }
         self.updateResizeState();
+      });
+    },
+
+    providerKeyBucket() {
+      var wsId = this.activeTabId || 'default';
+      if (!this._providerKeys[wsId]) this._providerKeys[wsId] = {};
+      return this._providerKeys[wsId];
+    },
+
+    applyReferenceImageLimit() {
+      var limit = this.maxReferenceImages || 14;
+      document.querySelectorAll('#nb-imageRefs .drop').forEach(function (drop) {
+        var input = drop.querySelector && drop.querySelector('input[type="file"]');
+        var match = input && input.name && input.name.match(/^image_(\d+)$/);
+        var enabled = !match || Number(match[1]) <= limit;
+        if (drop.style) drop.style.display = enabled ? '' : 'none';
+        if (input) input.disabled = !enabled;
       });
     },
 
@@ -523,6 +601,7 @@ function NanoBananaApp() {
             }
           }
         });
+        self.applyReferenceImageLimit();
       }, 0);
     },
 
@@ -928,6 +1007,12 @@ function NanoBananaApp() {
     applyPreset(preset) {
       clearAllMediaInputs();
       var values = (preset && preset.values) || {};
+      if (values.provider && values.api_key !== undefined) {
+        var presetProvider = this.providers[values.provider] || {};
+        if (!presetProvider.company_key) {
+          this.providerKeyBucket()[values.provider] = String(values.api_key || '');
+        }
+      }
       for (var k in values) {
         if (!Object.prototype.hasOwnProperty.call(values, k)) continue;
         var v = values[k];
@@ -1209,6 +1294,13 @@ function NanoBananaApp() {
         if (Object.prototype.hasOwnProperty.call(this.savedMedia, k)) {
           savedForBackend[k] = this.savedMedia[k];
         }
+      }
+      var providerCfg = this.providers[this.provider] || {};
+      if (providerCfg.company_key) data.delete('api_key');
+      var maxRefs = Number(providerCfg.max_reference_images || 14);
+      for (var refIndex = maxRefs + 1; refIndex <= 14; refIndex++) {
+        data.delete('image_' + refIndex);
+        delete savedForBackend['image_' + refIndex];
       }
       if (options.resizeImages) {
         var reInput = nbField('resize_enabled');

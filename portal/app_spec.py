@@ -54,6 +54,7 @@ class AppSpec:
     company_key_endpoint: Optional[str] = None  # e.g. "portrait-key" -> /api/platform/portrait-key
     needs_tos_creds: bool = False
     is_tos_source: bool = False
+    needs_ark_key: bool = False
     job_type: JobType = "image"
     job_type_rules: tuple[JobTypeRule, ...] = ()
     metrics: tuple[Metric, ...] = ("images",)
@@ -98,6 +99,7 @@ def _spec_from_dict(d: dict[str, Any], repo_root: Path) -> AppSpec:
         company_key_endpoint=d.get("company_key_endpoint"),
         needs_tos_creds=bool(d.get("needs_tos_creds", False)),
         is_tos_source=bool(d.get("is_tos_source", False)),
+        needs_ark_key=bool(d.get("needs_ark_key", False)),
         job_type=d.get("job_type", "image"),
         job_type_rules=tuple(_rule_from_dict(r) for r in (d.get("job_type_rules") or [])),
         metrics=tuple(d.get("metrics") or ["images"]),

@@ -338,6 +338,18 @@ FALLBACK_PROVIDERS = {
             "defaults": {"mode": "img2img", "model": "banana2-ssvip", "aspect_ratio": "auto", "image_size": "2K", "response_format": "url", "control_after_generate": "randomize", "repeat_count": 1, "concurrency": 1, "poll_interval": 10, "timeout": 900, "vary_seed": True, "resize_enabled": False, "resize_width": 1700, "resize_height": 2500, "resize_interpolation": "high", "resize_method": "stretch", "resize_condition": "always", "resize_multiple_of": 0},
             "models": [{"id": "banana2-ssvip", "label": "banana2-ssvip"}, {"id": "nano-banana2[2K]-base", "label": "nano-banana2[2K]-base"}, {"id": "gpt-image-2", "label": "gpt-image-2"}],
         },
+        "volcengine": {
+            "label": "火山引擎官方 (Seedream)",
+            "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+            "api_style": "ark_seedream",
+            "company_key": True,
+            "hint": "Seedream 5.0 Pro；使用 Seedance 相同的火山方舟密钥（服务器托管）。",
+            "image_size_options": ["1K", "1.5K", "2K"],
+            "max_reference_images": 10,
+            "supports_seed": False,
+            "defaults": {"mode": "img2img", "model": "doubao-seedream-5-0-pro-260628", "aspect_ratio": "auto", "image_size": "2K", "response_format": "url", "control_after_generate": "randomize", "repeat_count": 1, "concurrency": 1, "poll_interval": 10, "timeout": 300, "vary_seed": False, "resize_enabled": False, "resize_width": 1700, "resize_height": 2500, "resize_interpolation": "high", "resize_method": "stretch", "resize_condition": "always", "resize_multiple_of": 0},
+            "models": [{"id": "doubao-seedream-5-0-pro-260628", "label": "Seedream 5.0 Pro"}],
+        },
     },
 }
 
@@ -613,6 +625,27 @@ def load_default_key() -> str:
         except Exception:
             return ""
     return ""
+
+
+def resolve_provider_api_key(provider: str, provided_key: str = "") -> str:
+    """Resolve credentials without ever returning the managed key to clients."""
+    provided = str(provided_key or "").strip()
+    config, _ = load_provider_config()
+    provider_cfg = (config.get("providers") or {}).get(provider) or {}
+    if provider_cfg.get("company_key"):
+        return provided or os.environ.get("VOLCENGINE_ARK_API_KEY", "").strip()
+    return provided or load_default_key()
+
+
+def providers_for_client(config: dict[str, Any]) -> dict[str, Any]:
+    """Return provider metadata plus key availability, never key plaintext."""
+    providers = json.loads(json.dumps(config.get("providers") or {}, ensure_ascii=False))
+    for provider_cfg in providers.values():
+        if isinstance(provider_cfg, dict) and provider_cfg.get("company_key"):
+            provider_cfg["company_key_available"] = bool(
+                os.environ.get("VOLCENGINE_ARK_API_KEY", "").strip()
+            )
+    return providers
 
 
 def mask_key(key: str) -> str:
@@ -1472,6 +1505,58 @@ def file_to_data_url(filename: str, blob: bytes) -> str:
     return f"data:{mime};base64,{base64.b64encode(blob).decode('utf-8')}"
 
 
+# Seedream 5.0 Pro official size mapping. ``auto`` uses the resolution tier
+# directly; explicit ratios use pixel values so the existing ratio selector
+# remains meaningful without sending an unsupported ``aspect_ratio`` field.
+_SEEDREAM_5_PRO_SIZES: dict[str, dict[str, str]] = {
+    "1K": {
+        "1:1": "1024x1024", "4:3": "1152x864", "3:4": "864x1152",
+        "16:9": "1424x800", "9:16": "800x1424", "3:2": "1248x832",
+        "2:3": "832x1248", "21:9": "1568x672", "9:21": "672x1568",
+    },
+    "1.5K": {
+        "1:1": "1536x1536", "4:3": "1792x1344", "3:4": "1344x1792",
+        "16:9": "2048x1152", "9:16": "1152x2048", "3:2": "1872x1248",
+        "2:3": "1248x1872", "21:9": "2352x1008", "9:21": "1008x2352",
+    },
+    "2K": {
+        "1:1": "2048x2048", "4:3": "2368x1776", "3:4": "1776x2368",
+        "16:9": "2816x1584", "9:16": "1584x2816", "3:2": "2496x1664",
+        "2:3": "1664x2496", "21:9": "3136x1344", "9:21": "1344x3136",
+    },
+}
+
+
+def seedream_size(resolution: str, aspect_ratio: str) -> str:
+    resolution = str(resolution or "2K").strip()
+    aspect_ratio = str(aspect_ratio or "auto").strip()
+    mapping = _SEEDREAM_5_PRO_SIZES.get(resolution)
+    if mapping is None:
+        raise ValueError("Seedream 5.0 Pro 尺寸只支持 1K、1.5K、2K")
+    if aspect_ratio == "auto":
+        return resolution
+    if aspect_ratio not in mapping:
+        raise ValueError(f"Seedream 5.0 Pro 不支持比例 {aspect_ratio}")
+    return mapping[aspect_ratio]
+
+
+def build_seedream_payload(common: dict[str, Any], images: list[str]) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": common["model"],
+        "prompt": common["prompt"],
+        "size": seedream_size(
+            str(common.get("image_size") or "2K"),
+            str(common.get("aspect_ratio") or "auto"),
+        ),
+        "response_format": common.get("response_format") or "url",
+        "output_format": "png",
+        "watermark": False,
+    }
+    if images:
+        payload["image"] = images[0] if len(images) == 1 else images
+    return payload
+
+
 def save_gemini_image_item(item: dict[str, str], out_dir: Path, prefix: str, idx: int) -> tuple[str, str]:
     mime = item.get("mime_type", "image/png")
     suffix = mimetypes.guess_extension(mime) or ".png"
@@ -1557,6 +1642,69 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
 
     seed_label = f", seed:{seed}" if seed > 0 else ""
     add_event(job_id, f"Run {index}: submitting {provider}/{common['model']}/{mode}{seed_label}")
+    config, _ = load_provider_config()
+    provider_cfg = (config.get("providers") or {}).get(provider) or {}
+    if provider_cfg.get("company_key"):
+        # A server-managed credential must never follow a client-controlled
+        # URL. Lock managed providers to their committed official endpoint.
+        base_url = str(provider_cfg.get("base_url") or "").rstrip("/")
+        if not base_url:
+            raise RuntimeError("托管供应商缺少官方 Base URL 配置")
+    if provider_cfg.get("api_style") == "ark_seedream":
+        image_data_urls: list[str] = []
+        if mode != "text2img":
+            for i in range(1, 15):
+                file_data = get_file_or_saved(form, f"image_{i}", ws_id)
+                if not file_data:
+                    continue
+                filename, blob = file_data
+                image_data_urls.append(file_to_data_url(filename, blob))
+        max_images = int(provider_cfg.get("max_reference_images") or 10)
+        if len(image_data_urls) > max_images:
+            raise ValueError(f"Seedream 5.0 Pro 最多支持 {max_images} 张参考图")
+
+        payload = build_seedream_payload(common, image_data_urls)
+        result = request_json(
+            "POST",
+            f"{base_url}/images/generations",
+            api_key,
+            payload,
+            timeout=int(values.get("timeout") or 300),
+        )
+        task_id = f"seedream_{uuid.uuid4().hex[:12]}"
+        items = extract_items(result)
+        if not items:
+            raise RuntimeError(f"Seedream 未返回图片: {result}")
+
+        _ensure_output_dir(values, job_id)
+        out_dir = resolve_output_dir(values.get("output_dir"))
+        file_token_results = []
+        custom_name = values.get("output_name", "").strip()
+        if custom_name:
+            total = max(1, int(values.get("repeat_count") or 1), int(values.get("concurrency") or 1))
+            prefix = f"{custom_name}-{index}" if total > 1 else custom_name
+        else:
+            prefix = f"{time.strftime('%Y%m%d_%H%M%S')}_run{index}_{task_id}"
+        for item_index, item in enumerate(items, 1):
+            image_url, local_path = save_image_item(item, out_dir, prefix, item_index)
+            token = uuid.uuid4().hex
+            with LOCK:
+                FILES[token] = Path(local_path)
+            file_token_results.append({
+                "image_url": image_url,
+                "download_url": f"/api/download/{token}",
+                "filename": Path(local_path).name,
+                "local_path": local_path,
+            })
+        add_event(job_id, f"Run {index}: saved {len(file_token_results)} image(s), input_images:{len(image_data_urls)}")
+        return {
+            "index": index,
+            "task_id": task_id,
+            "status": "succeeded",
+            "seed": None,
+            "images": file_token_results,
+        }
+
     if provider == "gemini":
         image_count = 0
         if common["model"] == "gpt-image-2":
@@ -1879,7 +2027,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "ok": config_error is None,
                 "has_key": bool(load_default_key()),
                 "masked_key": mask_key(load_default_key()),
-                "providers": providers.get("providers", {}),
+                "providers": providers_for_client(providers),
                 "default_provider": providers.get("default_provider"),
                 "config_error": config_error,
             })
@@ -2195,7 +2343,8 @@ class Handler(SimpleHTTPRequestHandler):
             try:
                 payload = read_json_body(self)
                 values, files = values_files_from_json(payload)
-                api_key = str(values.get("api_key") or load_default_key()).strip()
+                provider = str(values.get("provider") or "t8star")
+                api_key = resolve_provider_api_key(provider, str(values.get("api_key") or ""))
                 if not api_key and not payload.get("dry_run"):
                     json_response(self, 400, api_error("invalid_request", "API key is required"))
                     return
@@ -2229,11 +2378,12 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, 404, {"error": "not found"})
             return
         form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
-        api_key = get_field(form, "api_key") or load_default_key()
+        values = {key: get_field(form, key) for key in form.keys() if not getattr(form[key], "filename", None)}
+        provider = str(values.get("provider") or "t8star")
+        api_key = resolve_provider_api_key(provider, str(values.get("api_key") or ""))
         if not api_key:
             json_response(self, 400, api_error("invalid_request", "API key is required"))
             return
-        values = {key: get_field(form, key) for key in form.keys() if not getattr(form[key], "filename", None)}
         values["api_key"] = api_key
         files = {}
         for key in form.keys():

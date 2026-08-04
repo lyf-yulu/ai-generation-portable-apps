@@ -578,6 +578,24 @@ class AppManager:
         except Exception:
             return "", ""
 
+    def _read_ark_key(self) -> str:
+        """Read Seedance's server-managed Ark Bearer key for child apps.
+
+        Only the child-process environment receives the plaintext value. API
+        config responses expose availability as a boolean, never the key.
+        """
+        seedance_spec = SPEC_BY_NAME.get("seedance")
+        if seedance_spec is None:
+            return ""
+        try:
+            secrets_path = seedance_spec.dir_path / "state" / "secrets.json"
+            if not secrets_path.exists():
+                return ""
+            data = json.loads(secrets_path.read_text("utf-8"))
+            return str(data.get("volcengine_api_key") or "").strip()
+        except Exception:
+            return ""
+
     def start_app(self, name: str, config: dict):
         spec: AppSpec | None = config.get("spec")
         if spec is not None and not spec.managed:
@@ -603,6 +621,10 @@ class AppManager:
             if ak and sk:
                 env["TOS_ACCESS_KEY"] = ak
                 env["TOS_SECRET_KEY"] = sk
+        if spec is not None and spec.needs_ark_key:
+            ark_key = self._read_ark_key()
+            if ark_key:
+                env["VOLCENGINE_ARK_API_KEY"] = ark_key
         old_log = self.log_handles.pop(name, None)
         if old_log:
             try: old_log.close()

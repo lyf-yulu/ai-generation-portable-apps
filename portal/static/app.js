@@ -1278,7 +1278,7 @@ function StatsApp() {
       if (meta && meta.display_name) return meta.display_name;
       return {
         'seedance': 'Seedance',
-        'nano-banana': 'Nano Banana',
+        'nano-banana': '图像生成模块',
         'dreamina': 'Dreamina',
         'volcengine-portrait': '人像生成',
       }[app] || app;

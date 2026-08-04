@@ -24,7 +24,7 @@
 
     <div class="app-tabs-bar">
       <button class="app-tab active" data-tab="seedance">Seedance</button>
-      <button class="app-tab" data-tab="nb">Nano Banana</button>
+      <button class="app-tab" data-tab="nb">图像生成模块</button>
       <button class="app-tab" data-tab="feishu-generation-agent">飞书任务 Agent</button>
       <button class="app-tab" data-tab="dreamina">Dreamina</button>
       <button class="app-tab" data-tab="volcengine-portrait">人像生成</button>
@@ -638,7 +638,7 @@
       <section class="stats-panel">
         <h2>按用户统计</h2>
         <table class="ip-stats-table">
-          <thead><tr><th>用户</th><th>Seedance<br><small style="font-weight:400;color:#94a3b8">秒</small></th><th>Nano Banana<br><small style="font-weight:400;color:#94a3b8">张</small></th><th>Dreamina<br><small style="font-weight:400;color:#94a3b8">张/秒</small></th><th>人像生成<br><small style="font-weight:400;color:#94a3b8">秒</small></th></tr></thead>
+          <thead><tr><th>用户</th><th>Seedance<br><small style="font-weight:400;color:#94a3b8">秒</small></th><th>图像生成模块<br><small style="font-weight:400;color:#94a3b8">张</small></th><th>Dreamina<br><small style="font-weight:400;color:#94a3b8">张/秒</small></th><th>人像生成<br><small style="font-weight:400;color:#94a3b8">秒</small></th></tr></thead>
           <tbody>
             <tr v-for="(stats, uname) in byUser">
               <td>{{ uname }}</td>
@@ -662,7 +662,7 @@
           </span>
         </div>
         <table class="ip-stats-table" v-if="daySnapshot">
-          <thead><tr><th>用户</th><th>Seedance<br><small style="font-weight:400;color:#94a3b8">秒</small></th><th>Nano Banana<br><small style="font-weight:400;color:#94a3b8">张</small></th><th>Dreamina<br><small style="font-weight:400;color:#94a3b8">张/秒</small></th><th>人像生成<br><small style="font-weight:400;color:#94a3b8">秒</small></th></tr></thead>
+          <thead><tr><th>用户</th><th>Seedance<br><small style="font-weight:400;color:#94a3b8">秒</small></th><th>图像生成模块<br><small style="font-weight:400;color:#94a3b8">张</small></th><th>Dreamina<br><small style="font-weight:400;color:#94a3b8">张/秒</small></th><th>人像生成<br><small style="font-weight:400;color:#94a3b8">秒</small></th></tr></thead>
           <tbody>
             <tr v-for="(stats, uname) in (daySnapshot.by_user || {})">
               <td>{{ uname }}</td>
@@ -705,7 +705,7 @@
             <tr>
               <th>用户</th>
               <th>Seedance<br><small style="font-weight:400;color:#94a3b8">秒</small></th>
-              <th>Nano Banana<br><small style="font-weight:400;color:#94a3b8">张</small></th>
+              <th>图像生成模块<br><small style="font-weight:400;color:#94a3b8">张</small></th>
               <th>Dreamina<br><small style="font-weight:400;color:#94a3b8">张/秒</small></th>
               <th>人像生成<br><small style="font-weight:400;color:#94a3b8">秒</small></th>
               <th>合计<br><small style="font-weight:400;color:#94a3b8">张/秒</small></th>
