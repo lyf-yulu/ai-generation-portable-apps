@@ -1827,14 +1827,12 @@ def _run_virtual_job_impl(job_id, job):
                         job["events"].append({"time": time.strftime("%H:%M:%S"), "message": f"Run {idx} 完成"})
                 else:
                     with JOBS_LOCK:
-                        job["results"].append({
-                            "index": idx,
-                            "task_id": task_id,
-                            "filename": f"output_{idx}.mp4",
-                            "download_url": extract_video_url(task_result) or "",
-                            "status": "succeeded",
-                        })
+                        job["errors"].append(f"Run {idx}: 任务已成功但没有视频地址")
                         job["done"] += 1
+                        job["events"].append({
+                            "time": time.strftime("%H:%M:%S"),
+                            "message": f"Run {idx} 失败: 任务已成功但没有视频地址",
+                        })
                 break
             elif t_status in ("failed", "error"):
                 with JOBS_LOCK:
@@ -1843,7 +1841,7 @@ def _run_virtual_job_impl(job_id, job):
                 break
 
     with JOBS_LOCK:
-        job["status"] = "succeeded" if len(job.get("results", [])) > 0 else "failed"
+        job["status"] = "failed" if job.get("errors") else "succeeded"
         job["finished_at"] = time.time()
         job["events"].append({"time": time.strftime("%H:%M:%S"), "message": f"任务结束: {job['status']}"})
         final_snapshot = {

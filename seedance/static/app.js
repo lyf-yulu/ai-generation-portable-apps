@@ -868,12 +868,12 @@ function SeedanceApp() {
     // work.
     _renderJobToDom(job) {
       const resultsEl = document.getElementById('sd-results');
-      const eventsEl = document.getElementById('sd-events');
-      if (!resultsEl && !eventsEl) return;
+      if (!resultsEl) return;
 
-      if (eventsEl) {
-        eventsEl.textContent = (job.events || []).map(e => '[' + (e.time || '') + '] ' + (e.message || '')).join('\n');
-      }
+      // #sd-events is owned by PetiteVue's {{ eventsText }} binding. Writing
+      // it here as well makes live polling and tab-state restoration compete
+      // for the same node, which causes the dark log panel to flicker when
+      // multiple topic tabs have running jobs.
 
       if (resultsEl) {
         const recentEvents = (job.events || []).slice(-8);

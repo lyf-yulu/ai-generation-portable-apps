@@ -1463,9 +1463,16 @@ def extract_video_url(data: dict[str, Any]) -> str | None:
                     return str(value["url"])
                 if isinstance(value, str):
                     return value
-    for key in ("video_url", "videoUrl", "output"):
+    for key in ("video_url", "videoUrl"):
         if data.get(key):
             return str(data[key])
+    output = data.get("output")
+    if isinstance(output, dict):
+        url = output.get("video_url") or output.get("videoUrl")
+        if url:
+            return str(url)
+    elif isinstance(output, str) and output:
+        return output
     results = data.get("results")
     if isinstance(results, list):
         for item in results:

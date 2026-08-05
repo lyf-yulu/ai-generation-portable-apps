@@ -87,11 +87,27 @@ class TestExtractGeminiImages:
         assert self.mod.extract_gemini_images({}) == []
         assert self.mod.extract_gemini_images({"candidates": []}) == []
 
-    def test_save_image_item_url_branch_reachable(self):
-        """The url dict produced above must be consumable by save_image_item's
-        existing url branch (we don't hit the network; just confirm it routes
-        to download_url rather than raising 'No image data')."""
-        import inspect
-        src = inspect.getsource(self.mod.save_image_item)
-        assert 'item.get("url")' in src
-        assert "download_url" in src
+    def test_gemini_url_item_is_downloaded_instead_of_read_as_b64(self, tmp_path, monkeypatch):
+        """The Gemini run path uses save_gemini_image_item, so a fileData URL
+        must be downloaded there instead of raising KeyError('b64_json')."""
+        calls = []
+
+        def fake_download(url, out_path):
+            calls.append((url, out_path))
+            out_path.write_bytes(b"PNG")
+
+        monkeypatch.setattr(self.mod, "download_url", fake_download)
+        source_url, local_path = self.mod.save_gemini_image_item(
+            {
+                "url": "https://cdn.example/generated?id=4",
+                "mime_type": "image/png",
+            },
+            tmp_path,
+            "parallel_4",
+            1,
+        )
+
+        assert source_url == "https://cdn.example/generated?id=4"
+        assert Path(local_path).name == "parallel_4_1.png"
+        assert Path(local_path).read_bytes() == b"PNG"
+        assert calls == [("https://cdn.example/generated?id=4", Path(local_path))]

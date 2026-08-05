@@ -1357,7 +1357,11 @@ def save_image_item(item: dict[str, Any], out_dir: Path, prefix: str, idx: int) 
         return str(item["url"]), str(out_path)
     if item.get("b64_json"):
         out_path = out_dir / f"{prefix}_{idx}.png"
-        out_path.write_bytes(base64.b64decode(item["b64_json"]))
+        data = str(item["b64_json"])
+        missing_padding = len(data) % 4
+        if missing_padding:
+            data += "=" * (4 - missing_padding)
+        out_path.write_bytes(base64.b64decode(data))
         return "", str(out_path)
     raise RuntimeError(f"No image data in result item: {item}")
 
@@ -1563,6 +1567,9 @@ def save_gemini_image_item(item: dict[str, str], out_dir: Path, prefix: str, idx
     if suffix == ".jpe":
         suffix = ".jpg"
     out_path = out_dir / f"{prefix}_{idx}{suffix}"
+    if item.get("url"):
+        download_url(item["url"], out_path)
+        return item["url"], str(out_path)
     data = item["b64_json"]
     missing_padding = len(data) % 4
     if missing_padding:
