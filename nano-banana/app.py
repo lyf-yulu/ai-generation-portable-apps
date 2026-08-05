@@ -1281,6 +1281,7 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
             "id": job_id, "status": "queued", "events": [], "results": [], "errors": [],
             "done": 0, "total": 0,
             "username": username,
+            "workspace_id": ws_id,
             "submitted_at": time.time(),
             "started_at": None,
             "finished_at": None,

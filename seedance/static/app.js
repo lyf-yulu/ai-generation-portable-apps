@@ -24,9 +24,9 @@ function getActiveWorkspaceId() {
   return window._activeWorkspaceId || workspaceId();
 }
 
-async function api(url, method, body) {
+async function api(url, method, body, workspaceOverride) {
   try {
-    const wsId = getActiveWorkspaceId();
+    const wsId = workspaceOverride || getActiveWorkspaceId();
     const sep = url.includes('?') ? '&' : '?';
     const urlWithWs = url + sep + 'ws=' + encodeURIComponent(wsId);
     const headers = { 'X-Workspace-Id': wsId };
@@ -48,9 +48,9 @@ async function api(url, method, body) {
 //                     cleared its in-memory JOBS). Poll stops cleanly.
 //   {kind:'error'}    network error / timeout / 5xx / non-JSON — transient,
 //                     caller retries with backoff.
-async function pollJobOnce(url) {
+async function pollJobOnce(url, workspaceOverride) {
   try {
-    const wsId = getActiveWorkspaceId();
+    const wsId = workspaceOverride || getActiveWorkspaceId();
     const sep = url.includes('?') ? '&' : '?';
     const urlWithWs = url + sep + 'ws=' + encodeURIComponent(wsId);
     const headers = { 'X-Workspace-Id': wsId };
@@ -342,6 +342,7 @@ function SeedanceApp() {
     editingTabId: null,         // tab id being renamed inline, or null
     _closeConfirmTabId: null,   // tab id that opened the close-confirm modal
     _tabStateCache: {},         // { wsId: {statusText, eventsText, submitting, baseUrl, provider, models, workspaceName} }
+    _topicSubmissionSeq: {},    // { wsId: latest submit sequence }
 
     // Internal (non-reactive but accessible)
     _workspaceId: effectiveWorkspaceId,
@@ -749,14 +750,39 @@ function SeedanceApp() {
     // FORM SUBMISSION
     // ============================================================
     async submit() {
+      const ownerWorkspaceId = this.activeTabId;
+      const ownerExists = () => this.tabs.some(t => t.id === ownerWorkspaceId);
+      const ownerCache = () => {
+        if (!ownerExists()) return null;
+        return (this._tabStateCache[ownerWorkspaceId] = this._tabStateCache[ownerWorkspaceId] || {});
+      };
+      const setOwnerState = (name, value) => {
+        const cache = ownerCache();
+        if (!cache) return;
+        cache[name] = value;
+        if (this.activeTabId === ownerWorkspaceId) this[name] = value;
+      };
       if (this.submitting) return;
-      this.submitting = true;
-      this.statusText = '提交中';
+      const submissionToken = (this._topicSubmissionSeq[ownerWorkspaceId] || 0) + 1;
+      this._topicSubmissionSeq[ownerWorkspaceId] = submissionToken;
+      const delivery = {
+        dirHandle: this.dirHandle,
+        autoDownload: this.autoDownload,
+        outputDir: this.outputDir,
+      };
+      const cache = ownerCache();
+      cache._submissionToken = submissionToken;
+      cache._activeJobId = null;
+      delete cache._latestJob;
+      setOwnerState('submitting', true);
+      setOwnerState('statusText', '提交中');
       const resultsEl = document.getElementById('sd-results');
       const eventsEl = document.getElementById('sd-events');
-      if (resultsEl) resultsEl.innerHTML = '';
-      if (eventsEl) eventsEl.textContent = '';
-      this.eventsText = '';
+      if (this.activeTabId === ownerWorkspaceId) {
+        if (resultsEl) resultsEl.innerHTML = '';
+        if (eventsEl) eventsEl.textContent = '';
+      }
+      setOwnerState('eventsText', '');
 
       const data = new FormData(document.getElementById('sd-form'));
       if (Object.keys(this.savedMedia).length) {
@@ -765,31 +791,45 @@ function SeedanceApp() {
 
       let res;
       try {
-        res = await api(APP_PATH + '/api/jobs', 'POST', data);
+        res = await api(APP_PATH + '/api/jobs', 'POST', data, ownerWorkspaceId);
       } finally {
-        this.submitting = false;
+        setOwnerState('submitting', false);
       }
       if (!res || res.error) {
-        this.statusText = res?.error || '提交失败';
+        setOwnerState('statusText', res?.error || '提交失败');
         return;
       }
-      this.statusText = '已提交，任务在后台运行';
+      if (!ownerExists() || ownerCache()._submissionToken !== submissionToken) return;
+      ownerCache()._activeJobId = res.job_id;
+      setOwnerState('statusText', '已提交，任务在后台运行');
       this.loadJobs();
-      this.pollJob(res.job_id);
+      this.pollJob(res.job_id, ownerWorkspaceId, submissionToken, delivery);
     },
 
-    async pollJob(jobId) {
-      // Record which tab initiated this poll. If the user switches tabs while the
-      // job is still running, subsequent state writes must NOT contaminate the
-      // now-active tab — they route into _tabStateCache[startWsId] instead.
-      const startWsId = this.activeTabId;
-      const isActive = () => this.activeTabId === startWsId;
-      const cache = () => (this._tabStateCache[startWsId] = this._tabStateCache[startWsId] || {});
-
-      const setStatus = (t) => { if (isActive()) this.statusText = t; else cache().statusText = t; };
-      const setEvents = (t) => { if (isActive()) this.eventsText = t; else cache().eventsText = t; };
-      const setSubmitting = (v) => { if (isActive()) this.submitting = v; else cache().submitting = v; };
-      const setLatestJob = (job) => { cache()._latestJob = job; };
+    async pollJob(jobId, ownerWorkspaceId, submissionToken, delivery) {
+      const ownerWsId = ownerWorkspaceId || this.activeTabId;
+      const ownerExists = () => this.tabs.some(t => t.id === ownerWsId);
+      const cache = () => {
+        if (!ownerExists()) return null;
+        return (this._tabStateCache[ownerWsId] = this._tabStateCache[ownerWsId] || {});
+      };
+      const isCurrent = () => {
+        const state = cache();
+        if (!state) return false;
+        if (submissionToken !== undefined && state._submissionToken !== submissionToken) return false;
+        return !state._activeJobId || state._activeJobId === jobId;
+      };
+      const isActive = () => isCurrent() && this.activeTabId === ownerWsId;
+      const setState = (name, value) => {
+        if (!isCurrent()) return;
+        const state = cache();
+        state[name] = value;
+        if (isActive()) this[name] = value;
+      };
+      const setStatus = (t) => setState('statusText', t);
+      const setEvents = (t) => setState('eventsText', t);
+      const setSubmitting = (v) => setState('submitting', v);
+      const setLatestJob = (job) => { if (isCurrent()) cache()._latestJob = job; };
 
       // Transient-failure tolerance. A single failed poll (proxy timeout, wifi
       // blip, sub-app 5xx) used to `break` and permanently abandon the watcher,
@@ -801,7 +841,9 @@ function SeedanceApp() {
       let consecutiveFails = 0;
 
       while (true) {
-        const r = await pollJobOnce(APP_PATH + '/api/jobs/' + jobId);
+        if (!isCurrent()) break;
+        const r = await pollJobOnce(APP_PATH + '/api/jobs/' + jobId, ownerWsId);
+        if (!isCurrent()) break;
         if (r.kind === 'gone') {
           // Job no longer exists server-side (restart). Refresh the jobs list so
           // any completed result recorded in activity can still surface there.
@@ -821,6 +863,11 @@ function SeedanceApp() {
         }
         consecutiveFails = 0;
         const job = r.job;
+        if (job.workspace_id !== ownerWsId) {
+          setStatus('主题隔离校验失败，已阻止错误结果显示');
+          setSubmitting(false);
+          return;
+        }
         setStatus((job.status || 'unknown') + ' ' + (job.done || 0) + '/' + (job.total || 0));
         setEvents((job.events || []).map(e => '[' + (e.time || '') + '] ' + (e.message || '')).join('\n'));
         setLatestJob(job);
@@ -833,17 +880,14 @@ function SeedanceApp() {
           // Preserved terminal-status behavior from original pollJob:
           //   - job.status === 'succeeded' + dirHandle → saveToClient
           //   - job.status === 'succeeded' + autoDownload → triggerDownloads
-          // Note: saveToClient/triggerDownloads still key on the literal 'succeeded'
-          // (not the whole TERMINAL_STATUSES set) so failed/cancelled jobs never
-          // trigger downloads. dirHandle/autoDownload are tab-scoped via
-          // saveCurrentTabState/loadTargetTabState, but here we intentionally read
-          // this.dirHandle/this.autoDownload at terminal time — matching the
-          // original behavior of using whatever is live now (side-effects still
-          // fire even if the user has since switched tabs).
-          if (job.status === 'succeeded' && this.dirHandle) {
-            await this.saveToClient(job);
-          } else if (job.status === 'succeeded' && this.autoDownload) {
-            this.triggerDownloads(job);
+          // Delivery settings are captured at submit time. Reading this.* here
+          // would use whichever topic happens to be active when the task ends.
+          if (job.status === 'succeeded' && delivery?.dirHandle) {
+            const saved = await this.saveToClient(job, delivery.dirHandle);
+            if (saved) setStatus('已保存 ' + saved + ' 个文件到 ' + delivery.outputDir);
+          } else if (job.status === 'succeeded' && delivery?.autoDownload) {
+            const downloaded = this.triggerDownloads(job);
+            if (downloaded) setStatus('已下载 ' + downloaded + ' 个文件');
           }
           setSubmitting(false);
           setStatus('空闲');
@@ -940,7 +984,14 @@ function SeedanceApp() {
       }
     },
 
-    async saveToClient(job) {
+    _clearTopicResultDom() {
+      const resultsEl = document.getElementById('sd-results');
+      const eventsEl = document.getElementById('sd-events');
+      if (resultsEl) resultsEl.innerHTML = '';
+      if (eventsEl) eventsEl.textContent = '';
+    },
+
+    async saveToClient(job, dirHandle) {
       try {
         const files = [];
         for (const r of job.results || []) {
@@ -949,14 +1000,15 @@ function SeedanceApp() {
         for (const { url, filename } of files) {
           const resp = await fetch(url);
           const blob = await resp.blob();
-          const fh = await this.dirHandle.getFileHandle(filename, { create: true });
+          const fh = await dirHandle.getFileHandle(filename, { create: true });
           const w = await fh.createWritable();
           await w.write(blob);
           await w.close();
         }
-        if (files.length) this.statusText = '已保存 ' + files.length + ' 个文件到 ' + this.outputDir;
+        return files.length;
       } catch (e) {
         console.warn('saveToClient failed:', e);
+        return 0;
       }
     },
 
@@ -968,7 +1020,7 @@ function SeedanceApp() {
       for (const { url, filename } of urls) {
         this._blobDownload(url, filename);
       }
-      if (urls.length) this.statusText = '已下载 ' + urls.length + ' 个文件';
+      return urls.length;
     },
 
     async _blobDownload(url, filename) {
@@ -1137,19 +1189,21 @@ function SeedanceApp() {
     },
 
     loadPreset() {
+      const ownerWorkspaceId = this.activeTabId;
       // Try workspace draft first
       if (this.loadWorkspaceDraft()) return;
 
       // Fall back to API preset
       if (this._workspaceId === 'default' || !this._workspaceId) {
         // Will load after init via the async pattern
-        this._loadApiPreset();
+        this._loadApiPreset(ownerWorkspaceId);
       }
     },
 
-    async _loadApiPreset() {
-      const res = await api(APP_PATH + '/api/preset');
-      if (res) {
+    async _loadApiPreset(ownerWorkspaceId) {
+      const ownerWsId = ownerWorkspaceId || this.activeTabId;
+      const res = await api(APP_PATH + '/api/preset', 'GET', null, ownerWsId);
+      if (res && this.activeTabId === ownerWsId) {
         this.applyPreset(res);
       }
     },
@@ -1176,6 +1230,9 @@ function SeedanceApp() {
       window._activeWorkspaceId = id;
       this.workspaceName = '';
       this.savedMedia = {};
+      this.outputDir = '';
+      this.dirHandle = null;
+      this.autoDownload = false;
       const form = document.querySelector('#sd-form');
       if (form) form.reset();
       // form.reset() clears file inputs' .files but not the preview <img>/<video>
@@ -1185,6 +1242,7 @@ function SeedanceApp() {
       this.statusText = '空闲';
       this.eventsText = '';
       this.submitting = false;
+      this._clearTopicResultDom();
       this.saveTabsToLocalStorage();
       setTimeout(() => this._scrollActiveTabIntoView(), 0);
     },
@@ -1248,6 +1306,9 @@ function SeedanceApp() {
         provider: this.provider,
         models: this.models ? JSON.parse(JSON.stringify(this.models)) : [],
         workspaceName: this.workspaceName,
+        outputDir: this.outputDir,
+        dirHandle: this.dirHandle,
+        autoDownload: this.autoDownload,
       };
     },
 
@@ -1261,6 +1322,9 @@ function SeedanceApp() {
       if (cache.provider !== undefined) this.provider = cache.provider;
       if (cache.models !== undefined) this.models = cache.models;
       if (cache.workspaceName !== undefined) this.workspaceName = cache.workspaceName;
+      this.outputDir = cache.outputDir !== undefined ? cache.outputDir : '';
+      this.dirHandle = cache.dirHandle || null;
+      this.autoDownload = cache.autoDownload || false;
       const form = document.querySelector('#sd-form');
       if (form) form.reset();
       this.savedMedia = {};
@@ -1268,13 +1332,11 @@ function SeedanceApp() {
 
       // If a background pollJob stashed a job snapshot for this tab, replay it
       // into the DOM. Otherwise clear any stale DOM left by the previous tab.
-      if (cache._latestJob) {
+      if (cache._latestJob && cache._latestJob.workspace_id === wsId) {
         this._renderJobToDom(cache._latestJob);
       } else {
-        const resultsEl = document.getElementById('sd-results');
-        const eventsEl = document.getElementById('sd-events');
-        if (resultsEl) resultsEl.innerHTML = '';
-        if (eventsEl) eventsEl.textContent = '';
+        delete cache._latestJob;
+        this._clearTopicResultDom();
       }
     },
 

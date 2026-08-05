@@ -26,9 +26,9 @@ function getActiveWorkspaceId() {
   return window._activeWorkspaceId || _workspaceId();
 }
 
-async function api(url, method, body) {
+async function api(url, method, body, workspaceOverride) {
   try {
-    const wsId = getActiveWorkspaceId();
+    const wsId = workspaceOverride || getActiveWorkspaceId();
     const sep = url.includes('?') ? '&' : '?';
     const urlWithWs = url + sep + 'ws=' + encodeURIComponent(wsId);
     const headers = { 'X-Workspace-Id': wsId };
@@ -48,9 +48,9 @@ async function api(url, method, body) {
 //   {kind:'ok', job}  HTTP 200 + a job object carrying a status field
 //   {kind:'gone'}     HTTP 404 — job gone (sub-app restarted, JOBS cleared)
 //   {kind:'error'}    network error / timeout / 5xx / non-JSON — transient
-async function pollJobOnce(url) {
+async function pollJobOnce(url, workspaceOverride) {
   try {
-    const wsId = getActiveWorkspaceId();
+    const wsId = workspaceOverride || getActiveWorkspaceId();
     const sep = url.includes('?') ? '&' : '?';
     const urlWithWs = url + sep + 'ws=' + encodeURIComponent(wsId);
     const headers = { 'X-Workspace-Id': wsId };
@@ -359,6 +359,7 @@ function NanoBananaApp() {
     editingTabId: null,         // tab id being renamed inline, or null
     _closeConfirmTabId: null,   // tab id that opened the close-confirm modal
     _tabStateCache: {},         // { wsId: {statusText, eventsText, submitting, baseUrl, provider, models, workspaceName} }
+    _topicSubmissionSeq: {},    // { wsId: latest submit sequence }
 
     // ---- 8b. init() ----
 
@@ -609,13 +610,39 @@ function NanoBananaApp() {
 
     async submit() {
       var self = this;
+      var ownerWorkspaceId = self.activeTabId;
+      var ownerExists = function () { return self.tabs.some(function (t) { return t.id === ownerWorkspaceId; }); };
+      var ownerCache = function () {
+        if (!ownerExists()) return null;
+        return (self._tabStateCache[ownerWorkspaceId] = self._tabStateCache[ownerWorkspaceId] || {});
+      };
+      var setOwnerState = function (name, value) {
+        var cache = ownerCache();
+        if (!cache) return;
+        cache[name] = value;
+        if (self.activeTabId === ownerWorkspaceId) self[name] = value;
+      };
       if (self.submitting) return;
-      self.submitting = true;
-      self.statusText = '提交中';
+      var submissionToken = (self._topicSubmissionSeq[ownerWorkspaceId] || 0) + 1;
+      self._topicSubmissionSeq[ownerWorkspaceId] = submissionToken;
+      var delivery = {
+        dirHandle: self.dirHandle,
+        autoDownload: self.autoDownload,
+        outputDir: self.outputDir,
+      };
+      var cache = ownerCache();
+      cache._submissionToken = submissionToken;
+      cache._activeJobId = null;
+      delete cache._latestJob;
+      setOwnerState('submitting', true);
+      setOwnerState('statusText', '提交中');
       var resultsEl = document.getElementById('nb-results');
       var eventsEl = document.getElementById('nb-events');
-      if (resultsEl) resultsEl.innerHTML = '';
-      if (eventsEl) eventsEl.textContent = '';
+      if (self.activeTabId === ownerWorkspaceId) {
+        if (resultsEl) resultsEl.innerHTML = '';
+        if (eventsEl) eventsEl.textContent = '';
+      }
+      setOwnerState('eventsText', '');
 
       // Auto-save workspace draft before submit
       if (self.isStandalone) {
@@ -625,32 +652,46 @@ function NanoBananaApp() {
       var data = await self.formDataWithSavedMedia({ resizeImages: true });
       var res;
       try {
-        res = await api(APP_PATH + '/api/jobs', 'POST', data);
+        res = await api(APP_PATH + '/api/jobs', 'POST', data, ownerWorkspaceId);
       } finally {
-        self.submitting = false;
+        setOwnerState('submitting', false);
       }
       if (!res || res.error) {
-        self.statusText = (res && res.error) || '提交失败';
+        setOwnerState('statusText', (res && res.error) || '提交失败');
         return;
       }
-      self.statusText = '已提交，任务在后台运行';
+      if (!ownerExists() || ownerCache()._submissionToken !== submissionToken) return;
+      ownerCache()._activeJobId = res.job_id;
+      setOwnerState('statusText', '已提交，任务在后台运行');
       try { self.loadActivity(); } catch (e) { /* ignore */ }
-      self.pollJob(res.job_id);
+      self.pollJob(res.job_id, ownerWorkspaceId, submissionToken, delivery);
     },
 
-    async pollJob(jobId) {
+    async pollJob(jobId, ownerWorkspaceId, submissionToken, delivery) {
       var self = this;
-      // Record which tab initiated this poll. If the user switches tabs while
-      // the job is still running, subsequent state writes must NOT contaminate
-      // the now-active tab — they route into _tabStateCache[startWsId] instead.
-      var startWsId = self.activeTabId;
-      var isActive = function () { return self.activeTabId === startWsId; };
-      var cache = function () { return (self._tabStateCache[startWsId] = self._tabStateCache[startWsId] || {}); };
-
-      var setStatus = function (t) { if (isActive()) self.statusText = t; else cache().statusText = t; };
-      var setEvents = function (t) { if (isActive()) self.eventsText = t; else cache().eventsText = t; };
-      var setSubmitting = function (v) { if (isActive()) self.submitting = v; else cache().submitting = v; };
-      var setLatestJob = function (job) { cache()._latestJob = job; };
+      var ownerWsId = ownerWorkspaceId || self.activeTabId;
+      var ownerExists = function () { return self.tabs.some(function (t) { return t.id === ownerWsId; }); };
+      var cache = function () {
+        if (!ownerExists()) return null;
+        return (self._tabStateCache[ownerWsId] = self._tabStateCache[ownerWsId] || {});
+      };
+      var isCurrent = function () {
+        var state = cache();
+        if (!state) return false;
+        if (submissionToken !== undefined && state._submissionToken !== submissionToken) return false;
+        return !state._activeJobId || state._activeJobId === jobId;
+      };
+      var isActive = function () { return isCurrent() && self.activeTabId === ownerWsId; };
+      var setState = function (name, value) {
+        if (!isCurrent()) return;
+        var state = cache();
+        state[name] = value;
+        if (isActive()) self[name] = value;
+      };
+      var setStatus = function (t) { setState('statusText', t); };
+      var setEvents = function (t) { setState('eventsText', t); };
+      var setSubmitting = function (v) { setState('submitting', v); };
+      var setLatestJob = function (job) { if (isCurrent()) cache()._latestJob = job; };
 
       // Transient-failure tolerance. A single failed poll (proxy timeout, wifi
       // blip, sub-app 5xx) used to `break` and permanently abandon the watcher,
@@ -662,7 +703,9 @@ function NanoBananaApp() {
       var consecutiveFails = 0;
 
       while (true) {
-        var r = await pollJobOnce(APP_PATH + '/api/jobs/' + jobId);
+        if (!isCurrent()) break;
+        var r = await pollJobOnce(APP_PATH + '/api/jobs/' + jobId, ownerWsId);
+        if (!isCurrent()) break;
         if (r.kind === 'gone') {
           setStatus('任务已失效(服务可能重启过),请查看活动记录或重新提交');
           break;
@@ -679,6 +722,11 @@ function NanoBananaApp() {
         }
         consecutiveFails = 0;
         var job = r.job;
+        if (job.workspace_id !== ownerWsId) {
+          setStatus('主题隔离校验失败，已阻止错误结果显示');
+          setSubmitting(false);
+          return;
+        }
         setStatus((job.status || '') + ' ' + (job.done || 0) + '/' + (job.total || 0));
         setEvents((job.events || []).map(function (e) { return '[' + (e.time || '') + '] ' + (e.message || ''); }).join('\n'));
         setLatestJob(job);
@@ -691,12 +739,14 @@ function NanoBananaApp() {
           // Preserved terminal-status behavior from original pollJob:
           //   - job.status === 'succeeded' + dirHandle → saveToClient
           //   - job.status === 'succeeded' + autoDownload → triggerDownloads
-          // dirHandle/autoDownload are read live (this.*) — side effects still
-          // fire even if the user has since switched tabs, matching original.
-          if (job.status === 'succeeded' && self.dirHandle) {
-            await self.saveToClient(job);
-          } else if (job.status === 'succeeded' && self.autoDownload) {
-            self.triggerDownloads(job);
+          // Delivery settings are captured at submit time. Reading self.* here
+          // would use whichever topic happens to be active when the task ends.
+          if (job.status === 'succeeded' && delivery && delivery.dirHandle) {
+            var saved = await self.saveToClient(job, delivery.dirHandle);
+            if (saved) setStatus('已保存 ' + saved + ' 个文件到 ' + delivery.outputDir);
+          } else if (job.status === 'succeeded' && delivery && delivery.autoDownload) {
+            var downloaded = self.triggerDownloads(job);
+            if (downloaded) setStatus('已下载 ' + downloaded + ' 个文件');
           }
           setSubmitting(false);
           setStatus('空闲');
@@ -771,6 +821,13 @@ function NanoBananaApp() {
       }
     },
 
+    _clearTopicResultDom() {
+      var resultsEl = document.getElementById('nb-results');
+      var eventsEl = document.getElementById('nb-events');
+      if (resultsEl) resultsEl.innerHTML = '';
+      if (eventsEl) eventsEl.textContent = '';
+    },
+
     async loadJobs() {
       var self = this;
       try {
@@ -793,7 +850,7 @@ function NanoBananaApp() {
 
     // ---- 8f. saveToClient / triggerDownloads / _blobDownload ----
 
-    async saveToClient(job) {
+    async saveToClient(job, dirHandle) {
       try {
         var files = [];
         for (var ri = 0; ri < (job.results || []).length; ri++) {
@@ -807,14 +864,15 @@ function NanoBananaApp() {
           var f = files[fi];
           var resp = await fetch(f.url);
           var blob = await resp.blob();
-          var fh = await this.dirHandle.getFileHandle(f.filename, { create: true });
+          var fh = await dirHandle.getFileHandle(f.filename, { create: true });
           var w = await fh.createWritable();
           await w.write(blob);
           await w.close();
         }
-        if (files.length) this.statusText = '已保存 ' + files.length + ' 个文件到 ' + this.outputDir;
+        return files.length;
       } catch (e) {
         console.warn('saveToClient failed:', e);
+        return 0;
       }
     },
 
@@ -830,7 +888,7 @@ function NanoBananaApp() {
       for (var ui = 0; ui < urls.length; ui++) {
         this._blobDownload(urls[ui].url, urls[ui].filename);
       }
-      if (urls.length) this.statusText = '已下载 ' + urls.length + ' 个文件';
+      return urls.length;
     },
 
     async _blobDownload(url, filename) {
@@ -1065,7 +1123,9 @@ function NanoBananaApp() {
       this.archiveHint = '已清空当前读取配置';
     },
 
-    async loadInitialPreset() {
+    async loadInitialPreset(ownerWorkspaceId) {
+      var ownerWsId = ownerWorkspaceId || this.activeTabId;
+      if (this.activeTabId !== ownerWsId) return;
       // Always prefer the per-tab workspace draft (localStorage). It holds this
       // tab's api_key / provider / prompt — which the server preset intentionally
       // strips (api_key is masked/omitted server-side). Gating this on
@@ -1076,11 +1136,10 @@ function NanoBananaApp() {
 
       // Fall back to the server preset only when this tab has no local draft
       // yet (e.g. first visit on a fresh browser, or a tab restored from server).
-      var wsId = getActiveWorkspaceId();
-      var res = await fetch(APP_PATH + '/api/preset?ws=' + encodeURIComponent(wsId), { headers: { 'X-Workspace-Id': wsId } });
+      var res = await fetch(APP_PATH + '/api/preset?ws=' + encodeURIComponent(ownerWsId), { headers: { 'X-Workspace-Id': ownerWsId } });
       if (res.ok) {
         var data = await res.json();
-        this.applyPreset(data);
+        if (this.activeTabId === ownerWsId) this.applyPreset(data);
       }
     },
 
@@ -1160,6 +1219,9 @@ function NanoBananaApp() {
       window._activeWorkspaceId = id;
       this.workspaceName = '';
       this.savedMedia = {};
+      this.outputDir = '';
+      this.dirHandle = null;
+      this.autoDownload = false;
       var form = document.querySelector('#nb-form');
       if (form) form.reset();
       // form.reset() clears file inputs' .files but not the preview <img>
@@ -1169,6 +1231,7 @@ function NanoBananaApp() {
       this.statusText = '空闲';
       this.eventsText = '';
       this.submitting = false;
+      this._clearTopicResultDom();
       this.saveTabsToLocalStorage();
       var self = this;
       setTimeout(function () { self._scrollActiveTabIntoView(); }, 0);
@@ -1232,6 +1295,9 @@ function NanoBananaApp() {
         provider: this.provider,
         models: this.models ? JSON.parse(JSON.stringify(this.models)) : [],
         workspaceName: this.workspaceName,
+        outputDir: this.outputDir,
+        dirHandle: this.dirHandle,
+        autoDownload: this.autoDownload,
       });
     },
 
@@ -1246,6 +1312,9 @@ function NanoBananaApp() {
       if (cache.provider !== undefined) this.provider = cache.provider;
       if (cache.models !== undefined) this.models = cache.models;
       if (cache.workspaceName !== undefined) this.workspaceName = cache.workspaceName;
+      this.outputDir = cache.outputDir !== undefined ? cache.outputDir : '';
+      this.dirHandle = cache.dirHandle || null;
+      this.autoDownload = cache.autoDownload || false;
       var form = document.querySelector('#nb-form');
       if (form) form.reset();
       this.savedMedia = {};
@@ -1253,13 +1322,11 @@ function NanoBananaApp() {
 
       // If a background pollJob stashed a job snapshot for this tab, replay it
       // into the DOM. Otherwise clear any stale DOM left by the previous tab.
-      if (cache._latestJob) {
+      if (cache._latestJob && cache._latestJob.workspace_id === wsId) {
         self._renderJobToDom(cache._latestJob);
       } else {
-        var resultsEl = document.getElementById('nb-results');
-        var eventsEl = document.getElementById('nb-events');
-        if (resultsEl) resultsEl.innerHTML = '';
-        if (eventsEl) eventsEl.textContent = '';
+        delete cache._latestJob;
+        self._clearTopicResultDom();
       }
     },
 

@@ -1933,6 +1933,7 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
             "id": job_id, "status": "queued", "events": [], "results": [], "errors": [],
             "done": 0, "total": 0, "duration": per_item_duration,
             "username": username,
+            "workspace_id": ws_id,
             "submitted_at": time.time(),
             "started_at": None,
             "finished_at": None,
@@ -1952,7 +1953,7 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
         "username": username,
         "started_at": time.time(),
         "restore": copy_files_to_restore(values, files, activity_id, ws_id),
-    })
+    }, ws_id)
     thread = threading.Thread(target=run_job, args=(job_id, values, files, activity_id, ws_id), daemon=True)
     thread.start()
     return job_id
