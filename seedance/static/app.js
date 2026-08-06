@@ -119,10 +119,14 @@ function wireFileDrop(drop, input, name) {
     const localUrl = URL.createObjectURL(f);
     showPreview(drop, name, localUrl, f.name);
     // Upload to server so the file survives tab switch / refresh / archive save.
+    // The upload is owned by the topic that was active when the file was picked;
+    // a response arriving after a topic switch must not touch the new topic.
+    const ownerWsId = getActiveWorkspaceId();
     try {
       const fd = new FormData();
       fd.set(input.name, f);
-      const res = await api(APP_PATH + '/api/media/upload', 'POST', fd);
+      const res = await api(APP_PATH + '/api/media/upload', 'POST', fd, ownerWsId);
+      if (getActiveWorkspaceId() !== ownerWsId) return;
       if (res && res.stored) {
         const app = window._app_sd;
         const media = (app && app.savedMedia) || window._currentSavedMedia || {};
@@ -496,7 +500,9 @@ function SeedanceApp() {
     // ARCHIVES
     // ============================================================
     async loadArchives() {
-      const res = await api(APP_PATH + '/api/archives');
+      const ownerWsId = this.activeTabId;
+      const res = await api(APP_PATH + '/api/archives', 'GET', null, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res) this.archives = res.archives || [];
       if (this.selectedArchive && !this.archives.some(a => a.name === this.selectedArchive)) {
         this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
@@ -504,16 +510,19 @@ function SeedanceApp() {
     },
 
     async saveArchive() {
+      const ownerWsId = this.activeTabId;
       this.archiveHint = '保存中...';
       const data = new FormData(document.getElementById('sd-form'));
       if (Object.keys(this.savedMedia).length) {
         data.set('saved_media', JSON.stringify(this.savedMedia));
       }
-      const res = await api(APP_PATH + '/api/preset', 'POST', data);
+      const res = await api(APP_PATH + '/api/preset', 'POST', data, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res) {
         this.archiveHint = res.archive ? '已保存：' + res.archive : (res.error || '保存失败');
         if (res.media) this.savedMedia = res.media;
         await this.loadArchives();
+        if (this.activeTabId !== ownerWsId) return;
         this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
       } else {
         this.archiveHint = '保存失败';
@@ -531,9 +540,11 @@ function SeedanceApp() {
         this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
         return;
       }
+      const ownerWsId = this.activeTabId;
       const data = new FormData();
       data.set('archive_name', name);
-      const res = await api(APP_PATH + '/api/archive/load', 'POST', data);
+      const res = await api(APP_PATH + '/api/archive/load', 'POST', data, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (!res) {
         this.archiveHint = '读取失败';
         return;
@@ -551,15 +562,18 @@ function SeedanceApp() {
       }
       const name = this.selectedArchive;
       if (!confirm('确定删除存档「' + name + '」？此操作不可恢复。')) return;
+      const ownerWsId = this.activeTabId;
       const data = new FormData();
       data.set('archive_name', name);
-      const res = await api(APP_PATH + '/api/archive/delete', 'POST', data);
+      const res = await api(APP_PATH + '/api/archive/delete', 'POST', data, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (!res || res.ok === false) {
         this.archiveHint = '删除失败：' + (res && res.error ? res.error : '存档可能已被删除或不存在');
         return;
       }
       this.selectedArchive = '';
       await this.loadArchives();
+      if (this.activeTabId !== ownerWsId) return;
       this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
       this.archiveHint = '已删除：' + name;
     },
@@ -572,11 +586,13 @@ function SeedanceApp() {
         this.optimizeError = '请先输入提示词';
         return;
       }
+      const ownerWsId = this.activeTabId;
       this.optimizing = true;
       this.optimizedPrompt = '';
       this.optimizeError = '';
       try {
-        const res = await api(APP_PATH + '/api/optimize-prompt', 'POST', JSON.stringify({ prompt: prompt }));
+        const res = await api(APP_PATH + '/api/optimize-prompt', 'POST', JSON.stringify({ prompt: prompt }), ownerWsId);
+        if (this.activeTabId !== ownerWsId) return;
         if (!res) {
           this.optimizeError = '优化失败：网络异常，请检查服务是否运行';
         } else if (!res.ok) {
@@ -585,9 +601,14 @@ function SeedanceApp() {
           this.optimizedPrompt = res.optimized;
         }
       } catch (e) {
-        this.optimizeError = '优化失败：' + (e.message || '未知异常');
+        if (this.activeTabId === ownerWsId) {
+          this.optimizeError = '优化失败：' + (e.message || '未知异常');
+        }
+      } finally {
+        // Must run even when the owner check bails out, or the spinner stays
+        // stuck for every topic.
+        this.optimizing = false;
       }
-      this.optimizing = false;
     },
     replacePrompt() {
       const promptEl = document.querySelector('textarea[name="prompt"][form="sd-form"]');
@@ -610,7 +631,9 @@ function SeedanceApp() {
     },
 
     async clearPreset() {
-      const res = await api(APP_PATH + '/api/preset/clear', 'POST');
+      const ownerWsId = this.activeTabId;
+      const res = await api(APP_PATH + '/api/preset/clear', 'POST', null, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (!res) return;
       this.savedMedia = {};
       clearAllMediaPreviews();
@@ -621,7 +644,9 @@ function SeedanceApp() {
     // ACTIVITY
     // ============================================================
     async loadActivity() {
-      const res = await api(APP_PATH + '/api/activity');
+      const ownerWsId = this.activeTabId;
+      const res = await api(APP_PATH + '/api/activity', 'GET', null, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res) {
         this.activityRecords = res.records || [];
         this.activityCounts = res.counts || null;
@@ -672,7 +697,9 @@ function SeedanceApp() {
     },
 
     async showDetail(id) {
-      const res = await api(APP_PATH + '/api/activity/' + id);
+      const ownerWsId = this.activeTabId;
+      const res = await api(APP_PATH + '/api/activity/' + id, 'GET', null, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res) this.activityDetail = res;
     },
 
@@ -699,8 +726,12 @@ function SeedanceApp() {
     // OUTPUT DIRECTORY
     // ============================================================
     async chooseOutputDir() {
+      // Delivery settings live in the per-topic cache, so a picker that resolves
+      // after the user switched topics must not rewrite the new topic's target.
+      const ownerWsId = this.activeTabId;
       // Backend native directory picker
-      const res = await api(APP_PATH + '/api/choose-output-dir', 'POST');
+      const res = await api(APP_PATH + '/api/choose-output-dir', 'POST', null, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res?.path) {
         this.outputDir = res.path;
         this.dirHandle = null;
@@ -709,11 +740,14 @@ function SeedanceApp() {
       // Browser File System Access API
       if (window.showDirectoryPicker) {
         try {
-          this.dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+          const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+          if (this.activeTabId !== ownerWsId) return;
+          this.dirHandle = handle;
           this.outputDir = this.dirHandle.name;
           this.statusText = '已选择: ' + this.outputDir;
           return;
         } catch (e) { /* user cancelled */ }
+        if (this.activeTabId !== ownerWsId) return;
       }
       // Fallback to browser download
       this.autoDownload = true;
@@ -724,7 +758,9 @@ function SeedanceApp() {
     },
 
     async desktopOutput() {
-      const res = await api(APP_PATH + '/api/default-output-dir');
+      const ownerWsId = this.activeTabId;
+      const res = await api(APP_PATH + '/api/default-output-dir', 'GET', null, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res?.path) this.outputDir = res.path;
     },
 
@@ -733,9 +769,11 @@ function SeedanceApp() {
         this.statusText = '文件将保存到 "' + this.outputDir + '"（浏览器限制无法代为打开）';
         return;
       }
+      const ownerWsId = this.activeTabId;
       const data = new FormData();
       data.set('output_dir', this.outputDir);
-      const res = await api(APP_PATH + '/api/open-output-dir', 'POST', data);
+      const res = await api(APP_PATH + '/api/open-output-dir', 'POST', data, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res?.remote) this.statusText = '远程客户端不支持打开服务端目录';
     },
 
@@ -863,7 +901,11 @@ function SeedanceApp() {
         }
         consecutiveFails = 0;
         const job = r.job;
-        if (job.workspace_id !== ownerWsId) {
+        // Jobs created before the backend started persisting workspace_id have
+        // no owner to compare against. Treating that as a mismatch would hide
+        // every result until the sub-app restarts, since the frontend picks up
+        // new JS on refresh while the backend keeps running old code.
+        if (job.workspace_id && job.workspace_id !== ownerWsId) {
           setStatus('主题隔离校验失败，已阻止错误结果显示');
           setSubmitting(false);
           return;
@@ -1332,7 +1374,9 @@ function SeedanceApp() {
 
       // If a background pollJob stashed a job snapshot for this tab, replay it
       // into the DOM. Otherwise clear any stale DOM left by the previous tab.
-      if (cache._latestJob && cache._latestJob.workspace_id === wsId) {
+      // The cache key already proves ownership, so a snapshot predating backend
+      // workspace_id persistence is still this tab's own result.
+      if (cache._latestJob && (!cache._latestJob.workspace_id || cache._latestJob.workspace_id === wsId)) {
         this._renderJobToDom(cache._latestJob);
       } else {
         delete cache._latestJob;

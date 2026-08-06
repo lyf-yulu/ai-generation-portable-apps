@@ -1065,7 +1065,16 @@ class UsageTracker:
         """Idempotent: mark a job final. If status indicates failure/cancel,
         roll back the +1 that inc_daily_jobs applied at registration time.
         Returns True if the rollback was applied (i.e. first time we saw
-        a failure for this job), False otherwise."""
+        a failure for this job), False otherwise.
+
+        This must NOT drop the job from _pending_jobs. Sub-apps report
+        final_status="failed" whenever a single item errored, so a partial
+        success (3 of 4 images generated and billed) arrives here as a failure.
+        The two paths write disjoint counters — this one owns daily.jobs, the
+        poll loop owns by_user.images/seconds — and the `finalized` flag above
+        already makes the daily.jobs rollback idempotent. Removing the job from
+        pending would leave those 3 real images uncounted forever.
+        """
         status = (status or "").lower()
         is_failure = status in ("failed", "fail", "failure", "cancelled", "canceled", "error")
         with self._lock:
@@ -1086,10 +1095,6 @@ class UsageTracker:
                 app_stats = day_stats.setdefault(app, {"requests": 0, "jobs": 0})
                 app_stats["jobs"] = max(0, int(app_stats.get("jobs", 0)) - 1)
                 rolled = True
-                # Drop from pending_jobs so the poll loop does not double-act.
-                self._pending_jobs = [
-                    j for j in self._pending_jobs if not (j["app"] == app and j["job_id"] == job_id)
-                ]
             self._save()
             return rolled
 
