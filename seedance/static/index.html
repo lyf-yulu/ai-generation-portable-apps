@@ -64,14 +64,18 @@
               <input name="custom_model" v-model="customModel" placeholder="留空使用上方模型">
             </label>
             <div class="grid2">
-              <label>时长<input name="duration" type="number" min="4" max="15" value="12"></label>
+              <label>时长（秒）<input name="duration" type="number" min="-1" max="15" value="12"></label>
               <label>分辨率
                 <select name="resolution">
-                  <option>720p</option><option>480p</option><option>1080p</option>
-                  <option>native1080p</option><option>2k</option><option>4k</option>
+                  <option>720p</option><option>480p</option><option>1080p</option><option>4k</option>
                 </select>
               </label>
             </div>
+            <p class="hint">
+              填 <strong>-1</strong> = 由模型自动决定时长。<strong>视频编辑</strong>（提示词含「删除/去掉、修改/替换/改成、增加/加上」）
+              必须用 -1，且比例要选 adaptive；<strong>视频延长</strong>（「续写、向前/向后延长」）比例也必须选 adaptive。
+              普通文生视频 / 参考生视频填正常秒数即可。
+            </p>
             <div class="grid2">
               <label>比例
                 <select name="ratio">

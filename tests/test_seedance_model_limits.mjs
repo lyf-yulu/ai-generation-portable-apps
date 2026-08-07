@@ -174,6 +174,38 @@ assert.ok(
   'adaptive is mandatory for video edit/extend tasks and must be selectable',
 );
 
+// --- duration=-1 is a sentinel, not an out-of-range number ---------------
+// Ark requires -1 ("model picks the length") for video edit tasks on every
+// model, so clamping it into the positive range would make those tasks
+// unsubmittable — the exact gap this change closes.
+modelSelect.value = 'doubao-seedance-2-5-260628';
+app.applyModelLimits();
+durationInput.value = '-1';
+app.applyModelLimits();
+assert.equal(durationInput.value, '-1', '-1 must survive applyModelLimits untouched');
+
+modelSelect.value = 'doubao-seedance-2-0-260128';
+app.applyModelLimits();
+assert.equal(durationInput.value, '-1', '-1 must survive a model switch, not clamp to the ceiling');
+assert.equal(durationInput.min, '-1', 'the number input must accept -1');
+
+// The sentinel must not stop the rest of the narrowing from running.
+resolutionSelect.value = '4k';                      // legal on 2.0 only
+durationInput.value = '-1';
+modelSelect.value = 'doubao-seedance-2-5-260628';
+app.applyModelLimits();
+assert.equal(durationInput.value, '-1', 'sentinel preserved');
+assert.ok(
+  spec25.resolutions.includes(resolutionSelect.value),
+  'resolution must still be narrowed while duration is -1, got ' + resolutionSelect.value,
+);
+
+// A normal value still clamps — the sentinel check must not disable clamping.
+durationInput.value = '30';
+modelSelect.value = 'doubao-seedance-2-0-260128';
+app.applyModelLimits();
+assert.equal(durationInput.value, '15', 'ordinary out-of-range values must still clamp');
+
 // --- init() must wire the change listener that drives all of the above ---
 // Without it the limits would only apply on provider load, so picking a
 // different model in the dropdown would leave a stale ceiling behind.

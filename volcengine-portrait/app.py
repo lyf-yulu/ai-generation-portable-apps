@@ -1601,7 +1601,12 @@ def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
             "extra_asset_ids": extra_asset_ids,
             "prompt": prompt,
             "model": model,
-            "duration": duration,
+            # Two fields on purpose. `requested_duration` is what Ark receives and
+            # may legitimately be -1 ("model picks the length"). `duration` is what
+            # Portal's usage poller bills as done * duration, so it must never be
+            # negative — it stays 0 until the real length is backfilled on success.
+            "requested_duration": duration,
+            "duration": max(0, duration),
             "resolution": resolution,
             "ratio": ratio,
             "status": "queued",
@@ -1743,7 +1748,8 @@ def _run_virtual_job_impl(job_id, job):
     extra_asset_ids = job.get("extra_asset_ids", []) or []
     prompt = job.get("prompt", "")
     model = job.get("model", "doubao-seedance-2-0-260128")
-    duration = int(job.get("duration", 12))
+    # Read the requested value (may be -1), not the billing-safe `duration`.
+    duration = int(job.get("requested_duration", job.get("duration", 12)))
     resolution = job.get("resolution", "720p")
     ratio = job.get("ratio", "16:9")
     repeat_count = int(job.get("total", 1))
@@ -1815,7 +1821,15 @@ def _run_virtual_job_impl(job_id, job):
                         with FILES_LOCK:
                             FILES[file_token] = local_path
                         save_files_map()
+                    # Ark reports the produced length, which is the only source
+                    # of truth when the request asked for duration=-1. Portal
+                    # bills video seconds as done * job["duration"], so a
+                    # negative value there would subtract from by_user.seconds.
+                    actual_duration = task_result.get("duration")
                     with JOBS_LOCK:
+                        if (isinstance(actual_duration, (int, float)) and actual_duration > 0
+                                and int(job.get("duration") or 0) <= 0):
+                            job["duration"] = int(actual_duration)
                         job["results"].append({
                             "index": idx,
                             "task_id": task_id,

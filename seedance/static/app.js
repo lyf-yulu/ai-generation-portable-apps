@@ -546,10 +546,15 @@ function SeedanceApp() {
       const durationEl = field('duration');
       if (durationEl && Array.isArray(cfg.duration_range)) {
         const [lo, hi] = cfg.duration_range;
-        durationEl.min = String(lo);
+        // Keep min at -1 regardless of the model's positive range: -1 is a
+        // sentinel meaning "let Ark pick" and is legal (in fact required) for
+        // video edit / extend tasks on every model.
+        durationEl.min = '-1';
         durationEl.max = String(hi);
         const current = parseInt(durationEl.value, 10);
-        if (!Number.isNaN(current)) {
+        // -1 is the sentinel and must survive a model switch untouched; only a
+        // real out-of-range number gets clamped.
+        if (!Number.isNaN(current) && current !== -1) {
           durationEl.value = String(Math.min(hi, Math.max(lo, current)));
         }
       }

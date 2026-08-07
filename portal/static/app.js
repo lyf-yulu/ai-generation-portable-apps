@@ -1932,7 +1932,11 @@ function VolcenginePortraitApp() {
     onModelChange() {
       const spec = this.modelSpec();
       if (!spec.resolutions.includes(this.resolution)) this.resolution = spec.resolutions[0];
-      if (Number(this.duration) > spec.maxDuration) this.duration = spec.maxDuration;
+      // -1 means "let Ark pick the length" and is required by video edit /
+      // extend tasks, so it must survive a model switch instead of being clamped.
+      if (Number(this.duration) !== -1 && Number(this.duration) > spec.maxDuration) {
+        this.duration = spec.maxDuration;
+      }
     },
 
     async createJob() {

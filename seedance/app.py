@@ -1928,6 +1928,12 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
         per_item_duration = int(values.get("duration") or 0)
     except (TypeError, ValueError):
         per_item_duration = 0
+    # duration=-1 asks the model to choose the length. Store 0 rather than -1:
+    # Portal bills video seconds as done * duration, so a negative value would
+    # subtract from by_user.seconds. run_one() backfills the real length once Ark
+    # reports it.
+    if per_item_duration < 0:
+        per_item_duration = 0
     with JOBS_LOCK:
         JOBS[job_id] = {
             "id": job_id, "status": "queued", "events": [], "results": [], "errors": [],
@@ -2035,11 +2041,22 @@ def run_one(job_id: str, index: int, form_values: dict[str, Any], form_files: di
             FILES[file_token] = out_path
         save_files_map()
         add_event(job_id, f"Run {index}: downloaded {out_name}")
+        # Ark reports the produced length back, which matters when the request
+        # asked for duration=-1 (model picks the length). Portal's usage poller
+        # bills seconds as done * job["duration"], so leaving -1 there would
+        # subtract from by_user.seconds instead of adding.
+        actual_duration = status_result.get("duration")
+        if isinstance(actual_duration, (int, float)) and actual_duration > 0:
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+                if job is not None and int(job.get("duration") or 0) <= 0:
+                    job["duration"] = int(actual_duration)
         return {
             "index": index,
             "task_id": task_id,
             "status": "succeeded",
             "video_url": video_url,
+            "duration": int(actual_duration) if isinstance(actual_duration, (int, float)) else None,
             "download_url": f"/api/download/{file_token}",
             "filename": out_name,
             "local_path": str(out_path),

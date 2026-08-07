@@ -439,17 +439,26 @@
               </select>
             </label>
             <div class="row" style="flex-wrap:wrap;gap:8px;margin-top:8px">
-              <label style="flex:1;min-width:100px">时长(秒) <input type="number" v-model="duration" min="4" :max="modelMaxDuration()"></label>
+              <label style="flex:1;min-width:100px">时长(秒) <input type="number" v-model="duration" min="-1" :max="modelMaxDuration()"></label>
               <label style="flex:1;min-width:100px">分辨率
                 <select v-model="resolution">
                   <option v-for="r in modelResolutions()" :value="r">{{ r }}</option>
                 </select>
               </label>
               <label style="flex:1;min-width:100px">比例
-                <select v-model="ratio"><option>16:9</option><option>9:16</option><option>1:1</option></select>
+                <select v-model="ratio">
+                  <option>16:9</option><option>9:16</option><option>1:1</option>
+                  <option>4:3</option><option>3:4</option><option>21:9</option>
+                  <option>adaptive</option>
+                </select>
               </label>
               <label style="flex:1;min-width:80px">次数 <input type="number" v-model="repeat" min="1" max="4"></label>
             </div>
+            <p class="hint" style="margin-top:6px">
+              时长填 <strong>-1</strong> = 由模型自动决定。<strong>视频编辑</strong>（提示词含「删除/去掉、修改/替换/改成、增加/加上」）
+              必须时长 -1 + 比例 adaptive；<strong>视频延长</strong>（「续写、向前/向后延长」）必须比例 adaptive；
+              <strong>首帧/首尾帧</strong>也必须比例 adaptive。普通参考生视频填正常秒数即可。
+            </p>
             <button @click="createJob()" :disabled="submitting" class="primary" style="margin-top:8px;width:100%">
               {{ submitting ? statusText : '开始生成' }}
             </button>
