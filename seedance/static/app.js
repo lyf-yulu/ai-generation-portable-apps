@@ -240,6 +240,8 @@ const FALLBACK_PROVIDERS = {
     models: [
       { id: 'doubao-seedance-2-0-260128', label: 'doubao-seedance-2-0-260128' },
       { id: 'doubao-seedance-2-0-fast-260128', label: 'doubao-seedance-2-0-fast-260128' },
+      { id: 'doubao-seedance-2-0-mini-260615', label: 'doubao-seedance-2-0-mini-260615' },
+      { id: 'doubao-seedance-2-5-260628', label: 'Seedance 2.5（未开通时报 ModelNotOpen）' },
     ],
     hint: '豆包官方火山方舟 API。本地图/视频/音频参考素材会先上传到公司 TOS bucket，再以预签名 URL 传给方舟。',
     label: '豆包官方 / 火山方舟',

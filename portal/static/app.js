@@ -1544,7 +1544,13 @@ function VolcenginePortraitApp() {
     assets: [],
     assetName: '',
     genAssetId: '', extraAssetIds: [], extraFiles: [],
-    prompt: '', duration: 12, resolution: '720p', ratio: '16:9', repeat: 1,
+    prompt: '', model: 'doubao-seedance-2-0-260128', duration: 12, resolution: '720p', ratio: '16:9', repeat: 1,
+    portraitModels: [
+      { id: 'doubao-seedance-2-0-260128', label: 'Seedance 2.0' },
+      { id: 'doubao-seedance-2-0-fast-260128', label: 'Seedance 2.0 fast' },
+      { id: 'doubao-seedance-2-0-mini-260615', label: 'Seedance 2.0 mini' },
+      { id: 'doubao-seedance-2-5-260628', label: 'Seedance 2.5（未开通时报 ModelNotOpen）' },
+    ],
     submitting: false, events: '', results: [], jobs: [],
     runtimeTick: 0,
     outputDir: '', outputDirInput: '', showOutputDirInput: false,
@@ -1913,6 +1919,7 @@ function VolcenginePortraitApp() {
           const fd = new FormData();
           fd.append('asset_id', this.genAssetId);
           fd.append('prompt', this.prompt);
+          fd.append('model', this.model);
           fd.append('duration', this.duration);
           fd.append('resolution', this.resolution);
           fd.append('ratio', this.ratio);
@@ -1928,6 +1935,7 @@ function VolcenginePortraitApp() {
             asset_id: this.genAssetId,
             extra_asset_ids: this.extraAssetIds,
             prompt: this.prompt,
+            model: this.model,
             duration: this.duration, resolution: this.resolution, ratio: this.ratio, repeat_count: this.repeat
           }));
         }

@@ -21,7 +21,9 @@
       },
       "models": [
         {"id": "doubao-seedance-2-0-260128", "label": "doubao-seedance-2-0-260128"},
-        {"id": "doubao-seedance-2-0-fast-260128", "label": "doubao-seedance-2-0-fast-260128"}
+        {"id": "doubao-seedance-2-0-fast-260128", "label": "doubao-seedance-2-0-fast-260128"},
+        {"id": "doubao-seedance-2-0-mini-260615", "label": "doubao-seedance-2-0-mini-260615"},
+        {"id": "doubao-seedance-2-5-260628", "label": "Seedance 2.5（未开通时报 ModelNotOpen）"}
       ]
     }
   }
