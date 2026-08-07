@@ -1545,11 +1545,26 @@ function VolcenginePortraitApp() {
     assetName: '',
     genAssetId: '', extraAssetIds: [], extraFiles: [],
     prompt: '', model: 'doubao-seedance-2-0-260128', duration: 12, resolution: '720p', ratio: '16:9', repeat: 1,
+    // Per-model limits from the official capability matrix. Ark only validates
+    // these after the job is queued, so an out-of-range value costs a wait plus
+    // an async error rather than failing fast.
     portraitModels: [
-      { id: 'doubao-seedance-2-0-260128', label: 'Seedance 2.0' },
-      { id: 'doubao-seedance-2-0-fast-260128', label: 'Seedance 2.0 fast' },
-      { id: 'doubao-seedance-2-0-mini-260615', label: 'Seedance 2.0 mini' },
-      { id: 'doubao-seedance-2-5-260628', label: 'Seedance 2.5（未开通时报 ModelNotOpen）' },
+      {
+        id: 'doubao-seedance-2-0-260128', label: 'Seedance 2.0（最高 4k）',
+        maxDuration: 15, resolutions: ['480p', '720p', '1080p', '4k'],
+      },
+      {
+        id: 'doubao-seedance-2-0-fast-260128', label: 'Seedance 2.0 fast',
+        maxDuration: 15, resolutions: ['480p', '720p'],
+      },
+      {
+        id: 'doubao-seedance-2-0-mini-260615', label: 'Seedance 2.0 mini（最快）',
+        maxDuration: 15, resolutions: ['480p', '720p'],
+      },
+      {
+        id: 'doubao-seedance-2-5-260628', label: 'Seedance 2.5（最长 30s）',
+        maxDuration: 30, resolutions: ['480p', '720p'],
+      },
     ],
     submitting: false, events: '', results: [], jobs: [],
     runtimeTick: 0,
@@ -1906,6 +1921,20 @@ function VolcenginePortraitApp() {
     },
 
     // === Jobs ===
+    // Capabilities of the currently selected model, read from portraitModels.
+    modelSpec() {
+      return this.portraitModels.find(m => m.id === this.model) || this.portraitModels[0];
+    },
+    modelResolutions() { return this.modelSpec().resolutions; },
+    modelMaxDuration() { return this.modelSpec().maxDuration; },
+    // Called from index.html on model change so a stale resolution or an
+    // out-of-range duration is corrected before the user can submit.
+    onModelChange() {
+      const spec = this.modelSpec();
+      if (!spec.resolutions.includes(this.resolution)) this.resolution = spec.resolutions[0];
+      if (Number(this.duration) > spec.maxDuration) this.duration = spec.maxDuration;
+    },
+
     async createJob() {
       if (!this.genAssetId) { this.statusText = '请选择资产 ID（图1）'; return; }
       if (!this.prompt) { this.statusText = '请输入 Prompt'; return; }

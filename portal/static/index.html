@@ -434,14 +434,16 @@
 
             <label style="margin-top:10px">Prompt <textarea v-model="prompt" rows="3" placeholder="描述你想生成的内容..."></textarea></label>
             <label style="margin-top:8px">模型
-              <select v-model="model">
+              <select v-model="model" @change="onModelChange()">
                 <option v-for="m in portraitModels" :value="m.id">{{ m.label }}</option>
               </select>
             </label>
             <div class="row" style="flex-wrap:wrap;gap:8px;margin-top:8px">
-              <label style="flex:1;min-width:100px">时长(秒) <input type="number" v-model="duration" min="4" max="60"></label>
+              <label style="flex:1;min-width:100px">时长(秒) <input type="number" v-model="duration" min="4" :max="modelMaxDuration()"></label>
               <label style="flex:1;min-width:100px">分辨率
-                <select v-model="resolution"><option>720p</option><option>1080p</option></select>
+                <select v-model="resolution">
+                  <option v-for="r in modelResolutions()" :value="r">{{ r }}</option>
+                </select>
               </label>
               <label style="flex:1;min-width:100px">比例
                 <select v-model="ratio"><option>16:9</option><option>9:16</option><option>1:1</option></select>

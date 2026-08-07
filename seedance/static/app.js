@@ -221,7 +221,17 @@ function providersFromConfig(providers) {
       base_url: p.base_url || '',
       models: (p.models || []).map(m => {
         if (typeof m === 'string') return { id: m, label: m };
-        return { id: m.id || m, label: m.label || m.id || m };
+        return {
+          id: m.id || m,
+          label: m.label || m.id || m,
+          // Per-model capability limits from providers.json. Ark rejects an
+          // out-of-range value only after the job is queued, so the form has to
+          // narrow itself when the model changes.
+          duration_range: m.duration_range || null,
+          resolutions: m.resolutions || null,
+          ratios: m.ratios || null,
+          defaults: m.defaults || null,
+        };
       }),
       hint: p.hint || '',
       label: p.label || id,
@@ -237,11 +247,31 @@ function providersFromConfig(providers) {
 const FALLBACK_PROVIDERS = {
   volcengine: {
     base_url: 'https://ark.cn-beijing.volces.com/api/v3',
+    // Capability limits must be repeated here, not just in providers.json:
+    // this list is what applyModelLimits() reads when /api/config fails, and
+    // without them the form would silently stop narrowing itself.
     models: [
-      { id: 'doubao-seedance-2-0-260128', label: 'doubao-seedance-2-0-260128' },
-      { id: 'doubao-seedance-2-0-fast-260128', label: 'doubao-seedance-2-0-fast-260128' },
-      { id: 'doubao-seedance-2-0-mini-260615', label: 'doubao-seedance-2-0-mini-260615' },
-      { id: 'doubao-seedance-2-5-260628', label: 'Seedance 2.5（未开通时报 ModelNotOpen）' },
+      {
+        id: 'doubao-seedance-2-0-260128', label: 'Seedance 2.0（最高 4k）',
+        duration_range: [4, 15], resolutions: ['480p', '720p', '1080p', '4k'],
+        ratios: ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16', 'adaptive'],
+      },
+      {
+        id: 'doubao-seedance-2-0-fast-260128', label: 'Seedance 2.0 fast',
+        duration_range: [4, 15], resolutions: ['480p', '720p'],
+        ratios: ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16', 'adaptive'],
+      },
+      {
+        id: 'doubao-seedance-2-0-mini-260615', label: 'Seedance 2.0 mini（最快）',
+        duration_range: [4, 15], resolutions: ['480p', '720p'],
+        ratios: ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16', 'adaptive'],
+      },
+      {
+        id: 'doubao-seedance-2-5-260628', label: 'Seedance 2.5（最长 30s / 50 素材）',
+        duration_range: [4, 30], resolutions: ['480p', '720p'],
+        ratios: ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16', 'adaptive'],
+        defaults: { duration: 10 },
+      },
     ],
     hint: '豆包官方火山方舟 API。本地图/视频/音频参考素材会先上传到公司 TOS bucket，再以预签名 URL 传给方舟。',
     label: '豆包官方 / 火山方舟',
@@ -395,6 +425,11 @@ function SeedanceApp() {
         form.addEventListener('change', () => this.scheduleWorkspaceSave());
       }
 
+      const modelEl = field('model');
+      if (modelEl) {
+        modelEl.addEventListener('change', () => this.applyModelLimits());
+      }
+
       // Download links: use blob download to avoid iframe navigation timeout.
       // Native <a download> triggers browser navigation which can time out
       // waiting for the proxy to buffer the entire video file.
@@ -495,7 +530,43 @@ function SeedanceApp() {
         }
         // API Key UI removed — provider is locked to volcengine and the key
         // lives in seedance/state/secrets.json on the server.
+        this.applyModelLimits();
       });
+    },
+
+    // Narrow duration / resolution / ratio to what the selected model accepts.
+    // Ark validates these only after the job is queued, so an out-of-range value
+    // costs the user a wait and an async error instead of failing fast.
+    applyModelLimits() {
+      const modelEl = field('model');
+      if (!modelEl) return;
+      const cfg = (this.models || []).find(m => m.id === modelEl.value);
+      if (!cfg) return;
+
+      const durationEl = field('duration');
+      if (durationEl && Array.isArray(cfg.duration_range)) {
+        const [lo, hi] = cfg.duration_range;
+        durationEl.min = String(lo);
+        durationEl.max = String(hi);
+        const current = parseInt(durationEl.value, 10);
+        if (!Number.isNaN(current)) {
+          durationEl.value = String(Math.min(hi, Math.max(lo, current)));
+        }
+      }
+
+      for (const [name, allowed] of [['resolution', cfg.resolutions], ['ratio', cfg.ratios]]) {
+        const el = field(name);
+        if (!el || !Array.isArray(allowed) || !allowed.length) continue;
+        const previous = el.value;
+        el.innerHTML = '';
+        for (const value of allowed) {
+          const option = document.createElement('option');
+          option.value = value;
+          option.textContent = value;
+          el.appendChild(option);
+        }
+        el.value = allowed.includes(previous) ? previous : allowed[0];
+      }
     },
 
     // ============================================================

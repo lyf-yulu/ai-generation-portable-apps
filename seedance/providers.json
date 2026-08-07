@@ -20,10 +20,35 @@
         "vary_seed": true
       },
       "models": [
-        {"id": "doubao-seedance-2-0-260128", "label": "doubao-seedance-2-0-260128"},
-        {"id": "doubao-seedance-2-0-fast-260128", "label": "doubao-seedance-2-0-fast-260128"},
-        {"id": "doubao-seedance-2-0-mini-260615", "label": "doubao-seedance-2-0-mini-260615"},
-        {"id": "doubao-seedance-2-5-260628", "label": "Seedance 2.5（未开通时报 ModelNotOpen）"}
+        {
+          "id": "doubao-seedance-2-0-260128",
+          "label": "Seedance 2.0（最高 4k）",
+          "duration_range": [4, 15],
+          "resolutions": ["480p", "720p", "1080p", "4k"],
+          "ratios": ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16", "adaptive"]
+        },
+        {
+          "id": "doubao-seedance-2-0-fast-260128",
+          "label": "Seedance 2.0 fast",
+          "duration_range": [4, 15],
+          "resolutions": ["480p", "720p"],
+          "ratios": ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16", "adaptive"]
+        },
+        {
+          "id": "doubao-seedance-2-0-mini-260615",
+          "label": "Seedance 2.0 mini（最快）",
+          "duration_range": [4, 15],
+          "resolutions": ["480p", "720p"],
+          "ratios": ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16", "adaptive"]
+        },
+        {
+          "id": "doubao-seedance-2-5-260628",
+          "label": "Seedance 2.5（最长 30s / 50 素材）",
+          "duration_range": [4, 30],
+          "resolutions": ["480p", "720p"],
+          "ratios": ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16", "adaptive"],
+          "defaults": {"duration": 10}
+        }
       ]
     }
   }
