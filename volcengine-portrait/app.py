@@ -1849,9 +1849,20 @@ def _run_virtual_job_impl(job_id, job):
                         })
                 break
             elif t_status in ("failed", "error"):
+                # Surface Ark's error.code and message. Without this the user
+                # only saw "Run 0: failed" while the real reason (content-policy
+                # violation, resource limits, model refusal, etc.) sat unread
+                # in Ark's task response.
+                err = task_result.get("error") if isinstance(task_result.get("error"), dict) else {}
+                detail = (err.get("message") or err.get("code") or "").strip()
+                summary = f"Run {idx}: {t_status}" + (f" — {detail}" if detail else "")
                 with JOBS_LOCK:
-                    job["errors"].append(f"Run {idx}: {t_status}")
+                    job["errors"].append(summary)
                     job["done"] += 1
+                    job["events"].append({
+                        "time": time.strftime("%H:%M:%S"),
+                        "message": summary,
+                    })
                 break
 
     with JOBS_LOCK:

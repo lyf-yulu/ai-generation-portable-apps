@@ -364,6 +364,23 @@ function SeedanceApp() {
     activityCounts: null,
     activityDetail: null,
 
+    // Task-type switch. Ark 2.5 auto-classifies a request as reference /
+    // extend / edit from the prompt wording, and edit/extend impose extra
+    // constraints (ratio=adaptive, duration=-1). If the user types a phrase
+    // that flips the classifier without knowing it, Ark rejects the job as
+    // "you asked for edit but sent a positive duration". This picker moves
+    // that decision from post-hoc keyword sniffing to an explicit control.
+    // Session-only — no persistence, matches the user's request.
+    taskMode: 'reference',
+    _prevTaskMode: 'reference',
+    // Per-mode memory of ratio + duration, so switching away and back
+    // preserves what the user typed in each mode.
+    _taskModeMemory: {
+      reference: { ratio: '16:9', duration: 12 },
+      extend:    { ratio: 'adaptive', duration: 5 },
+      edit:      { ratio: 'adaptive', duration: -1 },
+    },
+
     // Standalone-specific fields
     customModel: '',
     webSearch: false,
@@ -571,6 +588,52 @@ function SeedanceApp() {
           el.appendChild(option);
         }
         el.value = allowed.includes(previous) ? previous : allowed[0];
+      }
+    },
+
+    // Called when the user picks a different task type. Ark 2.5 imposes:
+    //   reference: ratio + duration are free
+    //   extend:    ratio must be 'adaptive', duration is free
+    //   edit:      ratio must be 'adaptive' AND duration must be -1
+    // Values are remembered per-mode so switching away and back restores what
+    // the user typed. Session-only, no localStorage.
+    changeTaskMode() {
+      const from = this._prevTaskMode || 'reference';
+      const to = this.taskMode || 'reference';
+      const ratioEl = field('ratio');
+      const durationEl = field('duration');
+      const mem = this._taskModeMemory;
+      // 1) Save the leaving mode's current values.
+      if (mem[from]) {
+        if (ratioEl) mem[from].ratio = ratioEl.value;
+        if (durationEl) mem[from].duration = parseInt(durationEl.value, 10);
+      }
+      // 2) Restore or seed the incoming mode's values.
+      const target = mem[to] || mem.reference;
+      if (ratioEl) {
+        const forced = (to === 'extend' || to === 'edit') ? 'adaptive' : null;
+        const wanted = forced || target.ratio || '16:9';
+        if (![...ratioEl.options].some(o => o.value === wanted)) {
+          // If the model doesn't currently list this ratio (applyModelLimits
+          // narrowed it away), fall back to the first available option so the
+          // select is never left in an invalid state.
+          ratioEl.value = ratioEl.options[0]?.value || wanted;
+        } else {
+          ratioEl.value = wanted;
+        }
+      }
+      if (durationEl) {
+        const forced = (to === 'edit') ? -1 : null;
+        const wanted = (forced !== null) ? forced
+          : (Number.isFinite(target.duration) ? target.duration : 5);
+        durationEl.value = String(wanted);
+      }
+      this._prevTaskMode = to;
+      // Save the entering mode's values too, so a later switch reads current
+      // state (in case the user typed something before switching again).
+      if (mem[to]) {
+        if (ratioEl) mem[to].ratio = ratioEl.value;
+        if (durationEl) mem[to].duration = parseInt(durationEl.value, 10);
       }
     },
 

@@ -1545,6 +1545,17 @@ function VolcenginePortraitApp() {
     assetName: '',
     genAssetId: '', extraAssetIds: [], extraFiles: [],
     prompt: '', model: 'doubao-seedance-2-0-260128', duration: 12, resolution: '720p', ratio: '16:9', repeat: 1,
+    // Task-type switch — see seedance/static/app.js for the rationale.
+    // Ark 2.5 auto-classifies as reference / extend / edit from the prompt;
+    // this makes the classification explicit so the user can't accidentally
+    // send a positive duration into an edit task.
+    taskMode: 'reference',
+    _prevTaskMode: 'reference',
+    _taskModeMemory: {
+      reference: { ratio: '16:9', duration: 12 },
+      extend:    { ratio: 'adaptive', duration: 5 },
+      edit:      { ratio: 'adaptive', duration: -1 },
+    },
     // Per-model limits from the official capability matrix. Ark only validates
     // these after the job is queued, so an out-of-range value costs a wait plus
     // an async error rather than failing fast.
@@ -1936,6 +1947,33 @@ function VolcenginePortraitApp() {
       // extend tasks, so it must survive a model switch instead of being clamped.
       if (Number(this.duration) !== -1 && Number(this.duration) > spec.maxDuration) {
         this.duration = spec.maxDuration;
+      }
+    },
+
+    // Task-type switch. reference / extend / edit each impose different
+    // constraints on ratio + duration (see seedance side for the full rules).
+    // Values are remembered per-mode so switching away and back restores what
+    // the user typed. Session-only, no persistence.
+    changeTaskMode() {
+      const from = this._prevTaskMode || 'reference';
+      const to = this.taskMode || 'reference';
+      const mem = this._taskModeMemory;
+      if (mem[from]) {
+        mem[from].ratio = this.ratio;
+        mem[from].duration = Number(this.duration);
+      }
+      const target = mem[to] || mem.reference;
+      if (to === 'extend' || to === 'edit') {
+        this.ratio = 'adaptive';
+      } else {
+        this.ratio = target.ratio || '16:9';
+      }
+      this.duration = (to === 'edit') ? -1
+        : (Number.isFinite(target.duration) ? target.duration : 5);
+      this._prevTaskMode = to;
+      if (mem[to]) {
+        mem[to].ratio = this.ratio;
+        mem[to].duration = Number(this.duration);
       }
     },
 

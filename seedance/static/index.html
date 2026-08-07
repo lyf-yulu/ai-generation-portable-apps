@@ -63,6 +63,13 @@
             <label>自定义模型名（高级）
               <input name="custom_model" v-model="customModel" placeholder="留空使用上方模型">
             </label>
+            <label>任务类型
+              <select v-model="taskMode" @change="changeTaskMode()">
+                <option value="reference">参考生视频（默认）</option>
+                <option value="extend">视频延长（ratio 自动锁 adaptive）</option>
+                <option value="edit">视频编辑（ratio=adaptive, duration=-1）</option>
+              </select>
+            </label>
             <div class="grid2">
               <label>时长（秒）<input name="duration" type="number" min="-1" max="15" value="12"></label>
               <label>分辨率
@@ -71,10 +78,19 @@
                 </select>
               </label>
             </div>
-            <p class="hint">
-              填 <strong>-1</strong> = 由模型自动决定时长。<strong>视频编辑</strong>（提示词含「删除/去掉、修改/替换/改成、增加/加上」）
-              必须用 -1，且比例要选 adaptive；<strong>视频延长</strong>（「续写、向前/向后延长」）比例也必须选 adaptive。
-              普通文生视频 / 参考生视频填正常秒数即可。
+            <p class="hint" v-if="taskMode === 'reference'">
+              <strong>参考生视频</strong>：ratio 与 duration 均可自定义。
+              提示词若含「删除/替换/续写/延长」等关键词，方舟会自动改判为编辑或延长——
+              这两类任务对参数有额外约束，请显式切到对应模式再填。
+            </p>
+            <p class="hint" v-if="taskMode === 'extend'" style="color:#b45309">
+              <strong>视频延长</strong>：ratio 必须为 <code>adaptive</code>（已自动锁定）；
+              duration 可自定义。请在参考素材里加入待延长的视频（role=reference_video），
+              提示词写清楚「向前/向后延长、续写」的具体内容。
+            </p>
+            <p class="hint" v-if="taskMode === 'edit'" style="color:#b45309">
+              <strong>视频编辑</strong>：ratio 必须为 <code>adaptive</code>、duration 必须为 <code>-1</code>（即由模型自动决定时长，均已锁定）。
+              请在参考素材里加入待编辑的视频，提示词描述编辑操作（删除/替换/增加/局部重绘等）。
             </p>
             <div class="grid2">
               <label>比例

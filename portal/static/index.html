@@ -438,6 +438,22 @@
                 <option v-for="m in portraitModels" :value="m.id">{{ m.label }}</option>
               </select>
             </label>
+            <label style="margin-top:8px">任务类型
+              <select v-model="taskMode" @change="changeTaskMode()">
+                <option value="reference">参考生视频（默认）</option>
+                <option value="extend">视频延长（ratio 锁 adaptive）</option>
+                <option value="edit">视频编辑（ratio=adaptive, duration=-1）</option>
+              </select>
+            </label>
+            <p class="hint" v-if="taskMode === 'reference'" style="margin:4px 0 6px">
+              <strong>参考生视频</strong>：ratio 与 duration 均可自定义。
+            </p>
+            <p class="hint" v-if="taskMode === 'extend'" style="margin:4px 0 6px;color:#b45309">
+              <strong>视频延长</strong>：ratio 锁 adaptive；duration 可自定义。参考素材需包含待延长的视频。
+            </p>
+            <p class="hint" v-if="taskMode === 'edit'" style="margin:4px 0 6px;color:#b45309">
+              <strong>视频编辑</strong>：ratio=adaptive、duration=-1（即由模型自动决定时长，均锁定）。参考素材需包含待编辑的视频。
+            </p>
             <div class="row" style="flex-wrap:wrap;gap:8px;margin-top:8px">
               <label style="flex:1;min-width:100px">时长(秒) <input type="number" v-model="duration" min="-1" :max="modelMaxDuration()"></label>
               <label style="flex:1;min-width:100px">分辨率
