@@ -1425,6 +1425,13 @@ function SeedanceApp() {
       this.statusText = '空闲';
       this.eventsText = '';
       this.submitting = false;
+      this.taskMode = 'reference';
+      this._prevTaskMode = 'reference';
+      this._taskModeMemory = {
+        reference: { ratio: '16:9', duration: 12 },
+        extend:    { ratio: 'adaptive', duration: 5 },
+        edit:      { ratio: 'adaptive', duration: -1 },
+      };
       this._clearTopicResultDom();
       this.saveTabsToLocalStorage();
       setTimeout(() => this._scrollActiveTabIntoView(), 0);
@@ -1492,6 +1499,9 @@ function SeedanceApp() {
         outputDir: this.outputDir,
         dirHandle: this.dirHandle,
         autoDownload: this.autoDownload,
+        taskMode: this.taskMode,
+        _prevTaskMode: this._prevTaskMode,
+        _taskModeMemory: JSON.parse(JSON.stringify(this._taskModeMemory)),
       };
     },
 
@@ -1508,6 +1518,17 @@ function SeedanceApp() {
       this.outputDir = cache.outputDir !== undefined ? cache.outputDir : '';
       this.dirHandle = cache.dirHandle || null;
       this.autoDownload = cache.autoDownload || false;
+      // Task-type mode is per-tab: the提示 <p class="hint" v-if="taskMode..."> and
+      // the ratio/duration memory would otherwise leak across topics.
+      this.taskMode = cache.taskMode || 'reference';
+      this._prevTaskMode = cache._prevTaskMode || this.taskMode;
+      this._taskModeMemory = cache._taskModeMemory
+        ? JSON.parse(JSON.stringify(cache._taskModeMemory))
+        : {
+            reference: { ratio: '16:9', duration: 12 },
+            extend:    { ratio: 'adaptive', duration: 5 },
+            edit:      { ratio: 'adaptive', duration: -1 },
+          };
       const form = document.querySelector('#sd-form');
       if (form) form.reset();
       this.savedMedia = {};
