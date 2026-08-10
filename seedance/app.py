@@ -31,6 +31,14 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 _DATA_BASE = Path(os.environ.get("DATA_DIR", str(ROOT)))
 STATIC_DIR = ROOT / "static"
+
+# Ark error translations live under portal/ so seedance and volcengine-portrait
+# share one table — the two sub-apps hit the same Ark video endpoint and would
+# otherwise duplicate the mapping.
+_PORTAL_DIR = str(ROOT.parent / "portal")
+if _PORTAL_DIR not in sys.path:
+    sys.path.insert(0, _PORTAL_DIR)
+from ark_errors import translate_ark_error  # noqa: E402
 OUTPUT_DIR = _DATA_BASE / "outputs"
 STATE_DIR = _DATA_BASE / "state"
 MEDIA_DIR = STATE_DIR / "media"
@@ -491,6 +499,10 @@ def _ws_preset_path(ws_id: str) -> Path:
 
 OFFICIAL_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 TERMINAL_STATUSES = {"succeeded", "success", "failed", "fail", "failure", "cancelled", "canceled"}
+
+# translate_ark_error lives in portal/ark_errors.py so seedance and
+# volcengine-portrait share one table; see the module for the matcher rules.
+
 
 JOBS: dict[str, dict[str, Any]] = {}
 FILES: dict[str, Path] = {}
@@ -2004,6 +2016,22 @@ def run_one(job_id: str, index: int, form_values: dict[str, Any], form_files: di
         if status not in TERMINAL_STATUSES:
             continue
         if status != "succeeded":
+            # Ark returns errors as {"code": ..., "message": ...}. Look the pair
+            # up in ARK_ERROR_MATCHERS for a Chinese explanation; if none of the
+            # matchers fires, still surface the raw code + message so the
+            # operator can find the request id — better than dumping the whole
+            # response dict.
+            err = status_result.get("error") if isinstance(status_result.get("error"), dict) else None
+            if err:
+                code = str(err.get("code") or "").strip()
+                message = str(err.get("message") or "").strip()
+                zh = translate_ark_error(code, message)
+                if zh:
+                    raise RuntimeError(f"Task {task_id}: {zh} 原始错误：{code}: {message}")
+                raise RuntimeError(
+                    f"Task {task_id} ended as {status}: {code} — {message}" if code
+                    else f"Task {task_id} ended as {status}: {message or status_result}"
+                )
             raise RuntimeError(f"Task {task_id} ended as {status}: {status_result}")
         video_url = extract_video_url(status_result)
         if not video_url:

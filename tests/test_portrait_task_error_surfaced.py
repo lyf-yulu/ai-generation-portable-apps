@@ -79,6 +79,43 @@ class PortraitFailedTaskErrorTests(unittest.TestCase):
         joined = " | ".join(job["errors"])
         self.assertIn("SomethingBroke", joined)
 
+    def test_known_error_gets_chinese_translation(self):
+        """Portrait must consume the shared ark_errors table too.
+
+        The portrait module hits the same Ark video endpoint as seedance, so a
+        content-policy refusal reads the same to Ark — but the user sees it in
+        the portrait UI. Without the translate call the raw English message
+        would still be there, but the actionable Chinese sentence wouldn't.
+        """
+        job = self._run({
+            "status": "failed",
+            "error": {
+                "code": "OutputVideoSensitiveContentDetected.PolicyViolation",
+                "message": "The request failed because the output video may be related to copyright restrictions.",
+            },
+        })
+        joined = " | ".join(job["errors"])
+        # Chinese hint must be present so a non-English user knows what to do.
+        self.assertIn("内容审核", joined,
+                      "portrait must translate via portal/ark_errors like seedance does")
+        # And the raw English must still be there for operator debugging.
+        self.assertIn("copyright restrictions", joined,
+                      "raw Ark message must remain for the operator to find the request id")
+
+    def test_asset_not_found_translation_works_for_portrait_too(self):
+        """The 18-hit-in-prod asset-missing error must translate for portrait."""
+        job = self._run({
+            "status": "failed",
+            "error": {
+                "code": "InvalidParameter",
+                "message": "The parameter `content[1].image_url.url` specified in the request is not valid: "
+                           "The specified asset asset-20260807113001-86tdg is not found.",
+            },
+        })
+        joined = " | ".join(job["errors"])
+        self.assertIn("素材", joined)
+        self.assertIn("刷新", joined)
+
     def test_generic_failure_stays_readable(self):
         """A task with no error object must not corrupt the summary."""
         job = self._run({"status": "failed"})

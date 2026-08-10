@@ -28,6 +28,13 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 _DATA_BASE = Path(os.environ.get("DATA_DIR", str(ROOT)))
 STATIC_DIR = ROOT / "static"
+
+# Share Ark error translations with seedance — same Ark video endpoint, same
+# error taxonomy. See portal/ark_errors.py for the matcher rules.
+_PORTAL_DIR = str(ROOT.parent / "portal")
+if _PORTAL_DIR not in sys.path:
+    sys.path.insert(0, _PORTAL_DIR)
+from ark_errors import translate_ark_error  # noqa: E402
 OUTPUT_DIR = _DATA_BASE / "outputs"
 STATE_DIR = _DATA_BASE / "state"
 LOG_DIR = _DATA_BASE / "logs"
@@ -1849,13 +1856,22 @@ def _run_virtual_job_impl(job_id, job):
                         })
                 break
             elif t_status in ("failed", "error"):
-                # Surface Ark's error.code and message. Without this the user
-                # only saw "Run 0: failed" while the real reason (content-policy
-                # violation, resource limits, model refusal, etc.) sat unread
-                # in Ark's task response.
+                # Surface Ark's error.code and message, and translate the
+                # common ones to Chinese so a non-English user doesn't need
+                # DevTools to know what went wrong (see portal/ark_errors.py).
                 err = task_result.get("error") if isinstance(task_result.get("error"), dict) else {}
-                detail = (err.get("message") or err.get("code") or "").strip()
-                summary = f"Run {idx}: {t_status}" + (f" — {detail}" if detail else "")
+                code = str(err.get("code") or "").strip()
+                message = str(err.get("message") or "").strip()
+                zh = translate_ark_error(code, message) if code or message else None
+                if zh:
+                    detail = f"{code}: {message}" if code else message
+                    summary = f"Run {idx}: {zh} 原始错误：{detail}"
+                else:
+                    # Compose from whatever pieces Ark provided so nothing gets
+                    # swallowed: message alone, code alone, or both together.
+                    detail_bits = [b for b in (code, message) if b]
+                    detail = ": ".join(detail_bits) if len(detail_bits) == 2 else (detail_bits[0] if detail_bits else "")
+                    summary = f"Run {idx}: {t_status}" + (f" — {detail}" if detail else "")
                 with JOBS_LOCK:
                     job["errors"].append(summary)
                     job["done"] += 1
