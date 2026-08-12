@@ -306,3 +306,32 @@ class AssetLibraryStore:
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
         )
+
+
+async def rewrite_storage_urls(
+    store: AssetLibraryStore, new_base_url: str
+) -> int:
+    base = new_base_url.rstrip("/")
+    if not base:
+        raise ValueError("new_base_url 不能为空")
+    connection = store._connection  # noqa: SLF001 — 迁移脚本专用
+    cursor = await connection.execute(
+        "SELECT asset_id, storage_path, storage_url FROM asset_library"
+    )
+    rows = await cursor.fetchall()
+    await cursor.close()
+
+    changed = 0
+    for row in rows:
+        expected = f"{base}/{row['storage_path']}"
+        if row["storage_url"] == expected:
+            continue
+        await connection.execute(
+            "UPDATE asset_library SET storage_url = ? WHERE asset_id = ?",
+            (expected, row["asset_id"]),
+        )
+        changed += 1
+    if changed:
+        await connection.commit()
+    store._base_url = base  # noqa: SLF001 — 让同进程后续写入用新 base
+    return changed
