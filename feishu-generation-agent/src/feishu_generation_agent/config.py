@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     lark_production_table_id: str | None = None
     lark_production_view_id: str | None = None
     lark_production_portrait_view_id: str | None = None
+    # 图片需求是完全独立的另一张多维表格（不是主表的视图），且那张表
+    # 没有「需求类型」字段，类型由来源声明补齐。
+    lark_image_bitable_url: str | None = None
+    lark_image_table_id: str | None = None
+    lark_image_view_id: str | None = None
     lark_result_folder_token: str | None = None
     lark_include_completed_for_test: bool = False
     lark_local_operator_open_id: str | None = None

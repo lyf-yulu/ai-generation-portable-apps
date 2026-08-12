@@ -13,13 +13,18 @@ from feishu_generation_agent.integrations.feishu_bitable import BitableSchemaErr
 
 _REQUIRED_FIELDS: dict[str, frozenset[int]] = {
     "需求名称": frozenset({1}),
-    "需求类型": frozenset({3}),
     "需求附件": frozenset({1, 15}),
     "项目名称": frozenset({4}),
     "发起人": frozenset({11}),
     "需求制作人": frozenset({11}),
     "当前进度": frozenset({3}),
 }
+# 图片需求表没有「需求类型」字段——类型由 ProductionTaskSource 声明并在
+# scan 时补齐，所以这个字段是可选的。
+_OPTIONAL_FIELDS: dict[str, frozenset[int]] = {
+    "需求类型": frozenset({3}),
+}
+_ALL_KNOWN_FIELDS = _REQUIRED_FIELDS | _OPTIONAL_FIELDS
 _COMPLETED_PROGRESS = "已确认完成"
 
 
@@ -46,15 +51,17 @@ class ProductionBitableClient:
         by_name: dict[str, dict] = {}
         for field in fields:
             name = field.get("field_name")
-            if isinstance(name, str) and name in _REQUIRED_FIELDS:
+            if isinstance(name, str) and name in _ALL_KNOWN_FIELDS:
                 if name in by_name:
                     raise BitableSchemaError(f"多维表格存在重复字段：{name}")
                 by_name[name] = field
 
         field_ids: dict[str, str] = {}
-        for name, types in _REQUIRED_FIELDS.items():
+        for name, types in _ALL_KNOWN_FIELDS.items():
             field = by_name.get(name)
             if field is None:
+                if name in _OPTIONAL_FIELDS:
+                    continue
                 raise BitableSchemaError(f"生产多维表格缺少字段：{name}")
             if field.get("type") not in types:
                 raise BitableSchemaError(f"生产多维表格字段类型不兼容：{name}")
@@ -64,7 +71,7 @@ class ProductionBitableClient:
             field_ids[name] = field_id
         return ProductionSchema(
             requirement_name_field_id=field_ids["需求名称"],
-            task_type_field_id=field_ids["需求类型"],
+            task_type_field_id=field_ids.get("需求类型", ""),
             requirement_attachment_field_id=field_ids["需求附件"],
             project_name_field_id=field_ids["项目名称"],
             requester_field_id=field_ids["发起人"],

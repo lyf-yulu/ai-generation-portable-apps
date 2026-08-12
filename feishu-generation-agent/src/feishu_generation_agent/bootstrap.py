@@ -416,6 +416,18 @@ async def _open_application_services(
                     ),
                     expected_task_type="真人类",
                 )
+            if settings.lark_image_bitable_url and settings.lark_image_table_id:
+                # 图片需求在另一张表，不是主表的视图，所以单独解析 location。
+                production_sources["image"] = ProductionTaskSource(
+                    parse_bitable_url(
+                        settings.lark_image_bitable_url,
+                        settings.lark_image_table_id,
+                        settings.lark_image_view_id or "",
+                    ),
+                    expected_task_type="",
+                    planning_mode="image",
+                    declared_task_type="图片类",
+                )
             production_factory = ProductionBitableServiceFactory(
                 bitable=ProductionBitableClient(feishu),
                 store=production_store,

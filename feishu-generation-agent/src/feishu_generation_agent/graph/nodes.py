@@ -497,10 +497,12 @@ def _character_context_argument(
 
 
 async def _planning_mode_for_run(run_id: str, services: GraphServices) -> str:
-    """从生产表「需求类型」推导规划模式。
+    """推导规划模式。
 
-    图片类 → image；动画类/真人类/legacy run → video。读取失败时回落 video，
-    不让一次多维表格抖动把整个 run 拖挂。
+    优先看 binding 上记录的 planning_mode——图片需求来自另一张多维表格，
+    那张表没有「需求类型」字段，无法靠字段值判定。存量 binding 没有该字段
+    时回落到需求类型。读取失败时回落 video，不让一次多维表格抖动把整个
+    run 拖挂。
     """
     store = getattr(services, "production_task_store", None)
     if store is None:
@@ -511,6 +513,9 @@ async def _planning_mode_for_run(run_id: str, services: GraphServices) -> str:
         return "video"
     if binding is None:
         return "video"
+    declared = getattr(binding, "planning_mode", None)
+    if declared in {"image", "video"}:
+        return declared
     task_type = getattr(getattr(binding, "snapshot", None), "task_type", None)
     return "image" if task_type == _IMAGE_REQUIREMENT_TYPE else "video"
 
