@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager, nullcontext
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -166,6 +167,8 @@ def create_app(
     if sum(value is not None for value in (runtime, services, settings)) > 1:
         raise ValueError("runtime, services and settings are mutually exclusive")
     static_dir = Path(__file__).with_name("static")
+    asset_library_settings = settings or Settings()
+    asset_library_settings.ensure_paths()
 
     @asynccontextmanager
     async def tracing_environment(settings):
@@ -220,7 +223,27 @@ def create_app(
                 await active.close()
 
     @asynccontextmanager
+    async def _asset_library_lifespan() -> AsyncIterator[None]:
+        store = await AssetLibraryStore.open(
+            db_path=asset_library_settings.asset_library_db_path,
+            assets_dir=asset_library_settings.asset_library_dir,
+            base_url=asset_library_settings.asset_base_url,
+        )
+        asset_library_holder["store"] = store
+        try:
+            yield
+        finally:
+            asset_library_holder.pop("store", None)
+            await store.close()
+
+    @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        async with _asset_library_lifespan():
+            async with _lifespan_inner(app):
+                yield
+
+    @asynccontextmanager
+    async def _lifespan_inner(app: FastAPI) -> AsyncIterator[None]:
         if services is not None:
             async with tracing_environment(services.settings):
                 async with activated_services(services) as active:
@@ -1028,6 +1051,25 @@ def create_app(
         except (RunNotFound, RunConflict, RunValidationError) as exc:
             raise_runtime_error(exc)
         return FileResponse(path, media_type=mime_type)
+
+    asset_library_holder: dict[str, AssetLibraryStore] = {}
+
+    def _get_asset_library_store() -> AssetLibraryStore:
+        store = asset_library_holder.get("store")
+        if store is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="素材库尚未初始化",
+            )
+        return store
+
+    register_asset_library_routes(app, _get_asset_library_store)
+    asset_library_settings.asset_library_dir.mkdir(parents=True, exist_ok=True)
+    app.mount(
+        f"/{asset_library_settings.asset_library_dir.name}",
+        StaticFiles(directory=asset_library_settings.asset_library_dir),
+        name="asset-library",
+    )
 
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
