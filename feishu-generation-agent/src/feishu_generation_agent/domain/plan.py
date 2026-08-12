@@ -10,6 +10,8 @@ class TaskType(StrEnum):
 
 
 ReferenceMode = Literal["multi_reference", "first_last_frame"]
+ImageProvider = Literal["seedream", "banana", "gpt-image2"]
+DEFAULT_IMAGE_PROVIDER: ImageProvider = "banana"
 
 
 def _contains_chinese(value: str) -> bool:
@@ -63,6 +65,9 @@ class GenerationTask(BaseModel):
     reference_mode: ReferenceMode | None = None
     aspect_ratio: str
     image_size: str | None = None
+    image_provider: ImageProvider | None = None
+    size_variants: list[str] = Field(default_factory=list)
+    safe_area: str | None = None
     duration: int | None = None
     resolution: Literal["720p", "1080p"] | None = None
     generate_audio: bool | None = None
@@ -86,6 +91,50 @@ class GenerationTask(BaseModel):
         }
         return aliases.get(normalized, normalized)
 
+    @property
+    def resolved_image_provider(self) -> ImageProvider | None:
+        """图片任务的实际 provider；视频任务返回 None。
+
+        不在校验器里回填 image_provider，避免 model_dump() 携带隐式字段后
+        被复用去构造视频任务时撞上「video 不允许 image_provider」的护栏。
+        """
+        if self.task_type is not TaskType.IMAGE_TO_IMAGE:
+            return None
+        return self.image_provider or DEFAULT_IMAGE_PROVIDER
+
+    @property
+    def resolved_size_variants(self) -> list[str]:
+        """图片任务要产出的尺寸变体；未显式指定时回退到 image_size 单尺寸。"""
+        if self.task_type is not TaskType.IMAGE_TO_IMAGE:
+            return []
+        return list(self.size_variants)
+
+    @field_validator("size_variants")
+    @classmethod
+    def normalize_size_variants(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for item in value:
+            candidate = (
+                item.strip().lower().replace("×", "x").replace("*", "x")
+            )
+            if not candidate:
+                continue
+            width, separator, height = candidate.partition("x")
+            if (
+                not separator
+                or not width.isdigit()
+                or not height.isdigit()
+                or int(width) <= 0
+                or int(height) <= 0
+            ):
+                raise ValueError(
+                    f"size_variants 需要形如 1700x2500 的尺寸，收到 {item!r}"
+                )
+            canonical = f"{int(width)}x{int(height)}"
+            if canonical not in normalized:
+                normalized.append(canonical)
+        return normalized
+
     @model_validator(mode="after")
     def validate_type_specific_fields(self) -> Self:
         if self.task_type is TaskType.IMAGE_TO_IMAGE:
@@ -107,6 +156,12 @@ class GenerationTask(BaseModel):
             raise ValueError("resolution is required for image_to_video")
         if self.image_size is not None:
             raise ValueError("image_size is not allowed for image_to_video")
+        if self.image_provider is not None:
+            raise ValueError("image_provider is not allowed for image_to_video")
+        if self.size_variants:
+            raise ValueError("size_variants is not allowed for image_to_video")
+        if self.safe_area is not None:
+            raise ValueError("safe_area is not allowed for image_to_video")
         self._normalize_video_reference_mode()
         return self
 
