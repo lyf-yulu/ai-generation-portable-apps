@@ -521,6 +521,52 @@
     return control;
   }
 
+  const IMAGE_PROVIDERS = [
+    ["banana", "banana（卡通 / 厚涂 / 插画）"],
+    ["seedream", "seedream（中式 / 国风）"],
+    ["gpt-image2", "gpt-image2（写实 / 真人质感）"],
+  ];
+
+  // 画风随剧本变，做成按钮直接追加到提示词末尾，人工审核时一键切换。
+  const STYLE_PRESETS = [
+    ["厚涂风", "3D 卡通动画风格，厚涂手绘风格，无明显笔触，画面平滑过渡自然"],
+    ["3D CG 风", "3D 偏真人 CG 游戏插图风格，强烈的色彩对比性和撞色的感觉"],
+    ["迪士尼风", "3D 卡通迪士尼风格，角色比例圆润，色彩明亮通透"],
+  ];
+
+  function providerPicker(task) {
+    const control = document.createElement("select");
+    IMAGE_PROVIDERS.forEach(([value, label]) => {
+      const option = element("option", "", label);
+      option.value = value;
+      option.selected = (task.image_provider || "banana") === value;
+      control.append(option);
+    });
+    control.addEventListener("change", () => {
+      updateTask(task.task_id, { image_provider: control.value });
+    });
+    return control;
+  }
+
+  function stylePresets(task) {
+    const wrapper = element("div", "task-style-presets");
+    STYLE_PRESETS.forEach(([label, fragment]) => {
+      const button = element("button", "task-style-preset", label);
+      button.type = "button";
+      button.title = fragment;
+      button.addEventListener("click", () => {
+        const current = (task.prompt || "").trim();
+        if (current.includes(fragment)) return;
+        updateTask(task.task_id, {
+          prompt: current ? `${current}，${fragment}` : fragment,
+        });
+        render(state.view, { refreshTasks: true });
+      });
+      wrapper.append(button);
+    });
+    return wrapper;
+  }
+
   function updateTask(taskId, patch) {
     try {
       state.review = ReviewState.patchTask(state.review, taskId, patch);
@@ -1026,6 +1072,24 @@
       grid.append(field("图片尺寸", textInput(task.image_size, (value) => {
         updateTask(task.task_id, { image_size: value });
       })));
+      grid.append(field("出图模型", providerPicker(task)));
+      grid.append(
+        field(
+          "输出尺寸（每行一个，如 1700x2500）",
+          textArea((task.size_variants || []).join("\n"), (value) => {
+            updateTask(task.task_id, {
+              size_variants: value
+                .split("\n")
+                .map((item) => item.trim())
+                .filter(Boolean),
+            });
+          }, 3, "task-size-variants-editor"),
+        ),
+      );
+      grid.append(field("安全区", textInput(task.safe_area, (value) => {
+        updateTask(task.task_id, { safe_area: value || null });
+      })));
+      grid.append(field("画风预设", stylePresets(task), true));
     } else {
       grid.append(
         field("视频时长", textInput(task.duration, (value) => {
