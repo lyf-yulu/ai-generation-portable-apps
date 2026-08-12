@@ -398,6 +398,41 @@ def _nearest_image_asset(
     return assets_by_id.get(chosen.image_asset_id)
 
 
+async def _character_media_assets(
+    resolved: list[Any],
+    store: Any | None,
+) -> list[MediaAsset]:
+    """把素材库条目转成 MediaAsset，使其能被下游按普通参考图消费。
+
+    转换后追加进 document.media_assets，_task_assets / provider / 校验
+    全部走既有路径，无需为素材库单开分支。
+    """
+    if store is None or not resolved:
+        return []
+    media: list[MediaAsset] = []
+    for asset in resolved:
+        try:
+            path = store.local_path(asset)
+            content = path.read_bytes()
+        except (OSError, AttributeError):
+            _LOGGER.warning(
+                "素材库文件不可读，跳过挂载 asset_id=%s", asset.asset_id
+            )
+            continue
+        media.append(
+            MediaAsset(
+                asset_id=asset.asset_id,
+                source_block_id=f"asset-library:{asset.asset_id}",
+                origin="asset_library",
+                local_path=path,
+                mime_type=asset.mime_type,
+                size=len(content),
+                sha256=sha256(content).hexdigest(),
+            )
+        )
+    return media
+
+
 def _character_context_argument(
     planner: RequirementPlanner,
     resolved: list[Any],
@@ -651,7 +686,27 @@ async def plan_requirements(
             ),
         )
         plan_json = _json_model(plan)
-        return {"draft_plan": plan_json, "task_plan": plan_json}
+        updates: AgentState = {
+            "draft_plan": plan_json,
+            "task_plan": plan_json,
+        }
+        # 素材库参考图要进 document.media_assets，否则 _task_assets 解析
+        # 不到这些 asset_id，执行阶段会直接判定计划无效。
+        character_media = await _character_media_assets(
+            resolved_characters,
+            getattr(services, "asset_library_store", None),
+        )
+        if character_media:
+            known = {asset.asset_id for asset in document.media_assets}
+            merged = list(document.media_assets) + [
+                asset
+                for asset in character_media
+                if asset.asset_id not in known
+            ]
+            updates["normalized_document"] = _json_model(
+                document.model_copy(update={"media_assets": merged})
+            )
+        return updates
 
     return await _run_node(state, "plan_requirements", services, operation)
 

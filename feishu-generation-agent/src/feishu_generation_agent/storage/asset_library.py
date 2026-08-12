@@ -81,6 +81,14 @@ class AssetLibraryStore:
     async def close(self) -> None:
         await self._connection.close()
 
+    def local_path(self, asset: CharacterAsset) -> Path:
+        """素材文件在磁盘上的绝对路径。
+
+        storage_path 是相对路径（形如 asset-library/<uuid>.png），存的是
+        相对 assets_dir 上级目录的位置，便于整体搬迁。
+        """
+        return self._assets_dir.parent / asset.storage_path
+
     async def create(
         self,
         *,
