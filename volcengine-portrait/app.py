@@ -1102,11 +1102,27 @@ def handle_virtual_assets_post(handler):
     elif fmime.startswith("audio/"):
         asset_type = "Audio"
 
-    # Upload to a public host to get an accessible URL for CreateAsset
-    source_url = _upload_to_public_host(fdata, fname, fmime)
-    if not source_url:
-        json_response(handler, 502, {"ok": False, "error": "failed to get public URL for file"})
-        return
+    # Upload to a location Ark can fetch. TOS 优先（大文件稳定，尤其视频），
+    # 未配 TOS 时回退 uguu.se 免费图床以兼容旧部署。TOS 若配了却上传失败，
+    # 直接抛错不回退——否则权限 / bucket / region 错配会被静默回退掩盖，
+    # 让人误以为已经在走 TOS。
+    source_url = None
+    if TOS_ACCESS_KEY and TOS_SECRET_KEY and TOS_BUCKET:
+        try:
+            source_url = tos_upload(fdata, fmime, fname)
+            print(f"  [asset_upload] TOS OK ({len(fdata)} bytes, {fmime})", flush=True)
+        except Exception as e:
+            print(f"  [asset_upload] TOS FAIL: {e}", flush=True)
+            json_response(handler, 502, {
+                "ok": False,
+                "error": f"TOS 上传失败: {e}",
+            })
+            return
+    else:
+        source_url = _upload_to_public_host(fdata, fname, fmime)
+        if not source_url:
+            json_response(handler, 502, {"ok": False, "error": "failed to get public URL for file"})
+            return
 
     # Call CreateAsset via OpenAPI
     create_body = {
