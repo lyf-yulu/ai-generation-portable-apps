@@ -74,6 +74,9 @@ class GraphServices:
     settings: Settings
     portrait_video_generator: Any | None = None
     production_task_store: Any | None = None
+    # 图片 provider registry：{"banana": gen, "seedream": gen, "gpt-image2": gen}。
+    # 为 None 时回落到单实例 image_generator，保持存量调用方零改动。
+    image_providers: Mapping[str, ImageGenerator] | None = None
 
 
 _Result = TypeVar("_Result")
@@ -356,6 +359,9 @@ async def normalize_document(
     return await _run_node(state, "normalize_document", services, operation)
 
 
+_VISION_MAX_CONCURRENCY = 5
+
+
 async def analyze_images(
     state: AgentState,
     config: RunnableConfig,
@@ -367,22 +373,34 @@ async def analyze_images(
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
+        assets = list(document.media_assets)
+        semaphore = asyncio.Semaphore(_VISION_MAX_CONCURRENCY)
+
+        async def analyze_one(asset: MediaAsset) -> VisionDescription | Exception:
+            async with semaphore:
+                try:
+                    return await services.vision_analyzer.analyze(asset)
+                except Exception as exc:
+                    return exc
+
+        outcomes = await asyncio.gather(
+            *(analyze_one(asset) for asset in assets)
+        )
+
         descriptions: list[VisionDescription] = []
         issues: list[str] = []
-        for asset in document.media_assets:
-            try:
-                descriptions.append(
-                    await services.vision_analyzer.analyze(asset)
-                )
-            except Exception as exc:
-                reason = (
-                    exc.detail.message
-                    if isinstance(exc, AgentError)
-                    else "图片无法完成视觉分析"
-                )
-                issues.append(
-                    f"素材 {asset.asset_id} 视觉分析失败：{reason}"
-                )
+        for asset, outcome in zip(assets, outcomes):
+            if isinstance(outcome, VisionDescription):
+                descriptions.append(outcome)
+                continue
+            reason = (
+                outcome.detail.message
+                if isinstance(outcome, AgentError)
+                else "图片无法完成视觉分析"
+            )
+            issues.append(
+                f"素材 {asset.asset_id} 视觉分析失败：{reason}"
+            )
         return {
             "vision_descriptions": [
                 _json_model(description) for description in descriptions
@@ -867,7 +885,18 @@ async def _keep_submission_intent_alive(
 
 async def _generator_for_task(run_id: str, task: GenerationTask, services: GraphServices):
     if task.task_type is TaskType.IMAGE_TO_IMAGE:
-        return "chiyun", services.image_generator
+        registry = getattr(services, "image_providers", None)
+        if not registry:
+            # 未配置 registry：沿用单实例与历史 provider 名，存量 run 不受影响。
+            return "chiyun", services.image_generator
+        requested = task.resolved_image_provider
+        generator = registry.get(requested)
+        if generator is None:
+            raise _validation_error(
+                f"图片 provider {requested} 未配置，"
+                f"当前可用：{'、'.join(sorted(registry))}"
+            )
+        return requested, generator
     if services.portrait_video_generator is not None and services.production_task_store is not None:
         binding = await services.production_task_store.get_by_run(run_id)
         if binding is not None and binding.snapshot.task_type == "真人类":

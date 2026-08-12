@@ -332,6 +332,7 @@ def test_agent_state_and_graph_services_contracts_are_stable():
             "settings",
             "portrait_video_generator",
             "production_task_store",
+            "image_providers",
         ]
 
 
