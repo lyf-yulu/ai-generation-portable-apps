@@ -18,6 +18,20 @@ _SHOT_MARKER = re.compile(
 _ABSOLUTE_SECONDS = re.compile(
     r"\d+(?:\.\d+)?\s*[-–—~～至到]\s*\d+(?:\.\d+)?\s*秒"
 )
+# 图片契约用：静帧必须有光影交代（顶光/逆光/光线/光影/明暗都命中「光」）
+_IMAGE_LIGHTING_KEYWORDS = ("光", "影调", "亮度", "明暗")
+# 图片契约用：这些只属于视频，出现即说明 planner 误用了视频契约
+_VIDEO_ONLY_VOCABULARY = (
+    "运镜",
+    "镜头运动",
+    "推拉摇移",
+    "时长",
+    "音效",
+    "配音",
+    "旁白",
+    "背景音乐",
+    "BGM",
+)
 _GENERIC_BINDING_ONLY = re.compile(
     r"(?:"
     r"镜头|总体|以|为|把|当作|调用|读取|根据|结合|进行|"
@@ -272,6 +286,62 @@ def validate_seedance_prompt(
         issues.append("Seedance 多分镜 prompt 缺少无水印约束")
     if "logo" not in prompt.lower():
         issues.append("Seedance 多分镜 prompt 缺少无 Logo 约束")
+    return issues
+
+
+def validate_image_prompt(
+    task: Mapping[str, Any],
+    mime_types: Mapping[str, str],
+) -> list[str]:
+    """校验图片（image_to_image）prompt 契约。
+
+    与 validate_seedance_prompt 并列，互不影响：视频契约要求分镜/运镜/声音，
+    图片契约反过来禁止这些语汇，并要求光影描述。
+    """
+    prompt = task.get("prompt")
+    if not isinstance(prompt, str):
+        return ["图片 prompt 必须是字符串"]
+    raw_references = task.get("reference_images")
+    if not isinstance(raw_references, list):
+        return ["图片 reference_images 必须是列表"]
+    try:
+        references = [
+            ImageReference.model_validate(reference)
+            for reference in raw_references
+        ]
+    except Exception:
+        return ["图片 reference_images 无法解析"]
+
+    issues: list[str] = []
+    ordered = sorted(references, key=lambda item: item.order)
+    if [reference.order for reference in ordered] != list(
+        range(1, len(ordered) + 1)
+    ):
+        issues.append("图片参考素材 order 必须按 1…N 连续排列")
+    try:
+        tokens = reference_tokens(ordered, mime_types)
+    except ValueError as exc:
+        issues.append(str(exc))
+        return issues
+
+    for asset_id, token in tokens.items():
+        if re.search(rf"(?<![\w-]){re.escape(asset_id)}(?![\w-])", prompt):
+            issues.append(f"图片 prompt 不得包含内部素材 ID {asset_id}")
+        if token not in prompt:
+            issues.append(f"图片 prompt 缺少素材引用 {token}")
+
+    if not any(keyword in prompt for keyword in _IMAGE_LIGHTING_KEYWORDS):
+        issues.append(
+            "图片 prompt 缺少光影描述（例：戏剧化顶光 + 侧逆光、明媚的光线）"
+        )
+
+    for vocabulary in _VIDEO_ONLY_VOCABULARY:
+        if vocabulary in prompt:
+            issues.append(f"图片 prompt 禁止视频语汇 {vocabulary}")
+
+    if _ABSOLUTE_SECONDS.search(prompt):
+        issues.append("图片 prompt 禁止时间轴秒数，静帧没有时间维度")
+
     return issues
 
 
