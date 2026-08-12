@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     outputs_dir: Path = Path("outputs")
     business_db_path: Path = Path("data/agent.sqlite3")
     checkpoint_db_path: Path = Path("data/checkpoints.sqlite3")
+    asset_library_db_path: Path = Path("data/asset-library.sqlite3")
+    asset_library_dir: Path = Path("data/asset-library")
+    # 服务机 LAN IP 每周变动，禁止在代码里硬编码；部署时通过 .env 覆盖。
+    asset_base_url: str = "http://127.0.0.1:8765"
 
     lark_app_id: str | None = None
     lark_app_secret: SecretStr | None = None
@@ -59,6 +63,17 @@ class Settings(BaseSettings):
     bot_scan_page_size: int = Field(default=10, ge=1, le=50)
     coordinator_poll_interval_seconds: float = Field(default=1.0, ge=0.05)
 
+    @field_validator("asset_base_url")
+    @classmethod
+    def strip_asset_base_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        if not normalized:
+            raise ValueError("asset_base_url 不能为空")
+        return normalized
+
+    def asset_public_url(self, storage_path: str) -> str:
+        return f"{self.asset_base_url}/{storage_path.lstrip('/')}"
+
     @property
     def production_bitable_configured(self) -> bool:
         return all(
@@ -77,6 +92,8 @@ class Settings(BaseSettings):
             self.outputs_dir,
             self.business_db_path.parent,
             self.checkpoint_db_path.parent,
+            self.asset_library_db_path.parent,
+            self.asset_library_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
 
