@@ -831,7 +831,9 @@ _OUTPUT_SLOT_MARKER = "::output:"
 
 
 def _execution_units(task: GenerationTask) -> list[GenerationTask]:
-    if task.task_type is not TaskType.IMAGE_TO_VIDEO or task.output_count == 1:
+    # 图片与视频都按 output_count 拆分执行单元；早期只有视频支持多产出，
+    # 图片模式接入后这个类型门槛不再成立。
+    if task.output_count == 1:
         return [task]
     return [
         task.model_copy(
