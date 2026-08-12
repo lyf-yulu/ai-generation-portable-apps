@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager, nullcontext
+from collections.abc import Callable
 from dataclasses import dataclass
 from inspect import Parameter, signature
 import logging
@@ -29,6 +30,7 @@ from feishu_generation_agent.bootstrap import (
     runtime_is_configured,
 )
 from feishu_generation_agent.config import Settings
+from feishu_generation_agent.domain.asset_library import AssetKind
 from feishu_generation_agent.domain.bitable import TableTaskStatus
 from feishu_generation_agent.domain.document import (
     PlanningPromptSnapshot,
@@ -48,10 +50,17 @@ from feishu_generation_agent.integrations.bitable_delivery import (
 from feishu_generation_agent.integrations.feishu_bitable import BitableSchemaError
 from feishu_generation_agent.integrations.planner import planner_system_prompt
 from feishu_generation_agent.storage.bitable_tasks import TaskAlreadyClaimed
+from feishu_generation_agent.storage.asset_library import (
+    AssetLibraryStore,
+    DuplicateAssetError,
+)
 from feishu_generation_agent.storage.production_tasks import ProductionTaskAlreadyClaimed
 from feishu_generation_agent.storage.checkpoints import open_checkpointer
 from feishu_generation_agent.storage.planner_prompts import PlannerPromptStore
 from feishu_generation_agent.web.schemas import (
+    AssetLibraryItem,
+    AssetLibraryListResponse,
+    AssetLibraryUpdateRequest,
     BitableClaimResponse,
     BitableRetryResponse,
     CreateRunRequest,
@@ -1032,3 +1041,112 @@ def create_app(
         )
 
     return app
+
+
+def _split_csv(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def register_asset_library_routes(
+    app: FastAPI,
+    store_provider: Callable[[], AssetLibraryStore],
+) -> None:
+    @app.post(
+        "/api/asset-library/assets",
+        response_model=AssetLibraryItem,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_asset_library_item(
+        file: Annotated[UploadFile, File()],
+        name: Annotated[str, Form()],
+        variant: Annotated[str, Form()] = "默认",
+        kind: Annotated[str, Form()] = "character",
+        description: Annotated[str, Form()] = "",
+        aliases: Annotated[str | None, Form()] = None,
+        tags: Annotated[str | None, Form()] = None,
+        model_prefs: Annotated[str | None, Form()] = None,
+        prompt_fragment: Annotated[str, Form()] = "",
+    ) -> AssetLibraryItem:
+        content = await file.read()
+        try:
+            asset = await store_provider().create(
+                name=name,
+                variant=variant,
+                kind=AssetKind(kind),
+                description=description,
+                aliases=_split_csv(aliases),
+                tags=_split_csv(tags),
+                model_prefs=_split_csv(model_prefs),
+                prompt_fragment=prompt_fragment,
+                content=content,
+                mime_type=file.content_type or "",
+            )
+        except DuplicateAssetError as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=str(error)
+            ) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)
+            ) from error
+        return AssetLibraryItem.from_domain(asset)
+
+    @app.get(
+        "/api/asset-library/assets",
+        response_model=AssetLibraryListResponse,
+    )
+    async def list_asset_library_items(
+        name: str | None = None,
+        kind: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> AssetLibraryListResponse:
+        assets = await store_provider().list_all(
+            kind=AssetKind(kind) if kind else None,
+            name=name,
+            limit=limit,
+            offset=offset,
+        )
+        return AssetLibraryListResponse.from_domain(assets)
+
+    @app.patch(
+        "/api/asset-library/assets/{asset_id}",
+        response_model=AssetLibraryItem,
+    )
+    async def update_asset_library_item(
+        asset_id: str,
+        payload: AssetLibraryUpdateRequest,
+    ) -> AssetLibraryItem:
+        try:
+            asset = await store_provider().update(
+                asset_id,
+                name=payload.name,
+                variant=payload.variant,
+                kind=AssetKind(payload.kind) if payload.kind else None,
+                description=payload.description,
+                aliases=payload.aliases,
+                tags=payload.tags,
+                model_prefs=payload.model_prefs,
+                prompt_fragment=payload.prompt_fragment,
+            )
+        except DuplicateAssetError as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=str(error)
+            ) from error
+        if asset is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="素材不存在"
+            )
+        return AssetLibraryItem.from_domain(asset)
+
+    @app.delete(
+        "/api/asset-library/assets/{asset_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def delete_asset_library_item(asset_id: str) -> None:
+        if not await store_provider().delete(asset_id):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="素材不存在"
+            )
