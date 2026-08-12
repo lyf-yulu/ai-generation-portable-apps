@@ -54,6 +54,7 @@ from feishu_generation_agent.integrations.vision import ClaudeVisionAnalyzer
 from feishu_generation_agent.storage.files import FileStore
 from feishu_generation_agent.storage.bitable_tasks import BitableTaskStore
 from feishu_generation_agent.storage.production_tasks import ProductionTaskStore
+from feishu_generation_agent.storage.asset_library import AssetLibraryStore
 from feishu_generation_agent.storage.portrait_assets import PortraitAssetStore
 from feishu_generation_agent.storage.provider_results import ProviderResultStore
 from feishu_generation_agent.storage.planner_prompts import PlannerPromptStore
@@ -112,6 +113,14 @@ def runtime_is_configured(settings: Settings) -> bool:
             or capability_is_configured(settings, "production_bitable")
             or capability_is_configured(settings, "legacy_delivery")
         )
+    )
+
+
+async def open_asset_library_store(settings: Settings) -> AssetLibraryStore:
+    return await AssetLibraryStore.open(
+        db_path=settings.asset_library_db_path,
+        assets_dir=settings.asset_library_dir,
+        base_url=settings.asset_base_url,
     )
 
 
