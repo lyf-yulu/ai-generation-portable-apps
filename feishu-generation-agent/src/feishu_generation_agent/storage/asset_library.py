@@ -9,6 +9,7 @@ from feishu_generation_agent.domain.asset_library import (
     ASSET_IMAGE_MIME_TYPES,
     AssetKind,
     CharacterAsset,
+    normalize_alias,
 )
 
 
@@ -169,7 +170,7 @@ class AssetLibraryStore:
         await cursor.close()
         return self._row_to_asset(row) if row is not None else None
 
-    async def list(
+    async def list_all(
         self,
         *,
         kind: AssetKind | None = None,
@@ -195,6 +196,96 @@ class AssetLibraryStore:
         rows = await cursor.fetchall()
         await cursor.close()
         return [self._row_to_asset(row) for row in rows]
+
+    async def update(
+        self,
+        asset_id: str,
+        *,
+        name: str | None = None,
+        variant: str | None = None,
+        kind: AssetKind | None = None,
+        description: str | None = None,
+        aliases: list[str] | None = None,
+        tags: list[str] | None = None,
+        model_prefs: list[str] | None = None,
+        prompt_fragment: str | None = None,
+    ) -> CharacterAsset | None:
+        current = await self.get(asset_id)
+        if current is None:
+            return None
+
+        merged = current.model_copy(
+            update={
+                "name": current.name if name is None else name,
+                "variant": current.variant if variant is None else variant,
+                "kind": current.kind if kind is None else kind,
+                "description": (
+                    current.description if description is None else description
+                ),
+                "aliases": current.aliases if aliases is None else aliases,
+                "tags": current.tags if tags is None else tags,
+                "model_prefs": (
+                    current.model_prefs if model_prefs is None else model_prefs
+                ),
+                "prompt_fragment": (
+                    current.prompt_fragment
+                    if prompt_fragment is None
+                    else prompt_fragment
+                ),
+                "updated_at": datetime.now(timezone.utc),
+            }
+        )
+        revalidated = CharacterAsset.model_validate(merged.model_dump())
+
+        try:
+            await self._connection.execute(
+                """
+                UPDATE asset_library
+                   SET name = ?, variant = ?, kind = ?, description = ?,
+                       aliases = ?, tags = ?, model_prefs = ?,
+                       prompt_fragment = ?, updated_at = ?
+                 WHERE asset_id = ?
+                """,
+                (
+                    revalidated.name,
+                    revalidated.variant,
+                    revalidated.kind.value,
+                    revalidated.description,
+                    json.dumps(revalidated.aliases, ensure_ascii=False),
+                    json.dumps(revalidated.tags, ensure_ascii=False),
+                    json.dumps(revalidated.model_prefs, ensure_ascii=False),
+                    revalidated.prompt_fragment,
+                    revalidated.updated_at.isoformat(),
+                    asset_id,
+                ),
+            )
+        except aiosqlite.IntegrityError as error:
+            raise DuplicateAssetError(
+                f"素材已存在：{revalidated.name} / {revalidated.variant}"
+            ) from error
+        await self._connection.commit()
+        return revalidated
+
+    async def delete(self, asset_id: str) -> bool:
+        current = await self.get(asset_id)
+        if current is None:
+            return False
+        await self._connection.execute(
+            "DELETE FROM asset_library WHERE asset_id = ?", (asset_id,)
+        )
+        await self._connection.commit()
+        target = self._assets_dir.parent / current.storage_path
+        target.unlink(missing_ok=True)
+        return True
+
+    async def find_by_match_key(self, key: str) -> list[CharacterAsset]:
+        normalized = normalize_alias(key)
+        if not normalized:
+            return []
+        candidates = await self.list_all(limit=500)
+        return [
+            asset for asset in candidates if normalized in asset.match_keys()
+        ]
 
     def _row_to_asset(self, row: aiosqlite.Row) -> CharacterAsset:
         return CharacterAsset(
