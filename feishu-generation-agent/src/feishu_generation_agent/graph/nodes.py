@@ -258,6 +258,49 @@ def _planning_prompt(state: AgentState) -> PlanningPromptSnapshot:
     )
 
 
+_IMAGE_REQUIREMENT_TYPE = "图片类"
+
+
+async def _planning_mode_for_run(run_id: str, services: GraphServices) -> str:
+    """从生产表「需求类型」推导规划模式。
+
+    图片类 → image；动画类/真人类/legacy run → video。读取失败时回落 video，
+    不让一次多维表格抖动把整个 run 拖挂。
+    """
+    store = getattr(services, "production_task_store", None)
+    if store is None:
+        return "video"
+    try:
+        binding = await store.get_by_run(run_id)
+    except Exception:
+        return "video"
+    if binding is None:
+        return "video"
+    task_type = getattr(getattr(binding, "snapshot", None), "task_type", None)
+    return "image" if task_type == _IMAGE_REQUIREMENT_TYPE else "video"
+
+
+def _planner_mode_argument(
+    planner: RequirementPlanner,
+    mode: str,
+) -> dict[str, str]:
+    """只在 planner 支持 mode 且需要非默认值时才传。
+
+    存量测试里的 fake planner 大多没有 mode 参数，直接传会 TypeError；
+    video 是默认值，省略可进一步减少对存量调用方的干扰。
+    """
+    if mode == "video":
+        return {}
+    try:
+        parameters = signature(planner.plan).parameters
+    except (TypeError, ValueError):
+        return {}
+    parameter = parameters.get("mode")
+    if parameter is None or parameter.kind is Parameter.POSITIONAL_ONLY:
+        return {}
+    return {"mode": mode}
+
+
 def _planner_prompt_argument(
     planner: RequirementPlanner,
     planning_prompt: PlanningPromptSnapshot,
@@ -427,11 +470,13 @@ async def plan_requirements(
             for item in state.get("vision_descriptions", [])
         ]
         planning_prompt = _planning_prompt(state)
+        mode = await _planning_mode_for_run(state["run_id"], services)
         plan = await services.planner.plan(
             document,
             descriptions,
             state.get("planner_feedback"),
             **_planner_prompt_argument(services.planner, planning_prompt),
+            **_planner_mode_argument(services.planner, mode),
         )
         plan_json = _json_model(plan)
         return {"draft_plan": plan_json, "task_plan": plan_json}
