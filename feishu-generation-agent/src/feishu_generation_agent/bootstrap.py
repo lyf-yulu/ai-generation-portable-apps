@@ -1,6 +1,8 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import httpx
 from langchain_anthropic import ChatAnthropic
@@ -114,6 +116,40 @@ def runtime_is_configured(settings: Settings) -> bool:
             or capability_is_configured(settings, "legacy_delivery")
         )
     )
+
+
+def build_image_providers(
+    settings: Settings,
+    http_client: Any,
+    *,
+    staging_dir: Path,
+    result_downloader: Any | None,
+    max_result_bytes: int,
+) -> dict[str, ChiyunImageGenerator]:
+    """构建图片模式的 provider registry。
+
+    banana 与 gpt-image2 都走 chiyun 中转，由 ChiyunImageGenerator 按 model
+    名前缀自动分流（gpt-image* → OpenAI 风格，其余 → Gemini 风格），
+    因此只需用不同 model 各实例化一次。seedream 走火山方舟，另行接入。
+    """
+    if settings.chiyun_api_key is None:
+        return {}
+    models = {
+        "banana": settings.banana_model,
+        "gpt-image2": settings.gpt_image_model,
+    }
+    return {
+        name: ChiyunImageGenerator(
+            http_client,
+            base_url=settings.chiyun_base_url,
+            api_key=settings.chiyun_api_key,
+            model=model,
+            staging_dir=staging_dir,
+            result_downloader=result_downloader,
+            max_result_bytes=max_result_bytes,
+        )
+        for name, model in models.items()
+    }
 
 
 async def open_asset_library_store(settings: Settings) -> AssetLibraryStore:
