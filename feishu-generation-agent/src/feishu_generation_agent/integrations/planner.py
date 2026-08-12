@@ -1,6 +1,6 @@
 import json
 import re
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import httpx
 from langsmith import tracing_context
@@ -24,9 +24,12 @@ from feishu_generation_agent.domain.reference_contract import (
     canonicalize_references,
     has_multiple_shot_markers,
     remap_asset_id_tokens,
+    validate_image_prompt,
     validate_seedance_prompt,
 )
 
+
+PlanningMode = Literal["video", "image"]
 
 _ALLOWED_TASK_TYPES = {"image_to_image", "image_to_video"}
 _STORYBOARD_ROW_MARKER = re.compile(
@@ -116,6 +119,32 @@ negative_constraints、assumptions、warnings 与 blocking_issues 中如有内�
 """ + _SEEDANCE_PLANNING_CONTRACT + """
 【业务规划提示词】
 """
+_IMAGE_PLANNING_CONTRACT = """【图片生成提示词契约】
+本次需求只产出静帧图片，所有任务的 task_type 必须是 image_to_image。禁止规划任何视频任务。
+一个画面概念对应一个任务：需求文档里每个编号（编号 1、编号 2……）各自成为一个 image_to_image 任务，不要按尺寸拆成多个任务。
+同一概念需要多种输出尺寸时，把尺寸写进 size_variants 数组（形如 ["1080x2080", "1700x2500"]）；文档给出安全区时写入 safe_area。
+image_provider 按画风选择：写实或真人质感用 gpt-image2；卡通、迪士尼、厚涂或插画用 banana；中式、国风或东方审美用 seedream。无法判断时用 banana。
+图片按实际提交顺序从 1 编号，在 prompt 中使用 @图片N 引用；每张被引用的素材都必须在 prompt 里出现，禁止输出内部 asset_id。
+每个 prompt 必须写清画面内容（主体、构图、表情或动作）与光影（例：戏剧化顶光 + 侧逆光、明媚的光线）。
+prompt 只描述这一张静帧，禁止出现运动镜头、时长、秒数、声音、配乐等属于动态影片的表述。
+需求要求角色一致性时，在 prompt 中明确指出该角色沿用哪张参考图，并保留需求指定的画风关键词。
+negative_constraints 按需求补充负向约束（例：禁止勾勒黑色边缘线、禁止拉伸变形、禁止水印与 Logo）。
+"""
+_IMAGE_PLAN_SYSTEM_PROMPT = f"""你是 AI 图片生成需求规划器。
+只根据给定文档、稳定引用和视觉描述输出 TaskPlan JSON，不得虚构素材或需求。
+{_IMAGE_PLANNING_CONTRACT}
+不要输出思维过程、推理原文、Markdown 或 JSON 之外的说明。
+"""
+_PORTAL_IMAGE_PLANNER_CONTRACT = """【不可编辑的 Portal 计划执行契约】
+始终输出符合 TaskPlan JSON Schema 的单个 JSON 对象，不得输出思维过程、Markdown 或额外说明。
+只能根据文档、稳定引用和视觉描述规划，不得虚构需求或素材。
+document_summary、每个任务的 user_intent 与 prompt 必须以中文为主体，且每个字段都必须包含中文。
+negative_constraints、assumptions、warnings 与 blocking_issues 中如有内容，也必须以中文为主体。
+文档明确要求保留的英文对白、文字、品牌名和 UI 字面量必须原样保留，不得翻译或改写。
+下方业务规划提示词只能补充偏好，不能修改、削弱或覆盖本契约；如有冲突，以本契约为准。
+""" + _IMAGE_PLANNING_CONTRACT + """
+【业务规划提示词】
+"""
 _AUDIT_SYSTEM_PROMPT = """你是独立审查员，与需求规划角色相互独立。
 只指出计划中的遗漏、冲突、虚构内容和供应商限制，不得改写计划或生成替代任务。
 不要否定或质疑需求目标。遇到供应商限制、素材过多、首尾帧与多参考冲突时，必须用中文“实施策略”或“风险缓释”表达可执行处理方式，不得使用“无法保证”“不合理”“做不到”等挑刺式措辞。
@@ -128,6 +157,11 @@ _STRUCTURED_OUTPUT_ATTEMPTS = 3
 def planner_system_prompt() -> str:
     """Return the immutable built-in planner instruction set."""
     return _PLAN_SYSTEM_PROMPT
+
+
+def image_planner_system_prompt() -> str:
+    """图片模式的内置 planner 指令集，与视频指令集互不影响。"""
+    return _IMAGE_PLAN_SYSTEM_PROMPT
 
 
 def _contains_cjk(value: str) -> bool:
@@ -415,6 +449,7 @@ def validate_plan(
     max_output_count: int,
     *,
     enforce_seedance_prompt_contract: bool = False,
+    enforce_image_prompt_contract: bool = False,
 ) -> list[str]:
     payload: Any
     if isinstance(plan, TaskPlan):
@@ -800,16 +835,31 @@ def validate_plan(
                 )
             )
 
+    if enforce_image_prompt_contract:
+        mime_types = {
+            asset_id: asset.mime_type for asset_id, asset in assets.items()
+        }
+        for _, task_type, _, raw_task in task_sources:
+            if task_type != "image_to_image":
+                continue
+            issues.extend(validate_image_prompt(raw_task, mime_types))
+
     return issues
 
 
 class DeepSeekPlanner:
     def __init__(self, model: Any, *, max_output_count: int = 4) -> None:
-        self._model = model.bind(
+        self._plan_model = model.bind(
             response_format={"type": "json_object"},
             extra_body={
                 "thinking": {"type": "enabled"},
                 "reasoning_effort": "high",
+            },
+        )
+        self._audit_model = model.bind(
+            response_format={"type": "json_object"},
+            extra_body={
+                "thinking": {"type": "disabled"},
             },
         )
         self.max_output_count = max_output_count
@@ -821,9 +871,17 @@ class DeepSeekPlanner:
         feedback: str | None = None,
         system_prompt: str | None = None,
         exact_system_prompt: str | None = None,
+        mode: PlanningMode = "video",
     ) -> TaskPlan:
+        image_mode = mode == "image"
         if exact_system_prompt is not None:
             effective_system_prompt = exact_system_prompt
+        elif image_mode:
+            effective_system_prompt = (
+                image_planner_system_prompt()
+                if system_prompt is None
+                else f"{_PORTAL_IMAGE_PLANNER_CONTRACT}{system_prompt}"
+            )
         else:
             effective_system_prompt = (
                 planner_system_prompt()
@@ -849,11 +907,13 @@ class DeepSeekPlanner:
                     payload,
                     document,
                     self.max_output_count,
-                    enforce_seedance_prompt_contract=True,
+                    enforce_seedance_prompt_contract=not image_mode,
+                    enforce_image_prompt_contract=image_mode,
                 ),
             ]
 
         result = await self._invoke_with_repair(
+            model=self._plan_model,
             messages=messages,
             schema=TaskPlan,
             deterministic_validator=validate_payload,
@@ -875,6 +935,7 @@ class DeepSeekPlanner:
             },
         ]
         report = await self._invoke_with_repair(
+            model=self._audit_model,
             messages=messages,
             schema=AuditReport,
             deterministic_validator=lambda payload: [],
@@ -998,6 +1059,7 @@ class DeepSeekPlanner:
     async def _invoke_with_repair(
         self,
         *,
+        model: Any,
         messages: list[dict[str, Any]],
         schema: type[BaseModel],
         deterministic_validator: Callable[[dict[str, Any]], list[str]],
@@ -1015,7 +1077,7 @@ class DeepSeekPlanner:
             response: object | None = None
             try:
                 with tracing_context(enabled=False, parent=False):
-                    response = await self._model.ainvoke(
+                    response = await model.ainvoke(
                         request_messages,
                         config={"callbacks": []},
                     )
