@@ -872,6 +872,7 @@ class DeepSeekPlanner:
         system_prompt: str | None = None,
         exact_system_prompt: str | None = None,
         mode: PlanningMode = "video",
+        character_context: str | None = None,
     ) -> TaskPlan:
         image_mode = mode == "image"
         if exact_system_prompt is not None:
@@ -888,12 +889,19 @@ class DeepSeekPlanner:
                 if system_prompt is None
                 else f"{_PORTAL_PLANNER_CONTRACT}{system_prompt}"
             )
+        user_content = self._planning_prompt(document, visions, feedback)
+        if character_context:
+            user_content = (
+                f"{user_content}\n\n"
+                "【素材库已匹配角色】\n"
+                f"{character_context}\n"
+                "画面出现上述角色时，必须把对应 asset_id 挂进 reference_images"
+                "（role=reference_image），并在 prompt 中沿用该角色的既有形象，"
+                "不要用文档里的普通图片替代。"
+            )
         messages = [
             {"role": "system", "content": effective_system_prompt},
-            {
-                "role": "user",
-                "content": self._planning_prompt(document, visions, feedback),
-            },
+            {"role": "user", "content": user_content},
         ]
 
         def validate_payload(payload: dict[str, Any]) -> list[str]:

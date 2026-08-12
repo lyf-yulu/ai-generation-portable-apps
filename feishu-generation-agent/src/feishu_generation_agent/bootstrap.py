@@ -43,6 +43,9 @@ from feishu_generation_agent.integrations.production_routing import (
 from feishu_generation_agent.integrations.safe_download import (
     SafeResultDownloader,
 )
+from feishu_generation_agent.integrations.character_semantic_matcher import (
+    DeepSeekCharacterMatcher,
+)
 from feishu_generation_agent.integrations.seedance import SeedanceVideoGenerator
 from feishu_generation_agent.integrations.seedream import SeedreamImageGenerator
 from feishu_generation_agent.integrations.public_media import (
@@ -284,6 +287,7 @@ async def _open_application_services(
     file_store: FileStore | None = None
     bitable_factory: BitableServiceFactory | ProductionBitableServiceFactory | None = None
     portrait_store: PortraitAssetStore | None = None
+    asset_library_store: AssetLibraryStore | None = None
     try:
         provider_results = ProviderResultStore(
             settings.data_dir / "provider-results",
@@ -338,6 +342,11 @@ async def _open_application_services(
             max_retries=2,
             timeout=120,
         )
+        # 素材库打不开不该阻断整个 agent：图片模式退化成人工挂参考图。
+        try:
+            asset_library_store = await open_asset_library_store(settings)
+        except Exception:
+            asset_library_store = None
         vision_options = {
             "api_key": settings.claude_api_key,
             "model_name": settings.claude_model,
@@ -477,6 +486,12 @@ async def _open_application_services(
             repository=repository,
             file_store=file_store,
             settings=settings,
+            asset_library_store=asset_library_store,
+            character_matcher=(
+                DeepSeekCharacterMatcher(planner_model)
+                if asset_library_store is not None
+                else None
+            ),
         )
         yield ApplicationServices(
             graph=services,
@@ -491,6 +506,8 @@ async def _open_application_services(
             file_store.close()
         if portrait_store is not None:
             await portrait_store.close()
+        if asset_library_store is not None:
+            await asset_library_store.close()
         await feishu.close()
         await downloader.aclose()
         await provider_http.aclose()

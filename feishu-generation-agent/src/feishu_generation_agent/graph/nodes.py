@@ -1,6 +1,7 @@
 import asyncio
 from inspect import Parameter, signature
 import json
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -14,6 +15,7 @@ from langgraph.types import Command, interrupt
 from pydantic import ValidationError
 
 from feishu_generation_agent.config import Settings
+from feishu_generation_agent.domain.character_matcher import match_characters
 from feishu_generation_agent.domain.document import (
     MediaAsset,
     NormalizedDocument,
@@ -77,6 +79,10 @@ class GraphServices:
     # 图片 provider registry：{"banana": gen, "seedream": gen, "gpt-image2": gen}。
     # 为 None 时回落到单实例 image_generator，保持存量调用方零改动。
     image_providers: Mapping[str, ImageGenerator] | None = None
+    # 角色素材库与语义匹配器，图片模式下用于自动挂载角色参考图。
+    # 未配置时跳过自动挂载，人工仍可在审核界面手动挂。
+    asset_library_store: Any | None = None
+    character_matcher: Any | None = None
 
 
 _Result = TypeVar("_Result")
@@ -259,6 +265,75 @@ def _planning_prompt(state: AgentState) -> PlanningPromptSnapshot:
 
 
 _IMAGE_REQUIREMENT_TYPE = "图片类"
+_LOGGER = logging.getLogger(__name__)
+
+
+async def _resolve_character_assets(
+    document: NormalizedDocument,
+    services: GraphServices,
+) -> list[Any]:
+    """把文档里出现的角色对应到素材库条目。
+
+    两级匹配：先按名字/别名字面命中，未覆盖的描述式指代交给语义匹配层。
+    任一环节失败都退回已有结果，不让素材库问题拖垮整个 run——挂不上参考图
+    只是少了自动化，人工仍可在审核界面手动挂。
+    """
+    store = getattr(services, "asset_library_store", None)
+    if store is None:
+        return []
+    try:
+        library = await store.list_all(limit=500)
+    except Exception:
+        _LOGGER.warning("素材库读取失败，跳过角色自动挂载", exc_info=True)
+        return []
+    if not library:
+        return []
+
+    by_id = {asset.asset_id: asset for asset in library}
+    anchors = match_characters(list(document.blocks), library)
+    resolved_ids = [anchor.asset_id for anchor in anchors]
+
+    matcher = getattr(services, "character_matcher", None)
+    if matcher is not None:
+        try:
+            result = await matcher.match(
+                document.text_view, library, anchors=anchors
+            )
+        except Exception:
+            _LOGGER.warning("角色语义匹配失败，仅使用精确匹配", exc_info=True)
+        else:
+            for item in result.matches:
+                if item.asset_id not in resolved_ids:
+                    resolved_ids.append(item.asset_id)
+
+    return [by_id[asset_id] for asset_id in resolved_ids if asset_id in by_id]
+
+
+def _character_context_argument(
+    planner: RequirementPlanner,
+    resolved: list[Any],
+) -> dict[str, str]:
+    """把已解析的角色素材描述成 planner 可读的上下文。
+
+    与 _planner_prompt_argument / _planner_mode_argument 同样的签名探测做法：
+    老 planner 没有该参数时省略，避免 TypeError。
+    """
+    if not resolved:
+        return {}
+    try:
+        parameters = signature(planner.plan).parameters
+    except (TypeError, ValueError):
+        return {}
+    parameter = parameters.get("character_context")
+    if parameter is None or parameter.kind is Parameter.POSITIONAL_ONLY:
+        return {}
+
+    lines = [
+        f"- {asset.name} / {asset.variant}（asset_id={asset.asset_id}）"
+        f"：{asset.prompt_fragment or asset.description or '无附加描述'}"
+        for asset in resolved
+    ]
+    return {"character_context": "\n".join(lines)}
 
 
 async def _planning_mode_for_run(run_id: str, services: GraphServices) -> str:
@@ -471,12 +546,20 @@ async def plan_requirements(
         ]
         planning_prompt = _planning_prompt(state)
         mode = await _planning_mode_for_run(state["run_id"], services)
+        resolved_characters = (
+            await _resolve_character_assets(document, services)
+            if mode == "image"
+            else []
+        )
         plan = await services.planner.plan(
             document,
             descriptions,
             state.get("planner_feedback"),
             **_planner_prompt_argument(services.planner, planning_prompt),
             **_planner_mode_argument(services.planner, mode),
+            **_character_context_argument(
+                services.planner, resolved_characters
+            ),
         )
         plan_json = _json_model(plan)
         return {"draft_plan": plan_json, "task_plan": plan_json}
