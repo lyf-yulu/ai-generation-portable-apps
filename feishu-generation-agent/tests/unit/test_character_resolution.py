@@ -222,3 +222,80 @@ def test_character_context_argument_is_omitted_for_legacy_planner():
     resolved = [_asset("a1", "Sarah")]
 
     assert _character_context_argument(LegacyPlanner(), resolved) == {}
+
+
+async def test_auto_ingested_characters_are_resolved_too(tmp_path):
+    """未知角色自动建档后必须一并挂上，否则本次出图仍然缺参考图。"""
+    from feishu_generation_agent.domain.document import MediaAsset
+    from feishu_generation_agent.integrations.character_semantic_matcher import (
+        UnresolvedCandidate,
+    )
+
+    image = tmp_path / "mike.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    document = NormalizedDocument(
+        document_id="doc-1",
+        title="CG 需求",
+        revision=1,
+        source_type=SourceType.WIKI,
+        source_token="token-1",
+        blocks=[
+            DocumentBlock(
+                block_id="b1",
+                parent_id=None,
+                block_type="text",
+                order=0,
+                path=["b1"],
+                text="新角色 Mike 登场",
+            ),
+            DocumentBlock(
+                block_id="b2",
+                parent_id=None,
+                block_type="image",
+                order=1,
+                path=["b2"],
+                text="",
+                image_asset_id="image-1",
+            ),
+        ],
+        text_view="[block:b1] 新角色 Mike 登场",
+        media_assets=[
+            MediaAsset(
+                asset_id="image-1",
+                source_block_id="b2",
+                origin="feishu",
+                local_path=image,
+                mime_type="image/png",
+                size=8,
+                sha256="a" * 64,
+            )
+        ],
+    )
+
+    created_asset = _asset("new-1", "Mike")
+
+    class Store:
+        def __init__(self) -> None:
+            self.assets = [_asset("a1", "Victor")]
+
+        async def list_all(self, **_kwargs: Any):
+            return self.assets
+
+        async def create(self, **_kwargs: Any):
+            return created_asset
+
+    matcher = _Matcher(
+        SemanticMatchResult(
+            unresolved_candidates=(
+                UnresolvedCandidate(
+                    proposed_name="Mike", block_ids=("b1",), reason="库里没有"
+                ),
+            )
+        )
+    )
+
+    resolved = await _resolve_character_assets(
+        document, _services(Store(), matcher)
+    )
+
+    assert "Mike" in [item.name for item in resolved]

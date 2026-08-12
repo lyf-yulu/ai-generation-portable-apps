@@ -305,8 +305,97 @@ async def _resolve_character_assets(
             for item in result.matches:
                 if item.asset_id not in resolved_ids:
                     resolved_ids.append(item.asset_id)
+            # 文档里出现但库里没有的角色，首次遇到即自动建档并一并挂上。
+            for record in await _auto_ingest_characters(
+                document, list(result.unresolved_candidates), store
+            ):
+                by_id[record.asset_id] = record
+                resolved_ids.append(record.asset_id)
 
     return [by_id[asset_id] for asset_id in resolved_ids if asset_id in by_id]
+
+
+async def _auto_ingest_characters(
+    document: NormalizedDocument,
+    candidates: list[Any],
+    store: Any | None,
+) -> list[Any]:
+    """把文档里出现、但素材库还没有的角色自动建档。
+
+    参考图取「候选人物所在 block 之后最近的一张图」——需求文档惯例是
+    角色名在前、设定图紧随其后。找不到图就跳过，宁可少建也不建错。
+
+    自动入库的条目打 auto-ingested 标签并记录来源文档，方便人工事后复核；
+    variant 一律先用「默认」，同人不同着装由人工在素材库界面拆分改名。
+    """
+    if store is None or not candidates:
+        return []
+
+    image_blocks = [
+        block
+        for block in sorted(document.blocks, key=lambda item: item.order)
+        if block.image_asset_id
+    ]
+    if not image_blocks:
+        return []
+    assets_by_id = {
+        asset.asset_id: asset for asset in document.media_assets
+    }
+    block_order = {
+        block.block_id: block.order for block in document.blocks
+    }
+
+    created: list[Any] = []
+    for candidate in candidates:
+        name = candidate.proposed_name.strip()
+        if not name:
+            continue
+        asset = _nearest_image_asset(
+            candidate.block_ids, image_blocks, block_order, assets_by_id
+        )
+        if asset is None:
+            continue
+        try:
+            content = asset.local_path.read_bytes()
+        except OSError:
+            _LOGGER.warning("自动入库读取参考图失败 name=%s", name)
+            continue
+        try:
+            record = await store.create(
+                name=name,
+                variant="默认",
+                content=content,
+                mime_type=asset.mime_type,
+                description=candidate.reason or "",
+                tags=["auto-ingested", f"需求文档:{document.document_id}"],
+            )
+        except Exception:
+            # 重名冲突或落盘失败都只跳过该候选，不影响其它候选与整个 run。
+            _LOGGER.warning("自动入库失败 name=%s", name, exc_info=True)
+            continue
+        created.append(record)
+    return created
+
+
+def _nearest_image_asset(
+    block_ids: tuple[str, ...],
+    image_blocks: list[Any],
+    block_order: dict[str, int],
+    assets_by_id: dict[str, Any],
+) -> Any | None:
+    anchors = [
+        block_order[block_id]
+        for block_id in block_ids
+        if block_id in block_order
+    ]
+    if not anchors:
+        return None
+    anchor = min(anchors)
+    following = [
+        block for block in image_blocks if block.order >= anchor
+    ]
+    chosen = following[0] if following else image_blocks[-1]
+    return assets_by_id.get(chosen.image_asset_id)
 
 
 def _character_context_argument(
