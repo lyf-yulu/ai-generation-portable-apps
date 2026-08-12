@@ -398,8 +398,9 @@ async def _open_application_services(
                 sources=production_sources,
                 include_completed_for_test=settings.lark_include_completed_for_test,
                 enabled_task_types=(
-                    frozenset({"动画类", "真人类"})
-                    if portrait_generator is not None else frozenset({"动画类"})
+                    frozenset({"动画类", "真人类", "图片类"})
+                    if portrait_generator is not None
+                    else frozenset({"动画类", "图片类"})
                 ),
             )
             production_writer = ProductionResultWriter(
