@@ -15,6 +15,7 @@ from langgraph.types import Command, interrupt
 from pydantic import ValidationError
 
 from feishu_generation_agent.config import Settings
+from feishu_generation_agent.domain.asset_library import normalize_alias
 from feishu_generation_agent.domain.character_matcher import match_characters
 from feishu_generation_agent.domain.document import (
     MediaAsset,
@@ -290,8 +291,17 @@ async def _resolve_character_assets(
         return []
 
     by_id = {asset.asset_id: asset for asset in library}
-    anchors = match_characters(list(document.blocks), library)
-    resolved_ids = [anchor.asset_id for anchor in anchors]
+    exact_matches = match_characters(list(document.blocks), library)
+    exact_ids = [anchor.asset_id for anchor in exact_matches]
+    semantic_ids: list[str] = []
+
+    # 只有单一变体的角色才作为锚点。锚点的含义是「已确定、不要再输出」，
+    # 而同名多变体恰恰需要语义层按上下文挑一个，把它们锁成锚点会剥夺
+    # 这个判断机会。
+    grouped: dict[str, list[Any]] = {}
+    for anchor in exact_matches:
+        grouped.setdefault(normalize_alias(anchor.name), []).append(anchor)
+    anchors = [group[0] for group in grouped.values() if len(group) == 1]
 
     matcher = getattr(services, "character_matcher", None)
     if matcher is not None:
@@ -302,17 +312,43 @@ async def _resolve_character_assets(
         except Exception:
             _LOGGER.warning("角色语义匹配失败，仅使用精确匹配", exc_info=True)
         else:
-            for item in result.matches:
-                if item.asset_id not in resolved_ids:
-                    resolved_ids.append(item.asset_id)
+            semantic_ids = [item.asset_id for item in result.matches]
             # 文档里出现但库里没有的角色，首次遇到即自动建档并一并挂上。
             for record in await _auto_ingest_characters(
                 document, list(result.unresolved_candidates), store
             ):
                 by_id[record.asset_id] = record
-                resolved_ids.append(record.asset_id)
+                semantic_ids.append(record.asset_id)
 
-    return [by_id[asset_id] for asset_id in resolved_ids if asset_id in by_id]
+    return _collapse_variants(exact_ids, semantic_ids, by_id)
+
+
+def _collapse_variants(
+    exact_ids: list[str],
+    semantic_ids: list[str],
+    by_id: dict[str, Any],
+) -> list[Any]:
+    """同一角色只保留一个着装变体。
+
+    角色名字面命中时，库里该角色的所有变体都会被精确匹配挑出来。把两套
+    冲突服装同时作为参考图会让模型不知道该用哪套——角色一致性正是要避免
+    这个。因此按角色名收敛：语义层明确挑过的变体优先，否则取精确匹配的
+    第一个。
+    """
+    chosen: dict[str, str] = {}
+    order: list[str] = []
+    for asset_id in [*exact_ids, *semantic_ids]:
+        asset = by_id.get(asset_id)
+        if asset is None:
+            continue
+        key = normalize_alias(asset.name)
+        if key not in chosen:
+            chosen[key] = asset_id
+            order.append(key)
+        elif asset_id in semantic_ids and chosen[key] not in semantic_ids:
+            # 语义层的选择覆盖精确匹配的任意变体。
+            chosen[key] = asset_id
+    return [by_id[chosen[key]] for key in order]
 
 
 async def _auto_ingest_characters(
