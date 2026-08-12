@@ -440,6 +440,14 @@ async def _open_application_services(
                 result_downloader=downloader,
                 max_result_bytes=settings.max_download_bytes,
             ),
+            image_providers=build_image_providers(
+                settings,
+                provider_http,
+                staging_dir=settings.data_dir / "provider-results",
+                result_downloader=downloader,
+                max_result_bytes=settings.max_download_bytes,
+            )
+            or None,
             video_generator=SeedanceVideoGenerator(
                 provider_http,
                 base_url=settings.ark_base_url,
