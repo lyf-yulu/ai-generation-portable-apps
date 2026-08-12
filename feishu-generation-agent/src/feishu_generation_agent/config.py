@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     # 靠 model 名前缀分流（gpt-image* → OpenAI 风格，其余 → Gemini 风格）。
     banana_model: str = "banana2-ssvip"
     gpt_image_model: str = "gpt-image-2"
+    # seedream 走火山方舟，复用 ark_api_key / ark_base_url。
+    seedream_model: str = "doubao-seedream-5-0-pro-260628"
     ark_api_key: SecretStr | None = None
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     seedance_model: str = "doubao-seedance-2-0-260128"

@@ -20,6 +20,7 @@ def _settings(**updates: object) -> Settings:
         "chiyun_api_key": "fictional-chiyun-key",
         "chiyun_base_url": "https://chiyun.work",
         "chiyun_model": "banana2-ssvip",
+        "ark_api_key": "fictional-ark-key",
     }
     base.update(updates)
     return Settings(**base)
@@ -29,18 +30,6 @@ def _settings(**updates: object) -> Settings:
 def http_client():
     client = httpx.AsyncClient()
     yield client
-
-
-def test_builds_banana_and_gpt_image2_from_chiyun(http_client, tmp_path):
-    providers = build_image_providers(
-        _settings(),
-        http_client,
-        staging_dir=tmp_path,
-        result_downloader=DOWNLOADER,
-        max_result_bytes=1024,
-    )
-
-    assert set(providers) == {"banana", "gpt-image2"}
 
 
 def test_banana_and_gpt_image2_use_distinct_models(http_client, tmp_path):
@@ -69,9 +58,59 @@ def test_custom_models_are_honoured(http_client, tmp_path):
     assert providers["gpt-image2"]._model == "gpt-image-3"
 
 
-def test_missing_chiyun_key_yields_empty_registry(http_client, tmp_path):
+def test_builds_all_three_image_providers(http_client, tmp_path):
+    providers = build_image_providers(
+        _settings(),
+        http_client,
+        staging_dir=tmp_path,
+        result_downloader=DOWNLOADER,
+        max_result_bytes=1024,
+    )
+
+    assert set(providers) == {"banana", "gpt-image2", "seedream"}
+
+
+def test_seedream_uses_ark_model_and_endpoint(http_client, tmp_path):
+    providers = build_image_providers(
+        _settings(),
+        http_client,
+        staging_dir=tmp_path,
+        result_downloader=DOWNLOADER,
+        max_result_bytes=1024,
+    )
+
+    seedream = providers["seedream"]
+    assert seedream._model == "doubao-seedream-5-0-pro-260628"
+    assert seedream._base_url.startswith("https://ark.cn-beijing.volces.com")
+
+
+def test_missing_ark_key_drops_only_seedream(http_client, tmp_path):
+    providers = build_image_providers(
+        _settings(ark_api_key=None),
+        http_client,
+        staging_dir=tmp_path,
+        result_downloader=DOWNLOADER,
+        max_result_bytes=1024,
+    )
+
+    assert set(providers) == {"banana", "gpt-image2"}
+
+
+def test_missing_chiyun_key_keeps_seedream(http_client, tmp_path):
     providers = build_image_providers(
         _settings(chiyun_api_key=None),
+        http_client,
+        staging_dir=tmp_path,
+        result_downloader=DOWNLOADER,
+        max_result_bytes=1024,
+    )
+
+    assert set(providers) == {"seedream"}
+
+
+def test_no_keys_yields_empty_registry(http_client, tmp_path):
+    providers = build_image_providers(
+        _settings(chiyun_api_key=None, ark_api_key=None),
         http_client,
         staging_dir=tmp_path,
         result_downloader=DOWNLOADER,

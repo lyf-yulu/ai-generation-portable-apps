@@ -44,6 +44,7 @@ from feishu_generation_agent.integrations.safe_download import (
     SafeResultDownloader,
 )
 from feishu_generation_agent.integrations.seedance import SeedanceVideoGenerator
+from feishu_generation_agent.integrations.seedream import SeedreamImageGenerator
 from feishu_generation_agent.integrations.public_media import (
     TosPublicMediaHost,
     UguuPublicMediaHost,
@@ -125,31 +126,45 @@ def build_image_providers(
     staging_dir: Path,
     result_downloader: Any | None,
     max_result_bytes: int,
-) -> dict[str, ChiyunImageGenerator]:
+) -> dict[str, Any]:
     """构建图片模式的 provider registry。
 
     banana 与 gpt-image2 都走 chiyun 中转，由 ChiyunImageGenerator 按 model
     名前缀自动分流（gpt-image* → OpenAI 风格，其余 → Gemini 风格），
-    因此只需用不同 model 各实例化一次。seedream 走火山方舟，另行接入。
+    因此只需用不同 model 各实例化一次。seedream 走火山方舟，复用 seedance
+    的 ark 传输层。
     """
-    if settings.chiyun_api_key is None:
-        return {}
-    models = {
-        "banana": settings.banana_model,
-        "gpt-image2": settings.gpt_image_model,
-    }
-    return {
-        name: ChiyunImageGenerator(
+    providers: dict[str, Any] = {}
+    if settings.chiyun_api_key is not None:
+        models = {
+            "banana": settings.banana_model,
+            "gpt-image2": settings.gpt_image_model,
+        }
+        providers.update(
+            {
+                name: ChiyunImageGenerator(
+                    http_client,
+                    base_url=settings.chiyun_base_url,
+                    api_key=settings.chiyun_api_key,
+                    model=model,
+                    staging_dir=staging_dir,
+                    result_downloader=result_downloader,
+                    max_result_bytes=max_result_bytes,
+                )
+                for name, model in models.items()
+            }
+        )
+    if settings.ark_api_key is not None:
+        providers["seedream"] = SeedreamImageGenerator(
             http_client,
-            base_url=settings.chiyun_base_url,
-            api_key=settings.chiyun_api_key,
-            model=model,
+            base_url=settings.ark_base_url,
+            api_key=settings.ark_api_key,
+            model=settings.seedream_model,
             staging_dir=staging_dir,
             result_downloader=result_downloader,
             max_result_bytes=max_result_bytes,
         )
-        for name, model in models.items()
-    }
+    return providers
 
 
 async def open_asset_library_store(settings: Settings) -> AssetLibraryStore:
