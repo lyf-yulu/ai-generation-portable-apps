@@ -12,6 +12,8 @@ class TaskType(StrEnum):
 ReferenceMode = Literal["multi_reference", "first_last_frame"]
 ImageProvider = Literal["seedream", "banana", "gpt-image2"]
 DEFAULT_IMAGE_PROVIDER: ImageProvider = "banana"
+# provider 只接受这三个基准分辨率档位；像素尺寸属于 size_variants。
+IMAGE_SIZE_TOKENS = ("1K", "1.5K", "2K")
 
 
 def _contains_chinese(value: str) -> bool:
@@ -135,11 +137,57 @@ class GenerationTask(BaseModel):
                 normalized.append(canonical)
         return normalized
 
+    def _normalize_image_size(self) -> None:
+        """把误填进 image_size 的像素尺寸搬到 size_variants。
+
+        需求文档原文写的是「尺寸：1700*2500」，planner 很自然会把它填进
+        image_size。但 provider 只认 1K/1.5K/2K 三个基准档位，像素尺寸传
+        过去会直接被拒；而 size_variants 空着又会让出图后的裁切不触发。
+        所以在领域层归一化，而不是只靠契约措辞约束。
+        """
+        raw = (self.image_size or "").strip()
+        if raw.upper() in {token.upper() for token in IMAGE_SIZE_TOKENS}:
+            self.image_size = next(
+                token
+                for token in IMAGE_SIZE_TOKENS
+                if token.upper() == raw.upper()
+            )
+            return
+
+        candidate = raw.lower().replace("×", "x").replace("*", "x")
+        width_text, separator, height_text = candidate.partition("x")
+        if (
+            not separator
+            or not width_text.isdigit()
+            or not height_text.isdigit()
+        ):
+            raise ValueError(
+                "image_size 只能是 1K、1.5K、2K，"
+                f"像素尺寸请写入 size_variants，收到 {self.image_size!r}"
+            )
+        width = int(width_text)
+        height = int(height_text)
+        if width <= 0 or height <= 0:
+            raise ValueError(f"image_size 尺寸无效：{self.image_size!r}")
+
+        pixel_variant = f"{width}x{height}"
+        if pixel_variant not in self.size_variants:
+            self.size_variants = [*self.size_variants, pixel_variant]
+        # 按长边归到最近的基准档位，保证 provider 出图分辨率不低于交付尺寸。
+        longest = max(width, height)
+        if longest <= 1024:
+            self.image_size = "1K"
+        elif longest <= 1600:
+            self.image_size = "1.5K"
+        else:
+            self.image_size = "2K"
+
     @model_validator(mode="after")
     def validate_type_specific_fields(self) -> Self:
         if self.task_type is TaskType.IMAGE_TO_IMAGE:
             if self.image_size is None:
                 raise ValueError("image_size is required for image_to_image")
+            self._normalize_image_size()
             for field_name in ("duration", "resolution", "generate_audio"):
                 if getattr(self, field_name) is not None:
                     raise ValueError(

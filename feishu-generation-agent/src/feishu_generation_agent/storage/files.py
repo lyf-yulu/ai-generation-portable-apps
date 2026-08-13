@@ -3,7 +3,7 @@ import binascii
 import os
 import shutil
 import stat
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from hashlib import sha256
 from io import BytesIO
@@ -139,6 +139,7 @@ class FileStore:
         result: ProviderResult,
         *,
         kind: str,
+        transform: Callable[[bytes], bytes | None] | None = None,
     ) -> MaterializedProviderResult:
         self._validate_segment(run_id)
         self._validate_segment(task_id)
@@ -180,6 +181,12 @@ class FileStore:
             else:
                 raise self._provider_result_error("missing_result_source")
 
+            if transform is not None:
+                # 必须在落盘前替换字节：产物文件名由内容 sha256 决定，
+                # 落盘后再改文件会让 verify_artifact 校验失败。
+                transformed = transform(content)
+                if transformed:
+                    content = transformed
             stored = self.save_download(
                 run_id,
                 task_id,

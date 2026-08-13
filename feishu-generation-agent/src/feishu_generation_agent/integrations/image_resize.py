@@ -83,6 +83,11 @@ def render_size_variants(
     return rendered
 
 
+def cover_crop(image: Image.Image, variant: SizeVariant) -> Image.Image:
+    """等比放大到覆盖目标框后居中裁切，不拉伸变形。"""
+    return _cover_crop(image, variant)
+
+
 def _cover_crop(image: Image.Image, variant: SizeVariant) -> Image.Image:
     scale = max(variant.width / image.width, variant.height / image.height)
     scaled_width = max(variant.width, round(image.width * scale))

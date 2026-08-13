@@ -15,6 +15,7 @@ from langgraph.types import Command, interrupt
 from pydantic import ValidationError
 
 from feishu_generation_agent.config import Settings
+from io import BytesIO
 from pathlib import Path
 
 from PIL import Image
@@ -22,8 +23,8 @@ from PIL import Image
 from feishu_generation_agent.domain.asset_library import normalize_alias
 from feishu_generation_agent.domain.character_matcher import match_characters
 from feishu_generation_agent.integrations.image_resize import (
+    cover_crop,
     parse_size_variant,
-    render_size_variants,
 )
 from feishu_generation_agent.domain.document import (
     MediaAsset,
@@ -1324,15 +1325,15 @@ async def _poll_submission(
     return None
 
 
-def _resize_artifact_to_variant(
-    source: Path,
-    variant: str | None,
-) -> Path | None:
-    """把出图裁到需求要求的尺寸，返回新文件路径；无需处理时返回 None。
+def _resize_image_bytes(content: bytes, variant: str | None) -> bytes | None:
+    """把出图字节裁到需求要求的尺寸；无需处理时返回 None。
 
-    需求文档里的尺寸（例 1700x2500）与模型原生出图尺寸通常不一致，必须
-    裁一次才是可交付的产物。裁切失败一律返回 None 走原图——出原图比整个
-    run 失败好，人工在审核界面能看到实际尺寸。
+    必须在落盘前处理：FileStore.verify_artifact 要求产物文件名恰好是
+    {sha256}.{extension}，落盘后另写文件会破坏这个契约，导致产物校验
+    失败、任务被判 failed。
+
+    裁切失败一律返回 None 走原图——出原图比整个 run 失败好，人工在审核
+    界面能看到实际尺寸。
     """
     if not variant:
         return None
@@ -1342,16 +1343,16 @@ def _resize_artifact_to_variant(
         _LOGGER.warning("尺寸变体无法解析，保留原图 variant=%s", variant)
         return None
     try:
-        with Image.open(source) as image:
+        with Image.open(BytesIO(content)) as image:
             if (image.width, image.height) == (target.width, target.height):
                 return None
-        rendered = render_size_variants(
-            source, [variant], output_dir=source.parent
-        )
+            resized = cover_crop(image.convert("RGB"), target)
+            buffer = BytesIO()
+            resized.save(buffer, format="PNG")
     except (OSError, ValueError):
         _LOGGER.warning("出图裁切失败，保留原图 variant=%s", variant)
         return None
-    return rendered[0].path if rendered else None
+    return buffer.getvalue()
 
 
 async def _materialize_submission(
@@ -1365,6 +1366,13 @@ async def _materialize_submission(
     kind = "image" if task.task_type is TaskType.IMAGE_TO_IMAGE else "video"
     artifacts: list[Artifact] = []
     for index, result in enumerate(submission.result_items):
+        # 模型原生出图尺寸与需求要求的尺寸通常不同，落盘前裁一次才是
+        # 可交付产物；落盘后再改会破坏 {sha256}.{ext} 的产物命名契约。
+        variant = (
+            next(iter(task.resolved_size_variants), None)
+            if kind == "image"
+            else None
+        )
         materialized = await services.file_store.materialize_provider_result(
             run_id,
             task.task_id,
@@ -1372,30 +1380,23 @@ async def _materialize_submission(
             index,
             result,
             kind=kind,
+            transform=(
+                (lambda content: _resize_image_bytes(content, variant))
+                if variant
+                else None
+            ),
         )
         stored = materialized.stored
-        local_path = stored.local_path
-        artifact_size = stored.size
-        artifact_sha256 = stored.sha256
-        # 模型原生出图尺寸与需求要求的尺寸通常不同，裁一次才是可交付产物。
-        if kind == "image":
-            variant = next(iter(task.resolved_size_variants), None)
-            resized = _resize_artifact_to_variant(local_path, variant)
-            if resized is not None:
-                content = resized.read_bytes()
-                local_path = resized
-                artifact_size = len(content)
-                artifact_sha256 = sha256(content).hexdigest()
         artifact = Artifact(
             artifact_id=sha256(
                 f"{run_id}\0{task.task_id}\0{index}".encode()
             ).hexdigest()[:32],
             task_id=task.task_id,
             kind=kind,
-            local_path=local_path,
+            local_path=stored.local_path,
             mime_type=stored.mime_type,
-            size=artifact_size,
-            sha256=artifact_sha256,
+            size=stored.size,
+            sha256=stored.sha256,
             provider_url=materialized.provider_url,
             provider_task_id=submission.provider_task_id,
             status="ready",
