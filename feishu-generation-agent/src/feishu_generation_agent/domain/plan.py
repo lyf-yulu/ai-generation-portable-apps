@@ -14,6 +14,8 @@ ImageProvider = Literal["seedream", "banana", "gpt-image2"]
 DEFAULT_IMAGE_PROVIDER: ImageProvider = "banana"
 # provider 只接受这三个基准分辨率档位；像素尺寸属于 size_variants。
 IMAGE_SIZE_TOKENS = ("1K", "1.5K", "2K")
+# 统一按最高档出图，再裁到交付尺寸，避免小档位放大导致画质损失。
+DEFAULT_IMAGE_SIZE = "2K"
 
 
 def _contains_chinese(value: str) -> bool:
@@ -173,20 +175,17 @@ class GenerationTask(BaseModel):
         pixel_variant = f"{width}x{height}"
         if pixel_variant not in self.size_variants:
             self.size_variants = [*self.size_variants, pixel_variant]
-        # 按长边归到最近的基准档位，保证 provider 出图分辨率不低于交付尺寸。
-        longest = max(width, height)
-        if longest <= 1024:
-            self.image_size = "1K"
-        elif longest <= 1600:
-            self.image_size = "1.5K"
-        else:
-            self.image_size = "2K"
+        # 统一按 2K 出图，再裁到交付尺寸：不做档位映射，避免小档位出图后
+        # 放大导致画质损失。2K 是 provider 支持的最高档，裁切总有余量。
+        self.image_size = DEFAULT_IMAGE_SIZE
 
     @model_validator(mode="after")
     def validate_type_specific_fields(self) -> Self:
         if self.task_type is TaskType.IMAGE_TO_IMAGE:
             if self.image_size is None:
-                raise ValueError("image_size is required for image_to_image")
+                # 缺失时按最高档兜底，而不是让整个计划失败：出图分辨率由
+                # 我们统一决定，交付尺寸靠 size_variants 裁切。
+                self.image_size = DEFAULT_IMAGE_SIZE
             self._normalize_image_size()
             for field_name in ("duration", "resolution", "generate_audio"):
                 if getattr(self, field_name) is not None:

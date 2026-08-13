@@ -51,21 +51,31 @@ def test_pixel_image_size_accepts_star_separator():
     assert task.size_variants == ["1700x2500"]
 
 
-def test_small_pixel_size_maps_to_1k():
+def test_pixel_size_always_uses_2k_baseline():
+    """统一按 2K 出图再裁，保证分辨率总是够用。"""
     task = GenerationTask.model_validate(
         _payload(image_size="640x640", size_variants=[])
     )
 
-    assert task.image_size == "1K"
+    assert task.image_size == "2K"
     assert task.size_variants == ["640x640"]
 
 
-def test_mid_pixel_size_maps_to_1_5k():
+def test_large_pixel_size_also_uses_2k():
     task = GenerationTask.model_validate(
-        _payload(image_size="1440x1600", size_variants=[])
+        _payload(image_size="1700x2500", size_variants=[])
     )
 
-    assert task.image_size == "1.5K"
+    assert task.image_size == "2K"
+
+
+def test_missing_image_size_defaults_to_2k():
+    payload = _payload()
+    del payload["image_size"]
+
+    task = GenerationTask.model_validate(payload)
+
+    assert task.image_size == "2K"
 
 
 def test_existing_variant_is_not_duplicated():
