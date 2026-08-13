@@ -906,7 +906,7 @@ class DeepSeekPlanner:
                 if system_prompt is None
                 else f"{_PORTAL_PLANNER_CONTRACT}{system_prompt}"
             )
-        user_content = self._planning_prompt(document, visions, feedback)
+        user_content = self._planning_prompt(document, visions, feedback, mode)
         if character_context:
             user_content = (
                 f"{user_content}\n\n"
@@ -974,6 +974,7 @@ class DeepSeekPlanner:
         document: NormalizedDocument,
         visions: list[VisionDescription],
         feedback: str | None,
+        mode: PlanningMode = "video",
     ) -> str:
         table_ids = {
             block.block_id
@@ -1006,6 +1007,46 @@ class DeepSeekPlanner:
             vision.model_dump(mode="json") for vision in visions
         ]
         schema = TaskPlan.model_json_schema()
+        if mode == "image":
+            # 图片模式不能带视频指令：用户提示词离生成更近，Seedance 的
+            # prompt 格式要求会压过 system prompt 里的图片模板，导致模板
+            # 骨架整段失效（实测产出的 prompt 一句模板都没有）。
+            return "\n".join(
+                [
+                    "请把以下文档规划为可执行的图片生成任务。",
+                    "允许的 task_type 只有 image_to_image。",
+                    (
+                        "图片匹配优先级：文档显式引用或同一表格行 > "
+                        "同一章节/路径 > 视觉描述语义匹配 > 文档顺序；"
+                        "不得虚构图片。"
+                    ),
+                    (
+                        "逐张读取全部视觉描述，先理解素材的主体、场景、风格、"
+                        "构图和可能用途，再决定它属于角色参考、场景参考、"
+                        "概念示意还是风格参考；不得机械平均分配。"
+                    ),
+                    (
+                        "prompt 必须严格套用 system 指令里的模板骨架，"
+                        "固定句式原样保留、顺序不变，只替换尖括号槽位。"
+                    ),
+                    (
+                        "每个下载成功的素材必须且只能归入任务 "
+                        "reference_images 或 excluded_assets；未使用素材必须"
+                        "写入 excluded_assets，reason 必须用中文说明。"
+                        "下载失败素材不得引用或排除。"
+                    ),
+                    f"max_output_count={self.max_output_count}",
+                    f"document_id={document.document_id}",
+                    "稳定 text_view（含 [block:*] / [image:*] 引用）：",
+                    document.text_view,
+                    f"序列化表格及后代 blocks={_compact_json(table_blocks)}",
+                    f"可用素材引用={_compact_json(media_references)}",
+                    f"全部视觉描述={_compact_json(vision_payload)}",
+                    f"用户反馈={_compact_json(feedback)}",
+                    f"TaskPlan JSON Schema={_compact_json(schema)}",
+                    "只返回符合 Schema 的 JSON 对象。",
+                ]
+            )
         return "\n".join(
             [
                 "请把以下文档规划为可执行生成任务。",
