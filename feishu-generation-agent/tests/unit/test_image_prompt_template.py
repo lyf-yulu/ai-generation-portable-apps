@@ -83,6 +83,19 @@ def test_edge_line_ban_is_emphasised_by_repetition():
     assert prompt.count("禁止勾勒边缘线") >= 2
 
 
+def test_contract_forbids_token_range_shorthand():
+    """真实故障：模板说「参考图一」，但实际挂了 5-9 张风格参考图。
+
+    模型只好写成 @图片4-9 这种区间简写，而 validate_image_prompt 要求
+    每个 token 逐字出现，于是判定「缺少素材引用 @图片5/6/7…」，三次重试
+    全废、整个 run 失败。契约必须明确要求逐个列出。
+    """
+    prompt = image_planner_system_prompt()
+
+    assert "逐个" in prompt
+    assert "区间" in prompt
+
+
 def test_video_contract_is_untouched_by_template():
     video = planner_system_prompt()
 
