@@ -153,6 +153,9 @@ def build_image_providers(
                     staging_dir=staging_dir,
                     result_downloader=result_downloader,
                     max_result_bytes=max_result_bytes,
+                    # 必须以 registry 的键自报身份，否则 nodes.py 的
+                    # provider 一致性校验会把成功的出图判成失败。
+                    provider_name=name,
                 )
                 for name, model in models.items()
             }

@@ -267,6 +267,13 @@ def _planning_prompt(state: AgentState) -> PlanningPromptSnapshot:
 
 _IMAGE_REQUIREMENT_TYPE = "图片类"
 _LOGGER = logging.getLogger(__name__)
+# 同步型出图 provider：submit 即终态、结果直接落盘，没有异步轮询阶段。
+# 下面两类判定原先写死 provider == "chiyun"，registry 拆出 banana /
+# gpt-image2 / seedream 后必须一起覆盖，否则它们会绕过标识校验与
+# 「落盘失败 → 提交状态未定」的判定。
+_SYNC_IMAGE_PROVIDERS = frozenset(
+    {"chiyun", "banana", "gpt-image2", "seedream"}
+)
 
 
 async def _resolve_character_assets(
@@ -1626,7 +1633,7 @@ async def _execute_one_task(
             official_id = immediate.provider_task_id
             if immediate.provider != provider:
                 raise _provider_terminal_error("供应商任务身份不一致")
-            if provider == "chiyun" and official_id != client_id:
+            if provider in _SYNC_IMAGE_PROVIDERS and official_id != client_id:
                 raise _provider_terminal_error("供应商任务标识不一致")
             transitioned = await _transition_operation(
                 services,
@@ -1750,7 +1757,7 @@ async def _execute_one_task(
             run_id, task.task_id, "submit"
         )
         chiyun_staging_invalid = (
-            provider == "chiyun"
+            provider in _SYNC_IMAGE_PROVIDERS
             and isinstance(exc, AgentError)
             and exc.detail.category is ErrorCategory.PROVIDER_TERMINAL
             and (

@@ -81,6 +81,11 @@ class ChiyunImageGenerator:
         max_result_bytes: int = _DEFAULT_MAX_RESULT_BYTES,
         max_input_bytes: int = _DEFAULT_MAX_INPUT_BYTES,
         max_total_input_bytes: int = _DEFAULT_MAX_TOTAL_INPUT_BYTES,
+        # registry 用 banana / gpt-image2 作键，提交结果必须以同一个名字
+        # 自报身份，否则 nodes.py 的 provider 一致性校验会把成功的出图
+        # 判成「生成服务拒绝了请求」。默认值保持 chiyun，存量 run 的
+        # provider 名已持久化，不能变。
+        provider_name: str = "chiyun",
     ) -> None:
         if not isinstance(base_url, str):
             raise self._configuration_error("base_url", "expected=https origin")
@@ -161,6 +166,7 @@ class ChiyunImageGenerator:
             else "gemini"
         )
         self._result_store = result_store
+        self._provider_name = provider_name
         self._result_downloader = result_downloader
 
     async def submit(
@@ -229,7 +235,7 @@ class ChiyunImageGenerator:
             ",".join(result.mime_type for result in provider_results),
         )
         return ProviderSubmission(
-            provider="chiyun",
+            provider=self._provider_name,
             provider_task_id=provider_task_id,
             status="succeeded",
             result_items=provider_results,
@@ -314,7 +320,7 @@ class ChiyunImageGenerator:
         self,
         submission: ProviderSubmission,
     ) -> ProviderSubmission:
-        if submission.provider != "chiyun" or submission.status not in {
+        if submission.provider != self._provider_name or submission.status not in {
             "submitted",
             "succeeded",
         }:
@@ -333,7 +339,7 @@ class ChiyunImageGenerator:
                 "operation=poll; cause=staging_invalid",
             ) from None
         return ProviderSubmission(
-            provider="chiyun",
+            provider=self._provider_name,
             provider_task_id=submission.provider_task_id,
             status="succeeded",
             result_items=self._provider_results(staged_results),
