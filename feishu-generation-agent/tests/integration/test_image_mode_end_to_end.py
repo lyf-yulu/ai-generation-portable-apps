@@ -142,7 +142,7 @@ async def test_image_requirement_flows_end_to_end(tmp_path: Path):
     # 3. 计划能被领域模型接受，图片专属字段完整保留
     plan = TaskPlan.model_validate(_cg_plan_payload())
     assert [task.task_id for task in plan.tasks] == ["cg-1", "cg-2"]
-    assert plan.tasks[0].size_variants == ["1080x2080", "1700x2500"]
+    assert plan.tasks[0].size_variants == ["1700x2500"]
     assert plan.tasks[0].safe_area == "1080x2080"
 
     # 4. provider 按 task 各自路由
@@ -185,7 +185,7 @@ async def test_image_requirement_flows_end_to_end(tmp_path: Path):
         plan.tasks[0].size_variants,
         output_dir=tmp_path / "variants",
     )
-    assert [item.variant for item in rendered] == ["1080x2080", "1700x2500"]
+    assert [item.variant for item in rendered] == ["1700x2500"]
     for item in rendered:
         with Image.open(item.path) as image:
             assert f"{image.width}x{image.height}" == item.variant

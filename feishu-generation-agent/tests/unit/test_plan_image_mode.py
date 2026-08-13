@@ -89,7 +89,8 @@ def test_image_task_keeps_size_variants_and_safe_area():
             safe_area="1080x2080",
         )
     )
-    assert task.size_variants == ["1080x2080", "1700x2500"]
+    # 安全区是构图界限而非交付尺寸，会被领域层从 variants 里剔除
+    assert task.size_variants == ["1700x2500"]
     assert task.safe_area == "1080x2080"
 
 

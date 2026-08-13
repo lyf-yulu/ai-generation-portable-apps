@@ -139,6 +139,24 @@ class GenerationTask(BaseModel):
                 normalized.append(canonical)
         return normalized
 
+    def _drop_safe_area_from_variants(self) -> None:
+        """把误当成交付尺寸的安全区从 size_variants 里剔除。
+
+        安全区是构图界限，不是交付物。契约已写明这点，但模型反复把它填进
+        size_variants，导致多裁一张安全区尺寸的图、甚至按尺寸把同一个概念
+        拆成多个任务。这是确定性规则，不该依赖模型听话。
+        """
+        if not self.safe_area or not self.size_variants:
+            return
+        normalized = (
+            self.safe_area.strip().lower().replace("×", "x").replace("*", "x")
+        )
+        self.size_variants = [
+            variant
+            for variant in self.size_variants
+            if variant.lower() != normalized
+        ]
+
     def _normalize_image_size(self) -> None:
         """把误填进 image_size 的像素尺寸搬到 size_variants。
 
@@ -187,6 +205,7 @@ class GenerationTask(BaseModel):
                 # 我们统一决定，交付尺寸靠 size_variants 裁切。
                 self.image_size = DEFAULT_IMAGE_SIZE
             self._normalize_image_size()
+            self._drop_safe_area_from_variants()
             for field_name in ("duration", "resolution", "generate_audio"):
                 if getattr(self, field_name) is not None:
                     raise ValueError(

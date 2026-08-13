@@ -69,7 +69,7 @@ def test_split_image_units_keep_image_fields():
 
     for unit in units:
         assert unit.image_provider == "seedream"
-        assert unit.size_variants == ["1080x2080", "1700x2500"]
+        assert unit.size_variants == ["1700x2500"]
         assert unit.safe_area == "1080x2080"
         assert unit.resolved_image_provider == "seedream"
 
