@@ -44,6 +44,34 @@ def test_contract_forbids_discarding_style_and_scene_refs():
     assert "excluded_assets" in prompt
 
 
+def test_contract_covers_concept_sketch_reference():
+    """「概念/豆包/火柴人」是制作人为提升模型理解力做的构图示意图。
+
+    有图时约束力高于风格参考，必须挂上。
+    """
+    prompt = image_planner_system_prompt()
+
+    assert "概念" in prompt
+    assert "火柴人" in prompt
+    assert "构图" in prompt
+
+
+def test_contract_makes_concept_sketch_conditional():
+    """该列不一定每次都有图；没有时不得虚构，跳过即可。"""
+    prompt = image_planner_system_prompt()
+
+    assert "没有图" in prompt
+
+
+def test_contract_treats_safe_area_as_boundary_not_output_size():
+    """出图按完整版尺寸一张；安全区是构图界限，不是第二个交付尺寸。"""
+    prompt = image_planner_system_prompt()
+
+    assert "完整版" in prompt
+    assert "安全区" in prompt
+    assert "不是交付尺寸" in prompt
+
+
 def test_contract_still_explains_required_fields():
     prompt = image_planner_system_prompt()
 
