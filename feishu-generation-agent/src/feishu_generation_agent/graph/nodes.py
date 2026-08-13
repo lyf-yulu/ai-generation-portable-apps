@@ -15,8 +15,16 @@ from langgraph.types import Command, interrupt
 from pydantic import ValidationError
 
 from feishu_generation_agent.config import Settings
+from pathlib import Path
+
+from PIL import Image
+
 from feishu_generation_agent.domain.asset_library import normalize_alias
 from feishu_generation_agent.domain.character_matcher import match_characters
+from feishu_generation_agent.integrations.image_resize import (
+    parse_size_variant,
+    render_size_variants,
+)
 from feishu_generation_agent.domain.document import (
     MediaAsset,
     NormalizedDocument,
@@ -1316,6 +1324,36 @@ async def _poll_submission(
     return None
 
 
+def _resize_artifact_to_variant(
+    source: Path,
+    variant: str | None,
+) -> Path | None:
+    """把出图裁到需求要求的尺寸，返回新文件路径；无需处理时返回 None。
+
+    需求文档里的尺寸（例 1700x2500）与模型原生出图尺寸通常不一致，必须
+    裁一次才是可交付的产物。裁切失败一律返回 None 走原图——出原图比整个
+    run 失败好，人工在审核界面能看到实际尺寸。
+    """
+    if not variant:
+        return None
+    try:
+        target = parse_size_variant(variant)
+    except ValueError:
+        _LOGGER.warning("尺寸变体无法解析，保留原图 variant=%s", variant)
+        return None
+    try:
+        with Image.open(source) as image:
+            if (image.width, image.height) == (target.width, target.height):
+                return None
+        rendered = render_size_variants(
+            source, [variant], output_dir=source.parent
+        )
+    except (OSError, ValueError):
+        _LOGGER.warning("出图裁切失败，保留原图 variant=%s", variant)
+        return None
+    return rendered[0].path if rendered else None
+
+
 async def _materialize_submission(
     services: GraphServices,
     run_id: str,
@@ -1336,16 +1374,28 @@ async def _materialize_submission(
             kind=kind,
         )
         stored = materialized.stored
+        local_path = stored.local_path
+        artifact_size = stored.size
+        artifact_sha256 = stored.sha256
+        # 模型原生出图尺寸与需求要求的尺寸通常不同，裁一次才是可交付产物。
+        if kind == "image":
+            variant = next(iter(task.resolved_size_variants), None)
+            resized = _resize_artifact_to_variant(local_path, variant)
+            if resized is not None:
+                content = resized.read_bytes()
+                local_path = resized
+                artifact_size = len(content)
+                artifact_sha256 = sha256(content).hexdigest()
         artifact = Artifact(
             artifact_id=sha256(
                 f"{run_id}\0{task.task_id}\0{index}".encode()
             ).hexdigest()[:32],
             task_id=task.task_id,
             kind=kind,
-            local_path=stored.local_path,
+            local_path=local_path,
             mime_type=stored.mime_type,
-            size=stored.size,
-            sha256=stored.sha256,
+            size=artifact_size,
+            sha256=artifact_sha256,
             provider_url=materialized.provider_url,
             provider_task_id=submission.provider_task_id,
             status="ready",
