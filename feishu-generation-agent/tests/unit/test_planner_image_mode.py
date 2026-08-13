@@ -156,6 +156,18 @@ def test_image_planner_prompt_is_distinct_and_image_specific():
     assert "generate_audio" not in image_prompt
 
 
+def test_image_contract_explains_every_required_field():
+    """契约必须交代所有必填字段，否则模型漏填导致三次重试全废。
+
+    真实文档跑失败过一次：契约只讲了 size_variants 没讲 image_size，
+    模型漏填该必填字段，三次结构化输出全部校验不通过。
+    """
+    image_prompt = image_planner_system_prompt()
+    assert "image_size" in image_prompt
+    for token in ("1K", "1.5K", "2K"):
+        assert token in image_prompt, f"缺少 image_size 取值说明：{token}"
+
+
 async def test_plan_mode_image_uses_image_system_prompt(tmp_path: Path):
     document = _cg_document(tmp_path)
     model = FakePlanModel([_image_plan_json()])

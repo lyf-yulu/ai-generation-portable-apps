@@ -496,14 +496,25 @@ def _character_context_argument(
     return {"character_context": "\n".join(lines)}
 
 
-async def _planning_mode_for_run(run_id: str, services: GraphServices) -> str:
+async def _planning_mode_for_run(
+    run_id: str,
+    services: GraphServices,
+    state: Mapping[str, Any] | None = None,
+) -> str:
     """推导规划模式。
 
-    优先看 binding 上记录的 planning_mode——图片需求来自另一张多维表格，
-    那张表没有「需求类型」字段，无法靠字段值判定。存量 binding 没有该字段
-    时回落到需求类型。读取失败时回落 video，不让一次多维表格抖动把整个
-    run 拖挂。
+    优先级：
+    1. state 里的显式声明——直连文档创建的 run 没有多维表格 binding，
+       模式在创建时声明；人工改过模式时也以此为准。
+    2. binding.planning_mode——图片需求来自另一张表，那张表没有
+       「需求类型」字段，无法靠字段值判定。
+    3. 需求类型字段——存量 binding 没有 planning_mode 时的回落。
+
+    读取失败一律回落 video，不让一次多维表格抖动把整个 run 拖挂。
     """
+    declared_state = (state or {}).get("planning_mode")
+    if declared_state in {"image", "video"}:
+        return declared_state
     store = getattr(services, "production_task_store", None)
     if store is None:
         return "video"
@@ -710,7 +721,7 @@ async def plan_requirements(
             for item in state.get("vision_descriptions", [])
         ]
         planning_prompt = _planning_prompt(state)
-        mode = await _planning_mode_for_run(state["run_id"], services)
+        mode = await _planning_mode_for_run(state["run_id"], services, state)
         resolved_characters = (
             await _resolve_character_assets(document, services)
             if mode == "image"

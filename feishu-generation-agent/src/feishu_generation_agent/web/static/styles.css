@@ -264,6 +264,17 @@ button {
   resize: vertical;
   line-height: 1.5;
 }
+.direct-run-panel { margin-bottom: 1rem; }
+.direct-run-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .5rem;
+  align-items: center;
+}
+.direct-run-form input[type="url"] {
+  flex: 1 1 22rem;
+  min-width: 14rem;
+}
 .task-prompt-editor { min-height: 18rem; }
 .task-negative-editor { min-height: 10rem; }
 .task-size-variants-editor { min-height: 4.5rem; }

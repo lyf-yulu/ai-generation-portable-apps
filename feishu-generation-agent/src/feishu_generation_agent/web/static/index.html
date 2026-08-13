@@ -22,6 +22,32 @@
 
     <p id="error-message" class="error-message" role="alert" hidden></p>
 
+    <section id="direct-run-panel" class="direct-run-panel panel" aria-label="直接分析需求文档">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">DIRECT DOCUMENT</p>
+          <h2>直接分析需求文档</h2>
+        </div>
+      </div>
+      <p class="mode-message">
+        贴入飞书文档或 wiki 链接，直接生成可修改的计划，不需要多维表格记录。
+      </p>
+      <div class="direct-run-form">
+        <input
+          id="direct-run-url"
+          type="url"
+          placeholder="https://xxx.feishu.cn/wiki/..."
+          aria-label="需求文档链接"
+        />
+        <select id="direct-run-mode" aria-label="产出类型">
+          <option value="image">图片计划</option>
+          <option value="video">视频计划</option>
+        </select>
+        <button id="direct-run-button" type="button" class="primary">生成计划</button>
+      </div>
+      <p id="direct-run-feedback" class="mode-message" aria-live="polite"></p>
+    </section>
+
     <section id="bitable-panel" class="bitable-panel panel" aria-label="多维表格任务">
       <div class="panel-heading">
         <div>

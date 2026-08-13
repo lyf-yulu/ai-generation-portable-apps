@@ -123,6 +123,7 @@ _IMAGE_PLANNING_CONTRACT = """【图片生成提示词契约】
 本次需求只产出静帧图片，所有任务的 task_type 必须是 image_to_image。禁止规划任何视频任务。
 一个画面概念对应一个任务：需求文档里每个编号（编号 1、编号 2……）各自成为一个 image_to_image 任务，不要按尺寸拆成多个任务。
 同一概念需要多种输出尺寸时，把尺寸写进 size_variants 数组（形如 ["1080x2080", "1700x2500"]）；文档给出安全区时写入 safe_area。
+每个 image_to_image 任务都必须填 image_size，取值只能是 1K、1.5K 或 2K，表示出图基准分辨率；size_variants 是出图后再裁切的交付尺寸，两者都要给，不能互相替代。
 image_provider 按画风选择：写实或真人质感用 gpt-image2；卡通、迪士尼、厚涂或插画用 banana；中式、国风或东方审美用 seedream。无法判断时用 banana。
 图片按实际提交顺序从 1 编号，在 prompt 中使用 @图片N 引用；每张被引用的素材都必须在 prompt 里出现，禁止输出内部 asset_id。
 每个 prompt 必须写清画面内容（主体、构图、表情或动作）与光影（例：戏剧化顶光 + 侧逆光、明媚的光线）。
@@ -1258,7 +1259,9 @@ class DeepSeekPlanner:
                 technical_detail=(
                     f"document_id={document_id}; operation={operation}; "
                     f"attempts={_STRUCTURED_OUTPUT_ATTEMPTS}; "
-                    f"error_count={len(errors)}"
+                    f"error_count={len(errors)}; "
+                    # 只记 error_count 时无法判断是哪条契约卡住，排查只能靠猜。
+                    f"issues={' | '.join(errors[:8])}"
                 ),
                 retryable=False,
             )

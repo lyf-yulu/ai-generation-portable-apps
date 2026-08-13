@@ -455,6 +455,7 @@ class GraphRuntime:
                         if request.planning_prompt is not None
                         else None
                     ),
+                    "planning_mode": request.planning_mode,
                     "status": "created",
                 },
                 config=self._config(thread_id),

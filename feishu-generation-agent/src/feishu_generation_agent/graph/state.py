@@ -6,6 +6,7 @@ class AgentState(TypedDict, total=False):
     thread_id: str
     source_url: str
     planning_prompt: dict[str, Any]
+    planning_mode: str
     source_type: str
     source_token: str
     document_id: str

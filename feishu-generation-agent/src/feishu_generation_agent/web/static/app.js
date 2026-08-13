@@ -37,6 +37,10 @@
   const conflictText = byId("review-conflict-text");
   const discardButton = byId("discard-review-draft");
   const scanBitableButton = byId("scan-bitable-button");
+  const directRunUrl = byId("direct-run-url");
+  const directRunMode = byId("direct-run-mode");
+  const directRunButton = byId("direct-run-button");
+  const directRunFeedback = byId("direct-run-feedback");
   const animationCategoryTab = byId("animation-category-tab");
   const portraitCategoryTab = byId("portrait-category-tab");
   const categoryTabs = [animationCategoryTab, portraitCategoryTab];
@@ -347,6 +351,39 @@
     } finally {
       setBusy(false);
       renderBitableTasks();
+    }
+  }
+
+  async function startDirectRun() {
+    if (state.busy) return;
+    const url = directRunUrl.value.trim();
+    const mode = directRunMode.value;
+    if (!url) {
+      directRunFeedback.textContent = "请先填入飞书文档或 wiki 链接。";
+      return;
+    }
+    setBusy(true);
+    clearError();
+    directRunFeedback.textContent = "正在读取文档并生成计划…";
+    try {
+      const created = await api("/api/runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source_url: url, planning_mode: mode }),
+      });
+      state.runId = created.run_id;
+      state.runMode = "direct";
+      state.review = ReviewState.createReviewState();
+      state.referenceUploads = ReferenceUploadState.createState();
+      state.referenceMutations = ReferenceMutationState.createState();
+      directRunFeedback.textContent = "计划生成中，下方可查看并修改。";
+      await poll(true);
+      startPolling();
+      document.querySelector(".workspace")?.scrollIntoView({ behavior: "smooth" });
+    } catch (error) {
+      directRunFeedback.textContent = error.message || "生成失败，请检查链接是否可访问。";
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -1409,6 +1446,7 @@
     plannerPromptReset.addEventListener("click", resetPlannerPrompt);
   }
   scanBitableButton.addEventListener("click", scanBitableTasks);
+  directRunButton.addEventListener("click", startDirectRun);
   categoryTabs.forEach((tab) => {
     tab.addEventListener("click", () => selectBitableCategory(tab.dataset.category));
   });

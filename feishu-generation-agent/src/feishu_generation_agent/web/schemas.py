@@ -18,6 +18,8 @@ class CreateRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     source_url: str = Field(min_length=1)
+    # 直连文档时由调用方声明产出类型；多维表格来的 run 走 binding 判定。
+    planning_mode: Literal["video", "image"] = "video"
 
     @field_validator("source_url")
     @classmethod
@@ -30,7 +32,10 @@ class CreateRunRequest(BaseModel):
         return f"https://{hostname.lower()}/{source_type.value}/{quote(token, safe='')}"
 
     def to_domain(self) -> RequirementRequest:
-        return RequirementRequest(source_url=self.source_url.strip())
+        return RequirementRequest(
+            source_url=self.source_url.strip(),
+            planning_mode=self.planning_mode,
+        )
 
 
 class DecisionRequest(BaseModel):
