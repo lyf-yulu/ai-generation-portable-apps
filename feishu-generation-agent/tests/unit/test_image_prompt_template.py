@@ -50,12 +50,30 @@ def test_contract_requires_natural_integration_into_scene():
     assert "融入" in prompt
 
 
-def test_contract_makes_time_and_window_context_dependent():
-    """「白天」「禁止出现窗户」要按文档实际情况写，不能一律硬套。"""
+def test_time_slot_follows_the_document():
+    """时间按文档实际写，夜景需求不能硬套白天。"""
     prompt = image_planner_system_prompt()
 
-    assert "窗户" in prompt
     assert "按文档" in prompt or "按需求" in prompt
+
+
+def test_window_ban_is_always_kept_as_anti_ai_constraint():
+    """「禁止出现窗户」是反 AI 味的负向约束，不是场景要求。
+
+    模型很爱给画面加大量窗户，加多了一眼就能看出是 AI 生成。所以这句
+    必须始终保留，不能因为「场景本来就有窗户」而删掉。
+    """
+    prompt = image_planner_system_prompt()
+
+    assert "禁止出现窗户" in prompt
+    assert "始终保留" in prompt
+
+
+def test_contract_explains_anti_ai_intent():
+    """契约要讲清这类约束的意图，否则模型会自作聪明地删掉。"""
+    prompt = image_planner_system_prompt()
+
+    assert "AI" in prompt
 
 
 def test_edge_line_ban_is_emphasised_by_repetition():
