@@ -55,6 +55,7 @@ from feishu_generation_agent.domain.artifact import (
     ProviderSubmission,
 )
 from feishu_generation_agent.integrations.planner import (
+    image_planner_system_prompt,
     language_validation_message,
     planner_system_prompt,
     validate_plan,
@@ -266,11 +267,19 @@ def _planning_prompt(state: AgentState) -> PlanningPromptSnapshot:
     value = state.get("planning_prompt")
     if value is not None:
         return PlanningPromptSnapshot.model_validate(value)
+    # 快照必须按 mode 选契约：直连 run 走 prime-local 分支，快照会通过
+    # exact_system_prompt 传给 planner，而该分支排在 image_mode 判断之前，
+    # 直接压过图片契约。快照装错内容，图片模板就永远不会被执行。
+    prompt_text = (
+        image_planner_system_prompt()
+        if state.get("planning_mode") == "image"
+        else planner_system_prompt()
+    )
     return build_planning_prompt_snapshot(
         owner_user_id="prime-local",
         source="prime",
         version=0,
-        prompt_text=planner_system_prompt(),
+        prompt_text=prompt_text,
     )
 
 
