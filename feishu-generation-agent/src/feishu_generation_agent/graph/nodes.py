@@ -155,11 +155,22 @@ def _safe_error(exc: BaseException) -> AgentError:
         category = ErrorCategory.TRANSIENT
         retryable = False
         message = "The workflow node could not be completed"
+    # 保留原始 technical_detail：planner 会把具体校验失败项写进去，
+    # 无条件覆盖成通用文案会让「三次校验未通过」这类故障完全不可诊断，
+    # 每次都得另写脚本复现。message 仍走上面的脱敏逻辑。
+    inner_detail = (
+        exc.detail.technical_detail
+        if isinstance(exc, AgentError) and exc.detail.technical_detail
+        else None
+    )
+    technical_detail = f"{category.value} in workflow node"
+    if inner_detail:
+        technical_detail = f"{technical_detail}; {inner_detail}"
     return AgentError(
         ErrorDetail(
             category=category,
             message=message,
-            technical_detail=f"{category.value} in workflow node",
+            technical_detail=technical_detail,
             retryable=retryable,
         )
     )
