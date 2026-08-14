@@ -28,6 +28,7 @@
       <button class="app-tab" data-tab="feishu-generation-agent">飞书任务 Agent</button>
       <button class="app-tab" data-tab="dreamina">Dreamina</button>
       <button class="app-tab" data-tab="volcengine-portrait">人像生成</button>
+      <button class="app-tab" data-tab="infinite-canvas">无限画布</button>
       <button class="app-tab" data-tab="keys">密钥库</button>
       <button class="app-tab" data-tab="stats">统计</button>
     </div>
@@ -46,6 +47,14 @@
   <!-- FEISHU GENERATION AGENT -->
   <div class="tab-panel" id="tab-feishu-generation-agent">
     <iframe id="iframe-feishu-generation-agent" data-app="feishu-generation-agent" style="width:100%;height:calc(100vh - 48px);border:none;display:block" allow="fullscreen"></iframe>
+  </div>
+
+  <!-- INFINITE CANVAS -->
+  <!-- id 必须是 "tab-" + data-tab 的值：切换逻辑用 getElementById('tab-'+dataset.tab)
+       （portal/static/app.js:80），拼错会 null.classList 抛错并卡死整个 tab 栏。
+       src 由 initConfiguredIframes() 从 /api/apps 注入，不写死。 -->
+  <div class="tab-panel" id="tab-infinite-canvas">
+    <iframe id="iframe-infinite-canvas" data-app="infinite-canvas" style="width:100%;height:calc(100vh - 48px);border:none;display:block" allow="fullscreen"></iframe>
   </div>
 
   <!-- DREAMINA -->

@@ -67,6 +67,23 @@
     "stats_combine": "images_or_seconds"
   },
   {
+    "name": "infinite-canvas",
+    "display_name": "无限画布",
+    "port_env": "INFINITE_CANVAS_PORT",
+    "port_default": 8893,
+    "mount": "iframe",
+    "iframe_url": "/infinite-canvas/index.html",
+    "color": "#ec4899",
+    "credential_scheme": "none",
+    "job_type": "dynamic",
+    "job_type_rules": [
+      {"keywords": ["image"], "type": "image"}
+    ],
+    "metrics": ["images", "seconds"],
+    "unit_label": "张+秒",
+    "stats_combine": "images_and_seconds"
+  },
+  {
     "name": "feishu-generation-agent",
     "display_name": "飞书任务 Agent",
     "dir": "feishu-generation-agent",

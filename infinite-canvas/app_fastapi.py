@@ -55,11 +55,26 @@ def _startup() -> None:
     store.init_schema()
 
 
+def _is_loopback(request: Request) -> bool:
+    host = (request.client.host if request.client else "") or ""
+    return host in ("127.0.0.1", "::1", "localhost")
+
+
 @app.middleware("http")
 async def identity_boundary(request: Request, call_next):
+    path = request.url.path
+    # Portal 的统计轮询是服务端到服务端直连子应用（portal/app.py:986-987 用裸
+    # HTTPConnection），**不经代理、不注入任何签名头**。这个兼容路由专供它使用，
+    # 因此只能以「来源必须是回环」为边界，不能要求签名。
+    # 它返回的字段仅任务状态与计数，不含用户名或素材内容。
+    # 画布前端用的是 /api/v1/jobs/{id}，仍然要求签名。
+    if path.startswith("/api/jobs/"):
+        if not _is_loopback(request):
+            return _error(404, "not_found", "资源不存在。")
+        return await call_next(request)
     # 静态资源不校验身份：Portal 代理层已要求登录（portal/app.py:1980 检查 use_apps），
     # 这里重复校验只会让 SPA 白屏难排查。
-    if request.url.path.startswith("/api/"):
+    if path.startswith("/api/"):
         user = verify_portal_identity(request.headers)
         if user is None:
             return _error(401, "unauthorized", "请通过 Portal 访问。", phase="authentication")

@@ -1103,7 +1103,12 @@ class UsageTracker:
             return False
         job_patterns = ["/api/jobs", "/api/text2image", "/api/image2image", "/api/text2video",
                         "/api/image2video", "/api/frames2video", "/api/multimodal2video", "/api/multiframe2video",
-                        "/api/virtual/jobs", "/api/real/jobs"]
+                        "/api/virtual/jobs", "/api/real/jobs",
+                        # infinite-canvas 的画布前端契约固定用 /api/v1/jobs（其 web/src/api/jobs.ts:4），
+                        # 而 "/api/v1/jobs".startswith("/api/jobs") 是 False —— 不列在这里就完全不计数。
+                        # 注意 /api/v1/jobs/{id}/cancel 也是 POST 且命中本前缀，但取消接口
+                        # 刻意不返回 X-Job-Id，因此 :2093-2097 的第三个条件不满足，不会误登记。
+                        "/api/v1/jobs"]
         return any(path.startswith(p) for p in job_patterns)
 
     def get_stats(self, username: str = "", role: str = "user") -> dict[str, Any]:
