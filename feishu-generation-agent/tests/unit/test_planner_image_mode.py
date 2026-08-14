@@ -147,8 +147,10 @@ def test_image_planner_prompt_is_distinct_and_image_specific():
     assert image_prompt != planner_system_prompt()
     # 图片契约要讲的
     assert "image_to_image" in image_prompt
-    assert "光" in image_prompt
-    assert "size_variants" in image_prompt
+    # 光影句式已移入 build_image_prompt 的固定模板（image_prompt.py），
+    # 契约只需交代槽位；光影不再由模型自由撰写。
+    assert "time_of_day" in image_prompt
+    assert "prompt_slots" in image_prompt
     assert "image_provider" in image_prompt
     # 视频契约的东西不该出现
     assert "运镜" not in image_prompt

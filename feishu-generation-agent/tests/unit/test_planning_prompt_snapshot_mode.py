@@ -58,9 +58,10 @@ def test_explicit_snapshot_is_respected():
     assert snapshot.prompt_text == "自定义业务提示词"
 
 
-def test_image_snapshot_carries_template_skeleton():
-    """快照里必须带上模板骨架，否则 planner 拿不到它。"""
+def test_image_snapshot_carries_slot_contract():
+    """快照必须带槽位契约——模板骨架已移到代码层拼装。"""
     snapshot = _planning_prompt({"planning_mode": "image"})
 
-    for token in ("画面主次分明", "高亮度高明度", "禁止出现窗户"):
-        assert token in snapshot.prompt_text
+    assert "prompt_slots" in snapshot.prompt_text
+    for field in ("shot", "subject_integration", "style", "canvas"):
+        assert field in snapshot.prompt_text

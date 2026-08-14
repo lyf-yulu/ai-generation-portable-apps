@@ -3,6 +3,11 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from feishu_generation_agent.domain.image_prompt import (
+    ImagePromptSlots,
+    build_image_prompt,
+)
+
 
 class TaskType(StrEnum):
     IMAGE_TO_IMAGE = "image_to_image"
@@ -72,6 +77,9 @@ class GenerationTask(BaseModel):
     image_provider: ImageProvider | None = None
     size_variants: list[str] = Field(default_factory=list)
     safe_area: str | None = None
+    # 模型只填槽位，最终 prompt 由代码按模板拼装——让模型自己写模板骨架
+    # 实测不稳定（时而套用、时而退回视频三段式）。
+    prompt_slots: ImagePromptSlots | None = None
     duration: int | None = None
     resolution: Literal["720p", "1080p"] | None = None
     generate_audio: bool | None = None
@@ -138,6 +146,25 @@ class GenerationTask(BaseModel):
             if canonical not in normalized:
                 normalized.append(canonical)
         return normalized
+
+    def _assemble_prompt_from_slots(self) -> None:
+        """槽位齐备时用代码拼装的 prompt 覆盖模型自己写的那版。
+
+        模型仍会写一版 prompt（schema 要求非空），但只要它给了槽位就以拼装
+        结果为准：固定约束句必须一字不差，不能靠模型记得写。槽位缺失时保留
+        模型原文，避免把任务弄成空 prompt。
+        """
+        if self.prompt_slots is None:
+            return
+        slots = self.prompt_slots
+        if not slots.canvas.strip() and self.size_variants:
+            # 画布尺寸没给就用交付尺寸兜底，避免模板缺这一句。
+            slots = slots.model_copy(
+                update={"canvas": self.size_variants[0].replace("x", "*")}
+            )
+        assembled = build_image_prompt(slots)
+        if assembled.strip():
+            self.prompt = assembled
 
     def _drop_safe_area_from_variants(self) -> None:
         """把误当成交付尺寸的安全区从 size_variants 里剔除。
@@ -206,6 +233,7 @@ class GenerationTask(BaseModel):
                 self.image_size = DEFAULT_IMAGE_SIZE
             self._normalize_image_size()
             self._drop_safe_area_from_variants()
+            self._assemble_prompt_from_slots()
             for field_name in ("duration", "resolution", "generate_audio"):
                 if getattr(self, field_name) is not None:
                     raise ValueError(
