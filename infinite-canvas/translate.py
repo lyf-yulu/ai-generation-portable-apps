@@ -51,6 +51,12 @@ OPERATION_ROUTING = {
 _CATALOG_TTL = 60
 _catalog_cache: dict[str, tuple[float, list]] = {}
 
+# 提示词输入端口。每个模型都必须声明，否则画布上的模型节点没有提示词输入口。
+# 形状对齐上游自己的模板（web/src/components/admin/model-templates.ts:3）。
+def _prompt_port() -> dict:
+    """每次返回新 dict，避免多个模型共享同一对象被下游意外修改。"""
+    return {"port_id": "prompt", "media_type": "text", "min_items": 1, "max_items": 1}
+
 PORTAL_PORT = int(os.environ.get("PORTAL_PORT", "9090"))
 _PORTAL_SSL = ssl.create_default_context()
 _PORTAL_SSL.check_hostname = False
@@ -150,11 +156,18 @@ async def _fetch_catalog(app: str) -> list:
                         "operations": ["image.generate", "image.edit"],
                         "input_media": ["text", "image"],
                         "parameter_schema": _image_schema(provider, cfg),
-                        "input_ports": [{
-                            "port_id": "reference_images", "media_type": "image",
-                            "min_items": 0,
-                            "max_items": int(cfg.get("max_reference_images") or 14),
-                        }],
+                        "input_ports": [
+                            # prompt 端口必须声明。模型节点的输入端口**完全**来自
+                            # 这里（web/src/features/graph/connect.ts:68-75 读
+                            # graph.inputPorts），漏了它画布上就没有提示词输入口，
+                            # 提示词节点的 prompt/source 输出接无处可接。
+                            # media_type "text" 会被映射成 accepts "prompt"
+                            # （web/src/features/graph/model-capabilities.ts:19-25）。
+                            _prompt_port(),
+                            {"port_id": "reference_images", "media_type": "image",
+                             "min_items": 0,
+                             "max_items": int(cfg.get("max_reference_images") or 14)},
+                        ],
                     })
                 else:
                     models.append({
@@ -165,7 +178,9 @@ async def _fetch_catalog(app: str) -> list:
                         "input_media": ["text", "image"],
                         "parameter_schema": _video_schema(cfg.get("defaults") or {}, entry),
                         "input_ports": [
+                            _prompt_port(),
                             {"port_id": "first_frame", "media_type": "image", "min_items": 0, "max_items": 1},
+                            {"port_id": "last_frame", "media_type": "image", "min_items": 0, "max_items": 1},
                             {"port_id": "reference_images", "media_type": "image", "min_items": 0, "max_items": 9},
                         ],
                     })

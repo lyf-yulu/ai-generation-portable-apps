@@ -58,6 +58,12 @@
       },
       "input_ports": [
         {
+          "port_id": "prompt",
+          "media_type": "text",
+          "min_items": 1,
+          "max_items": 1
+        },
+        {
           "port_id": "reference_images",
           "media_type": "image",
           "min_items": 0,
@@ -122,6 +128,12 @@
         "required": []
       },
       "input_ports": [
+        {
+          "port_id": "prompt",
+          "media_type": "text",
+          "min_items": 1,
+          "max_items": 1
+        },
         {
           "port_id": "reference_images",
           "media_type": "image",
@@ -188,6 +200,12 @@
       },
       "input_ports": [
         {
+          "port_id": "prompt",
+          "media_type": "text",
+          "min_items": 1,
+          "max_items": 1
+        },
+        {
           "port_id": "reference_images",
           "media_type": "image",
           "min_items": 0,
@@ -252,6 +270,12 @@
         "required": []
       },
       "input_ports": [
+        {
+          "port_id": "prompt",
+          "media_type": "text",
+          "min_items": 1,
+          "max_items": 1
+        },
         {
           "port_id": "reference_images",
           "media_type": "image",
@@ -318,6 +342,12 @@
       },
       "input_ports": [
         {
+          "port_id": "prompt",
+          "media_type": "text",
+          "min_items": 1,
+          "max_items": 1
+        },
+        {
           "port_id": "reference_images",
           "media_type": "image",
           "min_items": 0,
@@ -382,6 +412,12 @@
         "required": []
       },
       "input_ports": [
+        {
+          "port_id": "prompt",
+          "media_type": "text",
+          "min_items": 1,
+          "max_items": 1
+        },
         {
           "port_id": "reference_images",
           "media_type": "image",
@@ -448,6 +484,12 @@
       },
       "input_ports": [
         {
+          "port_id": "prompt",
+          "media_type": "text",
+          "min_items": 1,
+          "max_items": 1
+        },
+        {
           "port_id": "reference_images",
           "media_type": "image",
           "min_items": 0,
@@ -505,6 +547,12 @@
         "required": []
       },
       "input_ports": [
+        {
+          "port_id": "prompt",
+          "media_type": "text",
+          "min_items": 1,
+          "max_items": 1
+        },
         {
           "port_id": "reference_images",
           "media_type": "image",
@@ -575,7 +623,19 @@
       },
       "input_ports": [
         {
+          "port_id": "prompt",
+          "media_type": "text",
+          "min_items": 1,
+          "max_items": 1
+        },
+        {
           "port_id": "first_frame",
+          "media_type": "image",
+          "min_items": 0,
+          "max_items": 1
+        },
+        {
+          "port_id": "last_frame",
           "media_type": "image",
           "min_items": 0,
           "max_items": 1
@@ -648,7 +708,19 @@
       },
       "input_ports": [
         {
+          "port_id": "prompt",
+          "media_type": "text",
+          "min_items": 1,
+          "max_items": 1
+        },
+        {
           "port_id": "first_frame",
+          "media_type": "image",
+          "min_items": 0,
+          "max_items": 1
+        },
+        {
+          "port_id": "last_frame",
           "media_type": "image",
           "min_items": 0,
           "max_items": 1
@@ -721,7 +793,19 @@
       },
       "input_ports": [
         {
+          "port_id": "prompt",
+          "media_type": "text",
+          "min_items": 1,
+          "max_items": 1
+        },
+        {
           "port_id": "first_frame",
+          "media_type": "image",
+          "min_items": 0,
+          "max_items": 1
+        },
+        {
+          "port_id": "last_frame",
           "media_type": "image",
           "min_items": 0,
           "max_items": 1
@@ -794,7 +878,19 @@
       },
       "input_ports": [
         {
+          "port_id": "prompt",
+          "media_type": "text",
+          "min_items": 1,
+          "max_items": 1
+        },
+        {
           "port_id": "first_frame",
+          "media_type": "image",
+          "min_items": 0,
+          "max_items": 1
+        },
+        {
+          "port_id": "last_frame",
           "media_type": "image",
           "min_items": 0,
           "max_items": 1

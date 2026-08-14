@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { parameterControls } from "@/components/model-picker";
+import { declaredModelPorts, graphPortsForModel } from "@/features/graph/model-capabilities";
 import type { ModelSpec } from "@/api/contracts";
 
 /** 翻译层 GET /api/v1/models 的产出必须能被前端参数渲染器完整接受。
@@ -71,6 +72,31 @@ describe("翻译层模型目录", () => {
                 ? ["image.generate", "image.edit"]
                 : ["video.generate", "video.image_to_video"];
             expect(model.operations).toEqual(expected);
+        }
+    });
+
+    it("每个模型都必须声明 prompt 输入端口", () => {
+        // 模型节点的输入端口完全来自 input_ports（features/graph/connect.ts:68-75
+        // 读 graph.inputPorts）。漏了 prompt，画布上的生成节点就没有提示词输入口，
+        // 提示词节点的 prompt/source 输出接无处可接 —— 整条生成链路断掉。
+        for (const model of models) {
+            const prompt = (model.input_ports ?? []).find((p) => p.port_id === "prompt");
+            expect({ id: model.model_id, prompt }).toEqual({
+                id: model.model_id,
+                prompt: { port_id: "prompt", media_type: "text", min_items: 1, max_items: 1 },
+            });
+        }
+    });
+
+    it("input_ports 能通过前端的端口校验并映射出正确的 accepts", () => {
+        for (const model of models) {
+            const declared = model.input_ports ?? [];
+            const accepted = declaredModelPorts(model);
+            expect({ id: model.model_id, n: accepted.length })
+                .toEqual({ id: model.model_id, n: declared.length });
+            // media_type "text" 必须映射成 accepts "prompt"，否则连不上提示词节点。
+            const promptPort = graphPortsForModel(model).find((p) => p.id === "prompt");
+            expect(promptPort?.accepts).toBe("prompt");
         }
     });
 });
