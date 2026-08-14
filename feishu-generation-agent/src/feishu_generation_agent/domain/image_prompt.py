@@ -10,6 +10,21 @@
 
 from pydantic import BaseModel, Field
 
+# 模型没填 prompt_slots 时，从它自己写的带标签文本里反解。实测它会写成
+# 「景别：中景；时间与场景：…；动作：…」这种结构——解析它比强迫它改格式稳。
+_SLOT_LABELS: dict[str, tuple[str, ...]] = {
+    "shot": ("景别",),
+    "time_and_scene": ("时间与场景", "时间和场景"),
+    "subject_integration": ("主体融合", "画面内容", "主体"),
+    "action": ("动作", "人物活动"),
+    "background": ("背景",),
+    "style": ("风格", "画风"),
+    "canvas": ("画布", "画布尺寸"),
+    "mood": ("氛围", "整体氛围"),
+    "time_of_day": ("时间",),
+}
+_SEGMENT_SEPARATORS = "；;\n"
+
 
 class ImagePromptSlots(BaseModel):
     """模板里需要模型填的槽位。
@@ -28,6 +43,50 @@ class ImagePromptSlots(BaseModel):
     canvas: str = Field(default="", description="画布尺寸，如 1700*2500")
     mood: str = Field(default="", description="整体氛围")
     time_of_day: str = Field(default="白天", description="末尾的时间")
+
+
+def parse_prompt_slots(prompt: str) -> ImagePromptSlots | None:
+    """从模型写的带标签文本里反解槽位；解析不出来返回 None。
+
+    模型不填 prompt_slots 时会把内容写成「景别：中景；时间与场景：…」这种
+    结构。解析它比强迫模型改输出格式稳定得多。解析失败返回 None，由调用方
+    保留原文——出图比不出图重要，不能因为格式不合就阻断任务。
+    """
+    if not prompt or not prompt.strip():
+        return None
+
+    # 先按分号/换行切段，再在段内找「标签：值」。
+    segments: list[str] = []
+    for raw in prompt.replace("\r", "").split("\n"):
+        for part in raw.split("；"):
+            for piece in part.split(";"):
+                if piece.strip():
+                    segments.append(piece.strip())
+
+    found: dict[str, str] = {}
+    for segment in segments:
+        for field, labels in _SLOT_LABELS.items():
+            if field in found:
+                continue
+            for label in labels:
+                for marker in (f"{label}：", f"{label}:"):
+                    index = segment.find(marker)
+                    if index < 0:
+                        continue
+                    value = segment[index + len(marker):].strip().rstrip("。")
+                    if value:
+                        found[field] = value
+                    break
+                if field in found:
+                    break
+
+    # 只认出「时间」这类通用标签时不算解析成功，避免拼出空壳 prompt。
+    meaningful = {
+        key for key in found if key not in {"time_of_day", "canvas"}
+    }
+    if not meaningful:
+        return None
+    return ImagePromptSlots.model_validate(found)
 
 
 def build_image_prompt(slots: ImagePromptSlots) -> str:

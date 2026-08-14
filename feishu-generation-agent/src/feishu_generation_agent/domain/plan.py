@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from feishu_generation_agent.domain.image_prompt import (
     ImagePromptSlots,
     build_image_prompt,
+    parse_prompt_slots,
 )
 
 
@@ -154,9 +155,12 @@ class GenerationTask(BaseModel):
         结果为准：固定约束句必须一字不差，不能靠模型记得写。槽位缺失时保留
         模型原文，避免把任务弄成空 prompt。
         """
-        if self.prompt_slots is None:
+        # 模型常把槽位内容写进 prompt 文本而不填 prompt_slots（该字段不在
+        # schema 的 required 里）。此时从带标签文本反解，而不是让任务失败——
+        # 早先改成硬失败导致整个测试套件挂住，出图比不出图重要。
+        slots = self.prompt_slots or parse_prompt_slots(self.prompt)
+        if slots is None:
             return
-        slots = self.prompt_slots
         if not slots.canvas.strip() and self.size_variants:
             # 画布尺寸没给就用交付尺寸兜底，避免模板缺这一句。
             slots = slots.model_copy(
