@@ -72,7 +72,7 @@
     "port_env": "INFINITE_CANVAS_PORT",
     "port_default": 8893,
     "mount": "iframe",
-    "iframe_url": "/infinite-canvas/index.html",
+    "iframe_url": "/infinite-canvas/",
     "color": "#ec4899",
     "credential_scheme": "none",
     "job_type": "dynamic",

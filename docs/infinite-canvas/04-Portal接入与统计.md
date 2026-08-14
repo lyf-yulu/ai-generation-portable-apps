@@ -19,7 +19,7 @@
     "port_env": "INFINITE_CANVAS_PORT",
     "port_default": 8893,
     "mount": "iframe",
-    "iframe_url": "/infinite-canvas/index.html",
+    "iframe_url": "/infinite-canvas/",
     "color": "#ec4899",
     "credential_scheme": "none",
     "job_type": "dynamic",
@@ -31,6 +31,17 @@
     "stats_combine": "images_and_seconds"
   },
 ```
+
+⚠️ **`iframe_url` 必须是挂载根 `/infinite-canvas/`，不能写 `/infinite-canvas/index.html`。**
+
+其他子应用都用 `/xxx/index.html`，但它们是零构建的 PetiteVue 页面、没有前端路由。
+画布是 SPA：浏览器地址是 `.../index.html` 时，react-router 在路由表里找不到
+`/index.html` 这条路由（表里只有 `/`、`/canvas`、`/canvas/:id`、`/assets`、`/tasks`），
+于是匹配 `*` 兜底 → **iframe 内渲染出 NotFound 页面**。
+
+这个坑很隐蔽：服务端返回的是 **200**（HTML 正常送达），404 是 SPA 自己渲染的，
+所以任何 `curl` 检查都是绿的。必须用真实浏览器渲染验证，或直接检查渲染后的
+可见文字里有没有 404 文案。
 
 字段说明（对照 `portal/app_spec.py:36-71`）：
 
@@ -277,7 +288,7 @@ Portal 是 HTTPS 自签，**`curl` 必须带 `-k`**。未登录会 302 到 `/log
 
 浏览器登录 Portal → 点「无限画布」tab：
 
-- [ ] iframe 加载出画布，**没有**二次登录页
+- [ ] iframe 加载出画布，**没有**二次登录页，**且不是 404 页面**（服务端 200 不代表 SPA 没渲染 404）
 - [ ] 侧边栏只有「项目 / 资产 / 任务」
 - [ ] 右下角显示的用户名 = Portal 登录用户
 - [ ] 新建项目 → 拖节点 → 刷新页面，位置保留（存档链路通）
