@@ -627,6 +627,26 @@ def load_default_key() -> str:
     return ""
 
 
+# 按 provider 分别持有 Key。t8star 与 gemini(Chiyun) 是两个独立账户，
+# 共用一个 Key 必然有一方鉴权失败。文件在 gitignore 的 state/ 下，
+# 与 seedance/state/secrets.json 同一套约定。
+SECRETS_PATH = STATE_DIR / "secrets.json"
+
+
+def load_provider_keys() -> dict[str, str]:
+    """读 state/secrets.json 的 provider_keys 映射；缺文件返回空 dict（走旧逻辑兜底）。"""
+    if not SECRETS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(SECRETS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    keys = data.get("provider_keys") if isinstance(data, dict) else None
+    if not isinstance(keys, dict):
+        return {}
+    return {str(k): str(v).strip() for k, v in keys.items() if isinstance(v, str) and v.strip()}
+
+
 def resolve_provider_api_key(provider: str, provided_key: str = "") -> str:
     """Resolve credentials without ever returning the managed key to clients."""
     provided = str(provided_key or "").strip()
@@ -634,7 +654,10 @@ def resolve_provider_api_key(provider: str, provided_key: str = "") -> str:
     provider_cfg = (config.get("providers") or {}).get(provider) or {}
     if provider_cfg.get("company_key"):
         return provided or os.environ.get("VOLCENGINE_ARK_API_KEY", "").strip()
-    return provided or load_default_key()
+    if provided:
+        return provided
+    # 优先按 provider 取专属 Key，回退到全局默认（保持既有部署不变）。
+    return load_provider_keys().get(provider) or load_default_key()
 
 
 def providers_for_client(config: dict[str, Any]) -> dict[str, Any]:
