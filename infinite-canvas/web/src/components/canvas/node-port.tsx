@@ -43,7 +43,7 @@ export function NodePort({ node, port, active, disabled = false, onClick, onPoin
             data-canvas-no-drag
             data-node-port={port.portId}
             data-port-direction={port.direction}
-            className={`absolute z-20 size-5 rounded-full border-2 border-[#08100b] shadow-[0_0_0_1px_rgba(88,237,135,0.55)] transition-transform focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#7bff9f] ${active ? "scale-125 bg-[#7bff9f]" : "bg-[#47d978] hover:scale-110"} disabled:cursor-not-allowed disabled:bg-[#53645a] disabled:opacity-70`}
+            className={`absolute z-20 size-5 rounded-full border-2 border-[#ffffff] shadow-[0_0_0_1px_rgba(88,237,135,0.55)] transition-transform focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#5b8ff0] ${active ? "scale-125 bg-[#5b8ff0]" : "bg-[#3b76e0] hover:scale-110"} disabled:cursor-not-allowed disabled:bg-[#9aa4b4] disabled:opacity-70`}
             style={{
                 left: anchor.x - node.position.x,
                 top: anchor.y - node.position.y,
@@ -54,7 +54,7 @@ export function NodePort({ node, port, active, disabled = false, onClick, onPoin
             onPointerDown={(event) => onPointerDown(port, event)}
             onPointerUp={(event) => onPointerUp(port, event)}
         >
-            <span aria-hidden="true" className={`pointer-events-none absolute top-1/2 -translate-y-1/2 whitespace-nowrap rounded bg-[#08100b]/95 px-1.5 py-0.5 text-[10px] font-medium text-[#dceee1] shadow-sm ${port.direction === "source" ? "left-6" : "right-6"}`}>
+            <span aria-hidden="true" className={`pointer-events-none absolute top-1/2 -translate-y-1/2 whitespace-nowrap rounded bg-[#ffffff]/95 px-1.5 py-0.5 text-[10px] font-medium text-[#172033] shadow-sm ${port.direction === "source" ? "left-6" : "right-6"}`}>
                 {displayName}
             </span>
         </button>

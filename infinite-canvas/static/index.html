@@ -9,13 +9,14 @@
         <script>
             try {
                 var s = JSON.parse(localStorage.getItem("infinite-canvas:theme_store") || "{}");
-                var t = s.state && s.state.theme === "light" ? "light" : "dark";
+                // 默认 light（与 use-theme-store 的默认值保持一致），只有显式存了 dark 才用暗色。
+                var t = s.state && s.state.theme === "dark" ? "dark" : "light";
                 document.documentElement.classList.toggle("dark", t === "dark");
                 document.documentElement.style.colorScheme = t;
             } catch (e) {}
         </script>
-      <script type="module" crossorigin src="/infinite-canvas/assets/index-DUuZeF3t.js"></script>
-      <link rel="stylesheet" crossorigin href="/infinite-canvas/assets/index-CTaZ8DBD.css">
+      <script type="module" crossorigin src="/infinite-canvas/assets/index-CCPTnMoS.js"></script>
+      <link rel="stylesheet" crossorigin href="/infinite-canvas/assets/index-B4BK0fVJ.css">
     </head>
     <body class="bg-background text-foreground antialiased">
         <div id="root"></div>

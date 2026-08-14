@@ -37,7 +37,7 @@ export function AgentConnectView({
 }) {
     const { message } = App.useApp();
     const statusText = connectError ? "连接失败" : connected ? activity : enabled ? "连接中" : "未连接";
-    const statusColor = connectError ? "#dc2626" : connected ? "#16a34a" : enabled ? "#d97706" : theme.node.muted;
+    const statusColor = connectError ? "#dc2626" : connected ? "#4964a3" : enabled ? "#d97706" : theme.node.muted;
     const copyCommand = (command: string) => {
         copyToClipboard(command);
         message.success("命令已复制");

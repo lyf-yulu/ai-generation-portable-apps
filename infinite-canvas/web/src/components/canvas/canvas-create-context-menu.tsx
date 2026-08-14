@@ -72,18 +72,18 @@ export function CanvasCreateContextMenu({ menu, imageModelDisabled, videoModelDi
     };
 
     return (
-        <div ref={menuRef} role="menu" aria-label="创建节点" data-canvas-no-zoom className="fixed z-[80] min-w-52 overflow-hidden rounded-xl border border-[#285038] bg-[#08100b] py-1 text-[#dceee1] shadow-2xl" style={{ left: position.left, top: position.top }} onPointerDown={(event) => event.stopPropagation()} onKeyDown={(event) => {
+        <div ref={menuRef} role="menu" aria-label="创建节点" data-canvas-no-zoom className="fixed z-[80] min-w-52 overflow-hidden rounded-xl border border-[#d9e0ea] bg-[#ffffff] py-1 text-[#172033] shadow-2xl" style={{ left: position.left, top: position.top }} onPointerDown={(event) => event.stopPropagation()} onKeyDown={(event) => {
             if (event.key === "Escape") { event.preventDefault(); onClose(true); }
             else if (event.key === "Tab") onClose(false);
             else if (event.key === "ArrowDown") { event.preventDefault(); moveFocus(1); }
             else if (event.key === "ArrowUp") { event.preventDefault(); moveFocus(-1); }
         }}>
-            <p className="px-3 py-2 text-[10px] tracking-[0.14em] text-[#6d8f77]">在此处创建</p>
+            <p className="px-3 py-2 text-[10px] tracking-[0.14em] text-[#707a8f]">在此处创建</p>
             {items.map((item) => (
-                <button key={item.kind} role="menuitem" type="button" disabled={item.disabled} title={item.disabled ? item.reason : undefined} className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs hover:bg-[#173321] disabled:cursor-not-allowed disabled:opacity-40" onClick={() => onCreate(item.kind)} onKeyDown={(event) => {
+                <button key={item.kind} role="menuitem" type="button" disabled={item.disabled} title={item.disabled ? item.reason : undefined} className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs hover:bg-[#eef2f7] disabled:cursor-not-allowed disabled:opacity-40" onClick={() => onCreate(item.kind)} onKeyDown={(event) => {
                     if ((event.key === "Enter" || event.key === " ") && !item.disabled) { event.preventDefault(); onCreate(item.kind); }
                 }}>
-                    <span className="text-[#58ed87]">{item.icon}</span>
+                    <span className="text-[#235fd6]">{item.icon}</span>
                     <span>{item.label}</span>
                 </button>
             ))}

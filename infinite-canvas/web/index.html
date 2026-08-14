@@ -9,7 +9,8 @@
         <script>
             try {
                 var s = JSON.parse(localStorage.getItem("infinite-canvas:theme_store") || "{}");
-                var t = s.state && s.state.theme === "light" ? "light" : "dark";
+                // 默认 light（与 use-theme-store 的默认值保持一致），只有显式存了 dark 才用暗色。
+                var t = s.state && s.state.theme === "dark" ? "dark" : "light";
                 document.documentElement.classList.toggle("dark", t === "dark");
                 document.documentElement.style.colorScheme = t;
             } catch (e) {}

@@ -157,7 +157,7 @@ export function AgentPendingToolCard({ summary, detail, theme, onReject, onAppro
                     <Button danger type="text" className="!h-8" icon={<XCircle className="size-3.5" />} onClick={() => onReject?.()}>
                         拒绝执行
                     </Button>
-                    <Button type="text" className="!h-8" icon={<CheckCircle2 className="size-3.5" />} style={{ color: "#16a34a" }} onClick={() => onApprove?.()}>
+                    <Button type="text" className="!h-8" icon={<CheckCircle2 className="size-3.5" />} style={{ color: "#4964a3" }} onClick={() => onApprove?.()}>
                         批准执行
                     </Button>
                 </div>
@@ -290,7 +290,7 @@ function AgentCommandEntry({ item, index, theme }: { item: AgentCommandItem; ind
     const view = userDetail(item.detail);
     const state = commandViewState(item.detail);
     const status = state.failed ? "执行失败" : state.running ? "执行中" : "已完成";
-    const color = state.failed ? "#dc2626" : state.running ? "#d97706" : "#16a34a";
+    const color = state.failed ? "#dc2626" : state.running ? "#d97706" : "#4964a3";
     const content = (
         <>
             <span className="w-4 shrink-0 text-center text-[10px] tabular-nums opacity-50" style={{ color: theme.node.muted }}>{index + 1}</span>
@@ -474,7 +474,7 @@ function toolCardState(title: string, text: string, detail?: unknown) {
     if (["declined", "rejected", "cancelled", "canceled"].includes(status) || /拒绝|取消/.test(raw)) return { label: "已取消", color: "#dc2626", icon: <XCircle className="size-4" />, isError: true };
     if (["failed", "error"].includes(status) || /失败|错误/.test(raw) || lower.includes("failed") || lower.includes("error")) return { label: "执行失败", color: "#dc2626", icon: <XCircle className="size-4" />, isError: true };
     if (["inprogress", "in_progress", "running", "started", "pending"].includes(status)) return { label: "进行中", color: "#d97706", icon: <LoaderCircle className="size-4 animate-spin" />, isError: false };
-    if (["completed", "succeeded", "success"].includes(status) || /完成|成功/.test(raw)) return { label: "已完成", color: "#16a34a", icon: <CheckCircle2 className="size-4" />, isError: false };
+    if (["completed", "succeeded", "success"].includes(status) || /完成|成功/.test(raw)) return { label: "已完成", color: "#4964a3", icon: <CheckCircle2 className="size-4" />, isError: false };
     return { label: "已记录", color: "#2563eb", icon: <Wrench className="size-4" />, isError: false };
 }
 
@@ -488,13 +488,13 @@ function toolIcon(kind: string | undefined, fallback: ReactNode) {
 function planCardState(plan: PlanDetail, completed: number) {
     if (plan.status === "failed") return { label: "执行失败", color: "#dc2626" };
     if (["interrupted", "cancelled", "canceled"].includes(plan.status)) return { label: "已停止", color: "#d97706" };
-    if (completed === plan.tasks.length) return { label: "已完成", color: "#16a34a" };
+    if (completed === plan.tasks.length) return { label: "已完成", color: "#4964a3" };
     if (plan.status === "finished") return { label: "已结束", color: "#2563eb" };
     return { label: "进行中", color: "#d97706" };
 }
 
 function planTaskState(status: string, muted: string) {
-    if (status === "completed") return { label: "已完成", color: "#16a34a", icon: <CheckCircle2 className="size-3.5" /> };
+    if (status === "completed") return { label: "已完成", color: "#4964a3", icon: <CheckCircle2 className="size-3.5" /> };
     if (status === "inProgress") return { label: "进行中", color: "#d97706", icon: <LoaderCircle className="size-3.5 animate-spin" /> };
     return { label: "待处理", color: muted, icon: <Circle className="size-3.5" /> };
 }

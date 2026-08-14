@@ -54,8 +54,8 @@ const copyByType: Readonly<Record<GraphMediaType, { noun: string; accept: string
 function MediaPreview({ mediaType, item, label }: { mediaType: GraphMediaType; item: GraphMediaItem; label: string }) {
     const source = safeApiPath(`/api/v1/assets/${encodeURIComponent(item.assetId)}/content`);
     const accessibleName = `${label} ${item.displayName}`;
-    if (mediaType === "image") return <img src={source} alt={accessibleName} className="h-16 w-20 rounded-md border border-[#294936] object-cover" />;
-    if (mediaType === "video") return <video src={source} aria-label={accessibleName} controls preload="metadata" className="h-16 w-24 rounded-md border border-[#294936] bg-black object-cover" />;
+    if (mediaType === "image") return <img src={source} alt={accessibleName} className="h-16 w-20 rounded-md border border-[#d9e0ea] object-cover" />;
+    if (mediaType === "video") return <video src={source} aria-label={accessibleName} controls preload="metadata" className="h-16 w-24 rounded-md border border-[#d9e0ea] bg-black object-cover" />;
     return <audio src={source} aria-label={accessibleName} controls preload="metadata" className="h-9 w-40 max-w-full" />;
 }
 
@@ -243,10 +243,10 @@ export function MediaCollectionNode({ node, readOnly = false, onItemsChange, upl
 
     const overflowing = items.length + pending.length > 8;
 
-    return <article className="overflow-hidden rounded-xl border border-[#285039] bg-[#09140d] text-[#dceee1] shadow-[0_12px_36px_rgba(0,0,0,0.36)]">
-        <header className="flex items-center justify-between border-b border-[#203e2c] px-3 py-2">
-            <div><p className="text-[10px] tracking-[0.16em] text-[#58ed87]">MEDIA INPUT</p><h2 className="text-sm font-semibold">{node.title}</h2></div>
-            {!readOnly ? <label className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-[#356b48] bg-[#102319] px-2 py-1 text-xs text-[#bcebc9] hover:border-[#58ed87]">
+    return <article className="overflow-hidden rounded-xl border border-[#d9e0ea] bg-white text-[#172033] shadow-[0_12px_36px_rgba(0,0,0,0.36)]">
+        <header className="flex items-center justify-between border-b border-[#232b3e] px-3 py-2">
+            <div><p className="text-[10px] tracking-[0.16em] text-[#235fd6]">MEDIA INPUT</p><h2 className="text-sm font-semibold">{node.title}</h2></div>
+            {!readOnly ? <label className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-[#c3ccd9] bg-[#eef5ff] px-2 py-1 text-xs text-[#465267] hover:border-[#235fd6]">
                 <Plus className="size-3.5" />添加
                 <input className="sr-only" type="file" multiple accept={details.accept} aria-label={`添加${details.noun}`} onChange={(event) => {
                     const selected = Array.from(event.currentTarget.files ?? []);
@@ -256,7 +256,7 @@ export function MediaCollectionNode({ node, readOnly = false, onItemsChange, upl
             </label> : null}
         </header>
         <ol data-overflowing={String(overflowing)} className={`${overflowing ? "max-h-80 overflow-y-auto" : ""} space-y-2 p-2`}>
-            {selectionError ? <li role="alert" className="rounded-lg border border-[#744038] bg-[#281411] px-3 py-2 text-xs text-[#ffc0b5]">{selectionError}</li> : null}
+            {selectionError ? <li role="alert" className="rounded-lg border border-[#f3c5c0] bg-[#fee2e2] px-3 py-2 text-xs text-[#b91c1c]">{selectionError}</li> : null}
             {items.map((item, index) => {
                 const label = mediaItemLabel(mediaType, index);
                 return <li key={item.id} data-testid={`media-item-${item.id}`} draggable={!readOnly || undefined}
@@ -269,28 +269,28 @@ export function MediaCollectionNode({ node, readOnly = false, onItemsChange, upl
                         draggedItemRef.current = null;
                         if (dragged) onItemsChange((current) => [...moveMediaItemTo(current, dragged, item.id)]);
                     }}
-                    className="flex items-center gap-2 rounded-lg border border-[#1e3a29] bg-[#0d1b12] p-2">
-                    {!readOnly ? <GripVertical className="size-4 shrink-0 text-[#647b6a]" aria-hidden="true" /> : null}
+                    className="flex items-center gap-2 rounded-lg border border-[#21283a] bg-[#eef2f7] p-2">
+                    {!readOnly ? <GripVertical className="size-4 shrink-0 text-[#666d7b]" aria-hidden="true" /> : null}
                     <MediaPreview mediaType={mediaType} item={item} label={label} />
-                    <div className="min-w-0 flex-1"><p className="text-xs font-medium text-[#bcebc9]">{label}</p>{readOnly
-                        ? <p className="truncate text-[11px] text-[#829889]">{item.displayName}</p>
+                    <div className="min-w-0 flex-1"><p className="text-xs font-medium text-[#465267]">{label}</p>{readOnly
+                        ? <p className="truncate text-[11px] text-[#687386]">{item.displayName}</p>
                         : <input key={`${item.id}:${item.displayName}`} aria-label={`重命名 ${label}`} defaultValue={item.displayName} onBlur={(event) => {
                             const displayName = safeMediaDisplayName(event.currentTarget.value, mediaType);
                             onItemsChange((current) => current.map((candidate) => candidate.id === item.id ? { ...candidate, displayName } : candidate));
-                        }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} className="w-full rounded border border-transparent bg-transparent text-[11px] text-[#829889] outline-none focus:border-[#356b48] focus:bg-[#071009]" />}</div>
+                        }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} className="w-full rounded border border-transparent bg-transparent text-[11px] text-[#687386] outline-none focus:border-[#c3ccd9] focus:bg-[#ffffff]" />}</div>
                     {!readOnly ? <div className="flex shrink-0 items-center gap-1">
-                        <button type="button" aria-label={`上移 ${label}`} disabled={index === 0} onClick={() => onItemsChange((current) => [...moveMediaItem(current, item.id, -1)])} className="rounded p-1 text-[#9db4a3] hover:bg-[#183322] disabled:opacity-30"><ChevronUp className="size-3.5" /></button>
-                        <button type="button" aria-label={`下移 ${label}`} disabled={index === items.length - 1} onClick={() => onItemsChange((current) => [...moveMediaItem(current, item.id, 1)])} className="rounded p-1 text-[#9db4a3] hover:bg-[#183322] disabled:opacity-30"><ChevronDown className="size-3.5" /></button>
-                        <button type="button" aria-label={`移除 ${label}`} onClick={() => onItemsChange((current) => current.filter((candidate) => candidate.id !== item.id))} className="rounded p-1 text-[#e7a69a] hover:bg-[#3a1e1b]"><Trash2 className="size-3.5" /></button>
+                        <button type="button" aria-label={`上移 ${label}`} disabled={index === 0} onClick={() => onItemsChange((current) => [...moveMediaItem(current, item.id, -1)])} className="rounded p-1 text-[#687386] hover:bg-[#eef2f7] disabled:opacity-30"><ChevronUp className="size-3.5" /></button>
+                        <button type="button" aria-label={`下移 ${label}`} disabled={index === items.length - 1} onClick={() => onItemsChange((current) => [...moveMediaItem(current, item.id, 1)])} className="rounded p-1 text-[#687386] hover:bg-[#eef2f7] disabled:opacity-30"><ChevronDown className="size-3.5" /></button>
+                        <button type="button" aria-label={`移除 ${label}`} onClick={() => onItemsChange((current) => current.filter((candidate) => candidate.id !== item.id))} className="rounded p-1 text-[#b91c1c] hover:bg-[#f3c5c0]"><Trash2 className="size-3.5" /></button>
                     </div> : null}
                 </li>;
             })}
-            {pending.map((entry) => <li key={entry.id} role={entry.failed ? "alert" : "status"} className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-xs ${entry.failed ? "border-[#744038] bg-[#281411] text-[#ffc0b5]" : "border-[#355f43] bg-[#102319] text-[#bcebc9]"}`}>
+            {pending.map((entry) => <li key={entry.id} role={entry.failed ? "alert" : "status"} className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-xs ${entry.failed ? "border-[#f3c5c0] bg-[#fee2e2] text-[#b91c1c]" : "border-[#c3d6f7] bg-[#eef5ff] text-[#465267]"}`}>
                 <span className="min-w-0 flex-1 truncate">{entry.failed ? `${entry.name} 上传失败，请重试。` : `${entry.name} · ${entry.progress}%`}</span>
-                {!readOnly && entry.failed ? <><button type="button" aria-label={`重试 ${entry.name}`} onClick={() => retryEntry(entry.id)} className="rounded px-2 py-1 hover:bg-[#42221d]">重试</button><button type="button" aria-label={`移除 ${entry.name}`} onClick={() => cancelEntry(entry.id)} className="rounded px-2 py-1 hover:bg-[#42221d]">移除错误</button></> : null}
-                {!entry.failed && !readOnly ? <button type="button" aria-label={`取消上传 ${entry.name}`} onClick={() => cancelEntry(entry.id)} className="rounded p-1 hover:bg-[#24452f]"><X className="size-3.5" /></button> : null}
+                {!readOnly && entry.failed ? <><button type="button" aria-label={`重试 ${entry.name}`} onClick={() => retryEntry(entry.id)} className="rounded px-2 py-1 hover:bg-[#fee2e2]">重试</button><button type="button" aria-label={`移除 ${entry.name}`} onClick={() => cancelEntry(entry.id)} className="rounded px-2 py-1 hover:bg-[#fee2e2]">移除错误</button></> : null}
+                {!entry.failed && !readOnly ? <button type="button" aria-label={`取消上传 ${entry.name}`} onClick={() => cancelEntry(entry.id)} className="rounded p-1 hover:bg-[#eef5ff]"><X className="size-3.5" /></button> : null}
             </li>)}
-            {items.length === 0 && pending.length === 0 ? <li className="rounded-lg border border-dashed border-[#31523c] px-4 py-7 text-center text-xs text-[#829889]">添加一个或多个{details.noun}，顺序会决定 @引用编号。</li> : null}
+            {items.length === 0 && pending.length === 0 ? <li className="rounded-lg border border-dashed border-[#343d52] px-4 py-7 text-center text-xs text-[#687386]">添加一个或多个{details.noun}，顺序会决定 @引用编号。</li> : null}
         </ol>
     </article>;
 }

@@ -83,11 +83,11 @@ function CallingPresetCard({ model, preset, routes, pools, onCreate, onUpdate, o
     };
 
     return (
-        <article className="min-w-0 rounded-xl border border-[#1e482b] bg-[#0a1710] p-4" aria-label={`${preset.label} 调用设置`}>
+        <article className="min-w-0 rounded-xl border border-[#222e48] bg-[#0b0f17] p-4" aria-label={`${preset.label} 调用设置`}>
             <div className="flex flex-wrap items-start justify-between gap-3">
                 <div>
-                    <h3 className="text-base font-semibold text-[#8ff0aa]">{preset.label}</h3>
-                    <p className="mt-1 text-xs text-[#86a991]">调用协议由内置预置维护；只可调整池、优先级、并发与启用状态。</p>
+                    <h3 className="text-base font-semibold text-[#99b3f0]">{preset.label}</h3>
+                    <p className="mt-1 text-xs text-[#8a93a9]">调用协议由内置预置维护；只可调整池、优先级、并发与启用状态。</p>
                 </div>
                 <label className="flex items-center gap-2 text-sm text-[#c9decf]">
                     <input
@@ -96,13 +96,13 @@ function CallingPresetCard({ model, preset, routes, pools, onCreate, onUpdate, o
                         checked={route?.enabled ?? form.enabled}
                         disabled={saving || (!(route?.enabled) && !hasCompatibleSelection)}
                         onChange={(event) => changeEnabled(event.target.checked)}
-                        className="accent-[#58ed87]"
+                        className="accent-[#6b92ed]"
                     />
                     启用
                 </label>
             </div>
             {duplicate ? (
-                <p role="alert" className="mt-3 text-sm text-[#ffbd73]">
+                <p role="alert" className="mt-3 text-sm text-[#92400e]">
                     发现 {matchingRoutes.length} 条匹配的 {preset.label} 线路，无法安全选择其中一条；请在历史审计中确认重复记录后处理。
                 </p>
             ) : (
@@ -114,7 +114,7 @@ function CallingPresetCard({ model, preset, routes, pools, onCreate, onUpdate, o
                                 aria-label={`${preset.label} 凭据池`}
                                 value={form.poolId}
                                 onChange={(event) => setForm((current) => ({ ...current, poolId: event.target.value }))}
-                                className="mt-1 block w-full min-w-0 rounded border border-[#285038] bg-[#0b1710] px-3 py-2"
+                                className="mt-1 block w-full min-w-0 rounded border border-[#2c3750] bg-[#0c0f17] px-3 py-2"
                             >
                                 <option value="">请选择兼容池</option>
                                 {compatiblePools.map((pool) => (
@@ -133,7 +133,7 @@ function CallingPresetCard({ model, preset, routes, pools, onCreate, onUpdate, o
                                 max={1_000_000}
                                 value={form.priority}
                                 onChange={(event) => setForm((current) => ({ ...current, priority: Number(event.target.value) }))}
-                                className="mt-1 block w-full min-w-0 rounded border border-[#285038] bg-[#0b1710] px-3 py-2"
+                                className="mt-1 block w-full min-w-0 rounded border border-[#2c3750] bg-[#0c0f17] px-3 py-2"
                             />
                         </label>
                         <label className="min-w-0 text-sm">
@@ -145,32 +145,32 @@ function CallingPresetCard({ model, preset, routes, pools, onCreate, onUpdate, o
                                 max={4096}
                                 value={form.maxConcurrency}
                                 onChange={(event) => setForm((current) => ({ ...current, maxConcurrency: Number(event.target.value) }))}
-                                className="mt-1 block w-full min-w-0 rounded border border-[#285038] bg-[#0b1710] px-3 py-2"
+                                className="mt-1 block w-full min-w-0 rounded border border-[#2c3750] bg-[#0c0f17] px-3 py-2"
                             />
                         </label>
                     </div>
-                    <button type="button" disabled={!canSave} onClick={save} className="mt-4 rounded bg-[#42d977] px-4 py-2 text-sm font-semibold text-[#041008] disabled:opacity-50">
+                    <button type="button" disabled={!canSave} onClick={save} className="mt-4 rounded bg-[#6285d9] px-4 py-2 text-sm font-semibold text-[#070a10] disabled:opacity-50">
                         {saving ? "保存中…" : `保存 ${preset.label} 设置`}
                     </button>
                     {compatiblePools.length === 0 && (
-                        <p role="alert" className="mt-3 text-sm text-[#ffbd73]">
+                        <p role="alert" className="mt-3 text-sm text-[#92400e]">
                             尚未配置与此调用方式精确匹配的凭据池，因此不能启用。
                         </p>
                     )}
                     {compatiblePools.length > 0 && !hasCompatibleSelection && (
-                        <p role="status" className="mt-3 text-sm text-[#86a991]">
+                        <p role="status" className="mt-3 text-sm text-[#8a93a9]">
                             请选择兼容凭据池后保存。
                         </p>
                     )}
                 </>
             )}
             {message === "failed" && (
-                <p role="alert" className="mt-3 text-sm text-[#ffbd73]">
+                <p role="alert" className="mt-3 text-sm text-[#92400e]">
                     调用设置未保存，请检查凭据池状态。
                 </p>
             )}
             {message === "conflict" && (
-                <div role="alert" className="mt-3 flex flex-wrap gap-2 text-sm text-[#ffbd73]">
+                <div role="alert" className="mt-3 flex flex-wrap gap-2 text-sm text-[#92400e]">
                     配置已变化，请重新加载。
                     {onRefresh && (
                         <button type="button" onClick={onRefresh} className="underline">
@@ -181,11 +181,11 @@ function CallingPresetCard({ model, preset, routes, pools, onCreate, onUpdate, o
             )}
             <div className="mt-4 grid min-w-0 gap-2 sm:grid-cols-2" aria-label={`${preset.label} 安全池状态`}>
                 {compatiblePools.map((pool) => (
-                    <div key={pool.pool_id} className="min-w-0 rounded-lg border border-[#1e482b] bg-[#07110b] p-3 text-xs">
-                        <p className="truncate text-[#a9c6b0]">
+                    <div key={pool.pool_id} className="min-w-0 rounded-lg border border-[#222e48] bg-[#080b11] p-3 text-xs">
+                        <p className="truncate text-[#acb4c6]">
                             {pool.pool_id} · {pool.group}
                         </p>
-                        <p className="mt-1 text-[#86a991]">{pool.capacity_status === "available" ? `可用 ${pool.available_count ?? 0} · 忙碌 ${pool.busy_count ?? 0}` : "容量状态暂不可用"}</p>
+                        <p className="mt-1 text-[#8a93a9]">{pool.capacity_status === "available" ? `可用 ${pool.available_count ?? 0} · 忙碌 ${pool.busy_count ?? 0}` : "容量状态暂不可用"}</p>
                     </div>
                 ))}
             </div>
@@ -196,10 +196,10 @@ function CallingPresetCard({ model, preset, routes, pools, onCreate, onUpdate, o
 export function ModelCallSettings(props: Props) {
     const presets = callingPresetsForModel(props.model);
     return (
-        <section className="min-w-0 rounded-xl border border-[#245a35] bg-[#07110b] p-4 text-[#e5f5e9]">
+        <section className="min-w-0 rounded-xl border border-[#29385a] bg-[#080b11] p-4 text-[#172033]">
             <div>
                 <h2 className="text-lg font-semibold">调用设置</h2>
-                <p className="mt-1 text-xs text-[#86a991]">选择受信调用方式的兼容凭据池。真实凭据始终由部署配置管理。</p>
+                <p className="mt-1 text-xs text-[#8a93a9]">选择受信调用方式的兼容凭据池。真实凭据始终由部署配置管理。</p>
             </div>
             <div className="mt-4 grid min-w-0 gap-3">
                 {presets.map((preset) => (

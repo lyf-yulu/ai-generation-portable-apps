@@ -11,7 +11,8 @@ type ThemeStore = {
 export const useThemeStore = create<ThemeStore>()(
     persist(
         (set) => ({
-            theme: "dark",
+            // 默认浅色：画布挂在 Portal 的蓝白界面里，深色会显得割裂。
+            theme: "light",
             setTheme: (theme) => set({ theme }),
         }),
         { name: "infinite-canvas:theme_store" },

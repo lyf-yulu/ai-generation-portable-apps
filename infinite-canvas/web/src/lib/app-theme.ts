@@ -1,30 +1,32 @@
 import type { ThemeConfig } from "antd";
 import { theme as antdTheme } from "antd";
 
+// 蓝白主题，对齐 Portal 的 --accent #235fd6 / --accent-hover #194fb8
+// （portal/static/styles.css:19-22）。
 const neutral = {
     light: {
-        primary: "#171717",
-        primaryHover: "#000000",
+        primary: "#235fd6",
+        primaryHover: "#194fb8",
         primaryText: "#ffffff",
-        menuBg: "#f5f5f5",
-        menuText: "#171717",
-        selectActiveBg: "#f5f5f5",
-        selectSelectedBg: "#f0f0f0",
-        selectText: "#171717",
-        tableSelectedBg: "rgba(17, 17, 17, 0.05)",
-        tableSelectedHoverBg: "rgba(17, 17, 17, 0.08)",
+        menuBg: "#eef5ff",
+        menuText: "#172033",
+        selectActiveBg: "#eef5ff",
+        selectSelectedBg: "#dbe7ff",
+        selectText: "#172033",
+        tableSelectedBg: "rgba(35, 95, 214, 0.06)",
+        tableSelectedHoverBg: "rgba(35, 95, 214, 0.10)",
     },
     dark: {
-        primary: "#58ed87",
-        primaryHover: "#74f29a",
-        primaryText: "#041108",
-        menuBg: "#102619",
-        menuText: "#e9fff0",
-        selectActiveBg: "#102619",
-        selectSelectedBg: "#173823",
-        selectText: "#e9fff0",
-        tableSelectedBg: "rgba(88, 237, 135, 0.08)",
-        tableSelectedHoverBg: "rgba(88, 237, 135, 0.12)",
+        primary: "#5b8ff0",
+        primaryHover: "#7aa6f5",
+        primaryText: "#0b1220",
+        menuBg: "#eef5ff",
+        menuText: "#e8eefb",
+        selectActiveBg: "#eef5ff",
+        selectSelectedBg: "#dbe7ff",
+        selectText: "#e8eefb",
+        tableSelectedBg: "rgba(91, 143, 240, 0.10)",
+        tableSelectedHoverBg: "rgba(91, 143, 240, 0.16)",
     },
 };
 

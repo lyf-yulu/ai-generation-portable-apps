@@ -228,7 +228,7 @@ export function DraggableCanvasNode({ node, scale, onPositionChange, onMeasuredS
             aria-selected={selected}
             aria-disabled={disabled || undefined}
             tabIndex={0}
-            className={`absolute rounded-xl outline-offset-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#7bff9f] ${selected ? "outline outline-2 outline-[#58ed87] shadow-[0_0_0_4px_rgba(88,237,135,0.18)]" : ""}`}
+            className={`absolute rounded-xl outline-offset-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#5b8ff0] ${selected ? "outline outline-2 outline-[#235fd6] shadow-[0_0_0_4px_rgba(88,237,135,0.18)]" : ""}`}
             style={{ left: node.position.x, top: node.position.y, width: node.width, minHeight: contentSized ? undefined : node.height }}
             onPointerDownCapture={handlePointerDownCapture}
             onPointerDown={handlePointerDown}

@@ -26,8 +26,8 @@ function SummaryCards({ summary }: { summary: Usage["summary"] }) {
     return (
         <div className="mt-7 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             {cards.map(([label, value]) => (
-                <div key={label} className="rounded-xl border border-[#1f3f2a] bg-[#09120c] p-4">
-                    <div className="text-xs text-[#829889]">{label}</div>
+                <div key={label} className="rounded-xl border border-[#222b3f] bg-[#ffffff] p-4">
+                    <div className="text-xs text-[#848a98]">{label}</div>
                     <div className="mt-2 text-2xl font-semibold text-[#e4f5e9]">{value}</div>
                 </div>
             ))}
@@ -37,23 +37,23 @@ function SummaryCards({ summary }: { summary: Usage["summary"] }) {
 
 function ChargedJobs({ usage }: { usage: Usage }) {
     return (
-        <section className="mt-7 overflow-hidden rounded-xl border border-[#1f3f2a] bg-[#09120c]">
-            <div className="border-b border-[#183522] px-4 py-3">
+        <section className="mt-7 overflow-hidden rounded-xl border border-[#222b3f] bg-[#ffffff]">
+            <div className="border-b border-[#1b2335] px-4 py-3">
                 <h2 className="text-sm font-medium">已计费任务</h2>
             </div>
             {usage.jobs.length === 0 ? (
-                <p className="p-6 text-sm text-[#829889]">暂无已计费的生成任务。</p>
+                <p className="p-6 text-sm text-[#848a98]">暂无已计费的生成任务。</p>
             ) : (
-                <ul className="divide-y divide-[#183522]">
+                <ul className="divide-y divide-[#1b2335]">
                     {usage.jobs.map((job, index) => (
                         <li key={`${job.operation}-${job.charged_at}-${index}`} className="flex flex-wrap items-center justify-between gap-3 p-4">
                             <div>
                                 <div className="text-sm text-[#e4f5e9]">{job.model_id ? `${job.model_id} · ${job.operation}` : job.operation}</div>
-                                <div className="mt-1 text-xs text-[#688371]">
+                                <div className="mt-1 text-xs text-[#6b7283]">
                                     {job.route_id ? `${job.route_id} · ` : ""}{job.image_count} 张图片 · {job.video_seconds} 秒视频 · {job.status}
                                 </div>
                             </div>
-                            <div className="text-sm font-medium text-[#58d881]">{formatFen(job.cost_fen)}</div>
+                            <div className="text-sm font-medium text-[#6587d8]">{formatFen(job.cost_fen)}</div>
                         </li>
                     ))}
                 </ul>
@@ -89,20 +89,20 @@ function RateSettings({ rates, onSave }: { rates: UsageRates; onSave: (video: st
     };
 
     return (
-        <section className="mt-7 rounded-xl border border-[#1f3f2a] bg-[#09120c] p-5">
+        <section className="mt-7 rounded-xl border border-[#222b3f] bg-[#ffffff] p-5">
             <h2 className="text-sm font-medium">估算费率</h2>
-            <p className="mt-1 text-xs text-[#829889]">价格按元输入，服务端以分保存；这是内部估算，不是供应商账单。</p>
+            <p className="mt-1 text-xs text-[#848a98]">价格按元输入，服务端以分保存；这是内部估算，不是供应商账单。</p>
             <div className="mt-4 grid gap-4 md:grid-cols-2">
                 <label className="text-sm text-[#b9d0c0]">
                     每秒视频价格（元）
-                    <input aria-label="每秒视频价格（元）" inputMode="decimal" value={video} onChange={(event) => setVideo(event.target.value)} className="mt-2 block w-full rounded-lg border border-[#285038] bg-[#08100b] px-3 py-2 text-[#e5f5e9]" />
+                    <input aria-label="每秒视频价格（元）" inputMode="decimal" value={video} onChange={(event) => setVideo(event.target.value)} className="mt-2 block w-full rounded-lg border border-[#2c3750] bg-[#090b10] px-3 py-2 text-[#172033]" />
                 </label>
                 <label className="text-sm text-[#b9d0c0]">
                     每张图片价格（元）
-                    <input aria-label="每张图片价格（元）" inputMode="decimal" value={image} onChange={(event) => setImage(event.target.value)} className="mt-2 block w-full rounded-lg border border-[#285038] bg-[#08100b] px-3 py-2 text-[#e5f5e9]" />
+                    <input aria-label="每张图片价格（元）" inputMode="decimal" value={image} onChange={(event) => setImage(event.target.value)} className="mt-2 block w-full rounded-lg border border-[#2c3750] bg-[#090b10] px-3 py-2 text-[#172033]" />
                 </label>
             </div>
-            <button type="button" disabled={saving} onClick={() => void save()} className="mt-5 rounded-lg bg-[#47d978] px-4 py-2 text-sm font-medium text-[#041008] disabled:opacity-40">
+            <button type="button" disabled={saving} onClick={() => void save()} className="mt-5 rounded-lg bg-[#6285d9] px-4 py-2 text-sm font-medium text-[#070a10] disabled:opacity-40">
                 保存价格
             </button>
         </section>
@@ -111,10 +111,10 @@ function RateSettings({ rates, onSave }: { rates: UsageRates; onSave: (video: st
 
 function AdminUsageDetails({ usage }: { usage: AdminUsage }) {
     return (
-        <section className="mt-7 rounded-xl border border-[#1f3f2a] bg-[#09120c] p-5">
+        <section className="mt-7 rounded-xl border border-[#222b3f] bg-[#ffffff] p-5">
             <h2 className="text-sm font-medium">全部用户统计</h2>
-            <p className="mt-2 text-sm text-[#829889]">全局汇总：{summaryText(usage.summary)}</p>
-            <ul className="mt-4 divide-y divide-[#183522] border-y border-[#183522]">
+            <p className="mt-2 text-sm text-[#848a98]">全局汇总：{summaryText(usage.summary)}</p>
+            <ul className="mt-4 divide-y divide-[#1b2335] border-y border-[#1b2335]">
                 {usage.users.map((user) => (
                     <li key={user.user_id} className="flex flex-wrap items-center justify-between gap-3 py-3">
                         <span className="text-sm text-[#e4f5e9]">
@@ -125,20 +125,20 @@ function AdminUsageDetails({ usage }: { usage: AdminUsage }) {
             </ul>
             <h3 className="mt-6 text-sm font-medium">全部已计费任务</h3>
             {usage.jobs.length === 0 ? (
-                <p className="mt-3 text-sm text-[#829889]">暂无全局已计费任务。</p>
+                <p className="mt-3 text-sm text-[#848a98]">暂无全局已计费任务。</p>
             ) : (
-                <ul className="mt-3 divide-y divide-[#183522] border-y border-[#183522]">
+                <ul className="mt-3 divide-y divide-[#1b2335] border-y border-[#1b2335]">
                     {usage.jobs.map((job, index) => (
                         <li key={`${job.user_id}-${job.operation}-${job.charged_at}-${index}`} className="flex flex-wrap items-center justify-between gap-3 py-3">
                             <span>
                                 <span className="block text-sm text-[#e4f5e9]">
                                     {job.user_id} · {job.model_id ? `${job.model_id} · ` : ""}{job.operation}
                                 </span>
-                                <span className="mt-1 block text-xs text-[#688371]">
+                                <span className="mt-1 block text-xs text-[#6b7283]">
                                     {job.route_id ? `${job.route_id} · ` : ""}{job.status} · {job.image_count} 张图片 · {job.video_seconds} 秒视频 · {job.charged_at}
                                 </span>
                             </span>
-                            <span className="text-xs text-[#58d881]">{formatFen(job.cost_fen)}</span>
+                            <span className="text-xs text-[#6587d8]">{formatFen(job.cost_fen)}</span>
                         </li>
                     ))}
                 </ul>
@@ -219,28 +219,28 @@ export default function UsagePage() {
 
     return (
         <section className="mx-auto max-w-6xl px-5 py-8">
-            <p className="text-xs tracking-[0.2em] text-[#58ed87]">USAGE · COST</p>
+            <p className="text-xs tracking-[0.2em] text-[#6b92ed]">USAGE · COST</p>
             <h1 className="mt-2 text-3xl font-semibold">生成统计</h1>
-            <p className="mt-2 text-sm text-[#829889]">统计当前账号已完成的图片和视频任务；费用按管理员配置费率估算，不代表供应商账单。</p>
+            <p className="mt-2 text-sm text-[#848a98]">统计当前账号已完成的图片和视频任务；费用按管理员配置费率估算，不代表供应商账单。</p>
             {ownerFailed && (
-                <p role="alert" className="mt-5 rounded border border-[#70502b] bg-[#241a0c] p-3 text-sm text-[#ffbd73]">
+                <p role="alert" className="mt-5 rounded border border-[#92400e] bg-[#fef3c7] p-3 text-sm text-[#92400e]">
                     统计暂时无法完整加载，请稍后重试。
                 </p>
             )}
             {adminUsageFailed && (
-                <p role="alert" className="mt-5 rounded border border-[#70502b] bg-[#241a0c] p-3 text-sm text-[#ffbd73]">
+                <p role="alert" className="mt-5 rounded border border-[#92400e] bg-[#fef3c7] p-3 text-sm text-[#92400e]">
                     全部用户统计暂时无法加载，请稍后重试。
                 </p>
             )}
             {ratesFailed && (
-                <p role="alert" className="mt-5 rounded border border-[#70502b] bg-[#241a0c] p-3 text-sm text-[#ffbd73]">
+                <p role="alert" className="mt-5 rounded border border-[#92400e] bg-[#fef3c7] p-3 text-sm text-[#92400e]">
                     计费价格暂时无法加载，请稍后重试。
                 </p>
             )}
             {usage === null && ownerFailed ? (
-                <p className="mt-7 text-sm text-[#829889]">统计数据暂时不可用。</p>
+                <p className="mt-7 text-sm text-[#848a98]">统计数据暂时不可用。</p>
             ) : usage === null ? (
-                <p className="mt-7 text-sm text-[#829889]">正在加载统计…</p>
+                <p className="mt-7 text-sm text-[#848a98]">正在加载统计…</p>
             ) : (
                 <>
                     <SummaryCards summary={usage.summary} />

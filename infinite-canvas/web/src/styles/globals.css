@@ -48,59 +48,63 @@
     --radius-4xl: calc(var(--radius) * 2.6);
 }
 
+/* 简约蓝白，对齐 Portal 的色板（portal/static/styles.css:8-35）：
+   --page-bg #f3f6fa / --surface #fff / --border #d9e0ea / --text #172033 /
+   --accent #235fd6。这里用 oklch 表达同一组颜色，色相 264 ≈ Portal 蓝。 */
 :root {
     --radius: 0.625rem;
-    --border: oklch(0.3 0.055 145);
-    --ring: oklch(0.82 0.2 145);
-    --background: oklch(0.085 0.012 145);
-    --foreground: oklch(0.94 0.025 145);
-    --card: oklch(0.12 0.018 145);
-    --card-foreground: oklch(0.94 0.025 145);
+    --border: oklch(0.90 0.012 255);
+    --ring: oklch(0.55 0.17 264);
+    --background: oklch(0.975 0.005 255);
+    --foreground: oklch(0.25 0.03 264);
+    --card: oklch(1 0 0);
+    --card-foreground: oklch(0.25 0.03 264);
     --popover: oklch(1 0 0);
-    --popover-foreground: oklch(0.145 0 0);
-    --primary: oklch(0.82 0.2 145);
-    --primary-foreground: oklch(0.1 0.025 145);
-    --secondary: oklch(0.97 0 0);
-    --secondary-foreground: oklch(0.205 0 0);
-    --muted: oklch(0.17 0.025 145);
-    --muted-foreground: oklch(0.72 0.035 145);
-    --accent: oklch(0.97 0 0);
-    --accent-foreground: oklch(0.205 0 0);
+    --popover-foreground: oklch(0.25 0.03 264);
+    --primary: oklch(0.52 0.17 264);
+    --primary-foreground: oklch(1 0 0);
+    --secondary: oklch(0.96 0.008 255);
+    --secondary-foreground: oklch(0.32 0.03 264);
+    --muted: oklch(0.955 0.008 255);
+    --muted-foreground: oklch(0.52 0.02 260);
+    --accent: oklch(0.96 0.02 258);
+    --accent-foreground: oklch(0.38 0.13 264);
     --destructive: oklch(0.577 0.245 27.325);
-    --input: oklch(0.922 0 0);
-    --chart-1: oklch(0.87 0 0);
-    --chart-2: oklch(0.556 0 0);
-    --chart-3: oklch(0.439 0 0);
-    --chart-4: oklch(0.371 0 0);
-    --chart-5: oklch(0.269 0 0);
-    --sidebar: oklch(0.985 0 0);
-    --sidebar-foreground: oklch(0.145 0 0);
-    --sidebar-primary: oklch(0.205 0 0);
-    --sidebar-primary-foreground: oklch(0.985 0 0);
-    --sidebar-accent: oklch(0.97 0 0);
-    --sidebar-accent-foreground: oklch(0.205 0 0);
-    --sidebar-border: oklch(0.922 0 0);
-    --sidebar-ring: oklch(0.708 0 0);
+    --input: oklch(0.90 0.012 255);
+    --chart-1: oklch(0.52 0.17 264);
+    --chart-2: oklch(0.62 0.13 230);
+    --chart-3: oklch(0.70 0.11 200);
+    --chart-4: oklch(0.76 0.09 175);
+    --chart-5: oklch(0.62 0.10 285);
+    --sidebar: oklch(1 0 0);
+    --sidebar-foreground: oklch(0.25 0.03 264);
+    --sidebar-primary: oklch(0.52 0.17 264);
+    --sidebar-primary-foreground: oklch(1 0 0);
+    --sidebar-accent: oklch(0.96 0.02 258);
+    --sidebar-accent-foreground: oklch(0.38 0.13 264);
+    --sidebar-border: oklch(0.90 0.012 255);
+    --sidebar-ring: oklch(0.55 0.17 264);
     --task-tray-height: 3.5rem;
 }
 
+/* 暗色同样走蓝系（色相 264），避免切换主题时突然变绿。 */
 .dark {
-    --background: oklch(0.085 0.012 145);
-    --foreground: oklch(0.94 0.025 145);
-    --border: oklch(0.3 0.055 145);
-    --ring: oklch(0.82 0.2 145);
-    --card: oklch(0.12 0.018 145);
-    --card-foreground: oklch(0.94 0.025 145);
-    --popover: oklch(0.205 0 0);
-    --popover-foreground: oklch(0.985 0 0);
-    --primary: oklch(0.82 0.2 145);
-    --primary-foreground: oklch(0.1 0.025 145);
-    --secondary: oklch(0.269 0 0);
-    --secondary-foreground: oklch(0.985 0 0);
-    --muted: oklch(0.17 0.025 145);
-    --muted-foreground: oklch(0.72 0.035 145);
-    --accent: oklch(0.269 0 0);
-    --accent-foreground: oklch(0.985 0 0);
+    --background: oklch(0.16 0.015 264);
+    --foreground: oklch(0.95 0.008 255);
+    --border: oklch(0.32 0.02 264);
+    --ring: oklch(0.62 0.15 264);
+    --card: oklch(0.21 0.018 264);
+    --card-foreground: oklch(0.95 0.008 255);
+    --popover: oklch(0.21 0.018 264);
+    --popover-foreground: oklch(0.95 0.008 255);
+    --primary: oklch(0.66 0.16 264);
+    --primary-foreground: oklch(0.16 0.015 264);
+    --secondary: oklch(0.28 0.02 264);
+    --secondary-foreground: oklch(0.95 0.008 255);
+    --muted: oklch(0.26 0.018 264);
+    --muted-foreground: oklch(0.70 0.02 258);
+    --accent: oklch(0.30 0.03 264);
+    --accent-foreground: oklch(0.92 0.02 258);
     --destructive: oklch(0.704 0.191 22.216);
     --input: oklch(1 0 0 / 15%);
     --chart-1: oklch(0.87 0 0);
@@ -622,7 +626,7 @@
 
 .media-surface,
 .embed-surface {
-    border: 1px solid #1f3f2a;
-    background: #07100a;
+    border: 1px solid #242e45;
+    background: #0a0c11;
     color: #e5f5e9;
 }

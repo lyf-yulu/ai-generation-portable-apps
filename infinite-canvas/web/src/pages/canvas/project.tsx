@@ -686,34 +686,34 @@ export default function CanvasProjectPage() {
     if (!project) {
         if (loadError)
             return (
-                <main role="alert" className="flex h-full items-center justify-center bg-[#050806] px-6 text-center text-[#ffbd73]">
+                <main role="alert" className="flex h-full items-center justify-center bg-[#f3f6fa] px-6 text-center text-[#92400e]">
                     {loadError.message}
                 </main>
             );
-        if (!projectsLoaded) return <main className="flex h-full items-center justify-center bg-[#050806] text-[#829889]">正在加载画布…</main>;
+        if (!projectsLoaded) return <main className="flex h-full items-center justify-center bg-[#f3f6fa] text-[#687386]">正在加载画布…</main>;
         return <Navigate to="/canvas" replace />;
     }
 
     return (
-        <div className="flex h-full min-h-0 flex-col bg-[#050806] text-[#dceee1]">
+        <div className="flex h-full min-h-0 flex-col bg-[#f3f6fa] text-[#172033]">
             {loadError ? (
-                <p role="alert" className="shrink-0 border-b border-[#70502b] bg-[#241a0c] px-4 py-2 text-sm text-[#ffbd73]">
+                <p role="alert" className="shrink-0 border-b border-[#92400e] bg-[#fef3c7] px-4 py-2 text-sm text-[#92400e]">
                     {loadError.message}
                 </p>
             ) : null}
             {syncNotice ? (
-                <p data-testid="project-sync-notice" role="status" aria-live="polite" className="shrink-0 border-b border-[#70502b] bg-[#241a0c] px-4 py-2 text-sm text-[#ffbd73]">
+                <p data-testid="project-sync-notice" role="status" aria-live="polite" className="shrink-0 border-b border-[#92400e] bg-[#fef3c7] px-4 py-2 text-sm text-[#92400e]">
                     {syncNotice}
                 </p>
             ) : null}
             <main className="flex min-h-0 flex-1 flex-col overflow-hidden lg:grid lg:grid-cols-[152px_minmax(0,1fr)]">
-                <aside data-testid="studio-palette" className="shrink-0 border-b border-[#1d3d28] bg-[#08100b] p-2 lg:border-b-0 lg:border-r lg:p-3">
+                <aside data-testid="studio-palette" className="shrink-0 border-b border-[#20293d] bg-[#ffffff] p-2 lg:border-b-0 lg:border-r lg:p-3">
                     <div className="flex items-center justify-between gap-2 lg:block">
                         <div>
-                            <Link to="/canvas" aria-label="返回项目列表" className="mb-1 inline-flex items-center gap-1 px-2 text-[11px] text-[#8fa596] hover:text-[#dceee1] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#58ed87]">
+                            <Link to="/canvas" aria-label="返回项目列表" className="mb-1 inline-flex items-center gap-1 px-2 text-[11px] text-[#687386] hover:text-[#172033] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#235fd6]">
                                 <ArrowLeft className="size-3.5" />返回项目列表
                             </Link>
-                            <p className="px-2 text-xs tracking-[0.16em] text-[#58ed87] lg:pt-2">NODE PALETTE</p>
+                            <p className="px-2 text-xs tracking-[0.16em] text-[#235fd6] lg:pt-2">NODE PALETTE</p>
                             <h1 className="px-2 py-1 text-sm font-semibold lg:pb-4 lg:pt-2">{project.title}</h1>
                         </div>
                         <div className="flex flex-wrap gap-2 lg:block lg:space-y-2">
@@ -721,43 +721,43 @@ export default function CanvasProjectPage() {
                                 disabled={readOnly}
                                 type="button"
                                 onClick={() => addPromptNode()}
-                                className="flex items-center gap-2 rounded-lg border border-[#254b33] bg-[#0d1b12] px-3 py-2 text-left text-xs hover:border-[#4fbd70] disabled:cursor-not-allowed disabled:opacity-50 lg:w-full lg:py-2.5"
+                                className="flex items-center gap-2 rounded-lg border border-[#c3ccd9] bg-[#eef2f7] px-3 py-2 text-left text-xs hover:border-[#2f6bdd] disabled:cursor-not-allowed disabled:opacity-50 lg:w-full lg:py-2.5"
                             >
-                                <MessageSquareText className="size-4 text-[#58ed87]" />
+                                <MessageSquareText className="size-4 text-[#235fd6]" />
                                 提示词节点
                             </button>
                             <button
                                 disabled={readOnly}
                                 type="button"
                                 onClick={() => addMediaCollectionNode("image")}
-                                className="flex items-center gap-2 rounded-lg border border-[#254b33] bg-[#0d1b12] px-3 py-2 text-left text-xs hover:border-[#4fbd70] disabled:cursor-not-allowed disabled:opacity-50 lg:w-full lg:py-2.5"
+                                className="flex items-center gap-2 rounded-lg border border-[#c3ccd9] bg-[#eef2f7] px-3 py-2 text-left text-xs hover:border-[#2f6bdd] disabled:cursor-not-allowed disabled:opacity-50 lg:w-full lg:py-2.5"
                             >
-                                <ImagePlus className="size-4 text-[#58ed87]" />
+                                <ImagePlus className="size-4 text-[#235fd6]" />
                                 参考图节点
                             </button>
                             <button
                                 disabled={readOnly}
                                 type="button"
                                 onClick={() => addMediaCollectionNode("video")}
-                                className="flex items-center gap-2 rounded-lg border border-[#254b33] bg-[#0d1b12] px-3 py-2 text-left text-xs hover:border-[#4fbd70] disabled:cursor-not-allowed disabled:opacity-50 lg:w-full lg:py-2.5"
+                                className="flex items-center gap-2 rounded-lg border border-[#c3ccd9] bg-[#eef2f7] px-3 py-2 text-left text-xs hover:border-[#2f6bdd] disabled:cursor-not-allowed disabled:opacity-50 lg:w-full lg:py-2.5"
                             >
-                                <Film className="size-4 text-[#58ed87]" />
+                                <Film className="size-4 text-[#235fd6]" />
                                 参考视频节点
                             </button>
                             <button
                                 disabled={readOnly}
                                 type="button"
                                 onClick={() => addMediaCollectionNode("audio")}
-                                className="flex items-center gap-2 rounded-lg border border-[#254b33] bg-[#0d1b12] px-3 py-2 text-left text-xs hover:border-[#4fbd70] disabled:cursor-not-allowed disabled:opacity-50 lg:w-full lg:py-2.5"
+                                className="flex items-center gap-2 rounded-lg border border-[#c3ccd9] bg-[#eef2f7] px-3 py-2 text-left text-xs hover:border-[#2f6bdd] disabled:cursor-not-allowed disabled:opacity-50 lg:w-full lg:py-2.5"
                             >
-                                <Music2 className="size-4 text-[#58ed87]" />
+                                <Music2 className="size-4 text-[#235fd6]" />
                                 参考音频节点
                             </button>
                             <button
                                 disabled={readOnly || imageCreateOperation === null}
                                 type="button"
                                 onClick={() => imageCreateOperation && addModelNode(imageCreateOperation)}
-                                className="flex items-center gap-2 rounded-lg border border-[#254b33] bg-[#0d1b12] px-3 py-2 text-left text-xs hover:border-[#4fbd70] disabled:cursor-not-allowed disabled:opacity-50 lg:w-full lg:py-2.5"
+                                className="flex items-center gap-2 rounded-lg border border-[#c3ccd9] bg-[#eef2f7] px-3 py-2 text-left text-xs hover:border-[#2f6bdd] disabled:cursor-not-allowed disabled:opacity-50 lg:w-full lg:py-2.5"
                             >
                                 图片生成
                             </button>
@@ -765,13 +765,13 @@ export default function CanvasProjectPage() {
                                 disabled={readOnly || videoCreateOperation === null}
                                 type="button"
                                 onClick={() => videoCreateOperation && addModelNode(videoCreateOperation)}
-                                className="flex items-center gap-2 rounded-lg border border-[#254b33] bg-[#0d1b12] px-3 py-2 text-left text-xs hover:border-[#4fbd70] disabled:cursor-not-allowed disabled:opacity-50 lg:w-full lg:py-2.5"
+                                className="flex items-center gap-2 rounded-lg border border-[#c3ccd9] bg-[#eef2f7] px-3 py-2 text-left text-xs hover:border-[#2f6bdd] disabled:cursor-not-allowed disabled:opacity-50 lg:w-full lg:py-2.5"
                             >
                                 视频生成
                             </button>
                         </div>
                     </div>
-                    <p className="mt-5 hidden px-2 text-[11px] leading-5 text-[#688371] lg:block">集合内顺序决定 @图片N、@视频N、@音频N 的引用编号。</p>
+                    <p className="mt-5 hidden px-2 text-[11px] leading-5 text-[#8b95a7] lg:block">集合内顺序决定 @图片N、@视频N、@音频N 的引用编号。</p>
                 </aside>
                 <section data-testid="studio-canvas" className="embed-surface relative min-h-0 min-w-0 flex-1">
                     <InfiniteCanvas
@@ -887,13 +887,13 @@ export default function CanvasProjectPage() {
                             data-testid="connection-status"
                             role="status"
                             aria-live="polite"
-                            className="pointer-events-none absolute bottom-14 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-[#356b48] bg-[#08100b]/95 px-3 py-2 text-xs text-[#bcebc9] shadow-xl"
+                            className="pointer-events-none absolute bottom-14 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-[#c3ccd9] bg-[#ffffff]/95 px-3 py-2 text-xs text-[#465267] shadow-xl"
                         >
                             {connectionMessage}
                         </p>
                     ) : null}
                     {canvasCommandMessage ? (
-                        <p data-testid="canvas-command-status" role="status" aria-live="polite" className="pointer-events-none absolute bottom-24 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-[#356b48] bg-[#08100b]/95 px-3 py-2 text-xs text-[#bcebc9] shadow-xl">
+                        <p data-testid="canvas-command-status" role="status" aria-live="polite" className="pointer-events-none absolute bottom-24 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-[#c3ccd9] bg-[#ffffff]/95 px-3 py-2 text-xs text-[#465267] shadow-xl">
                             {canvasCommandMessage}
                         </p>
                     ) : null}
@@ -902,7 +902,7 @@ export default function CanvasProjectPage() {
                             data-testid="inactive-connection-status"
                             role="status"
                             aria-live="polite"
-                            className="pointer-events-none absolute bottom-3 left-1/2 z-40 -translate-x-1/2 rounded border border-[#526354] bg-[#08100b]/95 px-2 py-1 text-[11px] text-[#b8cdbd]"
+                            className="pointer-events-none absolute bottom-3 left-1/2 z-40 -translate-x-1/2 rounded border border-[#545863] bg-[#ffffff]/95 px-2 py-1 text-[11px] text-[#465267]"
                         >
                             {inactiveConnectionCount} 条连接暂不可用，已保留在画布中。
                         </p>
