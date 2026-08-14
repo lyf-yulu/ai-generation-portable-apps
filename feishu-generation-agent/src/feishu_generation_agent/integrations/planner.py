@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 from typing import Any, Callable, Literal
 
@@ -178,6 +179,23 @@ _AUDIT_SYSTEM_PROMPT = """你是独立审查员，与需求规划角色相互独
 严格输出 AuditReport JSON，不要输出思维过程、推理原文、Markdown 或额外说明。
 """
 _STRUCTURED_OUTPUT_ATTEMPTS = 3
+_LOGGER = logging.getLogger(__name__)
+# 审计输出被截断的特征：openai 抛 LengthFinishReasonError，或解析不出 JSON。
+# 这些都属于「审计没跑完」，不是计划本身有问题。
+_RECOVERABLE_AUDIT_CAUSES = (
+    # _model_error 只把异常类名写进 technical_detail（cause=XxxError），
+    # 异常消息不保留，所以这里按类名匹配，不能按消息内容匹配。
+    "length",
+    "truncat",
+    "invalid json",
+    "missing json",
+    "validationerror",
+)
+
+
+def _is_recoverable_audit_failure(exc: AgentError) -> bool:
+    detail = f"{exc.detail.message} {exc.detail.technical_detail}".lower()
+    return any(cause in detail for cause in _RECOVERABLE_AUDIT_CAUSES)
 
 
 def planner_system_prompt() -> str:
@@ -968,14 +986,33 @@ class DeepSeekPlanner:
                 "content": self._audit_prompt(document, plan),
             },
         ]
-        report = await self._invoke_with_repair(
-            model=self._audit_model,
-            messages=messages,
-            schema=AuditReport,
-            deterministic_validator=lambda payload: [],
-            document_id=document.document_id,
-            operation="audit",
-        )
+        try:
+            report = await self._invoke_with_repair(
+                model=self._audit_model,
+                messages=messages,
+                schema=AuditReport,
+                deterministic_validator=lambda payload: [],
+                document_id=document.document_id,
+                operation="audit",
+            )
+        except AgentError as exc:
+            # 审计是辅助环节（给人看的风险提示），不该有一票否决权。实测
+            # 4 个任务的审计报告会超模型输出上限抛 LengthFinishReasonError，
+            # 计划本身已经生成好了，却因为「审查意见写太长」把整个 run 判失败。
+            if not _is_recoverable_audit_failure(exc):
+                raise
+            _LOGGER.warning(
+                "审计未能完成，按无额外发现处理 document_id=%s detail=%s",
+                document.document_id,
+                exc.detail.technical_detail,
+            )
+            return AuditReport(
+                issues=[
+                    "自动审计未能完成（模型输出超长或返回异常），"
+                    "本次计划未经过自动审查，请人工重点核对。"
+                ],
+                corrections_required=False,
+            )
         return _normalize_audit_report(report)
 
     def _planning_prompt(
