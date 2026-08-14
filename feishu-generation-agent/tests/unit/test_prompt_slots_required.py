@@ -117,3 +117,31 @@ def test_video_task_is_never_reassembled():
 
     assert task.prompt == "景别：中景；动作：熊猫拉抽屉"
     assert "禁止勾勒边缘线" not in task.prompt
+
+
+def test_tokens_outside_labelled_segments_are_preserved():
+    """真实故障：模型把风格参考 token 写在「总体设定」段里，解析只取标签段，
+    这些 token 全丢，拼装后校验判「缺少素材引用 @图片4/5/6」，run 失败。
+    """
+    prompt = (
+        "总体设定与素材绑定：参考@图片4、@图片5、@图片6 中的完成图。"
+        "景别：中景；主体融合：Victor 如@图片1 所示；动作：握拳；"
+        "背景：帷幔；风格：3D 卡通渲染；画布：1700*2500；氛围：紧张"
+    )
+
+    task = GenerationTask.model_validate(_payload(prompt=prompt))
+
+    for token in ("@图片1", "@图片4", "@图片5", "@图片6"):
+        assert token in task.prompt, f"token 丢失：{token}"
+
+
+def test_preserved_tokens_are_not_duplicated():
+    prompt = (
+        "景别：中景；主体融合：@图片1 中的角色；动作：握拳；"
+        "背景：帷幔；风格：参考@图片4 的画风；画布：1700*2500"
+    )
+
+    task = GenerationTask.model_validate(_payload(prompt=prompt))
+
+    assert task.prompt.count("@图片4") == 1
+    assert task.prompt.count("@图片1") == 1

@@ -1,4 +1,5 @@
 from enum import StrEnum
+import re
 from typing import Any, Literal, Self
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -20,6 +21,8 @@ ImageProvider = Literal["seedream", "banana", "gpt-image2"]
 DEFAULT_IMAGE_PROVIDER: ImageProvider = "banana"
 # provider 只接受这三个基准分辨率档位；像素尺寸属于 size_variants。
 IMAGE_SIZE_TOKENS = ("1K", "1.5K", "2K")
+# 反解只取标签段，标签外的 @图片N 会丢；拼装后要按这个把它们补回去。
+_REFERENCE_TOKEN = re.compile(r"@(?:图片|视频|音频)\d+")
 # 统一按最高档出图，再裁到交付尺寸，避免小档位放大导致画质损失。
 DEFAULT_IMAGE_SIZE = "2K"
 
@@ -158,6 +161,7 @@ class GenerationTask(BaseModel):
         # 模型常把槽位内容写进 prompt 文本而不填 prompt_slots（该字段不在
         # schema 的 required 里）。此时从带标签文本反解，而不是让任务失败——
         # 早先改成硬失败导致整个测试套件挂住，出图比不出图重要。
+        original_prompt = self.prompt
         slots = self.prompt_slots or parse_prompt_slots(self.prompt)
         if slots is None:
             return
@@ -167,8 +171,25 @@ class GenerationTask(BaseModel):
                 update={"canvas": self.size_variants[0].replace("x", "*")}
             )
         assembled = build_image_prompt(slots)
-        if assembled.strip():
-            self.prompt = assembled
+        if not assembled.strip():
+            return
+        # 模型常把风格参考 token 写在「总体设定」这类标签之外的段落里，反解
+        # 只取标签段会把它们丢掉，拼装后校验就判「缺少素材引用 @图片N」。
+        # 把丢失的 token 补回句末，保持顺序且不重复。
+        dropped = [
+            token
+            for token in _REFERENCE_TOKEN.findall(original_prompt)
+            if token not in assembled
+        ]
+        if dropped:
+            unique: list[str] = []
+            for token in dropped:
+                if token not in unique:
+                    unique.append(token)
+            assembled = (
+                f"{assembled}，画面风格严格参考 {'、'.join(unique)}"
+            )
+        self.prompt = assembled
 
     def _drop_safe_area_from_variants(self) -> None:
         """把误当成交付尺寸的安全区从 size_variants 里剔除。
