@@ -173,21 +173,27 @@ class GenerationTask(BaseModel):
         assembled = build_image_prompt(slots)
         if not assembled.strip():
             return
-        # 模型常把风格参考 token 写在「总体设定」这类标签之外的段落里，反解
-        # 只取标签段会把它们丢掉，拼装后校验就判「缺少素材引用 @图片N」。
-        # 把丢失的 token 补回句末，保持顺序且不重复。
-        dropped = [
-            token
-            for token in _REFERENCE_TOKEN.findall(original_prompt)
-            if token not in assembled
+        # 每张挂载的参考图都必须在 prompt 里被引用，否则 validate_image_prompt
+        # 判「缺少素材引用 @图片N」。两种缺失都要补：
+        #   1. 模型把 token 写在标签段之外（反解只取标签段，会丢）
+        #   2. 模型压根没为某些挂载图写引用（实测 4 张图只提 1 张）
+        # token 序号按图片类参考图的挂载顺序算，与 reference_contract 一致。
+        expected = [
+            f"@图片{index}"
+            for index, _ in enumerate(
+                sorted(self.reference_images, key=lambda item: item.order),
+                start=1,
+            )
         ]
-        if dropped:
-            unique: list[str] = []
-            for token in dropped:
-                if token not in unique:
-                    unique.append(token)
+        # 原 prompt 里出现过的 token 也要算进来：模型可能引用了比 order 序号
+        # 更靠后的图（例如把风格参考写成 @图片4、@图片5），这些同样不能丢。
+        for token in _REFERENCE_TOKEN.findall(original_prompt):
+            if token not in expected:
+                expected.append(token)
+        missing = [token for token in expected if token not in assembled]
+        if missing:
             assembled = (
-                f"{assembled}，画面风格严格参考 {'、'.join(unique)}"
+                f"{assembled}，画面风格严格参考 {'、'.join(missing)}"
             )
         self.prompt = assembled
 
