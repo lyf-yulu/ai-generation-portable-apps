@@ -93,3 +93,7 @@ volcengine-portrait/视频生成合集/
 infinite-canvas/web/node_modules/
 infinite-canvas/web/dist/
 infinite-canvas/web/tsconfig.tsbuildinfo
+
+# 本地 AI 工具状态（firecrawl 抓取缓存 / codex 自动生成环境）
+.firecrawl/
+.codex/
