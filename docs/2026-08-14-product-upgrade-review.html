@@ -1,0 +1,805 @@
+<title>生成中台升级评审</title>
+<style>
+  :root {
+    --paper: #F7F8FA;
+    --surface: #FFFFFF;
+    --surface-sunk: #EFF2F6;
+    --ink: #141A22;
+    --ink-soft: #3D4854;
+    --ink-mute: #5A6675;
+    --ink-faint: #8B95A3;
+    --rule: #E1E5EB;
+    --rule-firm: #CBD2DB;
+    --accent: #0F6E8C;
+    --accent-soft: #E4F0F4;
+    --critical: #C6362F;
+    --critical-soft: #FBEAE8;
+    --warn: #A96C12;
+    --warn-soft: #FBF1E0;
+    --good: #1F7A4D;
+    --good-soft: #E5F2EA;
+    --app-seedance: #2563eb;
+    --app-image: #10b981;
+    --app-dreamina: #a855f7;
+    --app-portrait: #f59e0b;
+    --app-agent: #0F6E8C;
+    --shadow: 0 1px 2px rgba(20, 26, 34, .04), 0 8px 24px -12px rgba(20, 26, 34, .10);
+
+    --display: "Songti SC", "Source Han Serif SC", "Noto Serif CJK SC", "STSong", Georgia, serif;
+    --body: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+    --mono: "SF Mono", ui-monospace, SFMono-Regular, Menlo, "JetBrains Mono", monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #101419;
+      --surface: #171C23;
+      --surface-sunk: #1D242C;
+      --ink: #E4E8ED;
+      --ink-soft: #C3CAD3;
+      --ink-mute: #9AA4B0;
+      --ink-faint: #6E7885;
+      --rule: #262E38;
+      --rule-firm: #35404C;
+      --accent: #58BCD8;
+      --accent-soft: #14303A;
+      --critical: #F0857C;
+      --critical-soft: #35201E;
+      --warn: #DFA84E;
+      --warn-soft: #322717;
+      --good: #5FBE8B;
+      --good-soft: #162C21;
+      --app-seedance: #6699F7;
+      --app-image: #45D3A2;
+      --app-dreamina: #C58BFA;
+      --app-portrait: #F7B94A;
+      --app-agent: #58BCD8;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 8px 24px -12px rgba(0, 0, 0, .5);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --paper: #101419;
+    --surface: #171C23;
+    --surface-sunk: #1D242C;
+    --ink: #E4E8ED;
+    --ink-soft: #C3CAD3;
+    --ink-mute: #9AA4B0;
+    --ink-faint: #6E7885;
+    --rule: #262E38;
+    --rule-firm: #35404C;
+    --accent: #58BCD8;
+    --accent-soft: #14303A;
+    --critical: #F0857C;
+    --critical-soft: #35201E;
+    --warn: #DFA84E;
+    --warn-soft: #322717;
+    --good: #5FBE8B;
+    --good-soft: #162C21;
+    --app-seedance: #6699F7;
+    --app-image: #45D3A2;
+    --app-dreamina: #C58BFA;
+    --app-portrait: #F7B94A;
+    --app-agent: #58BCD8;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 8px 24px -12px rgba(0, 0, 0, .5);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 16px;
+    line-height: 1.75;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  .shell {
+    display: grid;
+    grid-template-columns: 1fr minmax(0, 40rem) 13rem 1fr;
+    column-gap: 2.5rem;
+  }
+  .shell > * { grid-column: 2; min-width: 0; }
+
+  /* ---------- masthead ---------- */
+
+  .masthead {
+    grid-column: 2 / 4;
+    padding: 4.5rem 0 2.25rem;
+    border-bottom: 1px solid var(--rule-firm);
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+  }
+  .eyebrow {
+    display: flex;
+    align-items: center;
+    gap: .75rem;
+    flex-wrap: wrap;
+    font-family: var(--mono);
+    font-size: .7rem;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  .eyebrow .tick { color: var(--accent); }
+  .masthead h1 {
+    font-family: var(--display);
+    font-weight: 700;
+    font-size: clamp(2.1rem, 5.5vw, 3.1rem);
+    line-height: 1.18;
+    letter-spacing: -.005em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .standfirst {
+    font-size: 1.075rem;
+    line-height: 1.7;
+    color: var(--ink-soft);
+    max-width: 38rem;
+    margin: 0;
+  }
+
+  .vitals {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    overflow: hidden;
+    margin-top: .25rem;
+  }
+  .vital {
+    background: var(--surface);
+    padding: .9rem 1rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: .1rem;
+  }
+  .vital b {
+    font-family: var(--mono);
+    font-size: 1.45rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -.02em;
+    line-height: 1.2;
+  }
+  .vital span {
+    font-size: .78rem;
+    color: var(--ink-mute);
+    letter-spacing: .01em;
+  }
+
+  /* ---------- sections ---------- */
+
+  main { grid-column: 2; padding-bottom: 6rem; }
+
+  section { padding-top: 3.5rem; scroll-margin-top: 1.5rem; }
+
+  .sec-head { margin-bottom: 1.5rem; }
+  .sec-num {
+    font-family: var(--mono);
+    font-size: .72rem;
+    letter-spacing: .18em;
+    text-transform: uppercase;
+    color: var(--accent);
+    display: block;
+    margin-bottom: .5rem;
+  }
+  h2 {
+    font-family: var(--display);
+    font-weight: 700;
+    font-size: clamp(1.5rem, 3vw, 1.95rem);
+    line-height: 1.3;
+    letter-spacing: -.005em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  h3 {
+    font-family: var(--body);
+    font-weight: 650;
+    font-size: 1.075rem;
+    line-height: 1.5;
+    margin: 2.5rem 0 .75rem;
+    letter-spacing: .002em;
+  }
+  h3 .h3num {
+    font-family: var(--mono);
+    font-size: .8rem;
+    font-weight: 500;
+    color: var(--ink-faint);
+    margin-right: .5rem;
+    font-variant-numeric: tabular-nums;
+  }
+  p { margin: 0 0 1.05rem; }
+  p:last-child { margin-bottom: 0; }
+  strong { font-weight: 650; color: var(--ink); }
+  em { font-style: normal; background: var(--accent-soft); padding: .05em .3em; border-radius: 2px; }
+
+  code {
+    font-family: var(--mono);
+    font-size: .855em;
+    background: var(--surface-sunk);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: .08em .35em;
+    color: var(--ink-soft);
+    word-break: break-word;
+  }
+
+  ul, ol { margin: 0 0 1.05rem; padding-left: 1.35rem; }
+  li { margin-bottom: .5rem; }
+  li::marker { color: var(--ink-faint); }
+
+  /* ---------- callouts ---------- */
+
+  .note {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--accent);
+    border-radius: 3px;
+    padding: 1.1rem 1.25rem;
+    margin: 1.5rem 0;
+    font-size: .95rem;
+  }
+  .note.risk { border-left-color: var(--critical); }
+  .note.win { border-left-color: var(--good); }
+  .note .lbl {
+    display: block;
+    font-family: var(--mono);
+    font-size: .68rem;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin-bottom: .45rem;
+  }
+  .note.risk .lbl { color: var(--critical); }
+  .note.win .lbl { color: var(--good); }
+
+  .measured {
+    font-family: var(--mono);
+    font-size: .82rem;
+    line-height: 1.7;
+    background: var(--surface-sunk);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: .9rem 1.1rem;
+    margin: 1.25rem 0;
+    overflow-x: auto;
+    color: var(--ink-soft);
+    white-space: pre;
+  }
+
+  /* ---------- tables ---------- */
+
+  .twrap { overflow-x: auto; margin: 1.5rem 0; border: 1px solid var(--rule); border-radius: 3px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: .92rem; }
+  th, td { padding: .7rem .9rem; text-align: left; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  thead th {
+    font-family: var(--mono);
+    font-size: .68rem;
+    font-weight: 600;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    background: var(--surface-sunk);
+    white-space: nowrap;
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: .45rem;
+    white-space: nowrap;
+    font-weight: 600;
+  }
+  .dot { width: .5rem; height: .5rem; border-radius: 50%; flex: none; }
+  .d-seedance { background: var(--app-seedance); }
+  .d-image { background: var(--app-image); }
+  .d-dreamina { background: var(--app-dreamina); }
+  .d-portrait { background: var(--app-portrait); }
+  .d-agent { background: var(--app-agent); }
+
+  .pill {
+    display: inline-block;
+    font-size: .74rem;
+    font-weight: 650;
+    letter-spacing: .02em;
+    padding: .12rem .5rem;
+    border-radius: 2px;
+    white-space: nowrap;
+  }
+  .p-core { background: var(--good-soft); color: var(--good); }
+  .p-dying { background: var(--critical-soft); color: var(--critical); }
+  .p-new { background: var(--accent-soft); color: var(--accent); }
+
+  /* ---------- bar figure ---------- */
+
+  figure { margin: 1.75rem 0; }
+  figcaption {
+    font-size: .8rem;
+    color: var(--ink-mute);
+    margin-top: .85rem;
+    padding-top: .6rem;
+    border-top: 1px solid var(--rule);
+  }
+  .bars { display: flex; flex-direction: column; gap: .7rem; }
+  .bar-row { display: grid; grid-template-columns: 7.5rem 1fr 3.5rem; align-items: center; gap: .85rem; font-size: .88rem; }
+  .bar-track { height: .7rem; background: var(--surface-sunk); border-radius: 1px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 1px; }
+  .bar-val { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: .82rem; color: var(--ink-mute); text-align: right; }
+
+  /* ---------- priority ---------- */
+
+  .tier { margin: 1.75rem 0; border: 1px solid var(--rule); border-radius: 3px; overflow: hidden; background: var(--surface); }
+  .tier-head {
+    display: flex;
+    align-items: baseline;
+    gap: .8rem;
+    flex-wrap: wrap;
+    padding: .8rem 1.1rem;
+    background: var(--surface-sunk);
+    border-bottom: 1px solid var(--rule);
+  }
+  .tier-tag {
+    font-family: var(--mono);
+    font-size: .82rem;
+    font-weight: 700;
+    letter-spacing: .06em;
+    padding: .05rem .45rem;
+    border-radius: 2px;
+  }
+  .t0 .tier-tag { background: var(--critical); color: var(--surface); }
+  .t1 .tier-tag { background: var(--warn); color: var(--surface); }
+  .t2 .tier-tag { background: var(--accent); color: var(--surface); }
+  .t3 .tier-tag { background: var(--rule-firm); color: var(--ink-soft); }
+  .tier-why { font-size: .85rem; color: var(--ink-mute); }
+  .tier ol { margin: 0; padding: .85rem 1.1rem .95rem 2.6rem; }
+  .tier li { margin-bottom: .35rem; font-size: .95rem; }
+  .tier li:last-child { margin-bottom: 0; }
+
+  /* ---------- rail ---------- */
+
+  .rail { grid-column: 3; grid-row: 2; align-self: start; position: sticky; top: 2rem; padding-top: 3.5rem; }
+  .rail nav { display: flex; flex-direction: column; gap: .1rem; border-left: 1px solid var(--rule); }
+  .rail a {
+    font-size: .8rem;
+    line-height: 1.45;
+    color: var(--ink-mute);
+    text-decoration: none;
+    padding: .32rem 0 .32rem .85rem;
+    margin-left: -1px;
+    border-left: 2px solid transparent;
+    transition: color .15s, border-color .15s;
+  }
+  .rail a:hover, .rail a:focus-visible { color: var(--accent); border-left-color: var(--accent); }
+  .rail .rail-lbl {
+    font-family: var(--mono);
+    font-size: .66rem;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    padding: 0 0 .6rem .85rem;
+  }
+
+  a { color: var(--accent); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+  footer {
+    grid-column: 2 / 4;
+    border-top: 1px solid var(--rule-firm);
+    padding: 1.5rem 0 4rem;
+    font-size: .82rem;
+    color: var(--ink-faint);
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    flex-wrap: wrap;
+  }
+
+  @media (max-width: 62rem) {
+    .shell { grid-template-columns: 1.25rem minmax(0, 1fr) 1.25rem; column-gap: 0; }
+    .shell > * { grid-column: 2; }
+    .masthead, footer { grid-column: 2; }
+    .rail { display: none; }
+    .bar-row { grid-template-columns: 6rem 1fr 3rem; gap: .6rem; font-size: .82rem; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+</style>
+
+<div class="shell">
+
+  <header class="masthead">
+    <div class="eyebrow">
+      <span class="tick">◆</span>
+      <span>产品评审</span>
+      <span>·</span>
+      <span>2026-08-14</span>
+      <span>·</span>
+      <span>本机实测，非文档快照</span>
+    </div>
+    <h1>生成中台升级评审</h1>
+    <p class="standfirst">
+      以产品视角对 AI 生成聚合平台做的一次现状盘点。结论全部来自实测数据与代码核对——
+      <code>CLAUDE.md</code> 的状态快照已有多处过期，附录列出了偏差。
+    </p>
+    <div class="vitals">
+      <div class="vital"><b>30</b><span>注册账号</span></div>
+      <div class="vital"><b>13</b><span>近两周活跃</span></div>
+      <div class="vital"><b>200+</b><span>每日生成任务</span></div>
+      <div class="vital"><b>31G</b><span>累计仓库体积</span></div>
+      <div class="vital"><b>0</b><span>成本核算能力</span></div>
+    </div>
+  </header>
+
+  <aside class="rail">
+    <nav>
+      <span class="rail-lbl">目录</span>
+      <a href="#s1">一 · 你在做什么产品</a>
+      <a href="#s2">二 · 被低估的现状</a>
+      <a href="#s3">三 · 核心短板</a>
+      <a href="#s4">四 · 前端升级</a>
+      <a href="#s5">五 · 技术债</a>
+      <a href="#s6">六 · 优先级排序</a>
+      <a href="#s7">附录 · 快照偏差</a>
+    </nav>
+  </aside>
+
+  <main>
+
+    <section id="s1">
+      <div class="sec-head">
+        <span class="sec-num">一</span>
+        <h2>你现在做的是什么产品</h2>
+      </div>
+
+      <p>摸完数据后，这个项目的真实定位比「工具集合」更清晰：<strong>它是一家公司内部的 AI 生成中台。</strong></p>
+
+      <p>30 个注册账号、近两周 13 人活跃、每天 200+ 次生成任务、累计产出 31G 素材。这已经不是「自己写的小工具」，而是有真实用户依赖、停机会被投诉的内部服务。</p>
+
+      <div class="note">
+        <span class="lbl">这个判断决定了后面所有优先级</span>
+        能力已经够多了，缺的是「运营一个服务」所需要的东西——花了多少钱、谁在浪费、失败了多少、数据在哪。
+      </div>
+
+      <h3>真实使用画像（近 14 天）</h3>
+
+      <div class="twrap">
+        <table>
+          <thead>
+            <tr><th>子应用</th><th>产出量</th><th>每日任务</th><th>状态</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="chip"><i class="dot d-seedance"></i>Seedance（视频）</span></td>
+              <td class="num">10 249 秒</td><td class="num">18–117</td>
+              <td><span class="pill p-core">主力</span></td>
+            </tr>
+            <tr>
+              <td><span class="chip"><i class="dot d-portrait"></i>人像生成</span></td>
+              <td class="num">9 331 秒</td><td class="num">30–95</td>
+              <td><span class="pill p-core">主力</span></td>
+            </tr>
+            <tr>
+              <td><span class="chip"><i class="dot d-image"></i>图像生成</span></td>
+              <td class="num">918 张</td><td class="num">21–108</td>
+              <td><span class="pill p-core">主力</span></td>
+            </tr>
+            <tr>
+              <td><span class="chip"><i class="dot d-dreamina"></i>Dreamina</span></td>
+              <td class="num">276</td><td class="num">0–2</td>
+              <td><span class="pill p-dying">接近废弃</span></td>
+            </tr>
+            <tr>
+              <td><span class="chip"><i class="dot d-agent"></i>飞书任务 Agent</span></td>
+              <td class="num">未计入</td><td class="num">—</td>
+              <td><span class="pill p-new">新增长点</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <figure>
+        <div class="bars">
+          <div class="bar-row">
+            <span class="chip"><i class="dot d-seedance"></i>Seedance</span>
+            <div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--app-seedance)"></div></div>
+            <span class="bar-val">80</span>
+          </div>
+          <div class="bar-row">
+            <span class="chip"><i class="dot d-portrait"></i>人像生成</span>
+            <div class="bar-track"><div class="bar-fill" style="width:88%;background:var(--app-portrait)"></div></div>
+            <span class="bar-val">71</span>
+          </div>
+          <div class="bar-row">
+            <span class="chip"><i class="dot d-image"></i>图像生成</span>
+            <div class="bar-track"><div class="bar-fill" style="width:79%;background:var(--app-image)"></div></div>
+            <span class="bar-val">63</span>
+          </div>
+          <div class="bar-row">
+            <span class="chip"><i class="dot d-dreamina"></i>Dreamina</span>
+            <div class="bar-track"><div class="bar-fill" style="width:1.2%;background:var(--app-dreamina)"></div></div>
+            <span class="bar-val">0.4</span>
+          </div>
+        </div>
+        <figcaption>日均任务数，2026-08-10 至 08-14。Dreamina 每天 0–2 个任务，却占着 2964 行代码（全项目最长的 <code>app.py</code>）、一套独有的双守卫权限机制和双前端兼容负担。</figcaption>
+      </figure>
+    </section>
+
+    <section id="s2">
+      <div class="sec-head">
+        <span class="sec-num">二</span>
+        <h2>被低估的现状</h2>
+      </div>
+
+      <p>盘点时发现几处架构其实已经很成熟，做升级规划时不该重做：</p>
+
+      <div class="note win">
+        <span class="lbl">子应用注册已配置化</span>
+        <code>portal/apps.json</code> 驱动一切——加一个子应用真的只要一条 JSON（端口、挂载方式、颜色、计量单位、统计合并策略都在里面）。这是很干净的插件化设计，本页的应用配色就直接取自它。
+      </div>
+
+      <div class="note win">
+        <span class="lbl">FastAPI 迁移已在生产运行</span>
+        四个子应用全部跑 uvicorn，只有 Portal 自己还是 stdlib。且 FastAPI 版是 <code>import app as legacy</code> 的<strong>薄壳</strong>，业务逻辑仍在 <code>app.py</code> 里——所以改 <code>app.py</code> 依然生效，没有双份代码漂移的风险。
+      </div>
+
+      <div class="note win">
+        <span class="lbl">真正的 RBAC 已落地</span>
+        三角色 + 权限位（<code>portal/app.py:138</code>），不是布尔 admin 标志。
+      </div>
+
+      <div class="note win">
+        <span class="lbl">飞书 Agent 是最大的隐藏资产</span>
+        23 433 行、LangGraph 12 节点、断电续跑、幂等提交、人工审批中断——工程完整度远超四个子应用，且已挂进 Portal 成为第五个 tab。
+      </div>
+    </section>
+
+    <section id="s3">
+      <div class="sec-head">
+        <span class="sec-num">三</span>
+        <h2>核心短板：有生成平台，没有运营后台</h2>
+      </div>
+
+      <p>这是我认为最值得投入的一块，三个问题互相关联。</p>
+
+      <h3><span class="h3num">3.1</span>花钱这件事完全是黑盒</h3>
+
+      <p><strong>实测</strong>：全项目 grep <code>quota</code> / <code>cost</code> / <code>price</code> / <code>billing</code> —— <strong>零命中</strong>。</p>
+
+      <ul>
+        <li>不知道每个同事花了多少钱，只知道产出了多少张、多少秒</li>
+        <li>没有配额，任何人可以无限提交——一个手滑的批量任务就能烧掉预算</li>
+        <li>没有失败成本核算：统计只记 <code>jobs</code> 提交数，<strong>不记成功/失败</strong>。而生成失败同样烧钱</li>
+      </ul>
+
+      <div class="note risk">
+        <span class="lbl">为什么这是第一优先级</span>
+        视频生成单价不低，13 个活跃用户每天 200+ 任务。这笔钱花得对不对、有没有人在浪费，你现在无法回答。上公网给外部客户时，这是绝对的 Blocker。
+      </div>
+
+      <p><strong>建议做法</strong>：</p>
+      <ul>
+        <li><code>apps.json</code> 里已有 <code>metrics</code> / <code>unit_label</code> / <code>stats_combine</code>——顺这个思路加 <code>unit_price</code>，成本核算就能复用现有统计管道</li>
+        <li>任务落库时记 <code>status</code>（success / failed / cancelled）和 <code>retry_count</code></li>
+        <li>统计页加「本月花费」「失败率」「人均成本」三个数</li>
+        <li>配额做成软限制先跑：超额只提示不拦截，观察一个月再决定要不要硬拦</li>
+      </ul>
+
+      <h3><span class="h3num">3.2</span>原始使用明细留存不到 5 分钟</h3>
+
+      <p><strong>实测</strong>：<code>portal/app.py:936-938</code> 把<strong>每一个 HTTP 请求</strong>都写进 <code>records</code>，包括前端每 5 秒一次的 <code>/api/jobs</code> 轮询。上限 1000 条，超过 2000 截断。</p>
+
+      <div class="measured">今日请求量  feishu-agent 22693 · nano-banana 18541 · seedance 16581 · …
+records 实际跨度  13:25:38 → 13:29:40   ← 只剩 4 分钟
+记录字段  time, app, ip, method, path, username</div>
+
+      <p>聚合数据（<code>daily</code> / <code>by_user</code>）是完好的，但凡是需要查明细的场景全部失效：「昨天下午谁把 seedance 打满了」「这个失败任务是谁提的」——查不了。</p>
+
+      <p><strong>建议做法</strong>：轮询类 GET 不入 <code>records</code>，只记任务创建等有业务含义的事件。量会掉两个数量级，再把上限提到几万条即可覆盖数周。</p>
+
+      <h3><span class="h3num">3.3</span>数据资产在膨胀但没人管</h3>
+
+      <figure>
+        <div class="bars">
+          <div class="bar-row">
+            <span class="chip"><i class="dot d-seedance"></i>Seedance</span>
+            <div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--app-seedance)"></div></div>
+            <span class="bar-val">5.8G</span>
+          </div>
+          <div class="bar-row">
+            <span class="chip"><i class="dot d-image"></i>图像生成</span>
+            <div class="bar-track"><div class="bar-fill" style="width:34.5%;background:var(--app-image)"></div></div>
+            <span class="bar-val">2.0G</span>
+          </div>
+          <div class="bar-row">
+            <span class="chip"><i class="dot d-agent"></i>飞书 Agent</span>
+            <div class="bar-track"><div class="bar-fill" style="width:4.3%;background:var(--app-agent)"></div></div>
+            <span class="bar-val">254M</span>
+          </div>
+          <div class="bar-row">
+            <span class="chip"><i class="dot d-portrait"></i>人像生成</span>
+            <div class="bar-track"><div class="bar-fill" style="width:1.2%;background:var(--app-portrait)"></div></div>
+            <span class="bar-val">69M</span>
+          </div>
+          <div class="bar-row">
+            <span class="chip"><i class="dot d-dreamina"></i>Dreamina</span>
+            <div class="bar-track"><div class="bar-fill" style="width:.7%;background:var(--app-dreamina)"></div></div>
+            <span class="bar-val">37M</span>
+          </div>
+        </div>
+        <figcaption>各子应用 <code>outputs/</code> 体积，合计约 8.2G；仓库整体 31G（含 .git 与虚拟环境），磁盘剩余 80G。</figcaption>
+      </figure>
+
+      <ul>
+        <li><code>feishu-generation-agent.log</code> 已 <strong>108MB</strong>，且全项目 grep <code>RotatingFileHandler</code> / <code>logrotate</code> —— 零命中，<strong>无日志轮转</strong></li>
+        <li><code>tools/</code> 下有 <code>cleanup_old_media.py</code>、<code>cleanup_server.py</code>，但没有定时任务在跑</li>
+      </ul>
+
+      <p><strong>建议做法</strong>：日志轮转；产出文件加保留策略（比如 90 天前自动归档，飞书表格已有归档兜底）；统计页加磁盘水位提示。</p>
+    </section>
+
+    <section id="s4">
+      <div class="sec-head">
+        <span class="sec-num">四</span>
+        <h2>前端升级建议</h2>
+      </div>
+
+      <p>现状：<code>app.js</code> 2092 行 + <code>index.html</code> 880 行 + <code>styles.css</code> 831 行，PetiteVue，7 个 tab（3 个 iframe + 2 个原生组件 + 密钥库 + 统计）。响应式断点有 6 处，<code>viewport</code> 也有。</p>
+
+      <h3><span class="h3num">4.1</span>最高价值：跨应用的统一产出库</h3>
+
+      <p><strong>现状</strong>：历史记录只有 Dreamina 内部有（<code>index.html:246</code> 的「历史」子 tab）。其他四个应用产出的东西，用完就散在各自 <code>outputs/</code> 里。</p>
+
+      <p><strong>问题</strong>：同事昨天生成的那张图想再用，得先回忆是在哪个 tab 做的，然后在那个 tab 里翻。<em>31G 素材实际上是不可检索的。</em></p>
+
+      <p><strong>建议</strong>：加一个「我的产出」tab——跨应用、按时间倒序、缩略图墙、按应用/类型/日期筛选、点击看参数、一键复用参数重生成。这是把沉睡数据变成资产的关键一步，也是同事感知最直接的功能。技术上不难：各子应用已有 <code>job_owners</code>（4099 条映射）和统一的下载 token 机制。</p>
+
+      <h3><span class="h3num">4.2</span>能力落差：好东西只有一个应用有</h3>
+
+      <p>盘完发现几处明显的「A 有 B 没有」，补齐就是低成本高感知的升级：</p>
+
+      <div class="twrap">
+        <table>
+          <thead><tr><th>能力</th><th>现状</th><th>建议</th></tr></thead>
+          <tbody>
+            <tr><td><strong>AI 提示词优化</strong></td><td>只有 Seedance 有<br>（DeepSeek + 229 行 SKILL.md）</td><td>图像类应用同样需要，抽成 Portal 级公共服务</td></tr>
+            <tr><td><strong>多标签工作区</strong></td><td>只有 Seedance / 图像生成有</td><td>人像生成、Dreamina 缺失</td></tr>
+            <tr><td><strong>历史记录</strong></td><td>只有 Dreamina 有</td><td>见 4.1，统一做</td></tr>
+            <tr><td><strong>toast 提示</strong></td><td>只有 Dreamina 局部有<br>（<code>dm-hist-toast</code>）</td><td>全局统一反馈组件</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3><span class="h3num">4.3</span>体验细节</h3>
+
+      <ul>
+        <li><strong>任务队列可视化</strong>：现在提交后靠 5 秒轮询刷状态，没有「我排在第几个 / 预计还要多久」。视频生成动辄几分钟，这个焦虑感很实在</li>
+        <li><strong>深色模式</strong>：grep <code>prefers-color-scheme</code> 零命中。同事白天用得多，优先级不高，但成本也低</li>
+        <li><strong>移动端</strong>：断点有了，但 iframe 里子应用是 <code>height:calc(100vh - 48px)</code> 固定，手机上体验待实测</li>
+      </ul>
+    </section>
+
+    <section id="s5">
+      <div class="sec-head">
+        <span class="sec-num">五</span>
+        <h2>技术债：会挡住未来的</h2>
+      </div>
+
+      <h3><span class="h3num">5.1</span><code>cgi</code> 模块 = Python 3.13 硬 Blocker</h3>
+
+      <p><code>cgi</code> 在 Python 3.13 已移除，而它<strong>深度渗透在业务函数签名里</strong>——Seedance / 图像生成 / 人像生成三个 <code>app.py</code> 的十几处函数都以 <code>form: cgi.FieldStorage</code> 为参数类型。</p>
+
+      <div class="note win">
+        <span class="lbl">好消息</span>
+        FastAPI 壳里已经有 <code>_FormShim</code> 适配层（<code>seedance/app_fastapi.py:130</code>），迁移路径已铺好——只需把 legacy 函数的类型注解和取值方式换掉，不用重写解析逻辑。成本比看起来低。
+      </div>
+
+      <h3><span class="h3num">5.2</span>Dreamina 的存在感与维护成本不匹配</h3>
+
+      <p>2964 行代码、双前端兼容负担（Portal 发 FormData / 独立前端发 JSON）、双守卫权限机制，换来每天 0–2 个任务。</p>
+
+      <p><strong>产品决策建议</strong>：明确它的去向——要么下线（保留数据、移除 tab），要么合并进其他应用。继续维持现状是持续的隐性成本，每次全局改动都要多测一个应用。</p>
+
+      <h3><span class="h3num">5.3</span>外网通道状态与文档不符（需你确认）</h3>
+
+      <div class="measured">com.ai-portal-tunnel   正在运行
+PID 91934              cloudflared tunnel --url http://127.0.0.1:9090
+CLAUDE.md 记载          「cloudflared 已 unload，改走局域网 HTTPS」</div>
+
+      <div class="note risk">
+        <span class="lbl">为什么要提</span>
+        这是 quick tunnel（随机 <code>trycloudflare.com</code> 域名），意味着服务当前<strong>对公网可达</strong>。配合上面的「无配额、无成本核算、密钥库在里面」，这个暴露面值得确认是有意开启还是遗留。<br><br>
+        如果是有意的，那 3.1 的配额和 <code>X-Is-Admin</code> 明文签名问题（<code>docs/security-hardening-v2-plan.md</code> 1b 条，实测 grep <code>internal_secret</code> 零命中、<strong>未修</strong>）优先级要往上提。
+      </div>
+    </section>
+
+    <section id="s6">
+      <div class="sec-head">
+        <span class="sec-num">六</span>
+        <h2>建议的优先级排序</h2>
+      </div>
+
+      <p>按「用户感知 × 风险 ÷ 成本」排，不按技术兴趣排。</p>
+
+      <div class="tier t0">
+        <div class="tier-head"><span class="tier-tag">P0</span><span class="tier-why">先做，因为涉及钱和风险</span></div>
+        <ol>
+          <li>成本核算 + 失败率统计（顺 <code>apps.json</code> 的 metrics 管道扩展）</li>
+          <li>确认外网通道意图；若保留则修 <code>X-Is-Admin</code> HMAC 签名</li>
+          <li>修 <code>records</code> 污染，让明细可查</li>
+          <li>日志轮转 + 产出保留策略</li>
+        </ol>
+      </div>
+
+      <div class="tier t1">
+        <div class="tier-head"><span class="tier-tag">P1</span><span class="tier-why">同事感知最强</span></div>
+        <ol start="5">
+          <li>跨应用统一产出库（「我的产出」tab）</li>
+          <li>提示词优化提升为 Portal 公共能力</li>
+          <li>任务队列可视化（排队位置 + 预计时间）</li>
+          <li>软配额（先只提示）</li>
+        </ol>
+      </div>
+
+      <div class="tier t2">
+        <div class="tier-head"><span class="tier-tag">P2</span><span class="tier-why">结构性</span></div>
+        <ol start="9">
+          <li>飞书 Super Agent P1–P5（已有完整 plan，是最大增长点）</li>
+          <li><code>cgi</code> 迁移（复用已有 <code>_FormShim</code>）</li>
+          <li>Dreamina 去向决策</li>
+        </ol>
+      </div>
+
+      <div class="tier t3">
+        <div class="tier-head"><span class="tier-tag">P3</span><span class="tier-why">锦上添花</span></div>
+        <ol start="12">
+          <li>深色模式、全局 toast、移动端实测</li>
+        </ol>
+      </div>
+    </section>
+
+    <section id="s7">
+      <div class="sec-head">
+        <span class="sec-num">附录</span>
+        <h2>CLAUDE.md 快照偏差</h2>
+      </div>
+
+      <p><code>## 当前状态快照</code> 标注 verified 2026-07-03，实测已有多处偏差：</p>
+
+      <div class="twrap">
+        <table>
+          <thead><tr><th>快照说法</th><th>实测</th></tr></thead>
+          <tbody>
+            <tr><td>cloudflared 已 unload</td><td><strong>正在运行</strong>（PID 91934）</td></tr>
+            <tr><td>plist 里是 <code>/usr/bin/python3</code>（3.9）</td><td>已是 <code>/opt/homebrew/bin/python3.12</code></td></tr>
+            <tr><td>子应用为 stdlib <code>http.server</code></td><td>四个子应用<strong>全部跑 uvicorn / FastAPI</strong></td></tr>
+            <tr><td>子应用注册是硬编码</td><td>已由 <code>portal/apps.json</code> 驱动</td></tr>
+            <tr><td>端口表缺 feishu-generation-agent</td><td>实际占用 8765，已是 Portal 第五个 tab</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note win">
+        <span class="lbl">另有两项已修但文档未更新</span>
+        <code>docs/pending-fixes.md</code> 的 P0（<code>_proxy()</code> 无 timeout 导致假死）<strong>已修</strong>——<code>portal/app.py</code> 五处 <code>HTTPConnection</code> 均已带 timeout。路径穿越校验（security-hardening 1a）也已修，各子应用都有 <code>is_relative_to</code> 校验。
+      </div>
+    </section>
+
+  </main>
+
+  <footer>
+    <span>生成中台升级评审 · 2026-08-14</span>
+    <span>结论基于本机实测与代码核对</span>
+  </footer>
+
+</div>
