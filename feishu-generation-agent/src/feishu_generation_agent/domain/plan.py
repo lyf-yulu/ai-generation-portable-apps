@@ -165,8 +165,14 @@ class GenerationTask(BaseModel):
         slots = self.prompt_slots or parse_prompt_slots(self.prompt)
         if slots is None:
             return
-        if not slots.canvas.strip() and self.size_variants:
-            # 画布尺寸没给就用交付尺寸兜底，避免模板缺这一句。
+        # 画布必须是交付尺寸。模型常把安全区写成画布（实测「画布：1080*2080」
+        # 而交付尺寸是 1700x2500），照抄会让主体按小一圈的框构图。
+        canvas = slots.canvas.strip()
+        safe = (self.safe_area or "").strip().lower().replace("×", "x").replace("*", "x")
+        canvas_normalized = canvas.lower().replace("×", "x").replace("*", "x")
+        if self.size_variants and (
+            not canvas or (safe and canvas_normalized == safe)
+        ):
             slots = slots.model_copy(
                 update={"canvas": self.size_variants[0].replace("x", "*")}
             )
