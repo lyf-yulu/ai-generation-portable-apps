@@ -1320,6 +1320,14 @@ function SeedanceApp() {
         this.savedMedia = {};
       }
 
+      // Re-narrow duration/resolution/ratio to the restored model's limits.
+      // The loop above writes the model <select> with `el.value = ...`, which
+      // does NOT fire a 'change' event, so the listener wired in init() never
+      // runs on restore. Without this call the duration input keeps the static
+      // max="15" from index.html, and the number-stepper refuses to reach 30
+      // even when Seedance 2.5 (duration_range [4,30]) is selected.
+      this.applyModelLimits();
+
       const mediaCount = Object.keys(this.savedMedia).length;
       if (mediaCount) this.archiveHint = '已读取保存配置：' + mediaCount + ' 个素材';
     },
@@ -1533,6 +1541,11 @@ function SeedanceApp() {
       if (form) form.reset();
       this.savedMedia = {};
       if (typeof this.loadPreset === 'function') this.loadPreset();
+      // form.reset() restores the duration input's default *value* but not the
+      // min/max *attributes* we set from the previous tab's model, and a tab
+      // with no saved draft never reaches applyPreset(). Re-narrow here so the
+      // limits always match whichever model the select is actually showing.
+      this.applyModelLimits();
 
       // If a background pollJob stashed a job snapshot for this tab, replay it
       // into the DOM. Otherwise clear any stale DOM left by the previous tab.
