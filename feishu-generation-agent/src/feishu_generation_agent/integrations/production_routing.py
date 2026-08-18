@@ -40,5 +40,7 @@ class ProductionRoutingDeliveryWriter:
         if await self._store.get_by_run(run_id) is not None:
             return self._production
         if self._legacy is None:
-            raise ValueError("legacy document delivery is not configured")
+            # 直连入口的 run 没有生产表绑定：legacy 未配置时进统一结果表兜底，
+            # 否则这类 run 的产出无处可去（2026-08-18 线上交付失败根因）。
+            return self._production
         return self._legacy

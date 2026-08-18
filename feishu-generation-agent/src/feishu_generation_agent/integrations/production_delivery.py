@@ -3,8 +3,11 @@ from typing import Any
 
 from feishu_generation_agent.domain.artifact import Artifact, DeliveryRecord
 from feishu_generation_agent.domain.document import NormalizedDocument
-from feishu_generation_agent.domain.plan import TaskPlan
-from feishu_generation_agent.domain.production_bitable import ResultTableTarget
+from feishu_generation_agent.domain.plan import TaskPlan, TaskType
+from feishu_generation_agent.domain.production_bitable import (
+    ProductionSourceSnapshot,
+    ResultTableTarget,
+)
 from feishu_generation_agent.integrations.bitable_delivery import BitableResultWriter
 from feishu_generation_agent.storage.production_tasks import ProductionTaskStore
 from feishu_generation_agent.storage.repository import Repository
@@ -43,8 +46,11 @@ class ProductionResultWriter:
         if not artifacts:
             raise ValueError("没有可写入结果表的生成产物")
         binding = await self._store.get_by_run(run_id)
-        if binding is None:
-            raise ValueError("生产表运行不存在")
+        snapshot = (
+            binding.snapshot
+            if binding is not None
+            else _synthesize_snapshot(document, plan)
+        )
         await self._save_context_if_absent(run_id, document, plan)
         target = await self._ensure_target()
         tokens = [
@@ -52,7 +58,7 @@ class ProductionResultWriter:
             for artifact in artifacts
         ]
         delivery = await self._store.reserve_delivery(run_id)
-        fields = _result_fields(binding.snapshot, tokens)
+        fields = _result_fields(snapshot, tokens)
         if delivery.result_record_id:
             await self._client.update_bitable_record(target.app_token, target.table_id, delivery.result_record_id, fields)
             record_id = delivery.result_record_id
@@ -180,6 +186,25 @@ class ProductionResultWriter:
             run_id, artifact.model_copy(update={"feishu_file_token": token})
         )
         return token
+
+
+def _synthesize_snapshot(
+    document: NormalizedDocument, plan: TaskPlan
+) -> ProductionSourceSnapshot:
+    """直连入口的 run 没有生产表绑定：用文档标题与任务类型合成快照，
+    结果仍进统一结果表（2026-08-18 起生效）。"""
+    task_types = {task.task_type for task in plan.tasks}
+    task_type = (
+        "图片类"
+        if task_types
+        and all(t.value == TaskType.IMAGE_TO_IMAGE.value for t in task_types)
+        else "动画类"
+    )
+    return ProductionSourceSnapshot(
+        requirement_name=document.title,
+        task_type=task_type,
+        requirement_attachment="",
+    )
 
 
 def _result_fields(snapshot, file_tokens: list[str]) -> dict[str, object]:

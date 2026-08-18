@@ -21,10 +21,16 @@ class RoutingDeliveryWriter:
         *,
         bitable: DeliveryWriter,
         legacy: DeliveryWriter | None = None,
+        fallback: DeliveryWriter | None = None,
     ) -> None:
         self._bindings = bindings
         self._bitable = bitable
         self._legacy = legacy
+        self._fallback = fallback
+
+    def set_fallback(self, writer: DeliveryWriter) -> None:
+        """无绑定且 legacy 未配置时使用的兜底 writer（统一结果表）。"""
+        self._fallback = writer
 
     async def deliver(
         self,
@@ -44,5 +50,7 @@ class RoutingDeliveryWriter:
         if await self._bindings.get_by_run(run_id) is not None:
             return self._bitable
         if self._legacy is None:
-            raise ValueError("legacy document delivery is not configured")
+            if self._fallback is None:
+                raise ValueError("legacy document delivery is not configured")
+            return self._fallback
         return self._legacy

@@ -448,6 +448,10 @@ async def _open_application_services(
                 repository=repository,
                 result_folder_token=settings.lark_result_folder_token or "",
             )
+            if isinstance(delivery_writer, RoutingDeliveryWriter):
+                # 直连入口的 run 没有任何 bitable 绑定：legacy 未配置时
+                # 统一结果表兜底，避免产出无处可去（2026-08-18 线上故障根因）。
+                delivery_writer.set_fallback(production_writer)
             delivery_writer = ProductionRoutingDeliveryWriter(
                 production_store,
                 production=production_writer,
