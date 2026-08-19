@@ -28,6 +28,13 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 _DATA_BASE = Path(os.environ.get("DATA_DIR", str(ROOT)))
 STATIC_DIR = ROOT / "static"
+
+# Share Ark error translations with seedance — same Ark video endpoint, same
+# error taxonomy. See portal/ark_errors.py for the matcher rules.
+_PORTAL_DIR = str(ROOT.parent / "portal")
+if _PORTAL_DIR not in sys.path:
+    sys.path.insert(0, _PORTAL_DIR)
+from ark_errors import translate_ark_error  # noqa: E402
 OUTPUT_DIR = _DATA_BASE / "outputs"
 STATE_DIR = _DATA_BASE / "state"
 LOG_DIR = _DATA_BASE / "logs"
@@ -35,6 +42,21 @@ UPLOAD_DIR = _DATA_BASE / "uploads"
 
 for d in [OUTPUT_DIR, STATE_DIR, LOG_DIR, UPLOAD_DIR]:
     d.mkdir(parents=True, exist_ok=True)
+
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
+
+
+def _safe_join_or_root(base: Path, rel: str) -> str:
+    """Traversal guard: join base/rel and reject anything outside base."""
+    try:
+        base_resolved = base.resolve()
+        target = (base / rel).resolve()
+    except (OSError, ValueError):
+        return str(base)
+    if target == base_resolved or target.is_relative_to(base_resolved):
+        return str(target)
+    return str(base)
+
 
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8891"))
@@ -49,8 +71,41 @@ _PORTAL_SSL_CTX.check_hostname = False
 _PORTAL_SSL_CTX.verify_mode = _ssl.CERT_NONE
 
 
+PORTAL_SIG_WINDOW = int(os.environ.get("PORTAL_SIG_WINDOW", "60"))
+
+
+def _verify_portal_sig(handler) -> bool:
+    """HMAC-verify the X-Portal-Sig header set by Portal.
+
+    Sub-apps bind to 127.0.0.1 today, but this defense-in-depth check means
+    any request without a valid signature is treated as unauthenticated even
+    if it manages to reach the sub-app directly."""
+    secret = os.environ.get("PORTAL_INTERNAL_TOKEN", "")
+    if not secret:
+        return False
+    sig = handler.headers.get("X-Portal-Sig") or ""
+    ts_raw = handler.headers.get("X-Portal-Ts") or ""
+    if not sig or not ts_raw:
+        return False
+    try:
+        ts = int(ts_raw)
+    except (TypeError, ValueError):
+        return False
+    if abs(int(time.time()) - ts) > PORTAL_SIG_WINDOW:
+        return False
+    username = handler.headers.get("X-Username", "") or ""
+    is_admin_flag = "1" if handler.headers.get("X-Is-Admin") == "1" else "0"
+    msg = f"{ts}:{is_admin_flag}:{username}".encode("utf-8")
+    expected = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
+def _is_admin(handler) -> bool:
+    return handler.headers.get("X-Is-Admin") == "1" and _verify_portal_sig(handler)
+
+
 def _view_scope(handler) -> tuple[bool, str]:
-    sees_all = handler.headers.get("X-Is-Admin", "") == "1"
+    sees_all = _is_admin(handler)
     username = _decode_username(handler)
     return sees_all, username
 
@@ -346,6 +401,35 @@ JOBS_LOCK = threading.Lock()
 GROUP_LOCK = threading.Lock()
 ASSET_LOCK = threading.Lock()
 FILES_LOCK = threading.Lock()
+
+# JOBS is in-memory and used to be unbounded. We evict *finished* jobs once JOBS
+# exceeds MAX_JOBS (this also drops the per-job api_key copy from memory sooner).
+# JOB_PRUNE_GRACE_SECONDS interlocks with Portal's usage tracker (polls
+# GET /api/jobs/<id> every 15s, credits by_user.images only on a terminal
+# status) — 600s >> the poll cycle guarantees a job is counted before eviction.
+MAX_JOBS = 500
+JOB_PRUNE_GRACE_SECONDS = 600
+_TERMINAL_JOB_STATUSES = ("succeeded", "failed", "completed")
+
+
+def _prune_jobs_locked() -> None:
+    """Evict old finished jobs when JOBS exceeds MAX_JOBS. Caller must hold
+    JOBS_LOCK. Running/queued jobs are never touched; the grace window ensures
+    Portal's usage poller has already counted anything we evict."""
+    if len(JOBS) <= MAX_JOBS:
+        return
+    now = time.time()
+    evictable = [
+        (job.get("finished_at") or 0, jid)
+        for jid, job in JOBS.items()
+        if job.get("status") in _TERMINAL_JOB_STATUSES
+        and (now - (job.get("finished_at") or now)) > JOB_PRUNE_GRACE_SECONDS
+    ]
+    evictable.sort(key=lambda t: t[0])
+    for _, jid in evictable:
+        if len(JOBS) <= MAX_JOBS:
+            break
+        JOBS.pop(jid, None)
 ACTIVITY_LOCK = threading.Lock()
 
 
@@ -475,7 +559,7 @@ def handle_config_post(handler):
     """Update runtime config (output_dir, and admin-only api_key/access_key/secret_key)."""
     data = read_json_body(handler)
     updates = {}
-    is_admin = handler.headers.get("X-Is-Admin") == "1"
+    is_admin = _is_admin(handler)
     if "output_dir" in data:
         p = (data["output_dir"] or "").strip()
         if not p:
@@ -608,8 +692,68 @@ def _openapi_v4_sign(ak, sk, method, host, uri, query, headers, payload):
 PROJECT_NAME = "Seedance2.0"
 
 
+# ============================================================
+# 重试策略
+# ============================================================
+# volcengine 的 HTTP 调用（openapi_call / ark_v3_call）不抛异常，而是返回
+# {"error": "HTTP 5xx", ...} 字典。这里用一个通用包装器：当返回的错误码属于
+# 瞬态错误（429/5xx）时自动重试，指数退避（1s→32s，最多 6 次）。
+# 4xx 客户端错误（除 408/429）不重试，直接返回。
+
+_RETRYABLE_HTTP_CODES = (408, 429, 500, 502, 503, 504)
+
+
+def _extract_http_code(result: dict) -> int | None:
+    """从 {"error": "HTTP 503", ...} 里提取状态码；非 HTTP 错误返回 None。"""
+    if not isinstance(result, dict):
+        return None
+    err = str(result.get("error") or "")
+    m = re.match(r"HTTP (\d+)", err)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _call_with_retry(fn, *, label: str, max_retries: int = 6):
+    """
+    调用 fn()（返回结果字典），对瞬态错误自动重试。
+
+    - 返回 {"error": "HTTP 429/5xx"} 或网络错误（error 存在但无 HTTP 码）→ 重试
+    - 返回 {"error": "HTTP 4xx"}（非 408/429）→ 立即返回，不重试
+    - 成功（无 error 字段）→ 立即返回
+    """
+    last_result = None
+    for attempt in range(max_retries):
+        result = fn()
+        last_result = result
+        if not isinstance(result, dict) or not result.get("error"):
+            return result  # 成功
+        code = _extract_http_code(result)
+        # 有明确 HTTP 码但不可重试 → 立即返回
+        if code is not None and code not in _RETRYABLE_HTTP_CODES:
+            return result
+        # 可重试（429/5xx 或无 HTTP 码的网络错误）
+        if attempt < max_retries - 1:
+            backoff = min(2 ** attempt, 32)
+            print(f"  [retry] {label} attempt {attempt+1}/{max_retries} failed ({result.get('error')}), retrying in {backoff}s", flush=True)
+            time.sleep(backoff)
+            continue
+    return last_result
+
+
 def openapi_call(action, body, ak=None, sk=None, timeout=120):
-    """Call Volcengine OpenAPI (Asset API) with AK/SK SigV4 signing."""
+    """Call Volcengine OpenAPI (Asset API) with AK/SK SigV4 signing.
+
+    自动重试瞬态错误（429/5xx/网络错误，指数退避 1s→32s，最多 6 次）。
+    """
+    return _call_with_retry(
+        lambda: _openapi_call_once(action, body, ak=ak, sk=sk, timeout=timeout),
+        label=f"openapi:{action}",
+    )
+
+
+def _openapi_call_once(action, body, ak=None, sk=None, timeout=120):
+    """Single OpenAPI call attempt (no retry)."""
     ak = ak or ACCESS_KEY
     sk = sk or SECRET_KEY
     if not ak or not sk:
@@ -661,7 +805,18 @@ def openapi_result(response):
 # === Ark API v3 calls (Bearer token) for video generation ===
 
 def ark_v3_call(method, path, body=None, timeout=120, api_key=None):
-    """Call Ark API v3 (video generation, files) with Bearer token."""
+    """Call Ark API v3 (video generation, files) with Bearer token.
+
+    自动重试瞬态错误（429/5xx/网络错误，指数退避 1s→32s，最多 6 次）。
+    """
+    return _call_with_retry(
+        lambda: _ark_v3_call_once(method, path, body=body, timeout=timeout, api_key=api_key),
+        label=f"ark_v3:{method} {path}",
+    )
+
+
+def _ark_v3_call_once(method, path, body=None, timeout=120, api_key=None):
+    """Single Ark v3 call attempt (no retry)."""
     url = f"{ARK_BASE_URL}{path}"
     data = json.dumps(body).encode("utf-8") if body else None
     headers = {"Authorization": f"Bearer {api_key or API_KEY}"}
@@ -947,11 +1102,27 @@ def handle_virtual_assets_post(handler):
     elif fmime.startswith("audio/"):
         asset_type = "Audio"
 
-    # Upload to a public host to get an accessible URL for CreateAsset
-    source_url = _upload_to_public_host(fdata, fname, fmime)
-    if not source_url:
-        json_response(handler, 502, {"ok": False, "error": "failed to get public URL for file"})
-        return
+    # Upload to a location Ark can fetch. TOS 优先（大文件稳定，尤其视频），
+    # 未配 TOS 时回退 uguu.se 免费图床以兼容旧部署。TOS 若配了却上传失败，
+    # 直接抛错不回退——否则权限 / bucket / region 错配会被静默回退掩盖，
+    # 让人误以为已经在走 TOS。
+    source_url = None
+    if TOS_ACCESS_KEY and TOS_SECRET_KEY and TOS_BUCKET:
+        try:
+            source_url = tos_upload(fdata, fmime, fname)
+            print(f"  [asset_upload] TOS OK ({len(fdata)} bytes, {fmime})", flush=True)
+        except Exception as e:
+            print(f"  [asset_upload] TOS FAIL: {e}", flush=True)
+            json_response(handler, 502, {
+                "ok": False,
+                "error": f"TOS 上传失败: {e}",
+            })
+            return
+    else:
+        source_url = _upload_to_public_host(fdata, fname, fmime)
+        if not source_url:
+            json_response(handler, 502, {"ok": False, "error": "failed to get public URL for file"})
+            return
 
     # Call CreateAsset via OpenAPI
     create_body = {
@@ -961,7 +1132,9 @@ def handle_virtual_assets_post(handler):
         "ProjectName": PROJECT_NAME,
     }
     if data_name := (form.getfirst("name") or "").strip():
-        create_body["Name"] = data_name
+        # Ark caps Name at 64 chars; a long filename otherwise trips
+        # InvalidParameter.Name (HTTP 400). Truncate instead of failing.
+        create_body["Name"] = data_name[:64]
 
     result = openapi_call("CreateAsset", create_body, ak=ak, sk=sk)
     if "error" in result:
@@ -981,6 +1154,9 @@ def handle_virtual_assets_post(handler):
             "group_id": group_id,
             "status": "processing",
             "file_name": fname,
+            # Record the type so generation can route asset:// to the right
+            # content field (image_url/video_url/audio_url) without a GetAsset.
+            "asset_type": asset_type,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "raw": result,
         }
@@ -1195,7 +1371,7 @@ _PURGE_MAX_GROUPS = 200
 def handle_virtual_groups_purge(handler):
     """Bulk-delete AIGC groups whose ID date is strictly before `before_date`.
     Admin only. See docs/superpowers/specs/2026-07-02-portrait-purge-old-groups-design.md."""
-    if handler.headers.get("X-Is-Admin", "") != "1":
+    if not _is_admin(handler):
         json_response(handler, 403, {"ok": False, "error": "admin only"})
         return
 
@@ -1448,7 +1624,12 @@ def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
             "extra_asset_ids": extra_asset_ids,
             "prompt": prompt,
             "model": model,
-            "duration": duration,
+            # Two fields on purpose. `requested_duration` is what Ark receives and
+            # may legitimately be -1 ("model picks the length"). `duration` is what
+            # Portal's usage poller bills as done * duration, so it must never be
+            # negative — it stays 0 until the real length is backfilled on success.
+            "requested_duration": duration,
+            "duration": max(0, duration),
             "resolution": resolution,
             "ratio": ratio,
             "status": "queued",
@@ -1466,6 +1647,7 @@ def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
             "api_key": api_key,
             "output_dir": output_dir_str,
         }
+        _prune_jobs_locked()
     title = (prompt or "").strip()[:80] or f"{task_type} task"
     record_activity({
         "id": activity_id,
@@ -1542,13 +1724,55 @@ def run_virtual_job(job_id):
     report_final_to_portal(job_id, final_status)
 
 
+def _asset_type_for(asset_id, cache=None):
+    """Resolve a virtual-portrait asset's AssetType (Image/Video/Audio).
+
+    The generation payload must reference an asset in the field matching its
+    real type: a Video asset put into content[].image_url.url is rejected by Ark
+    with "the specified asset is not an image" (HTTP 400). asset:// references
+    only carry the ID, so we look the type up.
+
+    Source order: (1) per-job cache, (2) in-memory ASSETS cache if it recorded a
+    type, (3) authoritative GetAsset. Falls back to "Image" only when everything
+    is unavailable — matching the historic assumption so pure-image jobs keep
+    working even if the lookup fails."""
+    if cache is not None and asset_id in cache:
+        return cache[asset_id]
+    atype = ""
+    with ASSET_LOCK:
+        local = ASSETS.get(asset_id)
+        if isinstance(local, dict):
+            atype = (local.get("asset_type") or "").strip()
+    if not atype:
+        result = openapi_call("GetAsset", {"Id": asset_id, "ProjectName": PROJECT_NAME})
+        if "error" not in result:
+            atype = (openapi_result(result).get("AssetType") or "").strip()
+    atype = atype or "Image"
+    if cache is not None:
+        cache[asset_id] = atype
+    return atype
+
+
+def _asset_content_item(asset_id, cache=None):
+    """Build one content[] entry for an asset:// reference, routed to the
+    image_url / video_url / audio_url field that matches the asset's type."""
+    atype = _asset_type_for(asset_id, cache=cache).lower()
+    url = f"asset://{asset_id}"
+    if atype == "video":
+        return {"type": "video_url", "video_url": {"url": url}, "role": "reference_video"}
+    if atype == "audio":
+        return {"type": "audio_url", "audio_url": {"url": url}, "role": "reference_audio"}
+    return {"type": "image_url", "image_url": {"url": url}, "role": "reference_image"}
+
+
 def _run_virtual_job_impl(job_id, job):
     api_key = job.get("api_key")
     asset_id = job.get("asset_id", "")
     extra_asset_ids = job.get("extra_asset_ids", []) or []
     prompt = job.get("prompt", "")
     model = job.get("model", "doubao-seedance-2-0-260128")
-    duration = int(job.get("duration", 12))
+    # Read the requested value (may be -1), not the billing-safe `duration`.
+    duration = int(job.get("requested_duration", job.get("duration", 12)))
     resolution = job.get("resolution", "720p")
     ratio = job.get("ratio", "16:9")
     repeat_count = int(job.get("total", 1))
@@ -1559,17 +1783,23 @@ def _run_virtual_job_impl(job_id, job):
         job["started_at"] = time.time()
         job["events"].append({"time": time.strftime("%H:%M:%S"), "message": "开始提交生成任务..."})
 
+    # Resolve each asset's real type once per job (image/video/audio) so a video
+    # or audio virtual-portrait asset is referenced in the matching content field
+    # instead of being force-fitted into image_url (which Ark rejects with
+    # "the specified asset is not an image").
+    asset_type_cache: dict[str, str] = {}
+
     for idx in range(repeat_count):
-        # Build content array: text prompt + reference images
+        # Build content array: text prompt + reference assets
         images = []
-        # 图1: asset_id (required)
-        images.append({"type": "image_url", "image_url": {"url": f"asset://{asset_id}"}, "role": "reference_image"})
+        # 图1: asset_id (required) — routed by its real AssetType
+        images.append(_asset_content_item(asset_id, cache=asset_type_cache))
 
         # 图2+：先按顺序加入所有 extra asset 资产，再加入上传的 extras。两者不再互斥。
         for aid in extra_asset_ids:
             if not aid or not isinstance(aid, str):
                 continue
-            images.append({"type": "image_url", "image_url": {"url": f"asset://{aid}"}, "role": "reference_image"})
+            images.append(_asset_content_item(aid, cache=asset_type_cache))
         for eiu in extra_image_urls:
             mt = (eiu.get("mime_type") or "image/png").lower()
             if mt.startswith("video/"):
@@ -1614,7 +1844,15 @@ def _run_virtual_job_impl(job_id, job):
                         with FILES_LOCK:
                             FILES[file_token] = local_path
                         save_files_map()
+                    # Ark reports the produced length, which is the only source
+                    # of truth when the request asked for duration=-1. Portal
+                    # bills video seconds as done * job["duration"], so a
+                    # negative value there would subtract from by_user.seconds.
+                    actual_duration = task_result.get("duration")
                     with JOBS_LOCK:
+                        if (isinstance(actual_duration, (int, float)) and actual_duration > 0
+                                and int(job.get("duration") or 0) <= 0):
+                            job["duration"] = int(actual_duration)
                         job["results"].append({
                             "index": idx,
                             "task_id": task_id,
@@ -1626,23 +1864,41 @@ def _run_virtual_job_impl(job_id, job):
                         job["events"].append({"time": time.strftime("%H:%M:%S"), "message": f"Run {idx} 完成"})
                 else:
                     with JOBS_LOCK:
-                        job["results"].append({
-                            "index": idx,
-                            "task_id": task_id,
-                            "filename": f"output_{idx}.mp4",
-                            "download_url": extract_video_url(task_result) or "",
-                            "status": "succeeded",
-                        })
+                        job["errors"].append(f"Run {idx}: 任务已成功但没有视频地址")
                         job["done"] += 1
+                        job["events"].append({
+                            "time": time.strftime("%H:%M:%S"),
+                            "message": f"Run {idx} 失败: 任务已成功但没有视频地址",
+                        })
                 break
             elif t_status in ("failed", "error"):
+                # Surface Ark's error.code and message, and translate the
+                # common ones to Chinese so a non-English user doesn't need
+                # DevTools to know what went wrong (see portal/ark_errors.py).
+                err = task_result.get("error") if isinstance(task_result.get("error"), dict) else {}
+                code = str(err.get("code") or "").strip()
+                message = str(err.get("message") or "").strip()
+                zh = translate_ark_error(code, message) if code or message else None
+                if zh:
+                    detail = f"{code}: {message}" if code else message
+                    summary = f"Run {idx}: {zh} 原始错误：{detail}"
+                else:
+                    # Compose from whatever pieces Ark provided so nothing gets
+                    # swallowed: message alone, code alone, or both together.
+                    detail_bits = [b for b in (code, message) if b]
+                    detail = ": ".join(detail_bits) if len(detail_bits) == 2 else (detail_bits[0] if detail_bits else "")
+                    summary = f"Run {idx}: {t_status}" + (f" — {detail}" if detail else "")
                 with JOBS_LOCK:
-                    job["errors"].append(f"Run {idx}: {t_status}")
+                    job["errors"].append(summary)
                     job["done"] += 1
+                    job["events"].append({
+                        "time": time.strftime("%H:%M:%S"),
+                        "message": summary,
+                    })
                 break
 
     with JOBS_LOCK:
-        job["status"] = "succeeded" if len(job.get("results", [])) > 0 else "failed"
+        job["status"] = "failed" if job.get("errors") else "succeeded"
         job["finished_at"] = time.time()
         job["events"].append({"time": time.strftime("%H:%M:%S"), "message": f"任务结束: {job['status']}"})
         final_snapshot = {
@@ -1706,15 +1962,43 @@ def handle_real_groups_get(handler):
 # === HTTP Handler ===
 
 class Handler(SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        super().end_headers()
+
+    def _reject_oversized_upload(self) -> bool:
+        raw = self.headers.get("Content-Length")
+        if not raw:
+            return False
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return False
+        if n > MAX_UPLOAD_BYTES:
+            body = json.dumps({
+                "ok": False,
+                "error": f"upload too large: {n} bytes (limit {MAX_UPLOAD_BYTES})",
+            }).encode("utf-8")
+            self.send_response(413)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return True
+        return False
+
     def translate_path(self, path: str) -> str:
         path = urllib.parse.urlparse(path).path
         if path.startswith("/outputs/"):
-            return str((OUTPUT_DIR / path.removeprefix("/outputs/")).resolve())
+            return _safe_join_or_root(OUTPUT_DIR, path.removeprefix("/outputs/"))
         if path.startswith("/uploads/"):
-            return str((UPLOAD_DIR / path.removeprefix("/uploads/")).resolve())
+            return _safe_join_or_root(UPLOAD_DIR, path.removeprefix("/uploads/"))
         if path in {"/", "/index.html"}:
             return str(STATIC_DIR / "index.html")
-        return str((STATIC_DIR / path.lstrip("/")).resolve())
+        return _safe_join_or_root(STATIC_DIR, path.lstrip("/"))
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -1810,8 +2094,17 @@ class Handler(SimpleHTTPRequestHandler):
             self._serve_file(fpath)
             return
         if path.startswith("/uploads/"):
-            fpath = UPLOAD_DIR / path.removeprefix("/uploads/")
-            if fpath.exists():
+            rel = urllib.parse.unquote(path.removeprefix("/uploads/"))
+            try:
+                base_resolved = UPLOAD_DIR.resolve()
+                fpath = (UPLOAD_DIR / rel).resolve()
+            except (OSError, ValueError):
+                self.send_error(404)
+                return
+            if not (fpath == base_resolved or fpath.is_relative_to(base_resolved)):
+                self.send_error(403)
+                return
+            if fpath.exists() and fpath.is_file():
                 self._serve_file(fpath)
                 return
 
@@ -1843,6 +2136,8 @@ class Handler(SimpleHTTPRequestHandler):
             pass
 
     def do_POST(self):
+        if self._reject_oversized_upload():
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 

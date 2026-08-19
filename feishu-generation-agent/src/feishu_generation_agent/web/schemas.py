@@ -1,0 +1,163 @@
+from typing import Literal
+from urllib.parse import quote, urlsplit
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from feishu_generation_agent.domain.asset_library import CharacterAsset
+from feishu_generation_agent.domain.document import RequirementRequest
+from feishu_generation_agent.domain.plan import (
+    ApprovalDecision,
+    GenerationTask,
+    ImageReference,
+    ReferenceMode,
+)
+from feishu_generation_agent.integrations.feishu_source import parse_feishu_url
+
+
+class CreateRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_url: str = Field(min_length=1)
+    # 直连文档时由调用方声明产出类型；多维表格来的 run 走 binding 判定。
+    planning_mode: Literal["video", "image"] = "video"
+
+    @field_validator("source_url")
+    @classmethod
+    def validate_source_url(cls, value: str) -> str:
+        normalized = value.strip()
+        source_type, token = parse_feishu_url(normalized)
+        hostname = urlsplit(normalized).hostname
+        if hostname is None:
+            raise ValueError("飞书文档链接缺少域名")
+        return f"https://{hostname.lower()}/{source_type.value}/{quote(token, safe='')}"
+
+    def to_domain(self) -> RequirementRequest:
+        return RequirementRequest(
+            source_url=self.source_url.strip(),
+            planning_mode=self.planning_mode,
+        )
+
+
+class DecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["approve", "reject", "cancel"]
+    selected_task_ids: list[str] = Field(default_factory=list)
+    tasks: list[GenerationTask] = Field(default_factory=list)
+    feedback: str | None = None
+
+    @model_validator(mode="after")
+    def validate_action_fields(self) -> "DecisionRequest":
+        if self.action == "approve":
+            if not self.selected_task_ids:
+                raise ValueError("批准时必须选择至少一个任务")
+            if len(self.selected_task_ids) != len(set(self.selected_task_ids)):
+                raise ValueError("不能重复选择同一任务")
+            if self.feedback is not None:
+                raise ValueError("批准时不能提交退回意见")
+        elif self.action == "reject":
+            if self.feedback is None or not self.feedback.strip():
+                raise ValueError("退回重新规划时必须填写意见")
+            if self.selected_task_ids or self.tasks:
+                raise ValueError("退回时不能提交已选任务")
+        elif self.selected_task_ids or self.tasks or self.feedback is not None:
+            raise ValueError("取消时不能提交任务或意见")
+        return self
+
+    def to_domain(self) -> ApprovalDecision:
+        return ApprovalDecision.model_validate(self.model_dump(mode="json"))
+
+
+class ReferenceListRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    references: list[ImageReference] = Field(min_length=1)
+    reference_mode: ReferenceMode | None = None
+
+
+class PlannerPromptUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    prompt_text: str = Field(min_length=1, max_length=20_000)
+
+    @field_validator("prompt_text")
+    @classmethod
+    def validate_prompt_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("提示词不能为空白")
+        return value
+
+
+class PlannerPromptResponse(BaseModel):
+    mode: Literal["prime", "personal"]
+    editable: bool
+    prompt_text: str
+    version: int = Field(ge=0)
+    source: Literal["prime", "personal"]
+
+
+class BitableClaimResponse(BaseModel):
+    run_id: str
+
+
+class BitableRetryResponse(BitableClaimResponse):
+    status: Literal["accepted"] = "accepted"
+
+
+class AssetLibraryItem(BaseModel):
+    asset_id: str
+    name: str
+    variant: str
+    kind: str
+    description: str
+    aliases: list[str]
+    tags: list[str]
+    model_prefs: list[str]
+    prompt_fragment: str
+    url: str
+    mime_type: str
+    byte_size: int
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_domain(cls, asset: CharacterAsset) -> "AssetLibraryItem":
+        return cls(
+            asset_id=asset.asset_id,
+            name=asset.name,
+            variant=asset.variant,
+            kind=asset.kind.value,
+            description=asset.description,
+            aliases=list(asset.aliases),
+            tags=list(asset.tags),
+            model_prefs=list(asset.model_prefs),
+            prompt_fragment=asset.prompt_fragment,
+            url=asset.storage_url,
+            mime_type=asset.mime_type,
+            byte_size=asset.byte_size,
+            created_at=asset.created_at.isoformat(),
+            updated_at=asset.updated_at.isoformat(),
+        )
+
+
+class AssetLibraryListResponse(BaseModel):
+    items: list[AssetLibraryItem]
+    total: int
+
+    @classmethod
+    def from_domain(
+        cls, assets: list[CharacterAsset]
+    ) -> "AssetLibraryListResponse":
+        items = [AssetLibraryItem.from_domain(asset) for asset in assets]
+        return cls(items=items, total=len(items))
+
+
+class AssetLibraryUpdateRequest(BaseModel):
+    name: str | None = None
+    variant: str | None = None
+    kind: str | None = None
+    description: str | None = None
+    aliases: list[str] | None = None
+    tags: list[str] | None = None
+    model_prefs: list[str] | None = None
+    prompt_fragment: str | None = None

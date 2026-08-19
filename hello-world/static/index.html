@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <title>Hello World — Echo</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 40px; }
+    .card { max-width: 560px; margin: 0 auto; background: #1e293b; padding: 24px; border-radius: 8px; }
+    h1 { margin-top: 0; color: #6366f1; }
+    input, button { font-size: 14px; padding: 8px 12px; border-radius: 4px; }
+    input { width: 340px; background: #0f172a; border: 1px solid #334155; color: #e2e8f0; }
+    button { background: #6366f1; border: none; color: #fff; cursor: pointer; margin-left: 6px; }
+    pre { background: #0f172a; padding: 12px; border-radius: 6px; white-space: pre-wrap; margin-top: 14px; min-height: 40px; }
+    .hint { color: #64748b; font-size: 12px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Hello World</h1>
+    <p class="hint">最小 echo 子应用 —— 用来验证 portal 抽象层是否真的可用。提交一条消息，1 秒后返回。</p>
+    <form id="f">
+      <input id="m" placeholder="随便写点什么…" required>
+      <button type="submit">发送</button>
+    </form>
+    <pre id="out">等待输入…</pre>
+  </div>
+  <script>
+    const out = document.getElementById('out');
+    document.getElementById('f').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const msg = document.getElementById('m').value.trim();
+      if (!msg) return;
+      out.textContent = '提交中…';
+      const res = await fetch('/hello-world/api/jobs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: msg }),
+      });
+      const data = await res.json();
+      if (!data.ok) { out.textContent = '错误：' + (data.error || 'unknown'); return; }
+      const jobId = data.job_id;
+      out.textContent = `任务已提交（${jobId}），轮询中…`;
+      for (let i = 0; i < 20; i++) {
+        await new Promise(r => setTimeout(r, 500));
+        const s = await fetch(`/hello-world/api/jobs/${jobId}`).then(r => r.json());
+        if (s.status === 'succeeded') {
+          out.textContent = `✓ echo: ${s.result?.echo || ''}`;
+          return;
+        }
+      }
+      out.textContent = '超时（未在 10s 内完成）';
+    });
+  </script>
+</body>
+</html>

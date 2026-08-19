@@ -1,0 +1,23 @@
+{
+  "responseId": "fictional-response-001",
+  "candidates": [
+    {
+      "content": {
+        "parts": [
+          {
+            "inlineData": {
+              "mimeType": "image/png",
+              "data": "ZmljdGlvbmFsLWltYWdlLXJlc3VsdA=="
+            }
+          },
+          {
+            "inlineData": {
+              "mimeType": "image/png",
+              "data": "ZmljdGlvbmFsLWltYWdlLXJlc3VsdC0y"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

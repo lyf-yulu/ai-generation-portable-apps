@@ -1,0 +1,485 @@
+from collections.abc import Mapping
+import re
+from typing import Any, Callable
+
+from feishu_generation_agent.domain.plan import ImageReference
+
+
+_MEDIA_LABELS = {
+    "image": ("图片", "参考图", "张参考图"),
+    "video": ("视频", "参考视频", "个参考视频"),
+    "audio": ("音频", "参考音频", "个参考音频"),
+}
+_SHOT_MARKER = re.compile(
+    r"镜头\s*(\d+)"
+    r"(?:\s*[（(][^）)\n]{1,20}[）)])?"
+    r"\s*[：:]"
+)
+_ABSOLUTE_SECONDS = re.compile(
+    r"\d+(?:\.\d+)?\s*[-–—~～至到]\s*\d+(?:\.\d+)?\s*秒"
+)
+# 图片契约用：静帧必须有光影交代（顶光/逆光/光线/光影/明暗都命中「光」）
+_IMAGE_LIGHTING_KEYWORDS = ("光", "影调", "亮度", "明暗")
+# 图片契约用：这些只属于视频，出现即说明 planner 误用了视频契约
+_VIDEO_ONLY_VOCABULARY = (
+    "运镜",
+    "镜头运动",
+    "推拉摇移",
+    "时长",
+    "音效",
+    "配音",
+    "旁白",
+    "背景音乐",
+    "BGM",
+)
+_GENERIC_BINDING_ONLY = re.compile(
+    r"(?:"
+    r"镜头|总体|以|为|把|当作|调用|读取|根据|结合|进行|"
+    r"生成|制作|创作|完成|参考|使用|采用|作为|用作|用于|"
+    r"展示|呈现|保持|沿用|提供|控制|决定|"
+    r"高清|高画质|超清|清晰|稳定|流畅|不变形|"
+    r"无水印|水印|无|有|"
+    r"主要|核心|辅助|重要|关键|最终|整体|统一|唯一|优先|一致|"
+    r"画面|内容|效果|作品|主体|素材|图片|视频|音频|"
+    r"场景|风格|构图|动作|运镜|声音|相关|对应|图|中|的"
+    r")+"
+)
+_CONCRETE_BINDING_SUFFIX = re.compile(
+    r"^\s*(?:"
+    r"中\s*的|中|的|作为|用作|用于|展示|呈现|保持|沿用|"
+    r"提供|控制|决定|参考|[（(]"
+    r")\s*(?P<description>.*)$"
+)
+
+
+class ReferenceRemapError(ValueError):
+    pass
+
+
+def canonicalize_references(
+    references: list[ImageReference],
+) -> list[ImageReference]:
+    ordered = sorted(references, key=lambda item: item.order)
+    if len({item.order for item in ordered}) != len(ordered):
+        raise ValueError("reference orders must be unique")
+    return [
+        reference.model_copy(update={"order": index})
+        for index, reference in enumerate(ordered, start=1)
+    ]
+
+
+def reference_tokens(
+    references: list[ImageReference],
+    mime_types: Mapping[str, str],
+) -> dict[str, str]:
+    return {
+        asset_id: f"@{_MEDIA_LABELS[media_type][0]}{media_index}"
+        for asset_id, media_type, media_index in _reference_positions(
+            references, mime_types
+        )
+    }
+
+
+def remap_prompt_references(
+    prompt: str,
+    old_references: list[ImageReference],
+    new_references: list[ImageReference],
+    mime_types: Mapping[str, str],
+    *,
+    replacement_asset_ids: Mapping[str, str] | None = None,
+) -> str:
+    old_positions = {
+        asset_id: (media_type, media_index)
+        for asset_id, media_type, media_index in _old_reference_positions(
+            old_references,
+            mime_types,
+            prompt,
+        )
+    }
+    new_positions = {
+        asset_id: (media_type, media_index)
+        for asset_id, media_type, media_index in _reference_positions(
+            new_references, mime_types
+        )
+    }
+    rewritten = prompt
+    placeholders: list[tuple[str, str | None]] = []
+    replacements = replacement_asset_ids or {}
+    for asset_offset, (asset_id, position) in enumerate(old_positions.items()):
+        media_type, old_index = position
+        for style_offset, (pattern, renderer) in enumerate(
+            _reference_patterns(media_type, old_index)
+        ):
+            placeholder = f"\ufff0REF{asset_offset}_{style_offset}\ufff1"
+            rewritten = pattern.sub(placeholder, rewritten)
+            replacement = None
+            target_asset_id = replacements.get(asset_id, asset_id)
+            if target_asset_id in new_positions:
+                new_media_type, new_index = new_positions[target_asset_id]
+                replacement = renderer(new_media_type, new_index)
+            placeholders.append((placeholder, replacement))
+
+    for placeholder, replacement in placeholders:
+        if replacement is not None:
+            rewritten = rewritten.replace(placeholder, replacement)
+            continue
+        rewritten = re.sub(
+            rf"(?:参考\s*)?{re.escape(placeholder)}\s*(?:中\s*的|中的|的)",
+            "",
+            rewritten,
+        )
+        rewritten = rewritten.replace(placeholder, "")
+    return rewritten
+
+
+def remap_asset_id_tokens(
+    prompt: str,
+    references: list[ImageReference],
+    mime_types: Mapping[str, str],
+) -> str:
+    canonical_tokens = reference_tokens(references, mime_types)
+    media_groups: dict[str, list[tuple[str, int, str]]] = {
+        "image": [],
+        "video": [],
+        "audio": [],
+    }
+    for asset_id, canonical_token in canonical_tokens.items():
+        media_type = _media_type(mime_types.get(asset_id, ""))
+        match = re.fullmatch(rf"{media_type}-(\d+)", asset_id)
+        if match is None:
+            continue
+        media_groups[media_type].append(
+            (asset_id, int(match.group(1)), canonical_token)
+        )
+
+    rewritten = prompt
+    replacements: list[tuple[str, str]] = []
+    for media_type, items in media_groups.items():
+        label = _MEDIA_LABELS[media_type][0]
+        count = len(items)
+        uses_asset_numbering = any(
+            asset_index > count
+            and re.search(
+                rf"@{label}{asset_index}(?!\d)",
+                prompt,
+            )
+            is not None
+            for _, asset_index, _ in items
+        )
+        if not uses_asset_numbering:
+            continue
+        for offset, (_, asset_index, canonical_token) in enumerate(items):
+            placeholder = f"\ufff0ASSETREF{media_type}{offset}\ufff1"
+            rewritten = re.sub(
+                rf"@{label}{asset_index}(?!\d)",
+                placeholder,
+                rewritten,
+            )
+            replacements.append((placeholder, canonical_token))
+
+    for placeholder, canonical_token in replacements:
+        rewritten = rewritten.replace(placeholder, canonical_token)
+    return rewritten
+
+
+def has_multiple_shot_markers(prompt: str) -> bool:
+    return len(_SHOT_MARKER.findall(prompt)) >= 2
+
+
+def validate_seedance_prompt(
+    task: Mapping[str, Any],
+    mime_types: Mapping[str, str],
+    *,
+    require_storyboard: bool,
+) -> list[str]:
+    prompt = task.get("prompt")
+    if not isinstance(prompt, str):
+        return ["Seedance prompt 必须是字符串"]
+    raw_references = task.get("reference_images")
+    if not isinstance(raw_references, list):
+        return ["Seedance reference_images 必须是列表"]
+    try:
+        references = [
+            ImageReference.model_validate(reference)
+            for reference in raw_references
+        ]
+    except Exception:
+        return ["Seedance reference_images 无法解析"]
+
+    issues: list[str] = []
+    ordered = sorted(references, key=lambda item: item.order)
+    if [reference.order for reference in ordered] != list(
+        range(1, len(ordered) + 1)
+    ):
+        issues.append("Seedance 参考素材 order 必须按 1…N 连续排列")
+    try:
+        tokens = reference_tokens(ordered, mime_types)
+    except ValueError as exc:
+        issues.append(str(exc))
+        return issues
+
+    for asset_id, token in tokens.items():
+        if re.search(
+            rf"(?<![\w-]){re.escape(asset_id)}(?![\w-])",
+            prompt,
+        ):
+            issues.append(
+                f"Seedance prompt 不得包含内部素材 ID {asset_id}"
+            )
+        if token not in prompt:
+            issues.append(
+                f"Seedance prompt 缺少素材引用 {token}"
+            )
+            continue
+        if not _has_concrete_reference_binding(prompt, token):
+            issues.append(
+                f"Seedance prompt 中 {token} 必须绑定具体主体、场景、动作、"
+                "运镜或声音"
+            )
+
+    if _ABSOLUTE_SECONDS.search(prompt):
+        issues.append(
+            "Seedance 多分镜 prompt 禁止绝对秒数，必须使用镜头 1/2/3 顺序"
+        )
+
+    if not require_storyboard:
+        return issues
+
+    matches = list(_SHOT_MARKER.finditer(prompt))
+    if len(matches) < 2:
+        issues.append(
+            "Seedance 多分镜 prompt 必须包含镜头 1、镜头 2 等顺序分镜"
+        )
+        return issues
+    shot_numbers = [int(match.group(1)) for match in matches]
+    if shot_numbers != list(range(1, len(shot_numbers) + 1)):
+        issues.append("Seedance 镜头编号必须唯一并按 1…N 连续排列")
+
+    shot_segments: list[tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(prompt)
+        )
+        shot_segments.append((match.group(1), prompt[match.start():end]))
+
+    token_values = set(tokens.values())
+    tokens_used_in_shots: set[str] = set()
+    for shot_number, segment in shot_segments:
+        used = {token for token in token_values if token in segment}
+        if not used:
+            issues.append(
+                f"镜头 {shot_number} 缺少明确的 Seedance 参考素材绑定"
+            )
+        tokens_used_in_shots.update(used)
+    for token in sorted(token_values - tokens_used_in_shots):
+        issues.append(
+            f"{token} 只被罗列但没有用于任何实际镜头"
+        )
+
+    if not any(
+        keyword in prompt for keyword in ("稳定", "不变形", "连贯")
+    ):
+        issues.append("Seedance 多分镜 prompt 缺少画面稳定性约束")
+    if "水印" not in prompt:
+        issues.append("Seedance 多分镜 prompt 缺少无水印约束")
+    if "logo" not in prompt.lower():
+        issues.append("Seedance 多分镜 prompt 缺少无 Logo 约束")
+    return issues
+
+
+def validate_image_prompt(
+    task: Mapping[str, Any],
+    mime_types: Mapping[str, str],
+) -> list[str]:
+    """校验图片（image_to_image）prompt 契约。
+
+    与 validate_seedance_prompt 并列，互不影响：视频契约要求分镜/运镜/声音，
+    图片契约反过来禁止这些语汇，并要求光影描述。
+    """
+    prompt = task.get("prompt")
+    if not isinstance(prompt, str):
+        return ["图片 prompt 必须是字符串"]
+    raw_references = task.get("reference_images")
+    if not isinstance(raw_references, list):
+        return ["图片 reference_images 必须是列表"]
+    try:
+        references = [
+            ImageReference.model_validate(reference)
+            for reference in raw_references
+        ]
+    except Exception:
+        return ["图片 reference_images 无法解析"]
+
+    issues: list[str] = []
+    ordered = sorted(references, key=lambda item: item.order)
+    if [reference.order for reference in ordered] != list(
+        range(1, len(ordered) + 1)
+    ):
+        issues.append("图片参考素材 order 必须按 1…N 连续排列")
+    try:
+        tokens = reference_tokens(ordered, mime_types)
+    except ValueError as exc:
+        issues.append(str(exc))
+        return issues
+
+    for asset_id, token in tokens.items():
+        if re.search(rf"(?<![\w-]){re.escape(asset_id)}(?![\w-])", prompt):
+            issues.append(f"图片 prompt 不得包含内部素材 ID {asset_id}")
+        if token not in prompt:
+            issues.append(f"图片 prompt 缺少素材引用 {token}")
+
+    if not any(keyword in prompt for keyword in _IMAGE_LIGHTING_KEYWORDS):
+        issues.append(
+            "图片 prompt 缺少光影描述（例：戏剧化顶光 + 侧逆光、明媚的光线）"
+        )
+
+    for vocabulary in _VIDEO_ONLY_VOCABULARY:
+        if vocabulary in prompt:
+            issues.append(f"图片 prompt 禁止视频语汇 {vocabulary}")
+
+    if _ABSOLUTE_SECONDS.search(prompt):
+        issues.append("图片 prompt 禁止时间轴秒数，静帧没有时间维度")
+
+    return issues
+
+
+def _reference_positions(
+    references: list[ImageReference],
+    mime_types: Mapping[str, str],
+) -> list[tuple[str, str, int]]:
+    counts = {"image": 0, "video": 0, "audio": 0}
+    positions: list[tuple[str, str, int]] = []
+    for reference in sorted(references, key=lambda item: item.order):
+        media_type = _media_type(mime_types.get(reference.asset_id, ""))
+        counts[media_type] += 1
+        positions.append(
+            (reference.asset_id, media_type, counts[media_type])
+        )
+    return positions
+
+
+def _old_reference_positions(
+    references: list[ImageReference],
+    mime_types: Mapping[str, str],
+    prompt: str,
+) -> list[tuple[str, str, int]]:
+    sequential = _reference_positions(references, mime_types)
+    orders = sorted(reference.order for reference in references)
+    if orders == list(range(1, len(orders) + 1)):
+        return sequential
+    if len({media_type for _, media_type, _ in sequential}) > 1:
+        raise ReferenceRemapError(
+            "旧任务的混合媒体参考编号存在断档，无法安全判断素材身份；"
+            "请重新规划任务或重新添加参考素材"
+        )
+
+    by_asset_id = {reference.asset_id: reference for reference in references}
+    positions: list[tuple[str, str, int]] = []
+    for asset_id, media_type, sequential_index in sequential:
+        visible_index = by_asset_id[asset_id].order
+        if visible_index == sequential_index:
+            positions.append((asset_id, media_type, sequential_index))
+            continue
+        sequential_used = _reference_mentioned(
+            prompt,
+            media_type,
+            sequential_index,
+        )
+        visible_used = _reference_mentioned(
+            prompt,
+            media_type,
+            visible_index,
+        )
+        if sequential_used and visible_used:
+            raise ReferenceRemapError(
+                "ambiguous legacy reference numbering; "
+                f"both {_MEDIA_LABELS[media_type][0]}{sequential_index} and "
+                f"{_MEDIA_LABELS[media_type][0]}{visible_index} are present"
+            )
+        positions.append(
+            (
+                asset_id,
+                media_type,
+                visible_index if visible_used else sequential_index,
+            )
+        )
+    return positions
+
+
+def _reference_mentioned(
+    prompt: str,
+    media_type: str,
+    index: int,
+) -> bool:
+    return any(
+        pattern.search(prompt) is not None
+        for pattern, _ in _reference_patterns(media_type, index)
+    )
+
+
+def _has_concrete_reference_binding(prompt: str, token: str) -> bool:
+    separators = "，。；;\n"
+    token_pattern = re.compile(r"@(图片|视频|音频)\d+")
+    for occurrence in re.finditer(re.escape(token), prompt):
+        ends = [
+            position
+            for separator in separators
+            if (position := prompt.find(separator, occurrence.end())) >= 0
+        ]
+        end = min(ends, default=len(prompt))
+        suffix = prompt[occurrence.end() : end]
+        binding = _CONCRETE_BINDING_SUFFIX.match(suffix)
+        if binding is None:
+            continue
+        without_tokens = token_pattern.sub(
+            "",
+            binding.group("description"),
+        )
+        cjk_text = "".join(
+            re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", without_tokens)
+        )
+        if (
+            len(cjk_text) >= 2
+            and _GENERIC_BINDING_ONLY.fullmatch(cjk_text) is None
+        ):
+            return True
+    return False
+
+
+def _media_type(mime_type: str) -> str:
+    for candidate in ("image", "video", "audio"):
+        if mime_type.startswith(f"{candidate}/"):
+            return candidate
+    raise ValueError(f"unsupported reference MIME type: {mime_type}")
+
+
+def _reference_patterns(
+    media_type: str,
+    index: int,
+) -> list[tuple[re.Pattern[str], Callable[[str, int], str]]]:
+    plain, reference, ordinal = _MEDIA_LABELS[media_type]
+    boundary = r"(?!\d)"
+    return [
+        (
+            re.compile(rf"@{plain}{index}{boundary}"),
+            lambda kind, value: f"@{_MEDIA_LABELS[kind][0]}{value}",
+        ),
+        (
+            re.compile(rf"第\s*{index}\s*{ordinal}{boundary}"),
+            lambda kind, value: (
+                f"第{value}{_MEDIA_LABELS[kind][2]}"
+            ),
+        ),
+        (
+            re.compile(rf"{reference}\s*{index}{boundary}"),
+            lambda kind, value: (
+                f"{_MEDIA_LABELS[kind][1]}{value}"
+            ),
+        ),
+        (
+            re.compile(rf"(?<![@\u4e00-\u9fff]){plain}\s*{index}{boundary}"),
+            lambda kind, value: f"{_MEDIA_LABELS[kind][0]}{value}",
+        ),
+    ]

@@ -1,0 +1,7 @@
+{
+  "id": "task-ark-fictional-123",
+  "status": "succeeded",
+  "content": {
+    "video_url": "https://cdn.fictional.test/video.mp4?X-Fictional-Signature=not-a-secret"
+  }
+}

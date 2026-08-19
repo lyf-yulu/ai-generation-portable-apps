@@ -13,8 +13,26 @@ PYTHON=""
 # ---- launchd 集成 ----
 LAUNCHD_LABEL="com.ai-portal"
 launchd_present() { launchctl list 2>/dev/null | awk '{print $3}' | grep -Fxq "$LAUNCHD_LABEL"; }
+# 返回 launchd 当前托管的 Portal PID（0 表示已注册但未跑，空表示未注册）
+launchd_pid() {
+    launchctl list 2>/dev/null | awk -v L="$LAUNCHD_LABEL" '$3==L {print $1}' | head -1
+}
+launchd_running() {
+    local p; p=$(launchd_pid)
+    [ -n "$p" ] && [ "$p" != "-" ] && [ "$p" != "0" ]
+}
+# 首次启动用（服务已注册但没跑起来时）；不加 -k，避免误杀在跑的进程
+launchd_start()     { launchctl kickstart "gui/$(id -u)/$LAUNCHD_LABEL"; }
 launchd_kickstart() { launchctl kickstart -k "gui/$(id -u)/$LAUNCHD_LABEL"; }
 launchd_kill()      { launchctl kill SIGTERM "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null || true; }
+# 局域网 IP 用于访问链接与状态展示
+lan_ip() {
+    local ip
+    ip=$(ipconfig getifaddr en0 2>/dev/null || true)
+    [ -z "$ip" ] && ip=$(ipconfig getifaddr en1 2>/dev/null || true)
+    [ -z "$ip" ] && ip="127.0.0.1"
+    echo "$ip"
+}
 
 # ---- 子应用元数据 ----
 SUBAPP_NAMES=(seedance nano-banana dreamina volcengine-portrait)
@@ -51,7 +69,7 @@ collect_child_pids() {
             local cmd cwd name
             cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
             cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' || true)
-            if echo "$cmd" | grep -q "app.py" && echo "$cwd" | grep -q "$SCRIPT_DIR"; then
+            if echo "$cmd" | grep -qE "app\.py|uvicorn.*app_fastapi" && echo "$cwd" | grep -q "$SCRIPT_DIR"; then
                 case "$cwd" in
                     */portal)             name="portal(9090)" ;;
                     */seedance)           name="seedance(8787)" ;;
@@ -67,8 +85,22 @@ collect_child_pids() {
     echo "$data"
 }
 
+# launchd 已管理时用 launchctl 数据（PID 权威），否则回退到启动器自己的 PID 文件
 status_text() {
-    local pids alive=() names=()
+    if launchd_present; then
+        local p; p=$(launchd_pid)
+        if [ -n "$p" ] && [ "$p" != "0" ] && [ "$p" != "-" ]; then
+            local ports_up=0
+            for port in "${PORTS[@]}"; do
+                lsof -iTCP:"$port" -sTCP:LISTEN -P -n 2>/dev/null | grep -q ":$port" && ports_up=$((ports_up+1))
+            done
+            echo "●  运行中 (launchd, Portal pid=$p, ${ports_up}/${#PORTS[@]} 端口 LISTEN)"
+        else
+            echo "●  已注册但未运行 (launchd $LAUNCHD_LABEL)"
+        fi
+        return
+    fi
+    local pids alive=()
     pids=$(load_pids)
     for name in portal\(9090\) seedance\(8787\) nano-banana\(8797\) dreamina\(8888\) volcengine-portrait\(8891\); do
         local pid
@@ -87,6 +119,11 @@ status_text() {
 # ---- 停止 ----
 # 有 launchd 服务：kill Portal 前先停 launchd（否则 KeepAlive 会立刻拉起）
 do_stop() {
+    if launchd_running; then
+        echo -e "${YELLOW}警告：Portal (launchd) 正在跑，停止会中断当前所有生成任务${NC}"
+        read -r -p "  仍要停止? 输入 'yes' 继续: " CONFIRM
+        [ "$CONFIRM" = "yes" ] || { echo "取消。"; return; }
+    fi
     echo -e "${YELLOW}正在停止...${NC}"
     if launchd_present; then
         echo "  发送 SIGTERM 给 launchd 服务 $LAUNCHD_LABEL"
@@ -110,7 +147,7 @@ do_stop() {
         lsof -ti ":$port" 2>/dev/null | while read -r pid; do
             local cmd
             cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
-            if echo "$cmd" | grep -q "app.py" 2>/dev/null; then
+            if echo "$cmd" | grep -qE "app\.py|uvicorn.*app_fastapi" 2>/dev/null; then
                 kill -9 "$pid" 2>/dev/null || true
                 echo "  清理端口 $port → pid $pid"
             fi
@@ -133,14 +170,20 @@ stop_cloudflared() {
 }
 
 # ---- 启动 ----
-# 有 launchd 服务：走 launchctl kickstart（KeepAlive 保证 Mac 重启后自动上线）
+# 有 launchd 服务且已在跑：什么都不做，仅同步 PID 文件（避免误杀生产任务）
+# 有 launchd 服务但未跑：走不带 -k 的 launchctl kickstart
 # 无 launchd 服务：本地开发场景，回退 python3 app.py &
 do_start() {
-    stop_cloudflared
     if launchd_present; then
-        echo -e "${BLUE}走 launchd 启动 $LAUNCHD_LABEL（Portal + 子应用）${NC}"
-        launchd_kickstart
-        sleep 6
+        if launchd_running; then
+            local p; p=$(launchd_pid)
+            echo -e "${GREEN}launchd 已在运行 (Portal pid=$p)，无需再启${NC}"
+            echo -e "${YELLOW}  如需重启，请返回主菜单选 [2] 重启全部${NC}"
+        else
+            echo -e "${BLUE}launchctl kickstart $LAUNCHD_LABEL${NC}"
+            launchd_start
+            sleep 6
+        fi
     else
         if ! find_python; then
             osascript -e 'display dialog "未找到 Python 3.9+。请安装:" & return & "brew install python@3.12" buttons {"OK"} default button "OK" with icon stop'
@@ -158,13 +201,21 @@ do_start() {
     data=$(collect_child_pids)
     echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); [print(f'  {k}: {v}') for k,v in sorted(d.items())]"
     save_pids "$data"
-    echo -e "${GREEN}启动完成。${NC}"
+    local ip; ip=$(lan_ip)
+    echo -e "${GREEN}启动完成。访问：${NC}"
+    echo -e "  本机 https://127.0.0.1:9090"
+    echo -e "  局域网 https://${ip}:9090"
 }
 
 # ---- 重启全部 ----
 # 有 launchd 服务：一条 kickstart -k 原子完成（Portal 重启，Portal 自己拉起子应用）
 # 无 launchd 服务：stop + start 回退
 do_restart_all() {
+    if launchd_running; then
+        echo -e "${YELLOW}警告：Portal (launchd) 正在跑，重启会杀掉当前所有生成任务${NC}"
+        read -r -p "  仍要重启? 输入 'yes' 继续: " CONFIRM
+        [ "$CONFIRM" = "yes" ] || { echo "取消。"; return; }
+    fi
     stop_cloudflared
     if launchd_present; then
         echo -e "${BLUE}launchctl kickstart -k gui/$(id -u)/$LAUNCHD_LABEL${NC}"
@@ -221,7 +272,7 @@ do_restart_subapp() {
     for pid in $(lsof -ti ":$port" 2>/dev/null); do
         local cmd
         cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
-        if echo "$cmd" | grep -q "app.py" 2>/dev/null; then
+        if echo "$cmd" | grep -qE "app\.py|uvicorn.*app_fastapi" 2>/dev/null; then
             kill -9 "$pid" 2>/dev/null && { echo "  kill $name pid=$pid"; killed=1; } || true
         fi
     done
@@ -240,7 +291,7 @@ do_restart_subapp() {
         if [ -n "$new_pid" ]; then
             local new_cmd
             new_cmd=$(ps -p "$new_pid" -o command= 2>/dev/null || true)
-            if echo "$new_cmd" | grep -q "app.py" 2>/dev/null; then
+            if echo "$new_cmd" | grep -qE "app\.py|uvicorn.*app_fastapi" 2>/dev/null; then
                 echo -e "${GREEN}  $name 已重启 → pid $new_pid${NC}"
                 return
             fi
@@ -259,23 +310,24 @@ show_menu() {
     echo ""
     echo -e "  $(status_text)"
     echo ""
-    echo -e "  ${BOLD}[1]${NC} 启动"
+    local ip; ip=$(lan_ip)
+    echo -e "  ${BOLD}[1]${NC} 启动（已运行则无操作）"
     echo -e "  ${BOLD}[2]${NC} 重启全部（Portal + 子应用）"
     echo -e "  ${BOLD}[3]${NC} 停止"
-    echo -e "  ${BOLD}[4]${NC} 打开网关  ${CYAN}https://127.0.0.1:9090${NC}"
+    echo -e "  ${BOLD}[4]${NC} 打开网关  ${CYAN}https://${ip}:9090${NC}"
     echo -e "  ${BOLD}[5]${NC} 查看日志"
     echo -e "  ${BOLD}[6]${NC} 重启单个子应用"
-    echo -e "  ${BOLD}[q]${NC} 退出"
+    echo -e "  ${BOLD}[q]${NC} 退出（launchd 服务不会被停）"
     echo ""
     read -r -p "  选择 [1-6/q]: " CHOICE
     case "$CHOICE" in
         1) do_start ;;
         2) do_restart_all ;;
         3) do_stop ;;
-        4) open "https://127.0.0.1:9090" ;;
+        4) open "https://${ip}:9090" ;;
         5) view_logs ;;
         6) do_restart_subapp ;;
-        q|Q) do_stop; echo "再见."; exit 0 ;;
+        q|Q) echo "再见."; exit 0 ;;
         *) ;;
     esac
     echo ""
@@ -285,7 +337,7 @@ show_menu() {
 view_logs() {
     local log_dir="$PORTAL_DIR/state/logs"
     if [ -d "$log_dir" ]; then
-        echo -e "${CYAN}最近的日志 (按 q 退出):${NC}"
+        echo -e "${CYAN}子应用最近日志：${NC}"
         echo ""
         for f in "$log_dir"/*.log; do
             [ -f "$f" ] || continue
@@ -295,7 +347,16 @@ view_logs() {
             echo ""
         done
     else
-        echo "日志目录不存在"
+        echo "子应用日志目录不存在"
+    fi
+    # launchd 托管时，Portal 的 stdout/stderr 走 launchd 配置的路径
+    local ld_out=~/Library/Logs/ai-portal.log
+    local ld_err=~/Library/Logs/ai-portal.err
+    if [ -f "$ld_out" ] || [ -f "$ld_err" ]; then
+        echo -e "${CYAN}launchd (Portal) 最近日志：${NC}"
+        echo ""
+        [ -f "$ld_out" ] && { echo -e "${BOLD}─── ai-portal.log (stdout) ───${NC}"; tail -8 "$ld_out" 2>/dev/null || echo "  (空)"; echo ""; }
+        [ -f "$ld_err" ] && { echo -e "${BOLD}─── ai-portal.err (stderr) ───${NC}"; tail -8 "$ld_err" 2>/dev/null || echo "  (空)"; echo ""; }
     fi
 }
 

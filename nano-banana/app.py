@@ -4,6 +4,9 @@ from __future__ import annotations
 import base64
 import cgi
 import concurrent.futures
+import hashlib
+import hmac
+import http.client
 import json
 import mimetypes
 import os
@@ -37,14 +40,122 @@ ARCHIVE_DIR = _DATA_BASE / "archives"
 PROVIDERS_PATH = ROOT / "providers.json"
 
 
+# ============================================================
+# STRUCTURED ERRORS
+# ============================================================
+
+class APIError(Exception):
+    """结构化 API 错误，携带 HTTP 状态码和是否可重试标志"""
+    def __init__(self, status_code: int, message: str, raw_response: str = ""):
+        self.status_code = status_code
+        self.message = message
+        self.raw_response = raw_response
+        super().__init__(f"HTTP {status_code}: {message}")
+
+    @property
+    def is_retryable(self) -> bool:
+        """判断是否值得重试（429 限流、408 超时、5xx 服务端错误）"""
+        return self.status_code in (408, 429, 500, 502, 503, 504)
+
+    @property
+    def error_category(self) -> str:
+        """错误分类，方便前端展示友好提示"""
+        if self.status_code == 401:
+            return "auth_failed"
+        elif self.status_code == 403:
+            return "permission_denied"
+        elif self.status_code == 429:
+            return "rate_limited"
+        elif 400 <= self.status_code < 500:
+            return "client_error"
+        elif 500 <= self.status_code < 600:
+            return "server_error"
+        return "unknown"
+
+
+class NetworkError(Exception):
+    """网络连接失败，通常可重试"""
+    pass
+
+
+def _safe_join_or_root(base: Path, rel: str) -> str:
+    """Join base/rel and reject any result outside base (path-traversal guard).
+
+    Illegal input returns base itself, which SimpleHTTPRequestHandler treats as
+    a safer failure than serving arbitrary files."""
+    try:
+        base_resolved = base.resolve()
+        target = (base / rel).resolve()
+    except (OSError, ValueError):
+        return str(base)
+    if target == base_resolved or target.is_relative_to(base_resolved):
+        return str(target)
+    return str(base)
+
+
+def sniff_is_image(head: bytes) -> bool:
+    """Return True iff head looks like a supported image format.
+
+    Used at upload time to reject evil.jpg-with-SVG-body — nano-banana only
+    accepts images, so this is a strict allowlist."""
+    if not head:
+        return False
+    if head.startswith(b"\xff\xd8\xff"):
+        return True  # JPEG
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True  # PNG
+    if head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
+        return True
+    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return True
+    if head.startswith(b"BM"):
+        return True  # BMP
+    if head.startswith(b"II*\x00") or head.startswith(b"MM\x00*"):
+        return True  # TIFF
+    if head[4:12] in (b"ftypheic", b"ftypheix", b"ftypmif1"):
+        return True  # HEIC
+    return False
+
+
 def _is_local(handler: SimpleHTTPRequestHandler) -> bool:
     ip = (handler.headers.get("X-Forwarded-For") or handler.client_address[0] or "").strip()
     return ip in ("127.0.0.1", "::1", "localhost")
 
 
+PORTAL_SIG_WINDOW = int(os.environ.get("PORTAL_SIG_WINDOW", "60"))
+
+
+def _verify_portal_sig(handler) -> bool:
+    """True iff Portal's HMAC signature over (ts, is_admin, username) matches.
+
+    Prevents a client from setting X-Is-Admin: 1 directly and bypassing auth."""
+    secret = os.environ.get("PORTAL_INTERNAL_TOKEN", "")
+    if not secret:
+        return False
+    sig = handler.headers.get("X-Portal-Sig") or ""
+    ts_raw = handler.headers.get("X-Portal-Ts") or ""
+    if not sig or not ts_raw:
+        return False
+    try:
+        ts = int(ts_raw)
+    except (TypeError, ValueError):
+        return False
+    if abs(int(time.time()) - ts) > PORTAL_SIG_WINDOW:
+        return False
+    username = handler.headers.get("X-Username", "") or ""
+    is_admin_flag = "1" if handler.headers.get("X-Is-Admin") == "1" else "0"
+    msg = f"{ts}:{is_admin_flag}:{username}".encode("utf-8")
+    expected = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
+def _is_admin(handler) -> bool:
+    return handler.headers.get("X-Is-Admin") == "1" and _verify_portal_sig(handler)
+
+
 def _view_scope(handler) -> tuple[bool, str]:
     """Returns (sees_all, username) for filtering jobs/activity by owner."""
-    sees_all = handler.headers.get("X-Is-Admin", "") == "1"
+    sees_all = _is_admin(handler)
     username = _decode_username(handler)
     return sees_all, username
 
@@ -71,12 +182,20 @@ def _user_day_subdir(base: Path, username: str | None, day: str | None = None) -
 
 
 def _ensure_output_dir(values: dict, job_id: str) -> None:
-    """Fill values['output_dir'] with a <user>/<date>/ subdir when the caller
-    left it empty. Reads username from the JOBS registry under the module lock."""
-    if values.get("output_dir"):
-        return
+    """Set values['output_dir'] to outputs/<user>/<date>/.
+
+    In Portal mode (CORS=1, served to remote colleagues) this OVERRIDES any
+    client-supplied output_dir: remote custom paths only wrote to the server FS
+    anyway (browsers can't reach the client FS), scattering results outside
+    outputs/ and hiding them from the Feishu sync. Standalone local mode (direct
+    :8797, no CORS) keeps a user-provided output_dir if present."""
     with LOCK:
         username = JOBS.get(job_id, {}).get("username", "")
+    if os.environ.get("CORS") == "1":
+        values["output_dir"] = str(_user_day_subdir(OUTPUT_DIR, username))
+        return
+    if values.get("output_dir"):
+        return
     values["output_dir"] = str(_user_day_subdir(OUTPUT_DIR, username))
 
 
@@ -150,6 +269,16 @@ JOBS: dict[str, dict[str, Any]] = {}
 FILES: dict[str, Path] = {}
 LOCK = threading.Lock()
 STATE_LOCK = threading.Lock()
+
+# JOBS is in-memory and used to be unbounded: every job stayed forever, so a
+# service machine running for weeks only grew. We evict *finished* jobs once
+# JOBS exceeds MAX_JOBS. JOB_PRUNE_GRACE_SECONDS interlocks with Portal's usage
+# tracker (it polls GET /api/jobs/<id> every 15s and only credits by_user.images
+# on a terminal status) — evicting a finished job before Portal counts it would
+# be a stats under-count, so 600s >> the 15s poll cycle keeps us safe.
+MAX_JOBS = 500
+JOB_PRUNE_GRACE_SECONDS = 600
+_TERMINAL_JOB_STATUSES = ("succeeded", "failed", "completed")
 ACTIVITY_LIMIT = 100
 
 
@@ -208,6 +337,18 @@ FALLBACK_PROVIDERS = {
             "api_style": "gemini_generate_content",
             "defaults": {"mode": "img2img", "model": "banana2-ssvip", "aspect_ratio": "auto", "image_size": "2K", "response_format": "url", "control_after_generate": "randomize", "repeat_count": 1, "concurrency": 1, "poll_interval": 10, "timeout": 900, "vary_seed": True, "resize_enabled": False, "resize_width": 1700, "resize_height": 2500, "resize_interpolation": "high", "resize_method": "stretch", "resize_condition": "always", "resize_multiple_of": 0},
             "models": [{"id": "banana2-ssvip", "label": "banana2-ssvip"}, {"id": "nano-banana2[2K]-base", "label": "nano-banana2[2K]-base"}, {"id": "gpt-image-2", "label": "gpt-image-2"}],
+        },
+        "volcengine": {
+            "label": "火山引擎官方 (Seedream)",
+            "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+            "api_style": "ark_seedream",
+            "company_key": True,
+            "hint": "Seedream 5.0 Pro；使用 Seedance 相同的火山方舟密钥（服务器托管）。",
+            "image_size_options": ["1K", "1.5K", "2K"],
+            "max_reference_images": 10,
+            "supports_seed": False,
+            "defaults": {"mode": "img2img", "model": "doubao-seedream-5-0-pro-260628", "aspect_ratio": "auto", "image_size": "2K", "response_format": "url", "control_after_generate": "randomize", "repeat_count": 1, "concurrency": 1, "poll_interval": 10, "timeout": 300, "vary_seed": False, "resize_enabled": False, "resize_width": 1700, "resize_height": 2500, "resize_interpolation": "high", "resize_method": "stretch", "resize_condition": "always", "resize_multiple_of": 0},
+            "models": [{"id": "doubao-seedream-5-0-pro-260628", "label": "Seedream 5.0 Pro"}],
         },
     },
 }
@@ -434,18 +575,35 @@ def media_item_to_file(field: str, item: Any) -> tuple[str, bytes] | None:
     if item.get("url"):
         url = str(item["url"])
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                blob = resp.read()
-                mime = resp.headers.get_content_type() or mimetypes.guess_type(url)[0] or "image/png"
-        except urllib.error.HTTPError as exc:
+        blob = b""
+        mime = "image/png"
+        attempts = 3
+        for attempt in range(1, attempts + 1):
             try:
-                detail = exc.read().decode("utf-8", errors="replace")[:500]
-            except Exception:
-                detail = ""
-            raise RuntimeError(f"参考素材下载失败 (HTTP {exc.code}): {url} — {detail}") from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise RuntimeError(f"参考素材下载失败 (连接错误): {url} — {exc}") from exc
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    blob = resp.read()
+                    mime = resp.headers.get_content_type() or mimetypes.guess_type(url)[0] or "image/png"
+                break
+            except urllib.error.HTTPError as exc:
+                try:
+                    detail = exc.read().decode("utf-8", errors="replace")[:500]
+                except Exception:
+                    detail = ""
+                raise RuntimeError(f"参考素材下载失败 (HTTP {exc.code}): {url} — {detail}") from exc
+            except http.client.IncompleteRead as exc:
+                # IncompleteRead subclasses HTTPException, not URLError/OSError —
+                # retry the transfer before giving up (transient CDN cutoff).
+                if attempt < attempts:
+                    time.sleep(min(2 ** attempt, 8))
+                    continue
+                raise RuntimeError(
+                    f"参考素材下载中断 (IncompleteRead,已重试 {attempts} 次): {url} — {exc}"
+                ) from exc
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                if attempt < attempts:
+                    time.sleep(min(2 ** attempt, 8))
+                    continue
+                raise RuntimeError(f"参考素材下载失败 (连接错误): {url} — {exc}") from exc
         if not blob:
             raise ValueError(f"media.{field} url returned empty content")
         return filename_from_media(field, item, mime), blob
@@ -469,26 +627,104 @@ def load_default_key() -> str:
     return ""
 
 
+# 按 provider 分别持有 Key。t8star 与 gemini(Chiyun) 是两个独立账户，
+# 共用一个 Key 必然有一方鉴权失败。文件在 gitignore 的 state/ 下，
+# 与 seedance/state/secrets.json 同一套约定。
+SECRETS_PATH = STATE_DIR / "secrets.json"
+
+
+def load_provider_keys() -> dict[str, str]:
+    """读 state/secrets.json 的 provider_keys 映射；缺文件返回空 dict（走旧逻辑兜底）。"""
+    if not SECRETS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(SECRETS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    keys = data.get("provider_keys") if isinstance(data, dict) else None
+    if not isinstance(keys, dict):
+        return {}
+    return {str(k): str(v).strip() for k, v in keys.items() if isinstance(v, str) and v.strip()}
+
+
+def resolve_provider_api_key(provider: str, provided_key: str = "") -> str:
+    """Resolve credentials without ever returning the managed key to clients."""
+    provided = str(provided_key or "").strip()
+    config, _ = load_provider_config()
+    provider_cfg = (config.get("providers") or {}).get(provider) or {}
+    if provider_cfg.get("company_key"):
+        return provided or os.environ.get("VOLCENGINE_ARK_API_KEY", "").strip()
+    if provided:
+        return provided
+    # 优先按 provider 取专属 Key，回退到全局默认（保持既有部署不变）。
+    return load_provider_keys().get(provider) or load_default_key()
+
+
+def providers_for_client(config: dict[str, Any]) -> dict[str, Any]:
+    """Return provider metadata plus key availability, never key plaintext."""
+    providers = json.loads(json.dumps(config.get("providers") or {}, ensure_ascii=False))
+    for provider_cfg in providers.values():
+        if isinstance(provider_cfg, dict) and provider_cfg.get("company_key"):
+            provider_cfg["company_key_available"] = bool(
+                os.environ.get("VOLCENGINE_ARK_API_KEY", "").strip()
+            )
+    return providers
+
+
 def mask_key(key: str) -> str:
     return f"{key[:5]}...{key[-4:]}" if key and len(key) > 12 else ("***" if key else "")
 
 
-def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | None = None, timeout: int = 900) -> dict[str, Any]:
+def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | None = None, timeout: int = 900, max_retries: int = 6) -> dict[str, Any]:
+    """
+    发送 JSON 请求，自动重试瞬态错误。
+
+    重试策略：
+    - 429/5xx: 最多重试 6 次，指数退避（1s, 2s, 4s, 8s, 16s, 32s）
+    - 网络超时/连接失败: 最多重试 6 次
+    - 4xx（除 408/429）: 不重试，立即抛出
+    """
     headers = {"Authorization": f"Bearer {api_key}"}
     data = None
     if body is not None:
         headers["Content-Type"] = "application/json"
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code}: {raw}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError(f"API 请求超时或连接失败 ({exc.__class__.__name__}: {exc})") from exc
+
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                return json.loads(raw) if raw else {}
+
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            error = APIError(exc.code, raw, raw)
+
+            # 4xx 非瞬态错误（除了 408/429），立即失败
+            if not error.is_retryable:
+                raise error
+
+            # 429/5xx 可重试错误
+            last_error = error
+            if attempt < max_retries - 1:
+                backoff = min(2 ** attempt, 32)  # 最多等 32 秒
+                time.sleep(backoff)
+                continue
+            raise error  # 最后一次重试也失败，抛出
+
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # 网络错误，可重试
+            last_error = NetworkError(f"连接失败 ({exc.__class__.__name__}: {exc})")
+            if attempt < max_retries - 1:
+                backoff = min(2 ** attempt, 32)
+                time.sleep(backoff)
+                continue
+            raise RuntimeError(f"API 请求失败，已重试 {max_retries} 次: {last_error}") from exc
+
+    # 不应该走到这里
+    raise last_error or RuntimeError("Unknown error in request_json")
 
 
 def request_gemini_generate(url: str, api_key: str, payload: dict[str, Any], timeout: int = 900) -> dict[str, Any]:
@@ -1068,10 +1304,12 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
             "id": job_id, "status": "queued", "events": [], "results": [], "errors": [],
             "done": 0, "total": 0,
             "username": username,
+            "workspace_id": ws_id,
             "submitted_at": time.time(),
             "started_at": None,
             "finished_at": None,
         }
+        _prune_jobs_locked()
     response = job_id_response(job_id)
     record_activity({
         "id": activity_id,
@@ -1104,19 +1342,35 @@ def extract_items(result: dict[str, Any]) -> list[dict[str, Any]]:
     return [x for x in data if isinstance(x, dict)]
 
 
-def download_url(url: str, out_path: Path) -> None:
+def download_url(url: str, out_path: Path, *, attempts: int = 3) -> None:
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            out_path.write_bytes(resp.read())
-    except urllib.error.HTTPError as exc:
+    for attempt in range(1, attempts + 1):
         try:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
-        except Exception:
-            detail = ""
-        raise RuntimeError(f"生成结果下载失败 (HTTP {exc.code}): {url[:120]} — {detail}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError(f"生成结果下载失败 (连接错误): {url[:120]} — {exc}") from exc
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                out_path.write_bytes(resp.read())
+            return
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                detail = ""
+            raise RuntimeError(f"生成结果下载失败 (HTTP {exc.code}): {url[:120]} — {detail}") from exc
+        except http.client.IncompleteRead as exc:
+            # CDN closed the connection before Content-Length bytes arrived.
+            # IncompleteRead subclasses HTTPException (not URLError/OSError),
+            # so it slipped past the handler below and surfaced raw to users.
+            # The generation itself succeeded — just retry the transfer.
+            if attempt < attempts:
+                time.sleep(min(2 ** attempt, 8))
+                continue
+            raise RuntimeError(
+                f"生成结果下载中断 (IncompleteRead,已重试 {attempts} 次): {url[:120]} — {exc}"
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if attempt < attempts:
+                time.sleep(min(2 ** attempt, 8))
+                continue
+            raise RuntimeError(f"生成结果下载失败 (连接错误): {url[:120]} — {exc}") from exc
 
 
 def save_image_item(item: dict[str, Any], out_dir: Path, prefix: str, idx: int) -> tuple[str, str]:
@@ -1127,7 +1381,11 @@ def save_image_item(item: dict[str, Any], out_dir: Path, prefix: str, idx: int) 
         return str(item["url"]), str(out_path)
     if item.get("b64_json"):
         out_path = out_dir / f"{prefix}_{idx}.png"
-        out_path.write_bytes(base64.b64decode(item["b64_json"]))
+        data = str(item["b64_json"])
+        missing_padding = len(data) % 4
+        if missing_padding:
+            data += "=" * (4 - missing_padding)
+        out_path.write_bytes(base64.b64decode(data))
         return "", str(out_path)
     raise RuntimeError(f"No image data in result item: {item}")
 
@@ -1147,7 +1405,101 @@ def extract_gemini_images(result: dict[str, Any]) -> list[dict[str, str]]:
                     "b64_json": str(image_node["data"]),
                     "mime_type": str(image_node.get("mimeType") or image_node.get("mime_type") or "image/png"),
                 })
+                continue
+            # Gemini generateContent may return an image by URL reference
+            # (fileData.fileUri) instead of inline base64 — e.g. Chiyun's
+            # gemini-*-image models under load. Treat it like any other URL
+            # result so save_image_item's existing url branch downloads it.
+            # Without this the caller raises "No image result found" even
+            # though the image was generated successfully.
+            file_node = part.get("fileData") or part.get("file_data")
+            if isinstance(file_node, dict):
+                file_uri = file_node.get("fileUri") or file_node.get("file_uri")
+                if file_uri:
+                    images.append({
+                        "url": str(file_uri),
+                        "mime_type": str(file_node.get("mimeType") or file_node.get("mime_type") or "image/png"),
+                    })
     return images
+
+
+# chiyun 上游对「参考图未通过内容审核」等确定性拒绝的返回特征。这类失败
+# 换多少次通道、重试多少次都必然同样结果,识别后应立即失败而非空耗重试。
+# 注意 gpt-image 的 chat/completions 通道会把审核拒绝错误地包装成
+# 404 "No endpoint POST /v1/chat/completions"(已由「同 key 换图即成」证实)。
+_DETERMINISTIC_REJECT_MARKERS = (
+    "no endpoint",
+    "content policy", "content_policy", "content-policy",
+    "safety", "moderation", "violat",  # violation/violates
+    "blocked", "rejected", "not allowed", "flagged",
+    "审核", "违规", "敏感", "policy",
+)
+
+
+def _is_deterministic_reject(code: Any, msg: str) -> bool:
+    """True 表示这是重试也无用的确定性拒绝(内容审核/端点缺失等)。"""
+    low = (msg or "").lower()
+    if any(mark in low for mark in _DETERMINISTIC_REJECT_MARKERS):
+        return True
+    # chiyun 对未过审图返回的典型伪 404,msg 里带 "No endpoint"
+    if str(code) == "404" and "endpoint" in low:
+        return True
+    return False
+
+
+def _friendly_reject_message(result: Any) -> str:
+    """把上游的原始错误翻译成用户能看懂的中文提示;保留简短原始摘要备查。"""
+    code = result.get("code") if isinstance(result, dict) else None
+    msg = str(result.get("msg") or "") if isinstance(result, dict) else ""
+    base = (
+        "生成失败:参考图可能未通过内容审核(涉及敏感/暴露/性暗示等),"
+        "或该图不被模型接受。请更换参考图或调整提示词后重试。"
+    )
+    detail = msg.strip() or (f"code={code}" if code is not None else "")
+    return f"{base}(上游返回:{detail[:120]})" if detail else base
+
+
+# 常见图片格式的 base64 前缀(magic bytes 编码后的头),用来识别
+# chiyun gpt-image-2 直接把整张图当 base64 塞进 message.content 的情形。
+_B64_IMAGE_PREFIXES = (
+    "iVBORw0KGgo",  # PNG  (\x89PNG\r\n)
+    "/9j/",          # JPEG (\xff\xd8\xff)
+    "R0lGOD",        # GIF
+    "UklGR",         # WEBP (RIFF)
+    "Qk",            # BMP  (BM)
+    "SUkq", "TU0A",  # TIFF (II* / MM\x00)
+)
+
+
+def _looks_like_b64_image(s: str) -> bool:
+    """Heuristic: does this string look like a bare base64-encoded image?
+
+    chiyun 的 gpt-image-2 图生图会把整张 PNG 当一段裸 base64 放进
+    message.content(既不是 markdown 链接,也不是 b64_json 字段)。
+    用图片格式的 base64 头 + 长度门槛判定,避免把普通文字误当图片。"""
+    if not s or len(s) < 128:
+        return False
+    head = s.lstrip()[:16]
+    return head.startswith(_B64_IMAGE_PREFIXES)
+
+
+def _collect_string_content(content: str, images: list[dict[str, str]]) -> None:
+    """Pull image references out of a string content field, in priority order:
+    markdown/plain https URL → data:image data URL → bare base64 image."""
+    urls = re.findall(r"https?://[^)\s]+", content)
+    if urls:
+        for url in urls:
+            images.append({"url": url})
+        return
+    # data:image/png;base64,xxxx
+    m = re.search(r"data:image/[^;]+;base64,([A-Za-z0-9+/=\s]+)", content)
+    if m:
+        images.append({"b64_json": m.group(1).strip()})
+        return
+    # 裸 base64 整图(chiyun gpt-image-2 img2img 的实际返回形态)
+    stripped = content.strip()
+    if _looks_like_b64_image(stripped):
+        images.append({"b64_json": stripped})
 
 
 def extract_chat_completion_images(result: dict[str, Any]) -> list[dict[str, str]]:
@@ -1158,16 +1510,14 @@ def extract_chat_completion_images(result: dict[str, Any]) -> list[dict[str, str
         message = choice.get("message") or {}
         content = message.get("content")
         if isinstance(content, str):
-            for url in re.findall(r"https?://[^)\s]+", content):
-                images.append({"url": url})
+            _collect_string_content(content, images)
         elif isinstance(content, list):
             for part in content:
                 if not isinstance(part, dict):
                     continue
                 text = part.get("text")
                 if isinstance(text, str):
-                    for url in re.findall(r"https?://[^)\s]+", text):
-                        images.append({"url": url})
+                    _collect_string_content(text, images)
                 image_url = part.get("image_url")
                 if isinstance(image_url, dict) and image_url.get("url"):
                     images.append({"url": str(image_url["url"])})
@@ -1183,12 +1533,67 @@ def file_to_data_url(filename: str, blob: bytes) -> str:
     return f"data:{mime};base64,{base64.b64encode(blob).decode('utf-8')}"
 
 
+# Seedream 5.0 Pro official size mapping. ``auto`` uses the resolution tier
+# directly; explicit ratios use pixel values so the existing ratio selector
+# remains meaningful without sending an unsupported ``aspect_ratio`` field.
+_SEEDREAM_5_PRO_SIZES: dict[str, dict[str, str]] = {
+    "1K": {
+        "1:1": "1024x1024", "4:3": "1152x864", "3:4": "864x1152",
+        "16:9": "1424x800", "9:16": "800x1424", "3:2": "1248x832",
+        "2:3": "832x1248", "21:9": "1568x672", "9:21": "672x1568",
+    },
+    "1.5K": {
+        "1:1": "1536x1536", "4:3": "1792x1344", "3:4": "1344x1792",
+        "16:9": "2048x1152", "9:16": "1152x2048", "3:2": "1872x1248",
+        "2:3": "1248x1872", "21:9": "2352x1008", "9:21": "1008x2352",
+    },
+    "2K": {
+        "1:1": "2048x2048", "4:3": "2368x1776", "3:4": "1776x2368",
+        "16:9": "2816x1584", "9:16": "1584x2816", "3:2": "2496x1664",
+        "2:3": "1664x2496", "21:9": "3136x1344", "9:21": "1344x3136",
+    },
+}
+
+
+def seedream_size(resolution: str, aspect_ratio: str) -> str:
+    resolution = str(resolution or "2K").strip()
+    aspect_ratio = str(aspect_ratio or "auto").strip()
+    mapping = _SEEDREAM_5_PRO_SIZES.get(resolution)
+    if mapping is None:
+        raise ValueError("Seedream 5.0 Pro 尺寸只支持 1K、1.5K、2K")
+    if aspect_ratio == "auto":
+        return resolution
+    if aspect_ratio not in mapping:
+        raise ValueError(f"Seedream 5.0 Pro 不支持比例 {aspect_ratio}")
+    return mapping[aspect_ratio]
+
+
+def build_seedream_payload(common: dict[str, Any], images: list[str]) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": common["model"],
+        "prompt": common["prompt"],
+        "size": seedream_size(
+            str(common.get("image_size") or "2K"),
+            str(common.get("aspect_ratio") or "auto"),
+        ),
+        "response_format": common.get("response_format") or "url",
+        "output_format": "png",
+        "watermark": False,
+    }
+    if images:
+        payload["image"] = images[0] if len(images) == 1 else images
+    return payload
+
+
 def save_gemini_image_item(item: dict[str, str], out_dir: Path, prefix: str, idx: int) -> tuple[str, str]:
     mime = item.get("mime_type", "image/png")
     suffix = mimetypes.guess_extension(mime) or ".png"
     if suffix == ".jpe":
         suffix = ".jpg"
     out_path = out_dir / f"{prefix}_{idx}{suffix}"
+    if item.get("url"):
+        download_url(item["url"], out_path)
+        return item["url"], str(out_path)
     data = item["b64_json"]
     missing_padding = len(data) % 4
     if missing_padding:
@@ -1209,6 +1614,27 @@ def build_form(values: dict[str, Any], files: dict[str, tuple[str, bytes]]) -> d
 def set_job(job_id: str, **updates: Any) -> None:
     with LOCK:
         JOBS[job_id].update(updates)
+
+
+def _prune_jobs_locked() -> None:
+    """Evict old finished jobs when JOBS exceeds MAX_JOBS. Caller must hold LOCK.
+    Only terminal jobs past the grace window are candidates — running/queued jobs
+    are never touched, and the grace window guarantees Portal's usage poller has
+    already counted them (see MAX_JOBS comment)."""
+    if len(JOBS) <= MAX_JOBS:
+        return
+    now = time.time()
+    evictable = [
+        (job.get("finished_at") or 0, jid)
+        for jid, job in JOBS.items()
+        if job.get("status") in _TERMINAL_JOB_STATUSES
+        and (now - (job.get("finished_at") or now)) > JOB_PRUNE_GRACE_SECONDS
+    ]
+    evictable.sort(key=lambda t: t[0])
+    for _, jid in evictable:
+        if len(JOBS) <= MAX_JOBS:
+            break
+        JOBS.pop(jid, None)
 
 
 def add_event(job_id: str, message: str) -> None:
@@ -1247,6 +1673,69 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
 
     seed_label = f", seed:{seed}" if seed > 0 else ""
     add_event(job_id, f"Run {index}: submitting {provider}/{common['model']}/{mode}{seed_label}")
+    config, _ = load_provider_config()
+    provider_cfg = (config.get("providers") or {}).get(provider) or {}
+    if provider_cfg.get("company_key"):
+        # A server-managed credential must never follow a client-controlled
+        # URL. Lock managed providers to their committed official endpoint.
+        base_url = str(provider_cfg.get("base_url") or "").rstrip("/")
+        if not base_url:
+            raise RuntimeError("托管供应商缺少官方 Base URL 配置")
+    if provider_cfg.get("api_style") == "ark_seedream":
+        image_data_urls: list[str] = []
+        if mode != "text2img":
+            for i in range(1, 15):
+                file_data = get_file_or_saved(form, f"image_{i}", ws_id)
+                if not file_data:
+                    continue
+                filename, blob = file_data
+                image_data_urls.append(file_to_data_url(filename, blob))
+        max_images = int(provider_cfg.get("max_reference_images") or 10)
+        if len(image_data_urls) > max_images:
+            raise ValueError(f"Seedream 5.0 Pro 最多支持 {max_images} 张参考图")
+
+        payload = build_seedream_payload(common, image_data_urls)
+        result = request_json(
+            "POST",
+            f"{base_url}/images/generations",
+            api_key,
+            payload,
+            timeout=int(values.get("timeout") or 300),
+        )
+        task_id = f"seedream_{uuid.uuid4().hex[:12]}"
+        items = extract_items(result)
+        if not items:
+            raise RuntimeError(f"Seedream 未返回图片: {result}")
+
+        _ensure_output_dir(values, job_id)
+        out_dir = resolve_output_dir(values.get("output_dir"))
+        file_token_results = []
+        custom_name = values.get("output_name", "").strip()
+        if custom_name:
+            total = max(1, int(values.get("repeat_count") or 1), int(values.get("concurrency") or 1))
+            prefix = f"{custom_name}-{index}" if total > 1 else custom_name
+        else:
+            prefix = f"{time.strftime('%Y%m%d_%H%M%S')}_run{index}_{task_id}"
+        for item_index, item in enumerate(items, 1):
+            image_url, local_path = save_image_item(item, out_dir, prefix, item_index)
+            token = uuid.uuid4().hex
+            with LOCK:
+                FILES[token] = Path(local_path)
+            file_token_results.append({
+                "image_url": image_url,
+                "download_url": f"/api/download/{token}",
+                "filename": Path(local_path).name,
+                "local_path": local_path,
+            })
+        add_event(job_id, f"Run {index}: saved {len(file_token_results)} image(s), input_images:{len(image_data_urls)}")
+        return {
+            "index": index,
+            "task_id": task_id,
+            "status": "succeeded",
+            "seed": None,
+            "images": file_token_results,
+        }
+
     if provider == "gemini":
         image_count = 0
         if common["model"] == "gpt-image-2":
@@ -1264,11 +1753,51 @@ def run_one(job_id: str, index: int, values: dict[str, Any], files: dict[str, tu
                 "messages": [{"role": "user", "content": content}],
                 "max_tokens": 256,
             }
-            result = request_chat_completion(f"{base_url}/v1/chat/completions", api_key, payload)
+            # chiyun 是多上游负载均衡:部分通道不支持 /v1/chat/completions,
+            # 会用 HTTP 200 包一个业务错误({code:404,msg:'No endpoint POST
+            # /v1/chat/completions'}),request_json 的 HTTP 层重试对此不触发。
+            # 这就是「并发2偶尔成一张、单发常失败」的真因——多打几次才命中
+            # 好通道。这里把「请求+解析」包成软错误重试,把碰运气变成确定成功。
+            # 图生图实测单次约 99s,超时给足 300s。
             task_id = f"chat_{uuid.uuid4().hex[:12]}"
-            items = extract_chat_completion_images(result)
+            items = []
+            last_result: Any = None
+            soft_attempts = 4
+            for soft_try in range(soft_attempts):
+                result = request_chat_completion(
+                    f"{base_url}/v1/chat/completions", api_key, payload, timeout=300)
+                last_result = result
+                biz_code = result.get("code") if isinstance(result, dict) else None
+                biz_msg = str(result.get("msg") or "") if isinstance(result, dict) else ""
+
+                # 确定性拒绝:内容审核未过 / 端点缺失等,重试再多次也必然同样结果。
+                # 立即失败,不再空耗——实测这类失败原本要重试满 4 次、白等十几分钟。
+                # 说明:gpt-image 的 chat/completions 通道对「未通过审核的参考图」
+                # 会把审核拒绝错误地包装成 404 "No endpoint POST /v1/chat/completions"
+                # (已由「同一 key 换张图即成功」证实),文案极具误导性,这里翻译成人话。
+                if _is_deterministic_reject(biz_code, biz_msg):
+                    add_event(job_id, f"Run {index}: 生成被拒(code={biz_code}),疑似参考图未通过内容审核")
+                    raise RuntimeError(_friendly_reject_message(result))
+
+                # 其它业务错误码(如瞬时通道抖动)→ 换通道重试
+                if biz_code not in (None, 200, "200"):
+                    if soft_try < soft_attempts - 1:
+                        add_event(job_id, f"Run {index}: 通道返回 code={biz_code},重试 {soft_try + 1}/{soft_attempts - 1}")
+                        time.sleep(min(2 ** soft_try, 8))
+                        continue
+                    break
+                items = extract_chat_completion_images(result)
+                if items:
+                    break
+                # 200 且无 code 错误,但解析不出图 → 也换一路再试
+                if soft_try < soft_attempts - 1:
+                    add_event(job_id, f"Run {index}: 未解析到图片,重试 {soft_try + 1}/{soft_attempts - 1}")
+                    time.sleep(min(2 ** soft_try, 8))
             if not items:
-                raise RuntimeError(f"No image result found: {result}")
+                # 到这里说明重试用尽仍无图(非确定性拒绝)。给友好提示,原始
+                # 响应记进日志备查,不再把整坨 raw JSON 甩给用户。
+                print(f"[nano] gpt-image-2 no result after retries: {str(last_result)[:500]}", flush=True)
+                raise RuntimeError(_friendly_reject_message(last_result))
             _ensure_output_dir(values, job_id)
             out_dir = resolve_output_dir(values.get("output_dir"))
             file_token_results = []
@@ -1435,6 +1964,19 @@ def run_job(job_id: str, values: dict[str, Any], files: dict[str, tuple[str, byt
                     with LOCK:
                         JOBS[job_id]["results"].append(result)
                         JOBS[job_id]["done"] += 1
+                except APIError as exc:
+                    # 结构化 API 错误，记录错误类型方便前端展示
+                    error_msg = f"[{exc.error_category}] {exc.message}"
+                    with LOCK:
+                        JOBS[job_id]["errors"].append(error_msg)
+                        JOBS[job_id]["done"] += 1
+                    add_event(job_id, f"API Error [{exc.error_category}]: {exc.message[:200]}")
+                except NetworkError as exc:
+                    error_msg = f"[network_error] {exc}"
+                    with LOCK:
+                        JOBS[job_id]["errors"].append(error_msg)
+                        JOBS[job_id]["done"] += 1
+                    add_event(job_id, f"Network Error: {exc}")
                 except Exception as exc:
                     with LOCK:
                         JOBS[job_id]["errors"].append(str(exc))
@@ -1460,12 +2002,43 @@ def run_job(job_id: str, values: dict[str, Any], files: dict[str, tuple[str, byt
         report_final_to_portal(job_id, "failed")
 
 
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
+
+
 class Handler(SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        super().end_headers()
+
+    def _reject_oversized_upload(self) -> bool:
+        raw = self.headers.get("Content-Length")
+        if not raw:
+            return False
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return False
+        if n > MAX_UPLOAD_BYTES:
+            body = json.dumps({
+                "ok": False,
+                "error": f"upload too large: {n} bytes (limit {MAX_UPLOAD_BYTES})",
+            }).encode("utf-8")
+            self.send_response(413)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return True
+        return False
+
     def translate_path(self, path: str) -> str:
         path = urllib.parse.urlparse(path).path
         if path in {"/", "/index.html"}:
             return str(STATIC_DIR / "index.html")
-        return str((STATIC_DIR / path.lstrip("/")).resolve())
+        return _safe_join_or_root(STATIC_DIR, path.lstrip("/"))
 
     def do_GET(self) -> None:
         self._raw_path = self.path
@@ -1485,7 +2058,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "ok": config_error is None,
                 "has_key": bool(load_default_key()),
                 "masked_key": mask_key(load_default_key()),
-                "providers": providers.get("providers", {}),
+                "providers": providers_for_client(providers),
                 "default_provider": providers.get("default_provider"),
                 "config_error": config_error,
             })
@@ -1518,7 +2091,8 @@ class Handler(SimpleHTTPRequestHandler):
             field = self.path.rsplit("/", 1)[-1]
             ws = _workspace_id(self)
             item = read_preset(ws).get("media", {}).get(field)
-            path = _ws_media_dir(ws) / item.get("stored", "") if item else None
+            stored_name = Path(item.get("stored", "")).name if item else ""
+            path = _ws_media_dir(ws) / stored_name if stored_name else None
             if not item or not path or not path.exists():
                 json_response(self, 404, {"error": "media not found"})
                 return
@@ -1639,6 +2213,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:
+        if self._reject_oversized_upload():
+            return
         self._raw_path = self.path
         self.path = urllib.parse.urlparse(self.path).path
         if self.path == "/api/choose-output-dir":
@@ -1730,6 +2306,12 @@ class Handler(SimpleHTTPRequestHandler):
             if not data:
                 json_response(self, 400, {"error": "empty file"})
                 return
+            if not sniff_is_image(data[:16]):
+                json_response(self, 415, {
+                    "ok": False,
+                    "error": "uploaded file is not a recognized image format",
+                })
+                return
             suffix = Path(filename).suffix.lower()
             stored = f"{uuid.uuid4().hex}_{field_name}{suffix}"
             media_dir = _ws_media_dir(ws)
@@ -1792,7 +2374,8 @@ class Handler(SimpleHTTPRequestHandler):
             try:
                 payload = read_json_body(self)
                 values, files = values_files_from_json(payload)
-                api_key = str(values.get("api_key") or load_default_key()).strip()
+                provider = str(values.get("provider") or "t8star")
+                api_key = resolve_provider_api_key(provider, str(values.get("api_key") or ""))
                 if not api_key and not payload.get("dry_run"):
                     json_response(self, 400, api_error("invalid_request", "API key is required"))
                     return
@@ -1826,11 +2409,12 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, 404, {"error": "not found"})
             return
         form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
-        api_key = get_field(form, "api_key") or load_default_key()
+        values = {key: get_field(form, key) for key in form.keys() if not getattr(form[key], "filename", None)}
+        provider = str(values.get("provider") or "t8star")
+        api_key = resolve_provider_api_key(provider, str(values.get("api_key") or ""))
         if not api_key:
             json_response(self, 400, api_error("invalid_request", "API key is required"))
             return
-        values = {key: get_field(form, key) for key in form.keys() if not getattr(form[key], "filename", None)}
         values["api_key"] = api_key
         files = {}
         for key in form.keys():

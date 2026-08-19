@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 from datetime import datetime, timedelta
 import hashlib
+import hmac
 import http.client
 import io
 import json
@@ -49,21 +50,90 @@ USER_KEYS_PATH = STATE_DIR / "user_keys.json"
 
 SESSION_MAX_AGE = 86400 * 30  # 30 days
 
-APPS = {
-    "seedance": {"dir": ROOT.parent / "seedance", "port": int(os.environ.get("SEEDANCE_PORT", "8787"))},
-    "nano-banana": {"dir": ROOT.parent / "nano-banana", "port": int(os.environ.get("NANO_PORT", "8797"))},
-    "dreamina": {"dir": ROOT.parent / "dreamina", "port": int(os.environ.get("DREAMINA_PORT", "8888"))},
-    "volcengine-portrait": {"dir": ROOT.parent / "volcengine-portrait", "port": int(os.environ.get("VOLCENGINE_PORTRAIT_PORT", "8891"))},
-}
+# Sub-app registry — read once from portal/apps.json. See portal/app_spec.py
+# for the AppSpec schema. Adding a new sub-app is one JSON entry + one folder.
+from app_spec import (
+    AppSpec,
+    classify_job_type,
+    load_specs,
+    resolve_extra_headers,
+)
+
+APPS_JSON = ROOT / "apps.json"
+SPECS: list[AppSpec] = load_specs(APPS_JSON, ROOT.parent)
+SPEC_BY_NAME: dict[str, AppSpec] = {s.name: s for s in SPECS}
+
+# Legacy dict view — keeps existing `APPS[name]["dir"]` / `APPS[name]["port"]`
+# / `APPS.items()` callers working without churn. Values are recomputed lazily
+# via AppSpec.port so env overrides at runtime still take effect.
+class _AppsView:
+    def __init__(self, specs: list[AppSpec]):
+        self._specs = specs
+        self._by_name = {s.name: s for s in specs}
+    def __getitem__(self, name: str) -> dict[str, Any]:
+        s = self._by_name[name]
+        return {"dir": s.dir_path, "port": s.port, "spec": s}
+    def __contains__(self, name: str) -> bool:
+        return name in self._by_name
+    def __iter__(self):
+        return iter(self._by_name)
+    def keys(self):
+        return self._by_name.keys()
+    def items(self):
+        for s in self._specs:
+            yield s.name, {"dir": s.dir_path, "port": s.port, "spec": s}
+    def get(self, name: str, default=None):
+        return self[name] if name in self._by_name else default
+
+APPS = _AppsView(SPECS)
 
 PORTAL_PORT = int(os.environ.get("PORTAL_PORT", "9090"))
 REDIRECT_PORT = int(os.environ.get("REDIRECT_PORT", "9089"))
+
+
+def _default_allowed_origins() -> frozenset[str]:
+    """Origins allowed to make credentialed cross-origin requests.
+
+    Defaults cover LAN IPs (auto-discovered) + loopback. Public deployments
+    should set ALLOWED_ORIGINS explicitly (comma-separated), e.g.
+    'https://apps.company.com,https://portal.company.com'."""
+    override = os.environ.get("ALLOWED_ORIGINS", "").strip()
+    if override:
+        return frozenset(o.strip() for o in override.split(",") if o.strip())
+    # Auto-discover: LAN IP (may fail early during startup — get_lan_ip is safe)
+    origins: set[str] = set()
+    try:
+        lan = get_lan_ip()
+        if lan:
+            origins.add(f"https://{lan}:{PORTAL_PORT}")
+            origins.add(f"http://{lan}:{PORTAL_PORT}")
+    except Exception:
+        pass
+    for host in ("127.0.0.1", "localhost"):
+        origins.add(f"https://{host}:{PORTAL_PORT}")
+        origins.add(f"http://{host}:{PORTAL_PORT}")
+    return frozenset(origins)
+
+
+# Lazy — get_lan_ip needs ifconfig/ipconfig which may take a beat.
+# Refreshed on each _cors_headers call if unset, so LAN IP changes get picked up.
+_ALLOWED_ORIGINS: frozenset[str] | None = None
 
 # Shared secret between portal and sub-apps for the internal finalize callback.
 # Generated fresh per portal launch; injected into each sub-app's env so a
 # malicious local user cannot retroactively decrement stats without it.
 INTERNAL_TOKEN = os.environ.get("PORTAL_INTERNAL_TOKEN") or secrets.token_hex(32)
 os.environ["PORTAL_INTERNAL_TOKEN"] = INTERNAL_TOKEN
+
+
+def _sign_admin_header(username: str, is_admin: bool, ts: int) -> str:
+    """HMAC-SHA256(INTERNAL_TOKEN, "<ts>:<is_admin_flag>:<username>").
+
+    Sub-apps verify this before trusting X-Is-Admin — without a valid sig,
+    the X-Is-Admin header is ignored. Timestamp lets sub-apps reject replays
+    older than PORTAL_SIG_WINDOW seconds (default 60)."""
+    msg = f"{ts}:{'1' if is_admin else '0'}:{username}".encode("utf-8")
+    return hmac.new(INTERNAL_TOKEN.encode("utf-8"), msg, hashlib.sha256).hexdigest()
 
 ROLE_PERMISSIONS: dict[str, set[str]] = {
     "admin": {"use_apps", "view_stats_all", "manage_users", "manage_dreamina_accounts"},
@@ -362,11 +432,12 @@ class KeyManager:
                      "note": k.get("note", ""), "key_hint": self._mask(k["key"])} for k in keys]
 
     def add_key(self, user_id: str, name: str, provider: str, key: str, note: str = "") -> dict:
-        # The volcengine-portrait subapp uses a single company-wide key managed by admin
-        # (POST /api/platform/portrait-key). Per-user personal keys are explicitly disabled
-        # to avoid drift between accounts.
-        if provider == "volcengine-portrait":
-            raise ValueError("人像生成由 admin 统一配置,不支持个人密钥")
+        # Sub-apps that declare `personal_key_disabled` use a company-wide key
+        # managed by admin (POST /api/platform/<endpoint>) — reject personal
+        # keys to avoid drift between accounts.
+        spec = SPEC_BY_NAME.get(provider)
+        if spec is not None and spec.personal_key_disabled:
+            raise ValueError(f"{spec.display_name}由 admin 统一配置,不支持个人密钥")
         with self._lock:
             data = self._load()
             entry = {
@@ -457,7 +528,14 @@ class AppManager:
 
     def start_all(self):
         for name, config in APPS.items():
-            self.start_app(name, config)
+            if config["spec"].managed:
+                self.start_app(name, config)
+            else:
+                alive = self._tcp_probe(config["port"])
+                self.status[name] = {
+                    "status": "running" if alive else "unavailable",
+                    "port": config["port"],
+                }
         threading.Thread(target=self._health_loop, daemon=True).start()
         threading.Thread(target=self._log_rotation_loop, daemon=True).start()
 
@@ -484,13 +562,15 @@ class AppManager:
                 print(f"  [log-rotate] loop error: {exc}", flush=True)
             self._stop_event.wait(3600)
 
-    def _read_portrait_keys(self) -> tuple[str, str]:
-        """Read volcengine AK/SK from the portrait sub-app's config.json so
-        seedance can inherit the same credentials for TOS uploads. Portrait
-        stores keys at <portrait_dir>/config.json (note: not in state/, see
-        volcengine-portrait/app.py load_config). Empty on any failure."""
+    def _read_tos_source_keys(self) -> tuple[str, str]:
+        """Read TOS AK/SK from whichever sub-app is declared `is_tos_source`
+        in apps.json (currently volcengine-portrait). Sub-apps with
+        `needs_tos_creds` get these injected via env at start_app time."""
+        source_spec = next((s for s in SPECS if s.is_tos_source), None)
+        if source_spec is None:
+            return "", ""
         try:
-            cfg_path = APPS["volcengine-portrait"]["dir"] / "config.json"
+            cfg_path = source_spec.dir_path / "config.json"
             if not cfg_path.exists():
                 return "", ""
             data = json.loads(cfg_path.read_text("utf-8"))
@@ -498,7 +578,33 @@ class AppManager:
         except Exception:
             return "", ""
 
+    def _read_ark_key(self) -> str:
+        """Read Seedance's server-managed Ark Bearer key for child apps.
+
+        Only the child-process environment receives the plaintext value. API
+        config responses expose availability as a boolean, never the key.
+        """
+        seedance_spec = SPEC_BY_NAME.get("seedance")
+        if seedance_spec is None:
+            return ""
+        try:
+            secrets_path = seedance_spec.dir_path / "state" / "secrets.json"
+            if not secrets_path.exists():
+                return ""
+            data = json.loads(secrets_path.read_text("utf-8"))
+            return str(data.get("volcengine_api_key") or "").strip()
+        except Exception:
+            return ""
+
     def start_app(self, name: str, config: dict):
+        spec: AppSpec | None = config.get("spec")
+        if spec is not None and not spec.managed:
+            alive = self._tcp_probe(config["port"])
+            self.status[name] = {
+                "status": "running" if alive else "unavailable",
+                "port": config["port"],
+            }
+            return
         app_dir = config["dir"]
         if not (app_dir / "app.py").exists():
             self.status[name] = {"status": "missing", "error": "app.py not found"}
@@ -510,11 +616,15 @@ class AppManager:
         env["CORS"] = "1"
         if "DATA_DIR" in os.environ:
             env["DATA_DIR"] = str(app_dir / "test-data")
-        if name in ("seedance", "volcengine-portrait"):
-            ak, sk = self._read_portrait_keys()
+        if spec is not None and spec.needs_tos_creds:
+            ak, sk = self._read_tos_source_keys()
             if ak and sk:
                 env["TOS_ACCESS_KEY"] = ak
                 env["TOS_SECRET_KEY"] = sk
+        if spec is not None and spec.needs_ark_key:
+            ark_key = self._read_ark_key()
+            if ark_key:
+                env["VOLCENGINE_ARK_API_KEY"] = ark_key
         old_log = self.log_handles.pop(name, None)
         if old_log:
             try: old_log.close()
@@ -525,9 +635,30 @@ class AppManager:
         popen_kwargs = dict(_POPEN_EXTRA)
         if hasattr(os, "setsid"):
             popen_kwargs["preexec_fn"] = os.setsid
+        # Per-app engine switch: FastAPI variants live in app_fastapi.py and
+        # are launched via uvicorn from the shared .venv. Falls back to the
+        # stdlib app.py when app_fastapi.py is missing or the env opts out.
+        engine_env = f"{name.upper().replace('-', '_')}_ENGINE"
+        engine = env.get(engine_env, os.environ.get(engine_env, "stdlib")).lower()
+        fastapi_path = app_dir / "app_fastapi.py"
+        venv_uvicorn = ROOT.parent / ".venv" / "bin" / "uvicorn"
+        expat_lib = "/opt/homebrew/opt/expat/lib"
+        if engine == "fastapi" and fastapi_path.exists() and venv_uvicorn.exists():
+            # DYLD lets Homebrew Python 3.12 load Homebrew expat rather than
+            # the (broken) system libexpat. See requirements.txt.
+            env["DYLD_LIBRARY_PATH"] = expat_lib + (":" + env["DYLD_LIBRARY_PATH"] if env.get("DYLD_LIBRARY_PATH") else "")
+            cmd = [
+                str(venv_uvicorn),
+                "app_fastapi:app",
+                "--host", "127.0.0.1",
+                "--port", str(config["port"]),
+                "--log-level", "warning",
+            ]
+        else:
+            cmd = [sys.executable, "app.py"]
         try:
             proc = subprocess.Popen(
-                [sys.executable, "app.py"], cwd=str(app_dir), env=env,
+                cmd, cwd=str(app_dir), env=env,
                 stdout=log_file, stderr=subprocess.STDOUT, **popen_kwargs,
             )
         except Exception as exc:
@@ -555,6 +686,13 @@ class AppManager:
         while not self._stop_event.is_set():
             time.sleep(15)
             for name, config in APPS.items():
+                if not config["spec"].managed:
+                    alive = self._tcp_probe(config["port"])
+                    self.status[name] = {
+                        "status": "running" if alive else "unavailable",
+                        "port": config["port"],
+                    }
+                    continue
                 proc = self.processes.get(name)
                 if proc and proc.poll() is not None:
                     self.status[name] = {"status": "crashed", "exit_code": proc.returncode, "port": config["port"]}
@@ -638,6 +776,24 @@ class UsageTracker:
         self._lock = threading.Lock()
         self._data = self._load()
         self._pending_jobs: list[dict] = []
+        # Debounced persistence: hot paths (record/register_job/inc_daily_jobs/
+        # finalize_job/_add_user_stat) used to json.dumps + double-write the whole
+        # usage.json to disk *while holding self._lock*, on EVERY proxied request
+        # (including every static JS/CSS/image of a sub-app). Under load all proxy
+        # threads serialized on that lock + disk I/O, and usage.json grows
+        # unboundedly (daily/by_user never pruned) so each write got slower. That
+        # was the portal-side stall that dragged all four sub-apps down together.
+        #
+        # Now _save() just marks dirty + wakes a background flusher. The flusher
+        # snapshots under the lock (cheap) and does the json.dumps + disk write
+        # OUTSIDE the lock, at most once per _FLUSH_INTERVAL. shutdown() forces a
+        # final synchronous flush so nothing is lost on restart.
+        self._dirty = False
+        self._flush_wake = threading.Event()
+        self._stop_flush = threading.Event()
+        self._FLUSH_INTERVAL = 2.0
+        self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
+        self._flush_thread.start()
         threading.Thread(target=self._job_poll_loop, daemon=True).start()
         threading.Thread(target=self._auto_backup_loop, daemon=True).start()
 
@@ -685,10 +841,21 @@ class UsageTracker:
         return d
 
     def _save(self):
+        """Mark usage data dirty and wake the background flusher.
+
+        MUST be called while holding self._lock (every caller already does).
+        This is now O(1) — no json.dumps, no disk I/O on the request thread —
+        so hot paths no longer serialize the whole file under the lock. The
+        actual write happens in _flush_loop, at most once per _FLUSH_INTERVAL.
+        """
+        self._dirty = True
+        self._flush_wake.set()
+
+    def _write_to_disk(self, payload: str):
         """Atomic double-write: tmp → primary (rename), then copy primary → .bak.
+        Runs OUTSIDE self._lock — payload is a pre-serialized snapshot string.
         Long-term retention: do NOT prune any date keys here."""
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(self._data, ensure_ascii=False, indent=2)
         tmp_path = USAGE_PATH.with_suffix(USAGE_PATH.suffix + ".tmp")
         bak_path = USAGE_PATH.with_suffix(USAGE_PATH.suffix + ".bak")
         try:
@@ -700,6 +867,53 @@ class UsageTracker:
         # Refresh .bak (best-effort; failure here doesn't compromise primary)
         try:
             shutil.copyfile(USAGE_PATH, bak_path)
+        except Exception:
+            pass
+
+    def _flush_now(self) -> bool:
+        """Serialize a snapshot under the lock, then write it to disk outside
+        the lock. Returns True if a write was performed. Only json.dumps holds
+        the lock (unavoidable — must snapshot a consistent view); the two disk
+        writes happen lock-free so other threads keep moving."""
+        with self._lock:
+            if not self._dirty:
+                return False
+            payload = json.dumps(self._data, ensure_ascii=False, indent=2)
+            self._dirty = False
+        self._write_to_disk(payload)
+        return True
+
+    def _flush_loop(self):
+        """Debounced writer: wake on _flush_wake or every _FLUSH_INTERVAL,
+        coalescing bursts of _save() calls into a single disk write. On
+        _stop_flush (shutdown), do a final flush and exit."""
+        while not self._stop_flush.is_set():
+            self._flush_wake.wait(timeout=self._FLUSH_INTERVAL)
+            self._flush_wake.clear()
+            try:
+                self._flush_now()
+            except Exception as exc:
+                print(f"  [usage] flush loop error: {exc}", flush=True)
+        # Final drain on shutdown so nothing dirty is lost across restart.
+        try:
+            self._flush_now()
+        except Exception:
+            pass
+
+    def flush(self):
+        """Stop the background flusher and force a final synchronous write.
+
+        Reliable barrier: signals the loop to stop, joins it (so it cannot race
+        us by grabbing the dirty flag and writing after we return), then does one
+        last _flush_now(). Used on shutdown and by tests that assert on-disk
+        state right after record()."""
+        self._stop_flush.set()
+        self._flush_wake.set()
+        t = getattr(self, "_flush_thread", None)
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=5)
+        try:
+            self._flush_now()
         except Exception:
             pass
 
@@ -779,7 +993,22 @@ class UsageTracker:
                         nested = data.get("job") if isinstance(data.get("job"), dict) else {}
                         status = data.get("status") or nested.get("status") or ""
                         if status in ("succeeded", "failed", "completed"):
-                            done = max(1, int(data.get("done") or nested.get("done") or 0))
+                            # `done` is the count of items the sub-app actually
+                            # produced (each successful item does JOBS[id]["done"] += 1),
+                            # independent of the final status: a partial success
+                            # (e.g. 3 of 4 images, final_status="failed") still
+                            # reports done=3, and those 3 were really generated and
+                            # billed. A pure failure reports done=0.
+                            #
+                            # We record the real `done` verbatim. Do NOT floor it to
+                            # max(1, ...) — that turned a 0-output failure into one
+                            # phantom image in by_user.images (the poll loop only sees
+                            # a job here when the sub-app's finalize_job callback failed
+                            # to land, so failures do reach this branch). We already
+                            # count and roll back the *job* separately in daily.jobs via
+                            # inc_daily_jobs/finalize_job; this branch is only for the
+                            # per-item images/seconds tally.
+                            done = int(data.get("done") or nested.get("done") or 0)
                             # Re-derive job_type from response when possible — dreamina
                             # retry endpoints may have been misclassified at register time.
                             # Only override if task_type carries explicit signal; otherwise
@@ -791,15 +1020,20 @@ class UsageTracker:
                                 job_type = "video"
                             elif "text2image" in task_type or "image2image" in task_type:
                                 job_type = "image"
-                            if job_type == "video":
-                                # Prefer per-item duration the subapp reports directly.
-                                per_item = (int(data.get("duration") or 0)
-                                            or int(data.get("duration_seconds") or 0)
-                                            or int(nested.get("duration") or 0)
-                                            or int(job.get("duration_per_item") or 0))
-                                self._add_user_stat(job["date"], job["username"], job["app"], 0, done * per_item)
-                            else:
-                                self._add_user_stat(job["date"], job["username"], job["app"], done, 0)
+                            # done <= 0 means the job produced nothing (pure
+                            # failure). Skip the stat write entirely — no phantom
+                            # image, no meaningless 0-row — but still drop it from
+                            # pending below so we stop polling it.
+                            if done > 0:
+                                if job_type == "video":
+                                    # Prefer per-item duration the subapp reports directly.
+                                    per_item = (int(data.get("duration") or 0)
+                                                or int(data.get("duration_seconds") or 0)
+                                                or int(nested.get("duration") or 0)
+                                                or int(job.get("duration_per_item") or 0))
+                                    self._add_user_stat(job["date"], job["username"], job["app"], 0, done * per_item)
+                                else:
+                                    self._add_user_stat(job["date"], job["username"], job["app"], done, 0)
                             done_ids.append(job["job_id"])
                     conn.close()
                 except Exception:
@@ -831,7 +1065,16 @@ class UsageTracker:
         """Idempotent: mark a job final. If status indicates failure/cancel,
         roll back the +1 that inc_daily_jobs applied at registration time.
         Returns True if the rollback was applied (i.e. first time we saw
-        a failure for this job), False otherwise."""
+        a failure for this job), False otherwise.
+
+        This must NOT drop the job from _pending_jobs. Sub-apps report
+        final_status="failed" whenever a single item errored, so a partial
+        success (3 of 4 images generated and billed) arrives here as a failure.
+        The two paths write disjoint counters — this one owns daily.jobs, the
+        poll loop owns by_user.images/seconds — and the `finalized` flag above
+        already makes the daily.jobs rollback idempotent. Removing the job from
+        pending would leave those 3 real images uncounted forever.
+        """
         status = (status or "").lower()
         is_failure = status in ("failed", "fail", "failure", "cancelled", "canceled", "error")
         with self._lock:
@@ -852,10 +1095,6 @@ class UsageTracker:
                 app_stats = day_stats.setdefault(app, {"requests": 0, "jobs": 0})
                 app_stats["jobs"] = max(0, int(app_stats.get("jobs", 0)) - 1)
                 rolled = True
-                # Drop from pending_jobs so the poll loop does not double-act.
-                self._pending_jobs = [
-                    j for j in self._pending_jobs if not (j["app"] == app and j["job_id"] == job_id)
-                ]
             self._save()
             return rolled
 
@@ -864,7 +1103,12 @@ class UsageTracker:
             return False
         job_patterns = ["/api/jobs", "/api/text2image", "/api/image2image", "/api/text2video",
                         "/api/image2video", "/api/frames2video", "/api/multimodal2video", "/api/multiframe2video",
-                        "/api/virtual/jobs", "/api/real/jobs"]
+                        "/api/virtual/jobs", "/api/real/jobs",
+                        # infinite-canvas 的画布前端契约固定用 /api/v1/jobs（其 web/src/api/jobs.ts:4），
+                        # 而 "/api/v1/jobs".startswith("/api/jobs") 是 False —— 不列在这里就完全不计数。
+                        # 注意 /api/v1/jobs/{id}/cancel 也是 POST 且命中本前缀，但取消接口
+                        # 刻意不返回 X-Job-Id，因此 :2093-2097 的第三个条件不满足，不会误登记。
+                        "/api/v1/jobs"]
         return any(path.startswith(p) for p in job_patterns)
 
     def get_stats(self, username: str = "", role: str = "user") -> dict[str, Any]:
@@ -1051,9 +1295,40 @@ tracker = UsageTracker()
 _AUTH_EXEMPT = {"/login", "/api/auth/login", "/api/auth/register"}
 
 
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
+
+
 class Handler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
+
+    def end_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        super().end_headers()
+
+    def _reject_oversized_upload(self) -> bool:
+        raw = self.headers.get("Content-Length")
+        if not raw:
+            return False
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return False
+        if n > MAX_UPLOAD_BYTES:
+            body = json.dumps({
+                "ok": False,
+                "error": f"upload too large: {n} bytes (limit {MAX_UPLOAD_BYTES})",
+            }).encode("utf-8")
+            self.send_response(413)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return True
+        return False
 
     def handle_one_request(self):
         try:
@@ -1131,8 +1406,8 @@ class Handler(SimpleHTTPRequestHandler):
             self._platform_stats_export(user)
         elif path == "/api/platform/activity":
             self._platform_activity(user)
-        elif path == "/api/platform/portrait-key":
-            self._platform_portrait_key_get(user)
+        elif self._try_company_key_route(path, "GET", user):
+            pass
         elif path == "/api/feishu/config":
             self._feishu_config_get(user)
         elif path.startswith("/api/reports/daily/") and path.endswith(".csv"):
@@ -1156,12 +1431,16 @@ class Handler(SimpleHTTPRequestHandler):
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             provider = qs.get("provider", [None])[0]
             self._json(200, {"ok": True, "keys": key_manager.list_keys(user["user_id"], provider)})
+        elif path == "/api/apps":
+            self._apps_meta()
         elif self._try_proxy(path, "GET", user):
             pass
         else:
             self._serve_portal(path)
 
     def do_POST(self):
+        if self._reject_oversized_upload():
+            return
         path = urllib.parse.urlparse(self.path).path
         if path == "/api/auth/login":
             self._auth_login()
@@ -1229,8 +1508,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             self._json(200, {"ok": True, "key": entry})
             return
-        if path == "/api/platform/portrait-key":
-            self._platform_portrait_key_set(user)
+        if self._try_company_key_route(path, "POST", user):
             return
         if path == "/api/reports/send":
             self._report_send(user)
@@ -1244,7 +1522,29 @@ class Handler(SimpleHTTPRequestHandler):
         if not self._try_proxy(path, "POST", user):
             self._json(404, {"ok": False, "error": "not found"})
 
+    def do_PUT(self):
+        if self._reject_oversized_upload():
+            return
+        path = urllib.parse.urlparse(self.path).path
+        user = self._require_auth(path)
+        if not user:
+            return
+        if not self._try_proxy(path, "PUT", user):
+            self._json(404, {"ok": False, "error": "not found"})
+
+    def do_PATCH(self):
+        if self._reject_oversized_upload():
+            return
+        path = urllib.parse.urlparse(self.path).path
+        user = self._require_auth(path)
+        if not user:
+            return
+        if not self._try_proxy(path, "PATCH", user):
+            self._json(404, {"ok": False, "error": "not found"})
+
     def do_DELETE(self):
+        if self._reject_oversized_upload():
+            return
         path = urllib.parse.urlparse(self.path).path
         user = self._require_auth(path)
         if not user:
@@ -1420,15 +1720,16 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _platform_portrait_key_get(self, user: dict):
-        """Admin-only: returns whether the company-wide volcengine-portrait key is set.
-        Never returns the plaintext."""
+    def _company_key_get(self, spec: AppSpec, user: dict):
+        """Admin-only: returns whether the company-wide key for `spec` is set.
+        Never returns the plaintext. Strict role check — do NOT go through
+        spec.admin_permission (which would let manage_dreamina_accounts read
+        another app's admin key)."""
         if user.get("role") != "admin":
             self._json(403, {"ok": False, "error": "admin only"})
             return
         try:
-            port = APPS["volcengine-portrait"]["port"]
-            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn = http.client.HTTPConnection("127.0.0.1", spec.port, timeout=5)
             conn.request("GET", "/api/config")
             resp = conn.getresponse()
             data = json.loads(resp.read()) if resp.status == 200 else {}
@@ -1443,9 +1744,10 @@ class Handler(SimpleHTTPRequestHandler):
             "has_secret_key": bool(data.get("has_secret_key")),
         })
 
-    def _platform_portrait_key_set(self, user: dict):
-        """Admin-only: write the company-wide volcengine-portrait key/AK/SK.
-        Empty fields are silently ignored (treated as 'do not modify')."""
+    def _company_key_set(self, spec: AppSpec, user: dict):
+        """Admin-only: write the company-wide key/AK/SK for `spec` via its
+        /api/config. Empty fields silently ignored ('do not modify'). Strict
+        role check (see _company_key_get)."""
         if user.get("role") != "admin":
             self._json(403, {"ok": False, "error": "admin only"})
             return
@@ -1461,13 +1763,17 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(400, {"ok": False, "error": "no key field provided"})
             return
         try:
-            port = APPS["volcengine-portrait"]["port"]
-            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn = http.client.HTTPConnection("127.0.0.1", spec.port, timeout=5)
             payload = json.dumps(forwarded).encode("utf-8")
+            username_encoded = urllib.parse.quote(user.get("username", ""), safe="")
+            ts = int(time.time())
             conn.request("POST", "/api/config", body=payload, headers={
                 "Content-Type": "application/json",
                 "Content-Length": str(len(payload)),
                 "X-Is-Admin": "1",
+                "X-Username": username_encoded,
+                "X-Portal-Ts": str(ts),
+                "X-Portal-Sig": _sign_admin_header(username_encoded, True, ts),
             })
             resp = conn.getresponse()
             data = json.loads(resp.read()) if resp.status == 200 else {}
@@ -1485,6 +1791,45 @@ class Handler(SimpleHTTPRequestHandler):
             "has_access_key": bool(data.get("has_access_key")),
             "has_secret_key": bool(data.get("has_secret_key")),
         })
+
+    def _apps_meta(self):
+        """Return sub-app metadata that the frontend needs to render tabs
+        and stats tables. Excludes backend-sensitive fields (credentials,
+        admin permissions, extra headers) — those are enforced server-side."""
+        payload = [
+            {
+                "name": s.name,
+                "display_name": s.display_name,
+                "mount": s.mount,
+                "iframe_url": s.iframe_url,
+                "component_factory": s.component_factory,
+                "color": s.color,
+                "metrics": list(s.metrics),
+                "unit_label": s.unit_label,
+                "stats_combine": s.stats_combine,
+            }
+            for s in SPECS
+        ]
+        self._json(200, {"ok": True, "apps": payload})
+
+    def _try_company_key_route(self, path: str, method: str, user: dict) -> bool:
+        """Dispatch /api/platform/<endpoint> if any spec declares that
+        endpoint. Returns True if handled. `/api/platform/portrait-key`
+        stays wired via the spec so old bookmarks/API clients keep working."""
+        prefix = "/api/platform/"
+        if not path.startswith(prefix):
+            return False
+        endpoint = path[len(prefix):]
+        for spec in SPECS:
+            if spec.company_key_endpoint == endpoint:
+                if method == "GET":
+                    self._company_key_get(spec, user)
+                elif method == "POST":
+                    self._company_key_set(spec, user)
+                else:
+                    self._json(405, {"ok": False, "error": "method not allowed"})
+                return True
+        return False
 
     def _valid_report_date(self, date: str) -> bool:
         """Accept YYYY-MM-DD strictly, reject future dates. Emits 400 on failure."""
@@ -1600,6 +1945,8 @@ class Handler(SimpleHTTPRequestHandler):
             return
         merged = []
         for name, config in APPS.items():
+            if not config["spec"].managed:
+                continue
             try:
                 conn = http.client.HTTPConnection("127.0.0.1", config["port"], timeout=5)
                 conn.request("GET", "/api/activity")
@@ -1649,40 +1996,51 @@ class Handler(SimpleHTTPRequestHandler):
 
         # Detect job type for usage stats. Video duration is read later from
         # /api/jobs/<id> directly, so we don't need to parse the request body.
+        # See app_spec.classify_job_type() for the per-app rules.
+        spec = SPEC_BY_NAME.get(app_name)
         job_type = "image"
-        if is_job:
-            if app_name in ("seedance", "volcengine-portrait"):
-                job_type = "video"
-            elif app_name == "dreamina":
-                # Mode is encoded in the path: /api/text2image, /api/frames2video, etc.
-                job_type = "image" if any(x in target_path for x in ("text2image", "image2image")) else "video"
+        if is_job and spec is not None:
+            job_type = classify_job_type(spec, target_path)
 
+        conn = None
         try:
             body = None
-            if method == "POST":
+            if method in {"POST", "PUT", "PATCH", "DELETE"}:
                 length = int(self.headers.get("Content-Length") or "0")
                 if length > 0:
                     body = self.rfile.read(length)
 
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=300)
             headers: dict[str, str] = {}
+            # Range must be forwarded so <video> scrubbing / resumable downloads
+            # of 50-200MB media work: the browser sends Range, sub-apps' serve_file
+            # already answers 206 + Content-Range, and the response side streams
+            # headers through verbatim. Without forwarding the request Range, the
+            # sub-app always returns 200 full-body and seeking re-downloads the clip.
             for key in ("Content-Type", "Content-Length", "Accept", "Accept-Encoding",
+                        "Range", "If-Range",
                         "X-Workspace-Id", "X-Api-Key", "X-Access-Key", "X-Secret-Key"):
                 val = self.headers.get(key)
                 if val:
                     headers[key] = val
 
-            # Resolve stored key by ID if client sent X-Key-Id
+            # Resolve stored key by ID if client sent X-Key-Id.
+            # Header wiring is driven by spec.credential_scheme:
+            #   api_key -> X-Api-Key: <key>
+            #   ak_sk   -> "<ak>:::<sk>" split into X-Access-Key + X-Secret-Key
+            #   none    -> skip
             key_id = self.headers.get("X-Key-Id", "").strip()
             if key_id:
                 key_val = key_manager.resolve(user["user_id"], key_id)
                 if key_val:
-                    if app_name == "volcengine-portrait" and ":::" in key_val:
+                    scheme = spec.credential_scheme if spec else "api_key"
+                    if scheme == "ak_sk" and ":::" in key_val:
                         ak, sk = key_val.split(":::", 1)
                         headers["X-Access-Key"] = ak
                         headers["X-Secret-Key"] = sk
-                    else:
+                    elif scheme == "api_key":
                         headers["X-Api-Key"] = key_val
+                    # scheme == "none": ignore any provided key
 
             headers["X-Forwarded-For"] = client_ip
             # Propagate public-facing host/proto so subapps can build absolute URLs
@@ -1703,11 +2061,32 @@ class Handler(SimpleHTTPRequestHandler):
             # http.client headers must be latin-1 safe, so URL-percent-encode
             # the username — sub-apps urllib.parse.unquote it back. Empty/ASCII
             # names pass through unchanged.
-            headers["X-Username"] = urllib.parse.quote(user.get("username", ""), safe="")
-            if user.get("role") == "admin" or auth.has_permission(user, "manage_dreamina_accounts"):
+            username_encoded = urllib.parse.quote(user.get("username", ""), safe="")
+            headers["X-Username"] = username_encoded
+            # User identity comes only from the authenticated Portal session.
+            # Never accept a browser-supplied X-Portal-User-Id value.
+            headers["X-Portal-User-Id"] = str(user["user_id"])
+            # X-Is-Admin: raised for the admin role and also for any spec that
+            # declares an `admin_permission` and the user has that permission
+            # (dreamina lets `manage_dreamina_accounts` proxy admin so ops folks
+            # can add accounts without full portal admin).
+            is_admin = user.get("role") == "admin"
+            if not is_admin and spec is not None and spec.admin_permission:
+                is_admin = auth.has_permission(user, spec.admin_permission)
+            if is_admin:
                 headers["X-Is-Admin"] = "1"
-            if app_name == "dreamina" and auth.has_permission(user, "use_apps"):
-                headers["X-Dreamina-Manage"] = "1"
+            # Static extra headers with {perm:xxx} placeholders — e.g. dreamina
+            # emits X-Dreamina-Manage=1 when the caller has use_apps.
+            if spec is not None and spec.extra_headers:
+                for hk, hv in resolve_extra_headers(spec, user, auth.has_permission).items():
+                    headers[hk] = hv
+            # HMAC-sign the (username, is_admin, ts) triple so a sub-app never
+            # trusts a raw X-Is-Admin header from an unauthenticated caller.
+            # See _sign_admin_header — sub-apps must verify with the shared
+            # PORTAL_INTERNAL_TOKEN and a small time window against replay.
+            ts = int(time.time())
+            headers["X-Portal-Ts"] = str(ts)
+            headers["X-Portal-Sig"] = _sign_admin_header(username_encoded, is_admin, ts)
 
             conn.request(method, target_path, body=body, headers=headers)
             resp = conn.getresponse()
@@ -1753,8 +2132,6 @@ class Handler(SimpleHTTPRequestHandler):
                 self._cors_headers()
                 self.end_headers()
                 shutil.copyfileobj(resp, self.wfile, length=65536)
-
-            conn.close()
         except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
             pass
         except Exception as exc:
@@ -1763,6 +2140,16 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(502, {"ok": False, "error": f"proxy error: {msg}"})
             except (BrokenPipeError, ConnectionResetError, ssl.SSLError, OSError):
                 pass
+        finally:
+            # Always release the upstream connection. Previously conn.close() sat
+            # on the normal path only, so a client disconnect mid-copyfileobj
+            # (BrokenPipe) jumped to except and leaked the http.client socket to
+            # the sub-app — fds/connections accumulated over repeated aborts.
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     # ── Static file serving ───────────────────────────────────────────────────
 
@@ -1825,11 +2212,20 @@ class Handler(SimpleHTTPRequestHandler):
         self._json(200, {"ok": True, "rolled_back": rolled})
 
     def _cors_headers(self):
-        self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin") or "*")
+        global _ALLOWED_ORIGINS
+        if _ALLOWED_ORIGINS is None:
+            _ALLOWED_ORIGINS = _default_allowed_origins()
+        origin = self.headers.get("Origin") or ""
+        # Only echo Origin back if it is in the whitelist. Missing or foreign
+        # origins get no ACAO header at all, so browsers block the response
+        # from any cross-origin script that expected it.
+        if origin and origin in _ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Credentials", "true")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers",
                          "Content-Type, X-Workspace-Id, X-Api-Key, X-Access-Key, X-Secret-Key, X-Key-Id")
-        self.send_header("Access-Control-Allow-Credentials", "true")
 
     def _read_json(self) -> dict | None:
         try:
@@ -1930,6 +2326,12 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        # Force a final synchronous flush of usage data before we tear down —
+        # the debounced flusher may have pending dirty state not yet written.
+        try:
+            tracker.flush()
+        except Exception:
+            pass
         manager.shutdown()
         if redirect_server:
             redirect_server.shutdown()

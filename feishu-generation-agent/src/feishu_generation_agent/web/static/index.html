@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>飞书生成任务审批工作区</title>
+    <link rel="stylesheet" href="static/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">LOCAL GENERATION AGENT</p>
+        <h1>飞书生成任务审批工作区</h1>
+      </div>
+      <div id="planner-prompt-entry" class="planner-prompt-entry" hidden>
+        <span id="planner-prompt-mode" class="planner-prompt-mode">使用 Prime</span>
+        <button id="planner-prompt-button" type="button" class="secondary" disabled>
+          计划提示词设置
+        </button>
+      </div>
+    </header>
+
+    <p id="error-message" class="error-message" role="alert" hidden></p>
+
+    <section id="direct-run-panel" class="direct-run-panel panel" aria-label="直接分析需求文档">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">DIRECT DOCUMENT</p>
+          <h2>直接分析需求文档</h2>
+        </div>
+      </div>
+      <p class="mode-message">
+        贴入飞书文档或 wiki 链接，直接生成可修改的计划，不需要多维表格记录。
+      </p>
+      <div class="direct-run-form">
+        <input
+          id="direct-run-url"
+          type="url"
+          placeholder="https://xxx.feishu.cn/wiki/..."
+          aria-label="需求文档链接"
+        />
+        <select id="direct-run-mode" aria-label="产出类型">
+          <option value="image">图片计划</option>
+          <option value="video">视频计划</option>
+        </select>
+        <button id="direct-run-button" type="button" class="primary">生成计划</button>
+      </div>
+      <p id="direct-run-feedback" class="mode-message" aria-live="polite"></p>
+    </section>
+
+    <section id="bitable-panel" class="bitable-panel panel" aria-label="多维表格任务">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">BITABLE TASKS</p>
+          <h2>多维表格任务</h2>
+        </div>
+        <button id="scan-bitable-button" type="button" class="secondary">刷新任务</button>
+      </div>
+      <div class="task-category-tabs" role="tablist" aria-label="任务类别">
+        <button
+          id="animation-category-tab"
+          class="task-category-tab is-active"
+          type="button"
+          role="tab"
+          aria-selected="true"
+          data-category="animation"
+        >动画类</button>
+        <button
+          id="portrait-category-tab"
+          class="task-category-tab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          data-category="portrait"
+        >真人类</button>
+      </div>
+      <p id="bitable-status" class="mode-message">
+        点击扫描，读取需求附件可访问且进度符合扫描规则的记录。
+      </p>
+      <div id="bitable-task-list" class="bitable-task-list"></div>
+      <section class="recent-runs" aria-label="最近完成任务">
+        <h3>最近完成任务</h3>
+        <div id="recent-run-list" class="recent-run-list"></div>
+      </section>
+    </section>
+
+    <main class="workspace">
+      <aside class="trace-panel panel" aria-label="LangGraph 执行信息">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">WORKFLOW</p>
+            <h2>节点轨迹</h2>
+          </div>
+          <span id="status-badge" class="status-badge">尚未创建</span>
+        </div>
+        <dl class="run-meta">
+          <div><dt>当前节点</dt><dd id="current-node">—</dd></div>
+          <div><dt>当前状态</dt><dd id="run-status">—</dd></div>
+          <div><dt>thread ID</dt><dd id="thread-id">—</dd></div>
+          <div><dt>累计耗时</dt><dd id="run-duration">—</dd></div>
+        </dl>
+        <ol id="event-list" class="event-list"></ol>
+        <p id="langsmith-warning" class="privacy-warning" hidden>
+          LangSmith 追踪已开启：工作流输入和输出会发送到外部追踪服务。
+        </p>
+      </aside>
+
+      <section class="review-panel panel" aria-label="任务审批工作区">
+        <div class="panel-heading review-heading">
+          <div>
+            <p class="eyebrow">REVIEW</p>
+            <h2 id="document-title">等待提交飞书文档</h2>
+          </div>
+          <a id="source-link" href="#" target="_blank" rel="noreferrer">查看源文档</a>
+        </div>
+        <p class="document-meta">文档版本 <span id="document-revision">—</span></p>
+        <p id="delivery-target" class="document-meta" hidden></p>
+        <p id="document-summary" class="document-summary"></p>
+        <p class="document-meta">可编辑提示词、负面约束、生成参数与参考图片。</p>
+        <div id="execution-errors" class="execution-errors" role="alert" hidden></div>
+        <div id="validation-issues" class="validation-issues" hidden></div>
+        <div id="blocking-ingest-issues" class="blocking-ingest-issues" role="alert" hidden></div>
+        <div id="asset-ingest-issues" class="asset-issue-message" hidden></div>
+        <div id="vision-issues" class="asset-issue-message" hidden></div>
+        <div id="review-conflict" class="review-conflict" role="alert" hidden>
+          <span id="review-conflict-text"></span>
+          <button id="discard-review-draft" type="button" class="quiet-button">
+            放弃本地修改并刷新
+          </button>
+        </div>
+        <section id="coverage-summary" class="coverage-summary" aria-label="素材覆盖">
+          <div class="panel-heading">
+            <h3>素材覆盖</h3>
+            <strong id="coverage-label">已使用 0 / 共 0 张</strong>
+          </div>
+          <p id="coverage-detail" class="mode-message"></p>
+          <div class="excluded-assets">
+            <h3>排除素材</h3>
+            <div id="excluded-asset-list" class="excluded-asset-list"></div>
+          </div>
+        </section>
+        <div id="task-list" class="task-list"></div>
+
+        <div class="feedback-box">
+          <label for="reject-feedback">退回意见</label>
+          <textarea id="reject-feedback" rows="3"
+            placeholder="说明需要重新规划的内容"></textarea>
+        </div>
+      </section>
+    </main>
+
+    <footer class="action-bar">
+      <span id="polling-note">每 1 秒自动刷新运行状态</span>
+      <div class="action-buttons">
+        <button id="next-task-button" type="button" class="secondary" disabled>开始下一任务</button>
+        <button id="rerun-button" type="button" class="secondary" disabled>重跑此任务</button>
+        <button id="retry-delivery-button" type="button" class="secondary">仅重试交付</button>
+        <button id="delete-run-button" type="button" class="quiet-button">删除本地运行</button>
+        <button id="reject-button" type="button" class="secondary">退回重新规划</button>
+        <button id="cancel-button" type="button" class="danger">全部取消</button>
+        <button id="approve-button" type="button" class="primary">批准所选任务</button>
+      </div>
+    </footer>
+
+    <div id="planner-prompt-modal" class="modal-overlay" hidden>
+      <section class="planner-prompt-modal" role="dialog" aria-modal="true"
+        aria-labelledby="planner-prompt-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">PLANNER PROMPT</p>
+            <h2 id="planner-prompt-title">计划提示词设置</h2>
+          </div>
+          <button id="planner-prompt-close" type="button" class="quiet-button">关闭</button>
+        </div>
+        <p id="planner-prompt-modal-mode" class="mode-message">使用 Prime</p>
+        <label for="planner-prompt-text">计划提示词</label>
+        <textarea id="planner-prompt-text" rows="14" spellcheck="false"></textarea>
+        <p class="planner-prompt-note">修改只影响之后领取的新任务</p>
+        <p id="planner-prompt-feedback" class="planner-prompt-feedback" aria-live="polite"></p>
+        <div class="planner-prompt-actions">
+          <button id="planner-prompt-reset" type="button" class="secondary">恢复 Prime</button>
+          <button id="planner-prompt-save" type="button" class="primary">保存个人版本</button>
+        </div>
+      </section>
+    </div>
+
+    <script src="static/reference-mutation-state.js" defer></script>
+    <script src="static/review-state.js" defer></script>
+    <script src="static/bitable-state.js" defer></script>
+    <script src="static/reference-upload-state.js" defer></script>
+    <script src="static/api-paths.js" defer></script>
+    <script src="static/planner-prompt-state.js" defer></script>
+    <script src="static/app.js" defer></script>
+    <script src="static/effects.js" defer></script>
+  </body>
+</html>

@@ -3,6 +3,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -19,6 +20,131 @@ def load_portal_module():
 
 
 class PortalStartupTests(unittest.TestCase):
+    @staticmethod
+    def _app_configs():
+        return {
+            "managed-demo": {
+                "dir": ROOT / "seedance",
+                "port": 18787,
+                "spec": SimpleNamespace(managed=True),
+            },
+            "external-agent": {
+                "dir": ROOT / "feishu-generation-agent",
+                "port": 8765,
+                "spec": SimpleNamespace(managed=False),
+            },
+        }
+
+    def test_start_all_starts_only_managed_apps_and_probes_external_apps(self):
+        module = load_portal_module()
+        manager = module.AppManager()
+        configs = self._app_configs()
+
+        with mock.patch.object(module, "APPS", configs), \
+             mock.patch.object(manager, "start_app") as start_app, \
+             mock.patch.object(manager, "_kill_port_squatter") as kill_port, \
+             mock.patch.object(manager, "_tcp_probe", side_effect=lambda port: port == 8765), \
+             mock.patch.object(module.threading, "Thread"):
+            manager.start_all()
+
+        start_app.assert_called_once_with("managed-demo", configs["managed-demo"])
+        kill_port.assert_not_called()
+        self.assertEqual(manager.status["external-agent"], {"status": "running", "port": 8765})
+        self.assertNotIn("external-agent", manager.processes)
+
+    def test_unhealthy_external_app_is_unavailable_without_restart_or_port_cleanup(self):
+        module = load_portal_module()
+        manager = module.AppManager()
+        configs = {"external-agent": self._app_configs()["external-agent"]}
+        sleeps = 0
+
+        def advance_three_health_cycles(_seconds):
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps >= 3:
+                manager._stop_event.set()
+
+        with mock.patch.object(module, "APPS", configs), \
+             mock.patch.object(manager, "start_app") as start_app, \
+             mock.patch.object(manager, "_kill_port_squatter") as kill_port, \
+             mock.patch.object(manager, "_tcp_probe", return_value=False), \
+             mock.patch.object(module.time, "sleep", side_effect=advance_three_health_cycles):
+            manager._health_loop()
+
+        self.assertEqual(manager.status["external-agent"], {"status": "unavailable", "port": 8765})
+        start_app.assert_not_called()
+        kill_port.assert_not_called()
+
+    def test_shutdown_never_registers_or_signals_an_external_app(self):
+        module = load_portal_module()
+        manager = module.AppManager()
+        managed_proc = mock.Mock(pid=12345)
+        managed_proc.poll.return_value = None
+        external_proc = mock.Mock(pid=8765)
+        external_proc.poll.return_value = None
+        configs = self._app_configs()
+
+        def fake_start_app(name, _config):
+            manager.processes[name] = external_proc if name == "external-agent" else managed_proc
+
+        with mock.patch.object(module, "APPS", configs), \
+             mock.patch.object(manager, "start_app", side_effect=fake_start_app), \
+             mock.patch.object(manager, "_tcp_probe", return_value=True), \
+             mock.patch.object(module.threading, "Thread"):
+            manager.start_all()
+
+        with mock.patch.object(module.os, "getpgid", return_value=managed_proc.pid) as getpgid, \
+             mock.patch.object(module.os, "killpg") as killpg:
+            manager.shutdown()
+
+        self.assertNotIn("external-agent", manager.processes)
+        getpgid.assert_called_once_with(managed_proc.pid)
+        killpg.assert_called_once_with(managed_proc.pid, module.signal.SIGTERM)
+        managed_proc.terminate.assert_not_called()
+        managed_proc.kill.assert_not_called()
+        external_proc.terminate.assert_not_called()
+        external_proc.kill.assert_not_called()
+
+    def test_platform_activity_skips_unmanaged_apps(self):
+        module = load_portal_module()
+        handler = object.__new__(module.Handler)
+        handler._json = mock.Mock()
+        configs = self._app_configs()
+        connections = []
+        requests = []
+
+        class FakeResponse:
+            status = 200
+
+            @staticmethod
+            def read():
+                return b'{"records": []}'
+
+        class FakeConnection:
+            def __init__(self, host, port, timeout):
+                connections.append((host, port, timeout))
+                self.port = port
+
+            def request(self, method, path):
+                requests.append((self.port, method, path))
+
+            @staticmethod
+            def getresponse():
+                return FakeResponse()
+
+            @staticmethod
+            def close():
+                pass
+
+        with mock.patch.object(module, "APPS", configs), \
+             mock.patch.object(module.auth, "has_permission", return_value=True), \
+             mock.patch.object(module.http.client, "HTTPConnection", FakeConnection):
+            handler._platform_activity({"role": "admin"})
+
+        self.assertEqual(connections, [("127.0.0.1", 18787, 5)])
+        self.assertEqual(requests, [(18787, "GET", "/api/activity")])
+        handler._json.assert_called_once_with(200, {"ok": True, "activity": []})
+
     def test_main_does_not_start_subapps_when_portal_bind_fails(self):
         module = load_portal_module()
 
@@ -64,11 +190,13 @@ class PortalStartupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             (app_dir / "app.py").write_text("print('ok')\n", encoding="utf-8")
-            with mock.patch.object(module.subprocess, "Popen", side_effect=fake_popen):
+            with mock.patch.object(module.subprocess, "Popen", side_effect=fake_popen), \
+                 mock.patch.object(manager, "_kill_port_squatter"):
                 manager.start_app("demo", {"dir": app_dir, "port": 9999})
 
         self.assertNotEqual(captured.get("stdout"), subprocess.PIPE)
         self.assertNotEqual(captured.get("stderr"), subprocess.PIPE)
+        manager.log_handles["demo"].close()
 
 
 if __name__ == "__main__":

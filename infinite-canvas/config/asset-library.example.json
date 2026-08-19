@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "ark_access_key": "replace-with-ark-access-key",
+  "ark_secret_key": "replace-with-ark-secret-key",
+  "tos_access_key": "replace-with-tos-access-key",
+  "tos_secret_key": "replace-with-tos-secret-key",
+  "tos_bucket": "replace-with-tos-bucket",
+  "tos_region": "cn-beijing",
+  "project_name": "Seedance2.0"
+}

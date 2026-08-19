@@ -39,12 +39,15 @@
             <p class="hint">供应商：豆包官方 / 火山方舟（公司统一 Key，服务端配置）</p>
             <label>Base URL<input name="base_url" v-model="baseUrl"></label>
             <p class="hint">{{ providerHint }}</p>
-            <label>输出目录<input name="output_dir" v-model="outputDir" placeholder="留空则保存到 outputs 文件夹"></label>
+            <!-- 输出目录选择仅在独立本地模式(直连 :8787)显示。Portal(远程)模式
+                 下隐藏:结果统一存服务机 outputs/<用户名>/<日期>/,自定义路径对远程
+                 用户无意义(浏览器写不到访问者电脑)且会导致产出散落、无法同步飞书。 -->
+            <label v-if="!inPortal">输出目录<input name="output_dir" v-model="outputDir" placeholder="留空则保存到 outputs 文件夹"></label>
             <div class="rowButtons outputDirBtns">
-              <button type="button" @click="chooseOutputDir()">选择目录</button>
-              <button type="button" @click="outputDir=''">程序 outputs</button>
-              <button type="button" @click="desktopOutput()">桌面 outputs</button>
-              <button type="button" @click="openOutputDir()">打开目录</button>
+              <button type="button" v-if="!inPortal" @click="chooseOutputDir()">选择目录</button>
+              <button type="button" v-if="!inPortal" @click="outputDir=''">程序 outputs</button>
+              <button type="button" v-if="!inPortal" @click="desktopOutput()">桌面 outputs</button>
+              <button type="button" v-if="!inPortal" @click="openOutputDir()">打开目录</button>
               <button type="button" @click="cleanCache()">清理缓存</button>
             </div>
           </section>
@@ -60,15 +63,35 @@
             <label>自定义模型名（高级）
               <input name="custom_model" v-model="customModel" placeholder="留空使用上方模型">
             </label>
+            <label>任务类型
+              <select v-model="taskMode" @change="changeTaskMode()">
+                <option value="reference">参考生视频（默认）</option>
+                <option value="extend">视频延长（ratio 自动锁 adaptive）</option>
+                <option value="edit">视频编辑（ratio=adaptive, duration=-1）</option>
+              </select>
+            </label>
             <div class="grid2">
-              <label>时长<input name="duration" type="number" min="4" max="15" value="12"></label>
+              <label>时长（秒）<input name="duration" type="number" min="-1" max="15" value="12"></label>
               <label>分辨率
                 <select name="resolution">
-                  <option>720p</option><option>480p</option><option>1080p</option>
-                  <option>native1080p</option><option>2k</option><option>4k</option>
+                  <option>720p</option><option>480p</option><option>1080p</option><option>4k</option>
                 </select>
               </label>
             </div>
+            <p class="hint" v-if="taskMode === 'reference'">
+              <strong>参考生视频</strong>：ratio 与 duration 均可自定义。
+              提示词若含「删除/替换/续写/延长」等关键词，方舟会自动改判为编辑或延长——
+              这两类任务对参数有额外约束，请显式切到对应模式再填。
+            </p>
+            <p class="hint" v-if="taskMode === 'extend'" style="color:#b45309">
+              <strong>视频延长</strong>：ratio 必须为 <code>adaptive</code>（已自动锁定）；
+              duration 可自定义。请在参考素材里加入待延长的视频（role=reference_video），
+              提示词写清楚「向前/向后延长、续写」的具体内容。
+            </p>
+            <p class="hint" v-if="taskMode === 'edit'" style="color:#b45309">
+              <strong>视频编辑</strong>：ratio 必须为 <code>adaptive</code>、duration 必须为 <code>-1</code>（即由模型自动决定时长，均已锁定）。
+              请在参考素材里加入待编辑的视频，提示词描述编辑操作（删除/替换/增加/局部重绘等）。
+            </p>
             <div class="grid2">
               <label>比例
                 <select name="ratio">
@@ -172,7 +195,7 @@
             <div v-if="statusText === '空闲'">
               <div class="resultHeader"><h2>生成历史 <button @click="loadJobs()" style="font-size:11px;padding:3px 10px;margin-left:8px;cursor:pointer">刷新</button></h2></div>
               <div v-if="jobs.length===0" style="color:#697386;font-size:12px;padding:12px 0">暂无生成记录，提交任务后自动显示</div>
-              <div v-for="j in jobs" :key="j.job_id" style="border:1px solid #e2e8f0;border-radius:8px;padding:10px;margin-bottom:10px">
+              <div v-for="j in visibleJobs()" :key="j.job_id" style="border:1px solid #e2e8f0;border-radius:8px;padding:10px;margin-bottom:10px">
                 <div style="display:flex;align-items:center;margin-bottom:2px;gap:8px">
                   <span :class="'tag tag-'+(j.status||'queued')">{{ j.status }}</span>
                   <span style="font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ (j.prompt||'').slice(0,60) }}</span>
@@ -181,12 +204,20 @@
                   <span style="font-size:11px;color:#697386;white-space:nowrap">{{ j.created_at }}</span>
                 </div>
                 <div v-if="j.errors && j.errors.length" style="font-size:11px;color:#dc2626;margin-top:4px">{{ j.errors.join('; ') }}</div>
-                <div v-for="r in (j.results||[]).filter(x => x.download_url)" style="display:flex;align-items:center;margin-top:6px;padding-top:6px;border-top:1px solid #f1f5f9;gap:8px">
-                  <video :src="appPath + r.download_url" controls style="width:120px;height:68px;border-radius:4px;object-fit:cover;flex-shrink:0"></video>
+                <div v-for="r in (j.results||[]).filter(function(x){ return x.download_url; })" style="display:flex;align-items:center;margin-top:6px;padding-top:6px;border-top:1px solid #f1f5f9;gap:8px">
+                  <!-- Lazy video: render a lightweight click-to-play placeholder instead of a live <video>.
+                       Dozens of live <video controls> in the history list pin decoder/buffer memory and
+                       crash the tab over time. Click swaps in the real element on demand. -->
+                  <div v-if="!r._play" @click="r._play = true" style="width:120px;height:68px;border-radius:4px;background:#0f172a;color:#cbd5e1;flex-shrink:0;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:11px">▶ 播放</div>
+                  <video v-else :src="appPath + r.download_url" controls autoplay muted playsinline style="width:120px;height:68px;border-radius:4px;object-fit:cover;flex-shrink:0"></video>
                   <span style="font-size:11px;color:#697386;flex:1">{{ r.filename || 'video' }}</span>
                   <button @click="_blobDownload(appPath + r.download_url, r.filename || 'video')" style="background:#2563eb;color:#fff;border:1px solid #2563eb;font-size:11px;padding:3px 10px;border-radius:4px;cursor:pointer">下载</button>
                 </div>
               </div>
+              <button v-if="jobs.length > jobsLimit" @click="jobsLimit += 20"
+                      style="width:100%;padding:8px;margin-top:4px;font-size:12px;cursor:pointer;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:6px">
+                加载更多（还有 {{ jobs.length - jobsLimit }} 条）
+              </button>
             </div>
           </div>
           <div v-show="wsTab==='activity'" class="activity-panel-inner">
@@ -227,7 +258,7 @@
 
     <div v-if="_closeConfirmTabId" class="modal-overlay" @click.self="_closeConfirmTabId = null">
       <div class="modal">
-        <div class="modal-title">关闭「{{ (tabs.find(t => t.id === _closeConfirmTabId) || {}).name }}」？</div>
+        <div class="modal-title">关闭「{{ (tabs.find(function(t){ return t.id === _closeConfirmTabId; }) || {}).name }}」？</div>
         <div class="modal-body">该主题有任务正在跑。关闭后任务会在后台继续，可从运行历史面板查看结果。</div>
         <div class="modal-btns">
           <button type="button" @click="_closeConfirmTabId = null">取消</button>
@@ -243,5 +274,6 @@
   </dialog>
 
   <script src="app.js"></script>
+  <script src="effects.js"></script>
 </body>
 </html>

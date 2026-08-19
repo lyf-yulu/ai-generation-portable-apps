@@ -1,0 +1,978 @@
+import base64
+import binascii
+from dataclasses import dataclass
+from hashlib import sha256
+import inspect
+import json
+import logging
+import os
+from pathlib import Path
+import stat
+from typing import Any, Literal
+from urllib.parse import quote, urlsplit
+
+import httpx
+from pydantic import BaseModel, Field, SecretStr
+
+from feishu_generation_agent.domain.artifact import (
+    ProviderResult,
+    ProviderSubmission,
+)
+from feishu_generation_agent.domain.document import MediaAsset
+from feishu_generation_agent.domain.errors import (
+    AgentError,
+    ErrorCategory,
+    ErrorDetail,
+)
+from feishu_generation_agent.domain.plan import GenerationTask
+from feishu_generation_agent.integrations.safe_download import (
+    ResultDownloader,
+)
+from feishu_generation_agent.storage.provider_results import (
+    ProviderResultStagingError,
+    ProviderResultStore,
+    StagedProviderResult,
+)
+
+
+_IMAGE_MIME_TYPES = frozenset(
+    {"image/gif", "image/jpeg", "image/png", "image/webp"}
+)
+# 模型名前缀 → OpenAI 风格接口（/v1/images/edits）。其余走 Gemini 风格
+# （/v1beta/models/{model}:generateContent）。中转站 chiyun 同时挂了两种范式。
+_OPENAI_MODEL_PREFIXES = ("gpt-image", "dall-e")
+# OpenAI gpt-image 固定输出 PNG，响应体不带 mime 字段，落盘时固定按此 mime。
+_OPENAI_RESULT_MIME = "image/png"
+# gpt-image 支持的离散尺寸；按 aspectRatio 归类，无法判定时回退 "auto"。
+_OPENAI_SIZES = ("1024x1024", "1024x1536", "1536x1024")
+_LOGGER = logging.getLogger(__name__)
+_DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+_DEFAULT_MAX_RESULT_BYTES = 32 * 1024 * 1024
+_DEFAULT_MAX_INPUT_BYTES = 32 * 1024 * 1024
+_DEFAULT_MAX_TOTAL_INPUT_BYTES = 64 * 1024 * 1024
+_READ_CHUNK_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingResult:
+    mime_type: str
+    data: bytes | None = None
+    url: str | None = None
+
+
+class ModelProbeResult(BaseModel):
+    status: Literal["available", "unsupported"]
+    model_ids: list[str] = Field(default_factory=list)
+    configured_model_available: bool | None = None
+    message: str
+
+
+class ChiyunImageGenerator:
+    def __init__(
+        self,
+        http_client: httpx.AsyncClient,
+        *,
+        base_url: str | None,
+        api_key: str | SecretStr | None,
+        model: str | None,
+        staging_dir: Path,
+        result_downloader: ResultDownloader | None,
+        max_response_bytes: int = _DEFAULT_MAX_RESPONSE_BYTES,
+        max_result_bytes: int = _DEFAULT_MAX_RESULT_BYTES,
+        max_input_bytes: int = _DEFAULT_MAX_INPUT_BYTES,
+        max_total_input_bytes: int = _DEFAULT_MAX_TOTAL_INPUT_BYTES,
+        # registry 用 banana / gpt-image2 作键，提交结果必须以同一个名字
+        # 自报身份，否则 nodes.py 的 provider 一致性校验会把成功的出图
+        # 判成「生成服务拒绝了请求」。默认值保持 chiyun，存量 run 的
+        # provider 名已持久化，不能变。
+        provider_name: str = "chiyun",
+    ) -> None:
+        if not isinstance(base_url, str):
+            raise self._configuration_error("base_url", "expected=https origin")
+        try:
+            parsed = urlsplit(base_url.strip())
+            port = parsed.port
+        except (TypeError, ValueError):
+            raise self._configuration_error(
+                "base_url", "expected=https origin"
+            ) from None
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or port not in {None, 443}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise self._configuration_error("base_url", "expected=https origin")
+        secret = (
+            api_key.get_secret_value()
+            if isinstance(api_key, SecretStr)
+            else api_key
+        )
+        if not isinstance(secret, str) or not secret.strip():
+            raise self._configuration_error("api_key", "cause=empty")
+        if not isinstance(model, str) or not model.strip():
+            raise self._configuration_error("model", "cause=empty")
+        limits = {
+            "max_response_bytes": max_response_bytes,
+            "max_result_bytes": max_result_bytes,
+            "max_input_bytes": max_input_bytes,
+            "max_total_input_bytes": max_total_input_bytes,
+        }
+        for field_name, value in limits.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise self._configuration_error(field_name, "cause=not_positive")
+        if max_total_input_bytes < max_input_bytes:
+            raise self._configuration_error(
+                "max_total_input_bytes", "cause=less_than_single_limit"
+            )
+        if not isinstance(staging_dir, Path):
+            raise self._configuration_error("staging_dir", "cause=not_path")
+        if (
+            not isinstance(result_downloader, ResultDownloader)
+            or not inspect.iscoroutinefunction(result_downloader.download)
+        ):
+            raise self._configuration_error(
+                "result_downloader",
+                "cause=missing_or_invalid",
+            )
+        try:
+            result_store = ProviderResultStore(
+                staging_dir,
+                max_item_bytes=max_result_bytes,
+            )
+        except (OSError, ValueError):
+            raise self._configuration_error(
+                "staging_dir", "cause=unavailable"
+            ) from None
+        self._http_client = http_client
+        self._base_url = f"https://{parsed.netloc}"
+        self._api_key = SecretStr(secret.strip())
+        self._model = model.strip()
+        self._max_response_bytes = max_response_bytes
+        self._max_result_bytes = max_result_bytes
+        self._max_input_bytes = max_input_bytes
+        self._max_total_input_bytes = max_total_input_bytes
+        self._timeout = httpx.Timeout(120, connect=10)
+        # OpenAI 图像编辑实测可达 ~80s，output_count 大时更慢；放宽到 180s，仍有界。
+        self._openai_timeout = httpx.Timeout(180, connect=10)
+        # 按模型名判定接口范式：gpt-image-* / dall-e-* → OpenAI，其余 → Gemini。
+        self._api_style = (
+            "openai"
+            if self._model.lower().startswith(_OPENAI_MODEL_PREFIXES)
+            else "gemini"
+        )
+        self._result_store = result_store
+        self._provider_name = provider_name
+        self._result_downloader = result_downloader
+
+    async def submit(
+        self,
+        task: GenerationTask,
+        assets: list[MediaAsset],
+        *,
+        submission_id: str | None = None,
+    ) -> ProviderSubmission:
+        if (
+            submission_id is not None
+            and not ProviderResultStore.is_valid_provider_task_id(submission_id)
+        ):
+            raise self._validation_error(
+                task.task_id,
+                "提交关联 ID 无效",
+                "cause=invalid_submission_id",
+            )
+        asset_contents = self._validate_assets(task, assets)
+        # 按接口范式分流；两条分支都产出 list[_PendingResult]，之后共用同一段
+        # 数量校验 / 下载 / 落盘 / 返回逻辑，保证 ProviderSubmission 契约不变。
+        if self._api_style == "openai":
+            results = await self._submit_openai(task, assets, asset_contents)
+        else:
+            results = await self._submit_gemini(task, assets, asset_contents)
+        if not results:
+            raise self._provider_error(
+                "Chiyun 未返回图片结果",
+                "operation=generate; cause=missing_result",
+            )
+        if len(results) < task.output_count:
+            raise self._provider_error(
+                "Chiyun 返回的图片数量不足",
+                (
+                    "operation=generate; cause=result_count_mismatch; "
+                    f"expected={task.output_count}; actual={len(results)}"
+                ),
+            )
+        results = results[: task.output_count]
+        materialized: list[tuple[bytes, str]] = []
+        for result in results:
+            if result.data is not None:
+                content = result.data
+            else:
+                if result.url is None:
+                    raise AssertionError("pending result has no source")
+                content = await self._result_downloader.download(
+                    result.url,
+                    expected_mime_type=result.mime_type,
+                )
+            materialized.append((content, result.mime_type))
+        try:
+            provider_task_id, staged_results = self._result_store.save(
+                materialized,
+                provider_task_id=submission_id,
+            )
+        except (OSError, ProviderResultStagingError):
+            raise self._provider_error(
+                "Chiyun 图片结果无法安全落盘",
+                "operation=generate; cause=staging_write_failed",
+            ) from None
+        provider_results = self._provider_results(staged_results)
+        _LOGGER.info(
+            "Chiyun generation completed result_count=%d mime_types=%s",
+            len(provider_results),
+            ",".join(result.mime_type for result in provider_results),
+        )
+        return ProviderSubmission(
+            provider=self._provider_name,
+            provider_task_id=provider_task_id,
+            status="succeeded",
+            result_items=provider_results,
+        )
+
+    async def _submit_gemini(
+        self,
+        task: GenerationTask,
+        assets: list[MediaAsset],
+        asset_contents: list[bytes],
+    ) -> list[_PendingResult]:
+        parts: list[dict[str, Any]] = [{"text": self._prompt(task)}]
+        for asset, content in zip(assets, asset_contents, strict=True):
+            parts.append(
+                {
+                    "inline_data": {
+                        "mime_type": asset.mime_type,
+                        "data": base64.b64encode(content).decode("ascii"),
+                    }
+                }
+            )
+        payload = {
+            "contents": [{"parts": parts}],
+            "generationConfig": {
+                "imageConfig": {
+                    "aspectRatio": task.aspect_ratio,
+                    "imageSize": task.image_size,
+                }
+            },
+        }
+        model_path = quote(self._model, safe="")
+        body = await self._request_json(
+            "POST",
+            f"{self._base_url}/v1beta/models/{model_path}:generateContent",
+            json_body=payload,
+            operation="generate",
+        )
+        if body is None:
+            raise AssertionError("generate endpoint cannot be unsupported")
+        return self._result_items(body)
+
+    async def _submit_openai(
+        self,
+        task: GenerationTask,
+        assets: list[MediaAsset],
+        asset_contents: list[bytes],
+    ) -> list[_PendingResult]:
+        # OpenAI 图生图走 /v1/images/edits（multipart），把全部参考图作为
+        # image[] 逐张上传；纯文生图的 /v1/images/generations 不接受参考图，
+        # 不满足飞书 Agent「图生图 + 至少一张参考图」的强制约束。
+        data = {
+            "model": self._model,
+            "prompt": self._prompt(task),
+            "n": str(task.output_count),
+            "size": self._openai_size(task.aspect_ratio, task.image_size),
+        }
+        files: list[tuple[str, tuple[str, bytes, str]]] = []
+        for index, (asset, content) in enumerate(
+            zip(assets, asset_contents, strict=True)
+        ):
+            extension = asset.mime_type.split("/")[-1] or "png"
+            files.append(
+                (
+                    "image[]",
+                    (f"reference-{index:03d}.{extension}", content, asset.mime_type),
+                )
+            )
+        body = await self._request_json(
+            "POST",
+            f"{self._base_url}/v1/images/edits",
+            json_body=None,
+            operation="generate",
+            data=data,
+            files=files,
+            timeout=self._openai_timeout,
+        )
+        if body is None:
+            raise AssertionError("edits endpoint cannot be unsupported")
+        return self._openai_result_items(body)
+
+    async def poll(
+        self,
+        submission: ProviderSubmission,
+    ) -> ProviderSubmission:
+        if submission.provider != self._provider_name or submission.status not in {
+            "submitted",
+            "succeeded",
+        }:
+            raise self._error(
+                ErrorCategory.VALIDATION,
+                "Chiyun 同步任务只能轮询已成功的提交",
+                "operation=poll; cause=nonterminal_submission",
+            )
+        try:
+            staged_results = self._result_store.load(
+                submission.provider_task_id
+            )
+        except (OSError, ProviderResultStagingError):
+            raise self._provider_error(
+                "Chiyun 已落盘的图片结果无效",
+                "operation=poll; cause=staging_invalid",
+            ) from None
+        return ProviderSubmission(
+            provider=self._provider_name,
+            provider_task_id=submission.provider_task_id,
+            status="succeeded",
+            result_items=self._provider_results(staged_results),
+        )
+
+    async def probe_models(self) -> ModelProbeResult:
+        # 按风格选只读模型列表端点：OpenAI /v1/models（返回 {data:[...]}）、
+        # Gemini /v1beta/models（返回 {models:[...]}）。都不计费。
+        list_path = (
+            "/v1/models" if self._api_style == "openai" else "/v1beta/models"
+        )
+        payload = await self._request_json(
+            "GET",
+            f"{self._base_url}{list_path}",
+            json_body=None,
+            operation="probe_models",
+            unsupported_statuses=frozenset({404, 405, 501}),
+        )
+        if payload is None:
+            return self._unsupported_probe()
+        models = payload.get("models")
+        if not isinstance(models, list):
+            models = payload.get("data")
+        if not isinstance(models, list):
+            return self._unsupported_probe()
+        model_ids: list[str] = []
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            value = item.get("name") or item.get("id")
+            if not isinstance(value, str) or not value.strip():
+                continue
+            model_id = value.strip()
+            if model_id.startswith("models/"):
+                model_id = model_id.removeprefix("models/")
+            if model_id and model_id not in model_ids:
+                model_ids.append(model_id)
+        if models and not model_ids:
+            return self._unsupported_probe()
+        configured = self._model.removeprefix("models/")
+        return ModelProbeResult(
+            status="available",
+            model_ids=model_ids,
+            configured_model_available=configured in model_ids,
+            message="已通过只读模型列表接口完成检查",
+        )
+
+    async def _request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        json_body: dict[str, Any] | None,
+        operation: str,
+        unsupported_statuses: frozenset[int] = frozenset(),
+        data: dict[str, str] | None = None,
+        files: list[tuple[str, tuple[str, bytes, str]]] | None = None,
+        timeout: httpx.Timeout | None = None,
+    ) -> dict[str, Any] | None:
+        # data/files 用于 multipart（OpenAI /v1/images/edits）；与 json_body 互斥。
+        # 全部安全护栏（响应大小上限、流式累积、超时、错误分类）两条路径共用。
+        request_kwargs: dict[str, Any] = {
+            "headers": {
+                "Authorization": (
+                    "Bearer " + self._api_key.get_secret_value()
+                )
+            },
+            "timeout": timeout if timeout is not None else self._timeout,
+        }
+        if files is not None:
+            request_kwargs["data"] = data or {}
+            request_kwargs["files"] = files
+        else:
+            request_kwargs["json"] = json_body
+        try:
+            async with self._http_client.stream(
+                method,
+                url,
+                **request_kwargs,
+            ) as response:
+                if response.status_code in unsupported_statuses:
+                    return None
+                if not 200 <= response.status_code < 300:
+                    raise self._http_error(operation, response.status_code)
+                declared_size = response.headers.get("content-length")
+                if declared_size is not None:
+                    try:
+                        if int(declared_size) > self._max_response_bytes:
+                            raise self._provider_error(
+                                "Chiyun 响应超过大小限制",
+                                f"operation={operation}; cause=response_too_large",
+                            )
+                    except ValueError:
+                        pass
+                raw = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if len(raw) + len(chunk) > self._max_response_bytes:
+                        raise self._provider_error(
+                            "Chiyun 响应超过大小限制",
+                            f"operation={operation}; cause=response_too_large",
+                        )
+                    raw.extend(chunk)
+        except AgentError:
+            raise
+        except httpx.TransportError as exc:
+            raise AgentError(
+                ErrorDetail(
+                    category=ErrorCategory.TRANSIENT,
+                    message="连接 Chiyun 服务失败，请稍后重试",
+                    technical_detail=(
+                        f"operation={operation}; cause={type(exc).__name__}"
+                    ),
+                    retryable=True,
+                )
+            ) from None
+
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise self._provider_error(
+                "Chiyun 返回了无法解析的响应",
+                f"operation={operation}; cause=invalid_json",
+            ) from None
+        if not isinstance(payload, dict):
+            raise self._provider_error(
+                "Chiyun 返回的数据结构无效",
+                f"operation={operation}; cause=non_object_json",
+            )
+        return payload
+
+    @staticmethod
+    def _unsupported_probe() -> ModelProbeResult:
+        return ModelProbeResult(
+            status="unsupported",
+            model_ids=[],
+            configured_model_available=None,
+            message="该通道无法无费用验证模型；未发起生成请求",
+        )
+
+    def _validate_assets(
+        self,
+        task: GenerationTask,
+        assets: list[MediaAsset],
+    ) -> list[bytes]:
+        if task.task_type.value != "image_to_image":
+            raise self._validation_error(
+                task.task_id,
+                "Chiyun 只接受图生图任务",
+                "cause=unsupported_task_type",
+            )
+        references = task.reference_images
+        if not references or not assets:
+            raise self._validation_error(
+                task.task_id,
+                "图生图任务至少需要一张参考图片",
+                "cause=missing_reference",
+            )
+        reference_ids = [reference.asset_id for reference in references]
+        reference_orders = [reference.order for reference in references]
+        if len(reference_ids) != len(set(reference_ids)):
+            raise self._validation_error(
+                task.task_id,
+                "任务重复引用了同一图片",
+                "cause=duplicate_asset_id",
+            )
+        if reference_orders != list(range(1, len(references) + 1)):
+            raise self._validation_error(
+                task.task_id,
+                "参考图片顺序必须从 1 连续递增",
+                "cause=order_mismatch",
+            )
+        if any(reference.role != "reference_image" for reference in references):
+            raise self._validation_error(
+                task.task_id,
+                "图生图任务只接受普通参考图",
+                "cause=invalid_role",
+            )
+        asset_ids = [asset.asset_id for asset in assets]
+        if len(asset_ids) != len(set(asset_ids)):
+            raise self._validation_error(
+                task.task_id,
+                "传入素材包含重复图片",
+                "cause=duplicate_input_asset",
+            )
+        if asset_ids != reference_ids:
+            raise self._validation_error(
+                task.task_id,
+                "传入素材与任务引用或顺序不一致",
+                "cause=asset_order_mismatch",
+            )
+
+        file_stats: list[os.stat_result] = []
+        total_size = 0
+        for asset in assets:
+            if asset.mime_type not in _IMAGE_MIME_TYPES:
+                raise self._validation_error(
+                    task.task_id,
+                    "参考素材不是支持的图片格式",
+                    f"asset_id={asset.asset_id}; cause=invalid_mime",
+                )
+            if asset.download_error is not None:
+                raise self._document_error(
+                    asset.asset_id,
+                    "参考图片下载失败",
+                    "cause=download_error",
+                )
+            if asset.size <= 0 or not asset.sha256:
+                raise self._document_error(
+                    asset.asset_id,
+                    "参考图片元数据无效",
+                    "cause=invalid_metadata",
+                )
+            try:
+                file_stat = asset.local_path.lstat()
+            except OSError as exc:
+                raise self._document_error(
+                    asset.asset_id,
+                    "无法读取参考图片",
+                    f"cause={type(exc).__name__}",
+                ) from None
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise self._document_error(
+                    asset.asset_id,
+                    "参考图片路径不安全",
+                    "cause=unsafe_file",
+                )
+            if file_stat.st_size > self._max_input_bytes:
+                raise self._document_error(
+                    asset.asset_id,
+                    "参考图片超过大小限制",
+                    "cause=input_too_large",
+                )
+            if file_stat.st_size != asset.size:
+                raise self._document_error(
+                    asset.asset_id,
+                    "参考图片完整性校验失败",
+                    "cause=content_mismatch",
+                )
+            total_size += file_stat.st_size
+            if total_size > self._max_total_input_bytes:
+                raise self._document_error(
+                    asset.asset_id,
+                    "参考图片总量超过大小限制",
+                    "cause=total_input_too_large",
+                )
+            file_stats.append(file_stat)
+
+        contents: list[bytes] = []
+        for asset, expected_stat in zip(assets, file_stats, strict=True):
+            content = self._read_verified_asset(asset, expected_stat)
+            contents.append(content)
+        return contents
+
+    def _read_verified_asset(
+        self,
+        asset: MediaAsset,
+        expected_stat: os.stat_result,
+    ) -> bytes:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
+            os, "O_NOFOLLOW", 0
+        )
+        try:
+            descriptor = os.open(asset.local_path, flags)
+        except OSError as exc:
+            raise self._document_error(
+                asset.asset_id,
+                "无法读取参考图片",
+                f"cause={type(exc).__name__}",
+            ) from None
+        try:
+            opened_stat = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened_stat.st_mode)
+                or self._file_identity(opened_stat)
+                != self._file_identity(expected_stat)
+            ):
+                raise self._document_error(
+                    asset.asset_id,
+                    "参考图片路径不安全",
+                    "cause=file_replaced",
+                )
+            content = bytearray()
+            digest = sha256()
+            while True:
+                chunk = os.read(descriptor, _READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                if len(content) + len(chunk) > self._max_input_bytes:
+                    raise self._document_error(
+                        asset.asset_id,
+                        "参考图片超过大小限制",
+                        "cause=input_too_large",
+                    )
+                content.extend(chunk)
+                digest.update(chunk)
+            final_stat = os.fstat(descriptor)
+        except AgentError:
+            raise
+        except OSError as exc:
+            raise self._document_error(
+                asset.asset_id,
+                "无法读取参考图片",
+                f"cause={type(exc).__name__}",
+            ) from None
+        finally:
+            os.close(descriptor)
+
+        try:
+            path_stat = asset.local_path.lstat()
+        except OSError as exc:
+            raise self._document_error(
+                asset.asset_id,
+                "参考图片路径在读取期间发生变化",
+                f"cause={type(exc).__name__}",
+            ) from None
+        if (
+            self._file_identity(final_stat) != self._file_identity(expected_stat)
+            or self._file_identity(path_stat) != self._file_identity(expected_stat)
+            or len(content) != asset.size
+            or digest.hexdigest() != asset.sha256
+        ):
+            raise self._document_error(
+                asset.asset_id,
+                "参考图片完整性校验失败",
+                "cause=content_mismatch",
+            )
+        return bytes(content)
+
+    @staticmethod
+    def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_size,
+            value.st_mtime_ns,
+        )
+
+    @staticmethod
+    def _prompt(task: GenerationTask) -> str:
+        lines = [task.prompt]
+        if task.negative_constraints:
+            lines.append("必须避免：" + "；".join(task.negative_constraints))
+        if task.output_count > 1:
+            lines.append(f"请生成 {task.output_count} 张结果图片。")
+        return "\n\n".join(lines)
+
+    @staticmethod
+    def _openai_size(aspect_ratio: str, image_size: str | None) -> str:
+        # image_size 已是 WxH（如 1024x1024）→ 直接用；否则按 aspectRatio 归到
+        # gpt-image 支持的离散尺寸；无法判定回退 "auto" 让服务端决定，避免 400。
+        if isinstance(image_size, str):
+            candidate = image_size.strip().lower().replace("×", "x")
+            if candidate in {size.lower() for size in _OPENAI_SIZES}:
+                return candidate
+        ratio = (aspect_ratio or "").strip()
+        if ratio in {"1:1", "auto", ""}:
+            return "1024x1024" if ratio == "1:1" else "auto"
+        parts = ratio.split(":")
+        if len(parts) == 2:
+            try:
+                width, height = float(parts[0]), float(parts[1])
+            except ValueError:
+                return "auto"
+            if width > 0 and height > 0:
+                if width > height:
+                    return "1536x1024"
+                if height > width:
+                    return "1024x1536"
+                return "1024x1024"
+        return "auto"
+
+    def _openai_result_items(
+        self, payload: dict[str, Any]
+    ) -> list[_PendingResult]:
+        data = payload.get("data")
+        if not isinstance(data, list):
+            raise self._provider_error(
+                "Chiyun 返回的数据结构无效",
+                "operation=generate; cause=invalid_data",
+            )
+        results: list[_PendingResult] = []
+        for item in data:
+            if not isinstance(item, dict):
+                raise self._provider_error(
+                    "Chiyun 返回的数据结构无效",
+                    "operation=generate; cause=invalid_data_item",
+                )
+            b64 = item.get("b64_json")
+            if isinstance(b64, str) and b64 and not b64.startswith("data:"):
+                padded = b64 + "=" * (-len(b64) % 4)
+                try:
+                    decoded = base64.b64decode(padded, validate=True)
+                except (binascii.Error, ValueError):
+                    raise self._invalid_result("invalid_base64") from None
+                if not decoded:
+                    raise self._invalid_result("empty_decoded_result")
+                if len(decoded) > self._max_result_bytes:
+                    raise self._invalid_result("decoded_result_too_large")
+                results.append(
+                    _PendingResult(mime_type=_OPENAI_RESULT_MIME, data=decoded)
+                )
+                continue
+            # b64 缺失时兜底走 url（复用现有安全下载器，强制 https）。
+            url = item.get("url")
+            if isinstance(url, str):
+                try:
+                    parsed = urlsplit(url)
+                except (TypeError, ValueError):
+                    raise self._invalid_result("unsafe_url") from None
+                if (
+                    parsed.scheme != "https"
+                    or not parsed.hostname
+                    or parsed.username is not None
+                    or parsed.password is not None
+                ):
+                    raise self._invalid_result("unsafe_url")
+                results.append(
+                    _PendingResult(mime_type=_OPENAI_RESULT_MIME, url=url)
+                )
+                continue
+            raise self._invalid_result("missing_openai_image")
+        return results
+
+    def _result_items(self, payload: dict[str, Any]) -> list[_PendingResult]:
+        results: list[_PendingResult] = []
+        candidates = payload.get("candidates")
+        if not isinstance(candidates, list):
+            raise self._provider_error(
+                "Chiyun 返回的数据结构无效",
+                "operation=generate; cause=invalid_candidates",
+            )
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                raise self._provider_error(
+                    "Chiyun 返回的数据结构无效",
+                    "operation=generate; cause=invalid_candidate",
+                )
+            content = candidate.get("content")
+            if not isinstance(content, dict):
+                continue
+            parts = content.get("parts")
+            if not isinstance(parts, list):
+                raise self._provider_error(
+                    "Chiyun 返回的数据结构无效",
+                    "operation=generate; cause=invalid_parts",
+                )
+            for part in parts:
+                if not isinstance(part, dict):
+                    raise self._provider_error(
+                        "Chiyun 返回的数据结构无效",
+                        "operation=generate; cause=invalid_part",
+                    )
+                inline = part.get("inlineData")
+                if inline is None:
+                    inline = part.get("inline_data")
+                if inline is not None:
+                    results.append(self._inline_result(inline))
+                    continue
+                file_data = part.get("fileData")
+                if file_data is None:
+                    file_data = part.get("file_data")
+                if file_data is not None:
+                    results.append(self._url_result(file_data))
+                    continue
+                if "url" in part or "image_url" in part:
+                    results.append(self._url_result(part))
+        return results
+
+    def _inline_result(self, value: Any) -> _PendingResult:
+        if not isinstance(value, dict):
+            raise self._invalid_result("inline_not_object")
+        mime_type = value.get("mimeType") or value.get("mime_type")
+        self._validate_result_mime(mime_type)
+        data = value.get("data")
+        if not isinstance(data, str) or not data or data.startswith("data:"):
+            raise self._invalid_result("invalid_inline_data")
+        padded = data + "=" * (-len(data) % 4)
+        try:
+            decoded = base64.b64decode(padded, validate=True)
+        except (binascii.Error, ValueError):
+            raise self._invalid_result("invalid_base64") from None
+        if not decoded:
+            raise self._invalid_result("empty_decoded_result")
+        if len(decoded) > self._max_result_bytes:
+            raise self._invalid_result("decoded_result_too_large")
+        return _PendingResult(mime_type=mime_type, data=decoded)
+
+    def _url_result(self, value: Any) -> _PendingResult:
+        if not isinstance(value, dict):
+            raise self._invalid_result("url_not_object")
+        mime_type = value.get("mimeType") or value.get("mime_type")
+        self._validate_result_mime(mime_type)
+        url = value.get("fileUri") or value.get("file_uri") or value.get("url")
+        image_url = value.get("image_url")
+        if url is None and isinstance(image_url, str):
+            url = image_url
+        elif url is None and isinstance(image_url, dict):
+            url = image_url.get("url")
+        if not isinstance(url, str):
+            raise self._invalid_result("missing_url")
+        try:
+            parsed = urlsplit(url)
+        except (TypeError, ValueError):
+            raise self._invalid_result("unsafe_url") from None
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise self._invalid_result("unsafe_url")
+        provider_result = ProviderResult(
+            url=url,
+            url_trust="untrusted",
+            mime_type=mime_type,
+        )
+        return _PendingResult(
+            mime_type=provider_result.mime_type,
+            url=provider_result.url,
+        )
+
+    @staticmethod
+    def _provider_results(
+        staged_results: list[StagedProviderResult],
+    ) -> list[ProviderResult]:
+        return [
+            ProviderResult(
+                local_path=result.local_path,
+                mime_type=result.mime_type,
+                size=result.size,
+                sha256=result.sha256,
+            )
+            for result in staged_results
+        ]
+
+    def _validate_result_mime(self, value: Any) -> None:
+        if not isinstance(value, str) or value not in _IMAGE_MIME_TYPES:
+            raise self._invalid_result("invalid_mime")
+
+    def _invalid_result(self, cause: str) -> AgentError:
+        return self._provider_error(
+            "Chiyun 图片结果无效",
+            f"operation=generate; cause={cause}",
+        )
+
+    @staticmethod
+    def _http_error(operation: str, status_code: int) -> AgentError:
+        if status_code in {401, 403}:
+            category = ErrorCategory.PERMISSION
+            message = "Chiyun 凭证无效或没有模型权限"
+            retryable = False
+        elif status_code == 429 or status_code >= 500:
+            category = ErrorCategory.TRANSIENT
+            message = "Chiyun 服务暂时不可用，请稍后重试"
+            retryable = True
+        else:
+            category = ErrorCategory.PROVIDER_TERMINAL
+            message = "Chiyun 拒绝了生成请求"
+            retryable = False
+        return AgentError(
+            ErrorDetail(
+                category=category,
+                message=message,
+                technical_detail=(
+                    f"operation={operation}; status={status_code}"
+                ),
+                retryable=retryable,
+            )
+        )
+
+    @staticmethod
+    def _provider_error(message: str, technical_detail: str) -> AgentError:
+        return AgentError(
+            ErrorDetail(
+                category=ErrorCategory.PROVIDER_TERMINAL,
+                message=message,
+                technical_detail=technical_detail,
+                retryable=False,
+            )
+        )
+
+    @staticmethod
+    def _error(
+        category: ErrorCategory,
+        message: str,
+        technical_detail: str,
+    ) -> AgentError:
+        return AgentError(
+            ErrorDetail(
+                category=category,
+                message=message,
+                technical_detail=technical_detail,
+                retryable=False,
+            )
+        )
+
+    @classmethod
+    def _configuration_error(cls, field_name: str, cause: str) -> AgentError:
+        messages = {
+            "base_url": "Chiyun 服务地址配置无效",
+            "api_key": "Chiyun API Key 未配置",
+            "model": "Chiyun 模型未配置",
+            "result_downloader": "Chiyun 结果下载器配置无效",
+        }
+        return cls._error(
+            ErrorCategory.CONFIGURATION,
+            messages.get(field_name, "Chiyun 大小限制配置无效"),
+            f"field={field_name}; {cause}",
+        )
+
+    @classmethod
+    def _validation_error(
+        cls,
+        task_id: str,
+        message: str,
+        detail: str,
+    ) -> AgentError:
+        return cls._error(
+            ErrorCategory.VALIDATION,
+            f"{message}（task_id={task_id}）",
+            f"task_id={task_id}; {detail}",
+        )
+
+    @classmethod
+    def _document_error(
+        cls,
+        asset_id: str,
+        message: str,
+        detail: str,
+    ) -> AgentError:
+        return cls._error(
+            ErrorCategory.DOCUMENT,
+            f"{message}（asset_id={asset_id}）",
+            f"asset_id={asset_id}; {detail}",
+        )

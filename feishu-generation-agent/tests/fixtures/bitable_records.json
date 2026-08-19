@@ -1,0 +1,55 @@
+{
+  "items": [
+    {
+      "record_id": "rec_valid",
+      "fields": {
+        "文本": [{"type": "text", "text": "纸船短片"}],
+        "需求来源": {"link": "https://tenant.feishu.cn/docx/docABC", "text": "需求"},
+        "执行人": [
+          {"id": "ou_alice", "name": "Alice"},
+          {"open_id": "ou_bob", "name": "Bob"}
+        ],
+        "结果": []
+      }
+    },
+    {
+      "record_id": "rec_done",
+      "fields": {
+        "文本": "已有结果",
+        "需求来源": "https://tenant.feishu.cn/docx/docDONE",
+        "执行人": [],
+        "结果": [{"file_token": "file_existing", "name": "done.mp4"}]
+      }
+    },
+    {
+      "record_id": "rec_invalid_source",
+      "fields": {
+        "文本": "无效来源",
+        "需求来源": "not-a-feishu-document",
+        "执行人": [],
+        "结果": null
+      }
+    },
+    {
+      "record_id": "rec_multiple_sources",
+      "fields": {
+        "文本": "多个来源",
+        "需求来源": [
+          {"link": "https://tenant.feishu.cn/docx/docONE"},
+          {"link": "https://tenant.feishu.cn/wiki/wikiTWO"}
+        ],
+        "执行人": [],
+        "结果": []
+      }
+    },
+    {
+      "record_id": "rec_second_page",
+      "fields": {
+        "文本": "第二页任务",
+        "需求来源": [{"link": "https://tenant.feishu.cn/wiki/wikiSOURCE"}],
+        "执行人": [{"user_id": "ou_carol", "name": "Carol"}],
+        "结果": []
+      }
+    }
+  ]
+}

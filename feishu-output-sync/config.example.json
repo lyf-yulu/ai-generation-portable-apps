@@ -1,0 +1,13 @@
+{
+  "app_id": "cli_xxxxxxxxxxxxxxxx",
+  "app_secret": "REPLACE_WITH_APP_SECRET",
+  "folder_token": "",
+  "poll_interval_seconds": 300,
+  "outputs_roots": {
+    "seedance": "../seedance/outputs",
+    "nano-banana": "../nano-banana/outputs",
+    "dreamina": "../dreamina/outputs",
+    "volcengine-portrait": "../volcengine-portrait/outputs"
+  },
+  "__note": "每个用户名(见 outputs/<用户名>/)自动建一张多维表格「<用户名>的AI产出」,设为组织内可编辑,无需 open_id 映射。"
+}

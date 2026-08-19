@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
+import hmac
 import json
 import mimetypes
 import os
@@ -30,6 +32,32 @@ _POPEN_EXTRA: dict[str, Any] = {}
 if hasattr(subprocess, "CREATE_NO_WINDOW"):
     _POPEN_EXTRA["creationflags"] = subprocess.CREATE_NO_WINDOW
 
+# Upstream install script for the Dreamina CLI. Verified by SHA-256 before
+# being fed to bash — see handle_install_cli.
+DREAMINA_CLI_URL = "https://jimeng.jianying.com/cli"
+
+# Known-good SHA-256 digests. Add new ones here (comma-separated in
+# DREAMINA_CLI_TRUSTED_SHA256 env var) when upstream releases a new script.
+_DEFAULT_TRUSTED_CLI_HASHES = frozenset({
+    # 2026-07-09 snapshot — verified in-context against jimeng.jianying.com/cli
+    "3d9a5cade9c94420b13c46f1a425d657e22225c926b06a4608eae32065d7e158",
+})
+
+
+def _trusted_cli_hashes() -> frozenset[str]:
+    """Return the set of accepted SHA-256 hashes for the install script.
+
+    Priority: env override > compiled-in defaults. Setting
+    DREAMINA_CLI_TRUST_UPSTREAM=1 accepts any hash (emergency bypass — use
+    only if the operator has out-of-band verified the upstream release)."""
+    if os.environ.get("DREAMINA_CLI_TRUST_UPSTREAM") == "1":
+        return frozenset()  # signal-value; handle_install_cli checks below
+    override = os.environ.get("DREAMINA_CLI_TRUSTED_SHA256", "").strip()
+    if override:
+        extras = {h.strip().lower() for h in override.split(",") if h.strip()}
+        return _DEFAULT_TRUSTED_CLI_HASHES | frozenset(extras)
+    return _DEFAULT_TRUSTED_CLI_HASHES
+
 # ---- Client IP helpers ----
 
 def _client_ip(handler: SimpleHTTPRequestHandler) -> str:
@@ -55,14 +83,52 @@ def _is_admin(handler: SimpleHTTPRequestHandler) -> bool:
     """Account-management gate. Dreamina account ops (login/install-cli/
     rename/delete/etc.) are intentionally open to anyone with use_apps, so
     portal also injects X-Dreamina-Manage for those users. Real admins keep
-    X-Is-Admin as before."""
-    return handler.headers.get("X-Is-Admin") == "1" or handler.headers.get("X-Dreamina-Manage") == "1"
+    X-Is-Admin as before.
+
+    Both headers require a valid Portal signature — an unsigned request that
+    just sets X-Is-Admin/X-Dreamina-Manage on the wire is treated as a
+    regular user."""
+    if not _verify_portal_sig(handler):
+        return False
+    return (
+        handler.headers.get("X-Is-Admin") == "1"
+        or handler.headers.get("X-Dreamina-Manage") == "1"
+    )
+
+
+PORTAL_SIG_WINDOW = int(os.environ.get("PORTAL_SIG_WINDOW", "60"))
+
+
+def _verify_portal_sig(handler) -> bool:
+    """HMAC-verify the X-Portal-Sig header set by Portal."""
+    secret = os.environ.get("PORTAL_INTERNAL_TOKEN", "")
+    if not secret:
+        return False
+    sig = handler.headers.get("X-Portal-Sig") or ""
+    ts_raw = handler.headers.get("X-Portal-Ts") or ""
+    if not sig or not ts_raw:
+        return False
+    try:
+        ts = int(ts_raw)
+    except (TypeError, ValueError):
+        return False
+    if abs(int(time.time()) - ts) > PORTAL_SIG_WINDOW:
+        return False
+    username = handler.headers.get("X-Username", "") or ""
+    is_admin_flag = "1" if handler.headers.get("X-Is-Admin") == "1" else "0"
+    msg = f"{ts}:{is_admin_flag}:{username}".encode("utf-8")
+    expected = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
 
 
 def _view_scope(handler) -> tuple[bool, str]:
     """Per-user task visibility for /api/jobs and activity. Only true admins
-    (X-Is-Admin=1) see everything; everyone else sees only their own jobs."""
-    sees_all = handler.headers.get("X-Is-Admin", "") == "1"
+    (X-Is-Admin=1 with a valid Portal signature) see everything; everyone
+    else sees only their own jobs."""
+    sees_all = (
+        handler.headers.get("X-Is-Admin", "") == "1"
+        and _verify_portal_sig(handler)
+    )
     username = _decode_username(handler)
     return sees_all, username
 
@@ -178,6 +244,36 @@ JOBS: dict[str, dict[str, Any]] = {}
 LOCK = threading.Lock()
 STATE_LOCK = threading.Lock()
 ACCOUNTS_LOCK = threading.Lock()  # protects accounts.json read/write
+
+# JOBS is in-memory and used to be unbounded: every job stayed forever. We evict
+# *finished* jobs once JOBS exceeds MAX_JOBS. JOB_PRUNE_GRACE_SECONDS interlocks
+# with Portal's usage tracker (polls GET /api/jobs/<id> every 15s, credits
+# by_user.images only on a terminal status) — 600s >> the poll cycle guarantees
+# a finished job is counted before we evict it. dreamina's terminal statuses are
+# "completed"/"failed" and it stamps finished_epoch (float) at completion.
+MAX_JOBS = 500
+JOB_PRUNE_GRACE_SECONDS = 600
+_TERMINAL_JOB_STATUSES = ("completed", "failed", "succeeded")
+
+
+def _prune_jobs_locked() -> None:
+    """Evict old finished jobs when JOBS exceeds MAX_JOBS. Caller must hold LOCK.
+    Running/pending jobs are never touched; the grace window ensures Portal's
+    usage poller has already counted anything we evict."""
+    if len(JOBS) <= MAX_JOBS:
+        return
+    now = time.time()
+    evictable = [
+        (job.get("finished_epoch") or 0, jid)
+        for jid, job in JOBS.items()
+        if job.get("status") in _TERMINAL_JOB_STATUSES
+        and (now - (job.get("finished_epoch") or now)) > JOB_PRUNE_GRACE_SECONDS
+    ]
+    evictable.sort(key=lambda t: t[0])
+    for _, jid in evictable:
+        if len(JOBS) <= MAX_JOBS:
+            break
+        JOBS.pop(jid, None)
 LOGIN_PROC: subprocess.Popen | None = None
 LOGIN_LOCK = threading.Lock()
 EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
@@ -1130,20 +1226,20 @@ def _execute_task_impl(job_id: str, task_type: str, args: list[str], params: dic
     with LOCK:
         job["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         job["finished_epoch"] = time.time()
-        if job["errors"] and not job["results"]:
+        if len(job["results"]) == 1:
+            job["result"] = job["results"][0]
+        else:
+            all_files = []
+            for r in job["results"]:
+                if isinstance(r, dict):
+                    all_files.extend(r.get("files", []))
+            job["result"] = {"files": all_files, "count": len(job["results"])}
+        if job["errors"]:
             job["status"] = "failed"
             job["error"] = "; ".join(job["errors"][:3])
             job["retryable"] = True
         else:
             job["status"] = "completed"
-            if len(job["results"]) == 1:
-                job["result"] = job["results"][0]
-            else:
-                all_files = []
-                for r in job["results"]:
-                    if isinstance(r, dict):
-                        all_files.extend(r.get("files", []))
-                job["result"] = {"files": all_files, "count": len(job["results"])}
         _final_status_for_callback = job["status"]
 
     with LOCK:
@@ -1253,11 +1349,15 @@ def cleanup_cache(media_days: int = 30, log_days: int = 14) -> dict[str, Any]:
 def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str, output_name: str = "", output_dir: str = "", sub_index: int = 1, total: int = 1, env_override: dict | None = None, on_cli_log=None) -> dict | None:
     if not submit_id:
         return None
-    if output_dir:
+    # Portal mode (CORS=1, served to remote colleagues): ignore any client
+    # output_dir and force outputs/<user>/<date>/. Remote custom paths only
+    # wrote to the server FS anyway and scattered results outside outputs/,
+    # hiding them from the Feishu sync. Standalone local mode keeps custom paths.
+    with LOCK:
+        username = JOBS.get(job_id, {}).get("username", "")
+    if output_dir and os.environ.get("CORS") != "1":
         base_dir = resolve_output_dir(output_dir)
     else:
-        with LOCK:
-            username = JOBS.get(job_id, {}).get("username", "")
         base_dir = _user_day_subdir(OUTPUT_DIR, username)
     ts = time.strftime("%Y%m%d_%H%M%S")
     short_id = job_id[:8]
@@ -1287,8 +1387,19 @@ def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str, 
                 on_cli_log(query_args, r)
             except Exception:
                 pass
+        # Files are stored as paths relative to _DATA_BASE (the DATA_DIR root),
+        # so the frontend can prefix them with '/dreamina/' and the URL resolves
+        # to the /outputs/ or /uploads/ dispatch regardless of whether DATA_DIR
+        # is the repo root (prod) or a test-data subdir. Using relative_to(ROOT)
+        # broke test env because the paths came back as 'test-data/outputs/...'
+        # which the serve dispatch does not match.
+        def _rel(p):
+            try:
+                return str(p.relative_to(_DATA_BASE))
+            except ValueError:
+                return str(p)
         if r["returncode"] != 0:
-            return {"download_dir": str(dl_dir.relative_to(ROOT)), "files": [],
+            return {"download_dir": _rel(dl_dir), "files": [],
                     "error": r["stderr"] or "query_result failed"}
 
         result_data = parse_cli_json(r["stdout"])
@@ -1296,12 +1407,12 @@ def download_if_needed(submit_id: str, data: dict, task_type: str, job_id: str, 
 
         if gs == "fail":
             reason = result_data.get("fail_reason", "generation failed")
-            return {"download_dir": str(dl_dir.relative_to(ROOT)), "files": [],
+            return {"download_dir": _rel(dl_dir), "files": [],
                     "error": reason, "gen_status": "fail"}
 
         if gs != "querying":
-            files = [str(f.relative_to(ROOT)) for f in dl_dir.iterdir() if f.is_file()]
-            return {"download_dir": str(dl_dir.relative_to(ROOT)), "files": files,
+            files = [_rel(f) for f in dl_dir.iterdir() if f.is_file()]
+            return {"download_dir": _rel(dl_dir), "files": files,
                     "cli_output": r["stdout"], "gen_status": gs}
 
         # Report queue progress to job events
@@ -1541,9 +1652,45 @@ def delete_archive(name: str, handler: SimpleHTTPRequestHandler | None = None) -
     return False
 
 
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
+
+
 class Handler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
+
+    def end_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        super().end_headers()
+
+    def _reject_oversized_upload(self) -> bool:
+        """Return True (and send 413) if Content-Length exceeds MAX_UPLOAD_BYTES.
+
+        Called at the top of do_POST/do_PUT before any body read. Returns False
+        (proceed) for missing or unparseable headers — those are handled by the
+        downstream reader with a smaller effective limit."""
+        raw = self.headers.get("Content-Length")
+        if not raw:
+            return False
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return False
+        if n > MAX_UPLOAD_BYTES:
+            body = json.dumps({
+                "ok": False,
+                "error": f"upload too large: {n} bytes (limit {MAX_UPLOAD_BYTES})",
+            }).encode("utf-8")
+            self.send_response(413)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return True
+        return False
 
     def _client_ip(self) -> str:
         forwarded = self.headers.get("X-Forwarded-For")
@@ -1591,6 +1738,14 @@ class Handler(SimpleHTTPRequestHandler):
             self.serve_file(OUTPUT_DIR, path[len("/outputs/"):])
         elif path.startswith("/uploads/"):
             self.serve_file(UPLOAD_DIR, path[len("/uploads/"):])
+        # Backwards-compat: older activity records logged file paths as
+        # 'test-data/outputs/...' relative to ROOT (broken in test env). Frontend
+        # requests /dreamina/test-data/outputs/... — resolve those against
+        # _DATA_BASE so historical thumbnails keep working after the fix.
+        elif path.startswith("/test-data/outputs/"):
+            self.serve_file(OUTPUT_DIR, path[len("/test-data/outputs/"):])
+        elif path.startswith("/test-data/uploads/"):
+            self.serve_file(UPLOAD_DIR, path[len("/test-data/uploads/"):])
         else:
             self.serve_static(path)
 
@@ -1607,6 +1762,8 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
+        if self._reject_oversized_upload():
+            return
 
         if path == "/api/env/install-cli":
             if not _is_admin(self):
@@ -1964,18 +2121,54 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.flush()
 
         try:
+            # Fetch → verify SHA-256 → exec. Previously this was
+            # `curl | bash`, which becomes RCE the day upstream is
+            # compromised or MITM'd. See DREAMINA_CLI_TRUSTED_SHA256 below.
+            send_event(json.dumps({"type": "log", "text": f"Downloading {DREAMINA_CLI_URL}..."}))
+            with urllib.request.urlopen(DREAMINA_CLI_URL, timeout=30) as resp:
+                script_bytes = resp.read()
+            actual = hashlib.sha256(script_bytes).hexdigest()
+            trusted = _trusted_cli_hashes()
+            bypass = os.environ.get("DREAMINA_CLI_TRUST_UPSTREAM") == "1"
+            if not bypass and actual not in trusted:
+                send_event(json.dumps({
+                    "type": "done", "success": False,
+                    "error": (
+                        f"install script SHA-256 mismatch: got {actual}, "
+                        f"expected one of {sorted(trusted)}. Upstream may have "
+                        "released a new version. Ask an operator to update "
+                        "DREAMINA_CLI_TRUSTED_SHA256 (or set "
+                        "DREAMINA_CLI_TRUST_UPSTREAM=1 for a one-time bypass)."
+                    ),
+                }))
+                return
+            send_event(json.dumps({
+                "type": "log",
+                "text": f"SHA-256 {actual[:12]}... verified, executing...",
+            }))
+            # Feed the verified bytes to bash on stdin — no shell interpolation
+            # of the payload, no cache reuse issues.
             proc = subprocess.Popen(
-                ["bash", "-c", "curl -fsSL https://jimeng.jianying.com/cli | bash"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                ["bash"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=False,
                 **_POPEN_EXTRA,
             )
-            for line in proc.stdout:
-                send_event(json.dumps({"type": "log", "text": line.rstrip()}))
+            proc.stdin.write(script_bytes)
+            proc.stdin.close()
+            for raw in proc.stdout:
+                send_event(json.dumps({
+                    "type": "log",
+                    "text": raw.decode("utf-8", errors="replace").rstrip(),
+                }))
             proc.wait()
             if proc.returncode == 0:
                 send_event(json.dumps({"type": "done", "success": True}))
             else:
-                send_event(json.dumps({"type": "done", "success": False, "error": f"exit code {proc.returncode}"}))
+                send_event(json.dumps({
+                    "type": "done", "success": False,
+                    "error": f"exit code {proc.returncode}",
+                }))
         except Exception as e:
             send_event(json.dumps({"type": "done", "success": False, "error": str(e)}))
 
@@ -2168,6 +2361,7 @@ class Handler(SimpleHTTPRequestHandler):
 
         with LOCK:
             JOBS[job_id] = job
+            _prune_jobs_locked()
 
         prompt_text = str(fields.get("prompt") or "").strip()
         record_activity({
@@ -2349,6 +2543,7 @@ class Handler(SimpleHTTPRequestHandler):
         }
         with LOCK:
             JOBS[new_job_id] = new_job
+            _prune_jobs_locked()
         prompt_text = str(fields.get("prompt") or "").strip()
         record_activity({
             "id": new_activity_id,
@@ -2629,11 +2824,15 @@ class Handler(SimpleHTTPRequestHandler):
             return
         mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
         content = file_path.read_bytes()
-        filename = file_path.name
         self.send_response(200)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(content)))
-        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        # NO Content-Disposition here: these are the app's own static assets
+        # (index.html / app.js / styles.css). Sending attachment made the
+        # browser download index.html instead of rendering it, so the standalone
+        # :8888 front-end showed a blank page + "Failed to fetch" (app.js never
+        # loaded). serve_file (below) is where attachment vs inline matters.
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.end_headers()
         try:
             self.wfile.write(content)
@@ -2641,7 +2840,15 @@ class Handler(SimpleHTTPRequestHandler):
             pass
 
     def serve_file(self, base_dir: Path, rel_path: str):
-        file_path = base_dir / urllib.parse.unquote(rel_path)
+        try:
+            base_resolved = base_dir.resolve()
+            file_path = (base_dir / urllib.parse.unquote(rel_path)).resolve()
+        except (OSError, ValueError):
+            self.send_error(404)
+            return
+        if not (file_path == base_resolved or file_path.is_relative_to(base_resolved)):
+            self.send_error(403)
+            return
         if not file_path.exists() or not file_path.is_file():
             self.send_error(404)
             return
@@ -2654,7 +2861,7 @@ class Handler(SimpleHTTPRequestHandler):
         # 其它类型保留 attachment 让浏览器触发下载
         inline = mime.startswith("image/") or mime.startswith("video/") or mime.startswith("audio/")
 
-        # If-None-Match 短路：无论 Range 与否，命中就返 304
+        # If-None-Match 短路：无论 Range 与否,命中就返 304
         if self.headers.get("If-None-Match", "") == etag:
             self.send_response(304)
             self.send_header("ETag", etag)

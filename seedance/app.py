@@ -31,6 +31,14 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 _DATA_BASE = Path(os.environ.get("DATA_DIR", str(ROOT)))
 STATIC_DIR = ROOT / "static"
+
+# Ark error translations live under portal/ so seedance and volcengine-portrait
+# share one table — the two sub-apps hit the same Ark video endpoint and would
+# otherwise duplicate the mapping.
+_PORTAL_DIR = str(ROOT.parent / "portal")
+if _PORTAL_DIR not in sys.path:
+    sys.path.insert(0, _PORTAL_DIR)
+from ark_errors import translate_ark_error  # noqa: E402
 OUTPUT_DIR = _DATA_BASE / "outputs"
 STATE_DIR = _DATA_BASE / "state"
 MEDIA_DIR = STATE_DIR / "media"
@@ -42,6 +50,118 @@ FILES_MAP_PATH = STATE_DIR / "download_files.json"
 SKILL_PATH = ROOT / "SKILL.md"
 DEEPSEEK_KEY_PATH = STATE_DIR / "deepseek.key"
 SECRETS_PATH = STATE_DIR / "secrets.json"
+
+
+# ============================================================
+# STRUCTURED ERRORS
+# ============================================================
+
+class APIError(Exception):
+    """结构化 API 错误，携带 HTTP 状态码和是否可重试标志"""
+    def __init__(self, status_code: int, message: str, raw_response: str = ""):
+        self.status_code = status_code
+        self.message = message
+        self.raw_response = raw_response
+        super().__init__(f"HTTP {status_code}: {message}")
+
+    @property
+    def is_retryable(self) -> bool:
+        """判断是否值得重试（429 限流、408 超时、5xx 服务端错误）"""
+        return self.status_code in (408, 429, 500, 502, 503, 504)
+
+    @property
+    def error_category(self) -> str:
+        """错误分类，方便前端展示友好提示"""
+        if self.status_code == 401:
+            return "auth_failed"
+        elif self.status_code == 403:
+            return "permission_denied"
+        elif self.status_code == 429:
+            return "rate_limited"
+        elif 400 <= self.status_code < 500:
+            return "client_error"
+        elif 500 <= self.status_code < 600:
+            return "server_error"
+        return "unknown"
+
+
+class NetworkError(Exception):
+    """网络连接失败，通常可重试"""
+    pass
+
+
+def _safe_join_or_root(base: Path, rel: str) -> str:
+    """Join base/rel and reject any result outside base (path-traversal guard).
+
+    Falls back to returning base itself for illegal input; SimpleHTTPRequestHandler
+    then serves a directory listing (or 403 if listing disabled), which is a safer
+    failure mode than serving arbitrary files."""
+    try:
+        base_resolved = base.resolve()
+        target = (base / rel).resolve()
+    except (OSError, ValueError):
+        return str(base)
+    if target == base_resolved or target.is_relative_to(base_resolved):
+        return str(target)
+    return str(base)
+
+
+# Magic bytes for common formats; used to verify uploads instead of trusting the
+# client's declared extension / Content-Type. An attacker who uploads evil.jpg
+# with SVG-plus-<script> body would slip past extension checks and (without
+# nosniff) execute in the victim's browser.
+_MAGIC_IMAGE = {
+    "image/jpeg": [b"\xff\xd8\xff"],
+    "image/png": [b"\x89PNG\r\n\x1a\n"],
+    "image/gif": [b"GIF87a", b"GIF89a"],
+    "image/webp": [b"RIFF"],  # + "WEBP" at offset 8; checked below
+    "image/bmp": [b"BM"],
+    "image/tiff": [b"II*\x00", b"MM\x00*"],
+    "image/heic": [b"ftypheic", b"ftypheix", b"ftypmif1"],  # matched at offset 4
+}
+_MAGIC_VIDEO = {
+    "video/mp4": [b"ftypmp4", b"ftypisom", b"ftypM4V", b"ftypavc1"],  # offset 4
+    "video/quicktime": [b"ftypqt"],  # offset 4
+    "video/webm": [b"\x1a\x45\xdf\xa3"],
+}
+_MAGIC_AUDIO = {
+    "audio/mpeg": [b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"],
+    "audio/wav": [b"RIFF"],  # + "WAVE" at offset 8
+    "audio/ogg": [b"OggS"],
+}
+
+
+def sniff_kind(head: bytes) -> str | None:
+    """Return the top-level media kind ('image' | 'video' | 'audio') detected
+    from the file header, or None if unrecognized. Uses first ~16 bytes so
+    callers should pass at least that many."""
+    if not head:
+        return None
+    for magics in _MAGIC_IMAGE.values():
+        for m in magics:
+            if head.startswith(m):
+                if m == b"RIFF" and head[8:12] != b"WEBP":
+                    continue
+                return "image"
+        # heic/tiff family: bytes 4-11 marker
+    if head[4:12] in (b"ftypheic", b"ftypheix", b"ftypmif1"):
+        return "image"
+    if head[4:8] in (b"ftyp",) and head[8:12] in (b"heic", b"heix", b"mif1"):
+        return "image"
+    for magics in _MAGIC_VIDEO.values():
+        for m in magics:
+            if m.startswith(b"ftyp"):
+                if head[4:4 + len(m)] == m:
+                    return "video"
+            elif head.startswith(m):
+                return "video"
+    for magics in _MAGIC_AUDIO.values():
+        for m in magics:
+            if head.startswith(m):
+                if m == b"RIFF" and head[8:12] != b"WAVE":
+                    continue
+                return "audio"
+    return None
 
 
 def load_secrets() -> dict[str, str]:
@@ -243,16 +363,47 @@ except Exception:
     SEEDANCE_SKILL = ""
 
 
+PORTAL_SIG_WINDOW = int(os.environ.get("PORTAL_SIG_WINDOW", "60"))
+
+
+def _verify_portal_sig(handler) -> bool:
+    """True iff Portal's HMAC signature over (ts, is_admin, username) matches.
+
+    Prevents a client from setting X-Is-Admin: 1 directly and bypassing auth.
+    Timestamp guards against replay of an old signed request."""
+    secret = os.environ.get("PORTAL_INTERNAL_TOKEN", "")
+    if not secret:
+        return False
+    sig = handler.headers.get("X-Portal-Sig") or ""
+    ts_raw = handler.headers.get("X-Portal-Ts") or ""
+    if not sig or not ts_raw:
+        return False
+    try:
+        ts = int(ts_raw)
+    except (TypeError, ValueError):
+        return False
+    if abs(int(time.time()) - ts) > PORTAL_SIG_WINDOW:
+        return False
+    username = handler.headers.get("X-Username", "") or ""
+    is_admin_flag = "1" if handler.headers.get("X-Is-Admin") == "1" else "0"
+    msg = f"{ts}:{is_admin_flag}:{username}".encode("utf-8")
+    expected = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
 def _is_admin(handler: SimpleHTTPRequestHandler) -> bool:
-    """Check if request comes from an authenticated admin (set by portal proxy)."""
-    return handler.headers.get("X-Is-Admin") == "1"
+    """Check if request comes from an authenticated admin (set by portal proxy).
+
+    Requires a valid X-Portal-Sig — an unauthenticated LAN client that just
+    sets X-Is-Admin: 1 will fail verification and be treated as a regular user."""
+    return handler.headers.get("X-Is-Admin") == "1" and _verify_portal_sig(handler)
 
 
 def _view_scope(handler) -> tuple[bool, str]:
     """Returns (sees_all, username). Used by jobs/activity endpoints to
     enforce per-user task visibility. Admins see everything; everyone else
     sees only jobs whose `username` matches."""
-    sees_all = handler.headers.get("X-Is-Admin", "") == "1"
+    sees_all = _is_admin(handler)
     username = _decode_username(handler)
     return sees_all, username
 
@@ -349,9 +500,27 @@ def _ws_preset_path(ws_id: str) -> Path:
 OFFICIAL_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 TERMINAL_STATUSES = {"succeeded", "success", "failed", "fail", "failure", "cancelled", "canceled"}
 
+# translate_ark_error lives in portal/ark_errors.py so seedance and
+# volcengine-portrait share one table; see the module for the matcher rules.
+
+
 JOBS: dict[str, dict[str, Any]] = {}
 FILES: dict[str, Path] = {}
 JOBS_LOCK = threading.Lock()
+
+# JOBS is in-memory and used to be unbounded: every job (with its results/events/
+# errors) stayed forever, so a service machine running for weeks only ever grew.
+# We now evict *finished* jobs once the dict exceeds MAX_JOBS.
+#
+# JOB_PRUNE_GRACE_SECONDS is the safety interlock for usage stats: Portal's
+# tracker polls GET /api/jobs/<id> every 15s and only credits by_user.images
+# once it observes a terminal status. Evicting a finished job too early would
+# hand Portal a 404 -> the job is never counted and is silently dropped at its
+# 7200s timeout (a stats *under*-count). 600s is far beyond the 15s poll cycle,
+# so anything we evict has certainly been counted already.
+MAX_JOBS = 500
+JOB_PRUNE_GRACE_SECONDS = 600
+_TERMINAL_JOB_STATUSES = ("succeeded", "failed", "completed")
 STATE_LOCK = threading.Lock()
 ACTIVITY_LIMIT = 100
 
@@ -707,18 +876,35 @@ def media_item_to_file(field: str, item: Any) -> tuple[str, bytes] | None:
             url,
             headers={"User-Agent": "Mozilla/5.0"},
         )
-        try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                blob = resp.read()
-                mime = resp.headers.get_content_type() or mimetypes.guess_type(url)[0] or "application/octet-stream"
-        except urllib.error.HTTPError as exc:
+        blob = b""
+        mime = "application/octet-stream"
+        attempts = 3
+        for attempt in range(1, attempts + 1):
             try:
-                detail = exc.read().decode("utf-8", errors="replace")[:500]
-            except Exception:
-                detail = ""
-            raise RuntimeError(f"参考素材下载失败 (HTTP {exc.code}): {url} — {detail}") from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise RuntimeError(f"参考素材下载失败 (连接错误): {url} — {exc}") from exc
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    blob = resp.read()
+                    mime = resp.headers.get_content_type() or mimetypes.guess_type(url)[0] or "application/octet-stream"
+                break
+            except urllib.error.HTTPError as exc:
+                try:
+                    detail = exc.read().decode("utf-8", errors="replace")[:500]
+                except Exception:
+                    detail = ""
+                raise RuntimeError(f"参考素材下载失败 (HTTP {exc.code}): {url} — {detail}") from exc
+            except http.client.IncompleteRead as exc:
+                # IncompleteRead subclasses HTTPException, not URLError/OSError —
+                # retry the transfer before giving up (transient CDN cutoff).
+                if attempt < attempts:
+                    time.sleep(min(2 ** attempt, 8))
+                    continue
+                raise RuntimeError(
+                    f"参考素材下载中断 (IncompleteRead,已重试 {attempts} 次): {url} — {exc}"
+                ) from exc
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                if attempt < attempts:
+                    time.sleep(min(2 ** attempt, 8))
+                    continue
+                raise RuntimeError(f"参考素材下载失败 (连接错误): {url} — {exc}") from exc
         if not blob:
             raise ValueError(f"media.{field} url returned empty content")
         return filename_from_media(field, item, mime), blob
@@ -1081,22 +1267,56 @@ def normalize_status(value: str | None) -> str:
     return status
 
 
-def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | None = None, timeout: int = 600) -> dict[str, Any]:
+def request_json(method: str, url: str, api_key: str, body: dict[str, Any] | None = None, timeout: int = 600, max_retries: int = 6) -> dict[str, Any]:
+    """
+    发送 JSON 请求，自动重试瞬态错误。
+
+    重试策略：
+    - 429/5xx: 最多重试 6 次，指数退避（1s, 2s, 4s, 8s, 16s, 32s）
+    - 网络超时/连接失败: 最多重试 6 次
+    - 4xx（除 408/429）: 不重试，立即抛出
+    """
     headers = {"Authorization": f"Bearer {api_key}"}
     data = None
     if body is not None:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code}: {raw}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError(f"API 请求超时或连接失败 ({exc.__class__.__name__}: {exc})") from exc
+
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                return json.loads(raw) if raw else {}
+
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            error = APIError(exc.code, raw, raw)
+
+            # 4xx 非瞬态错误（除了 408/429），立即失败
+            if not error.is_retryable:
+                raise error
+
+            # 429/5xx 可重试错误
+            last_error = error
+            if attempt < max_retries - 1:
+                backoff = min(2 ** attempt, 32)  # 最多等 32 秒
+                time.sleep(backoff)
+                continue
+            raise error  # 最后一次重试也失败，抛出
+
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # 网络错误，可重试
+            last_error = NetworkError(f"连接失败 ({exc.__class__.__name__}: {exc})")
+            if attempt < max_retries - 1:
+                backoff = min(2 ** attempt, 32)
+                time.sleep(backoff)
+                continue
+            raise RuntimeError(f"API 请求失败，已重试 {max_retries} 次: {last_error}") from exc
+
+    # 不应该走到这里
+    raise last_error or RuntimeError("Unknown error in request_json")
 
 
 def _public_base_url(handler: SimpleHTTPRequestHandler) -> str | None:
@@ -1255,9 +1475,16 @@ def extract_video_url(data: dict[str, Any]) -> str | None:
                     return str(value["url"])
                 if isinstance(value, str):
                     return value
-    for key in ("video_url", "videoUrl", "output"):
+    for key in ("video_url", "videoUrl"):
         if data.get(key):
             return str(data[key])
+    output = data.get("output")
+    if isinstance(output, dict):
+        url = output.get("video_url") or output.get("videoUrl")
+        if url:
+            return str(url)
+    elif isinstance(output, str) and output:
+        return output
     results = data.get("results")
     if isinstance(results, list):
         for item in results:
@@ -1277,22 +1504,61 @@ def download_video(url: str, out_path: Path) -> None:
             )
         },
     )
-    try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            out_path.write_bytes(resp.read())
-    except urllib.error.HTTPError as exc:
+    attempts = 3
+    for attempt in range(1, attempts + 1):
         try:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
-        except Exception:
-            detail = ""
-        raise RuntimeError(f"视频下载失败 (HTTP {exc.code}): {url[:120]} — {detail}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError(f"视频下载失败 (连接错误): {url[:120]} — {exc}") from exc
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                out_path.write_bytes(resp.read())
+            return
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                detail = ""
+            raise RuntimeError(f"视频下载失败 (HTTP {exc.code}): {url[:120]} — {detail}") from exc
+        except http.client.IncompleteRead as exc:
+            # CDN closed the connection before Content-Length bytes arrived.
+            # IncompleteRead subclasses HTTPException (not URLError/OSError),
+            # so it slipped past the handler below and surfaced raw to users.
+            # The video itself was generated — just retry the transfer.
+            if attempt < attempts:
+                time.sleep(min(2 ** attempt, 8))
+                continue
+            raise RuntimeError(
+                f"视频下载中断 (IncompleteRead,已重试 {attempts} 次): {url[:120]} — {exc}"
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if attempt < attempts:
+                time.sleep(min(2 ** attempt, 8))
+                continue
+            raise RuntimeError(f"视频下载失败 (连接错误): {url[:120]} — {exc}") from exc
 
 
 def set_job(job_id: str, **updates: Any) -> None:
     with JOBS_LOCK:
         JOBS[job_id].update(updates)
+
+
+def _prune_jobs_locked() -> None:
+    """Evict old finished jobs when JOBS exceeds MAX_JOBS. Caller must hold
+    JOBS_LOCK. Only terminal jobs past the grace window are candidates —
+    running/queued jobs are never touched, and the grace window guarantees
+    Portal's usage poller has already counted them (see MAX_JOBS comment)."""
+    if len(JOBS) <= MAX_JOBS:
+        return
+    now = time.time()
+    evictable = [
+        (job.get("finished_at") or 0, jid)
+        for jid, job in JOBS.items()
+        if job.get("status") in _TERMINAL_JOB_STATUSES
+        and (now - (job.get("finished_at") or now)) > JOB_PRUNE_GRACE_SECONDS
+    ]
+    # Oldest finished first; stop as soon as we are back under the cap.
+    evictable.sort(key=lambda t: t[0])
+    for _, jid in evictable:
+        if len(JOBS) <= MAX_JOBS:
+            break
+        JOBS.pop(jid, None)
 
 
 def add_event(job_id: str, message: str) -> None:
@@ -1674,15 +1940,23 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
         per_item_duration = int(values.get("duration") or 0)
     except (TypeError, ValueError):
         per_item_duration = 0
+    # duration=-1 asks the model to choose the length. Store 0 rather than -1:
+    # Portal bills video seconds as done * duration, so a negative value would
+    # subtract from by_user.seconds. run_one() backfills the real length once Ark
+    # reports it.
+    if per_item_duration < 0:
+        per_item_duration = 0
     with JOBS_LOCK:
         JOBS[job_id] = {
             "id": job_id, "status": "queued", "events": [], "results": [], "errors": [],
             "done": 0, "total": 0, "duration": per_item_duration,
             "username": username,
+            "workspace_id": ws_id,
             "submitted_at": time.time(),
             "started_at": None,
             "finished_at": None,
         }
+        _prune_jobs_locked()
     response = job_id_response(job_id)
     record_activity({
         "id": activity_id,
@@ -1697,7 +1971,7 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
         "username": username,
         "started_at": time.time(),
         "restore": copy_files_to_restore(values, files, activity_id, ws_id),
-    })
+    }, ws_id)
     thread = threading.Thread(target=run_job, args=(job_id, values, files, activity_id, ws_id), daemon=True)
     thread.start()
     return job_id
@@ -1742,16 +2016,41 @@ def run_one(job_id: str, index: int, form_values: dict[str, Any], form_files: di
         if status not in TERMINAL_STATUSES:
             continue
         if status != "succeeded":
+            # Ark returns errors as {"code": ..., "message": ...}. Look the pair
+            # up in ARK_ERROR_MATCHERS for a Chinese explanation; if none of the
+            # matchers fires, still surface the raw code + message so the
+            # operator can find the request id — better than dumping the whole
+            # response dict.
+            err = status_result.get("error") if isinstance(status_result.get("error"), dict) else None
+            if err:
+                code = str(err.get("code") or "").strip()
+                message = str(err.get("message") or "").strip()
+                zh = translate_ark_error(code, message)
+                if zh:
+                    raise RuntimeError(f"Task {task_id}: {zh} 原始错误：{code}: {message}")
+                raise RuntimeError(
+                    f"Task {task_id} ended as {status}: {code} — {message}" if code
+                    else f"Task {task_id} ended as {status}: {message or status_result}"
+                )
             raise RuntimeError(f"Task {task_id} ended as {status}: {status_result}")
         video_url = extract_video_url(status_result)
         if not video_url:
             raise RuntimeError(f"Task {task_id} succeeded but no video URL was found")
-        raw_output_dir = form_values.get("output_dir")
-        if not raw_output_dir:
-            with JOBS_LOCK:
-                username = JOBS.get(job_id, {}).get("username", "")
-            form_values["output_dir"] = str(_user_day_subdir(OUTPUT_DIR, username))
-        out_dir = resolve_output_dir(form_values.get("output_dir"))
+        # In Portal mode (CORS=1, i.e. served to remote colleagues), IGNORE any
+        # client-supplied output_dir and force outputs/<user>/<date>/. Remote
+        # users' custom paths only ever wrote to the server's filesystem anyway
+        # (browsers can't reach the client FS), which scattered results outside
+        # outputs/ and made them invisible to the Feishu sync. Standalone local
+        # mode (direct :8787, no CORS) keeps the custom-path ability.
+        with JOBS_LOCK:
+            username = JOBS.get(job_id, {}).get("username", "")
+        if os.environ.get("CORS") == "1":
+            out_dir = _user_day_subdir(OUTPUT_DIR, username)
+        else:
+            raw_output_dir = form_values.get("output_dir")
+            if not raw_output_dir:
+                form_values["output_dir"] = str(_user_day_subdir(OUTPUT_DIR, username))
+            out_dir = resolve_output_dir(form_values.get("output_dir"))
         custom_name = form_values.get("output_name", "").strip()
         if custom_name:
             total = max(1, int(form_values.get("repeat_count") or 1), int(form_values.get("concurrency") or 1))
@@ -1770,11 +2069,22 @@ def run_one(job_id: str, index: int, form_values: dict[str, Any], form_files: di
             FILES[file_token] = out_path
         save_files_map()
         add_event(job_id, f"Run {index}: downloaded {out_name}")
+        # Ark reports the produced length back, which matters when the request
+        # asked for duration=-1 (model picks the length). Portal's usage poller
+        # bills seconds as done * job["duration"], so leaving -1 there would
+        # subtract from by_user.seconds instead of adding.
+        actual_duration = status_result.get("duration")
+        if isinstance(actual_duration, (int, float)) and actual_duration > 0:
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+                if job is not None and int(job.get("duration") or 0) <= 0:
+                    job["duration"] = int(actual_duration)
         return {
             "index": index,
             "task_id": task_id,
             "status": "succeeded",
             "video_url": video_url,
+            "duration": int(actual_duration) if isinstance(actual_duration, (int, float)) else None,
             "download_url": f"/api/download/{file_token}",
             "filename": out_name,
             "local_path": str(out_path),
@@ -1797,6 +2107,19 @@ def run_job(job_id: str, form_values: dict[str, Any], form_files: dict[str, tupl
                     with JOBS_LOCK:
                         JOBS[job_id]["results"].append(result)
                         JOBS[job_id]["done"] += 1
+                except APIError as exc:
+                    # 结构化 API 错误，记录错误类型方便前端展示
+                    error_msg = f"[{exc.error_category}] {exc.message}"
+                    with JOBS_LOCK:
+                        JOBS[job_id]["errors"].append(error_msg)
+                        JOBS[job_id]["done"] += 1
+                    add_event(job_id, f"API Error [{exc.error_category}]: {exc.message[:200]}")
+                except NetworkError as exc:
+                    error_msg = f"[network_error] {exc}"
+                    with JOBS_LOCK:
+                        JOBS[job_id]["errors"].append(error_msg)
+                        JOBS[job_id]["done"] += 1
+                    add_event(job_id, f"Network Error: {exc}")
                 except Exception as exc:
                     with JOBS_LOCK:
                         JOBS[job_id]["errors"].append(str(exc))
@@ -1820,14 +2143,48 @@ def run_job(job_id: str, form_values: dict[str, Any], form_files: dict[str, tupl
         report_final_to_portal(job_id, "failed")
 
 
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
+
+
 class Handler(SimpleHTTPRequestHandler):
+    def end_headers(self):
+        # Injected globally so every response carries nosniff without touching
+        # each send_header site. Prevents browsers from executing an uploaded
+        # .jpg whose bytes are actually HTML/SVG+JS.
+        self.send_header("X-Content-Type-Options", "nosniff")
+        super().end_headers()
+
+    def _reject_oversized_upload(self) -> bool:
+        raw = self.headers.get("Content-Length")
+        if not raw:
+            return False
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return False
+        if n > MAX_UPLOAD_BYTES:
+            body = json.dumps({
+                "ok": False,
+                "error": f"upload too large: {n} bytes (limit {MAX_UPLOAD_BYTES})",
+            }).encode("utf-8")
+            self.send_response(413)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return True
+        return False
+
     def translate_path(self, path: str) -> str:
         path = urllib.parse.urlparse(path).path
         if path.startswith("/outputs/"):
-            return str((OUTPUT_DIR / path.removeprefix("/outputs/")).resolve())
+            return _safe_join_or_root(OUTPUT_DIR, path.removeprefix("/outputs/"))
         if path in {"/", "/index.html"}:
             return str(STATIC_DIR / "index.html")
-        return str((STATIC_DIR / path.lstrip("/")).resolve())
+        return _safe_join_or_root(STATIC_DIR, path.lstrip("/"))
 
     def do_GET(self) -> None:
         self._raw_path = self.path
@@ -1894,6 +2251,12 @@ class Handler(SimpleHTTPRequestHandler):
                         "total": j.get("total", 0),
                     })
             items.sort(key=lambda it: (it.get("submitted_at") or 0), reverse=True)
+            # Cap the payload to the most recent N jobs. JOBS grows unbounded in
+            # memory until restart; returning every job every 5s (poll) bloats
+            # both the response and the client DOM (each job renders a <video>),
+            # which crashed long-lived browser tabs. 200 is well past what any
+            # user scrolls; the frontend further paginates to 20.
+            items = items[:200]
             json_response(self, 200, {"ok": True, "jobs": items})
             return
         if self.path == "/api/activity":
@@ -1916,7 +2279,10 @@ class Handler(SimpleHTTPRequestHandler):
             ws = _workspace_id(self)
             preset = read_preset(ws)
             item = preset.get("media", {}).get(field)
-            path = _ws_media_dir(ws) / item.get("stored", "") if item else None
+            # Collapse stored to bare basename — preset.json is normally written
+            # by our own upload path but treat it as untrusted anyway.
+            stored_name = Path(item.get("stored", "")).name if item else ""
+            path = _ws_media_dir(ws) / stored_name if stored_name else None
             if not item or not path or not path.exists():
                 json_response(self, 404, {"error": "media not found"})
                 return
@@ -2022,6 +2388,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:
+        if self._reject_oversized_upload():
+            return
         self._raw_path = self.path
         self.path = urllib.parse.urlparse(self.path).path
         if self.path == "/api/choose-output-dir":
@@ -2125,6 +2493,25 @@ class Handler(SimpleHTTPRequestHandler):
             if not data:
                 json_response(self, 400, {"error": "empty file"})
                 return
+            # Enforce that the actual file bytes match the field's declared
+            # media kind. Prevents evil.jpg-with-SVG-body upload → XSS on
+            # any client that ever renders it as image.
+            expected_kind = None
+            if field_name.startswith("ref_image_"):
+                expected_kind = "image"
+            elif field_name.startswith("ref_video_"):
+                expected_kind = "video"
+            elif field_name.startswith("ref_audio_"):
+                expected_kind = "audio"
+            if expected_kind:
+                actual = sniff_kind(data[:16])
+                if actual != expected_kind:
+                    json_response(self, 415, {
+                        "ok": False,
+                        "error": f"content does not match {expected_kind}: "
+                                 f"detected {actual or 'unknown'}",
+                    })
+                    return
             suffix = Path(filename).suffix.lower()
             stored = f"{uuid.uuid4().hex}_{field_name}{suffix}"
             media_dir = _ws_media_dir(ws)

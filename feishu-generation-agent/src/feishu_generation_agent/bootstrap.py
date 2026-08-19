@@ -1,0 +1,534 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import httpx
+from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
+
+from feishu_generation_agent.config import Settings
+from feishu_generation_agent.bitable.mvp_service import BitableMvpService
+from feishu_generation_agent.bitable.production_service import (
+    ProductionBitableService,
+    ProductionTaskSource,
+)
+from feishu_generation_agent.domain import BitableLocation
+from feishu_generation_agent.graph.nodes import GraphServices
+from feishu_generation_agent.integrations.chiyun import ChiyunImageGenerator
+from feishu_generation_agent.integrations.feishu_client import FeishuClient
+from feishu_generation_agent.integrations.feishu_bitable import FeishuBitableClient
+from feishu_generation_agent.integrations.bitable_delivery import BitableResultWriter
+from feishu_generation_agent.integrations.bitable_url import (
+    parse_bitable_url,
+    with_bitable_view,
+)
+from feishu_generation_agent.integrations.feishu_delivery import (
+    FeishuDeliveryWriter,
+)
+from feishu_generation_agent.integrations.feishu_source import (
+    FeishuDocumentSource,
+)
+from feishu_generation_agent.integrations.feishu_sheet_export import (
+    FeishuSheetExporter,
+)
+from feishu_generation_agent.integrations.planner import DeepSeekPlanner
+from feishu_generation_agent.integrations.routing_delivery import RoutingDeliveryWriter
+from feishu_generation_agent.integrations.production_bitable import ProductionBitableClient
+from feishu_generation_agent.integrations.production_delivery import ProductionResultWriter
+from feishu_generation_agent.integrations.production_routing import (
+    ProductionRoutingDeliveryWriter,
+)
+from feishu_generation_agent.integrations.safe_download import (
+    SafeResultDownloader,
+)
+from feishu_generation_agent.integrations.character_semantic_matcher import (
+    DeepSeekCharacterMatcher,
+)
+from feishu_generation_agent.integrations.seedance import SeedanceVideoGenerator
+from feishu_generation_agent.integrations.seedream import SeedreamImageGenerator
+from feishu_generation_agent.integrations.public_media import (
+    TosPublicMediaHost,
+    UguuPublicMediaHost,
+)
+from feishu_generation_agent.integrations.volcengine_portrait import (
+    VolcengineAssetClient,
+    VolcenginePortraitVideoGenerator,
+)
+from feishu_generation_agent.integrations.vision import ClaudeVisionAnalyzer
+from feishu_generation_agent.storage.files import FileStore
+from feishu_generation_agent.storage.bitable_tasks import BitableTaskStore
+from feishu_generation_agent.storage.production_tasks import ProductionTaskStore
+from feishu_generation_agent.storage.asset_library import AssetLibraryStore
+from feishu_generation_agent.storage.portrait_assets import PortraitAssetStore
+from feishu_generation_agent.storage.provider_results import ProviderResultStore
+from feishu_generation_agent.storage.planner_prompts import PlannerPromptStore
+from feishu_generation_agent.storage.repository import Repository
+
+
+CAPABILITY_FIELDS: dict[str, tuple[str, ...]] = {
+    "core": (
+        "lark_app_id", "lark_app_secret", "deepseek_api_key",
+        "claude_api_key", "claude_model",
+    ),
+    "generation": (
+        "chiyun_api_key", "chiyun_model", "ark_api_key",
+        "seedance_model",
+    ),
+    "portrait_generation": (
+        "ark_api_key", "volcengine_access_key", "volcengine_secret_key",
+    ),
+    "bitable": (
+        "lark_app_id", "lark_app_secret", "lark_bitable_url",
+        "lark_bitable_table_id", "lark_bitable_view_id",
+    ),
+    "production_bitable": (
+        "lark_app_id", "lark_app_secret", "lark_production_bitable_url",
+        "lark_production_table_id", "lark_production_view_id",
+        "lark_result_folder_token",
+    ),
+    "local_claim": ("lark_local_operator_open_id",),
+    "legacy_delivery": (
+        "lark_output_owner_open_id", "lark_output_folder_token",
+    ),
+}
+
+# Compatibility for callers that still inspect the legacy document mode fields.
+REQUIRED_RUNTIME_FIELDS = (
+    *CAPABILITY_FIELDS["core"],
+    *CAPABILITY_FIELDS["generation"],
+    *CAPABILITY_FIELDS["legacy_delivery"],
+)
+
+
+def capability_is_configured(settings: Settings, name: str) -> bool:
+    try:
+        settings.require(*CAPABILITY_FIELDS[name])
+    except (KeyError, ValueError):
+        return False
+    return True
+
+
+def runtime_is_configured(settings: Settings) -> bool:
+    return (
+        capability_is_configured(settings, "core")
+        and capability_is_configured(settings, "generation")
+        and (
+            capability_is_configured(settings, "bitable")
+            or capability_is_configured(settings, "production_bitable")
+            or capability_is_configured(settings, "legacy_delivery")
+        )
+    )
+
+
+def build_image_providers(
+    settings: Settings,
+    http_client: Any,
+    *,
+    staging_dir: Path,
+    result_downloader: Any | None,
+    max_result_bytes: int,
+) -> dict[str, Any]:
+    """构建图片模式的 provider registry。
+
+    banana 与 gpt-image2 都走 chiyun 中转，由 ChiyunImageGenerator 按 model
+    名前缀自动分流（gpt-image* → OpenAI 风格，其余 → Gemini 风格），
+    因此只需用不同 model 各实例化一次。seedream 走火山方舟，复用 seedance
+    的 ark 传输层。
+    """
+    providers: dict[str, Any] = {}
+    if settings.chiyun_api_key is not None:
+        models = {
+            "banana": settings.banana_model,
+            "gpt-image2": settings.gpt_image_model,
+        }
+        providers.update(
+            {
+                name: ChiyunImageGenerator(
+                    http_client,
+                    base_url=settings.chiyun_base_url,
+                    api_key=settings.chiyun_api_key,
+                    model=model,
+                    staging_dir=staging_dir,
+                    result_downloader=result_downloader,
+                    max_result_bytes=max_result_bytes,
+                    # 必须以 registry 的键自报身份，否则 nodes.py 的
+                    # provider 一致性校验会把成功的出图判成失败。
+                    provider_name=name,
+                )
+                for name, model in models.items()
+            }
+        )
+    if settings.ark_api_key is not None:
+        providers["seedream"] = SeedreamImageGenerator(
+            http_client,
+            base_url=settings.ark_base_url,
+            api_key=settings.ark_api_key,
+            model=settings.seedream_model,
+            staging_dir=staging_dir,
+            result_downloader=result_downloader,
+            max_result_bytes=max_result_bytes,
+        )
+    return providers
+
+
+async def open_asset_library_store(settings: Settings) -> AssetLibraryStore:
+    return await AssetLibraryStore.open(
+        db_path=settings.asset_library_db_path,
+        assets_dir=settings.asset_library_dir,
+        base_url=settings.asset_base_url,
+    )
+
+
+@dataclass(slots=True)
+class BitableServiceFactory:
+    bitable: FeishuBitableClient
+    store: BitableTaskStore
+    location: BitableLocation
+    _claimed: bool = False
+
+    def create(self, runtime) -> BitableMvpService:
+        if self._claimed:
+            raise RuntimeError("多维表格服务已创建")
+        self._claimed = True
+        return BitableMvpService(
+            bitable=self.bitable,
+            store=self.store,
+            runtime=runtime,
+            location=self.location,
+        )
+
+    async def close_unclaimed(self) -> None:
+        if not self._claimed:
+            await self.store.close()
+
+
+@dataclass(slots=True)
+class ProductionBitableServiceFactory:
+    bitable: ProductionBitableClient
+    store: ProductionTaskStore
+    sources: dict[str, ProductionTaskSource]
+    include_completed_for_test: bool
+    enabled_task_types: frozenset[str] = frozenset({"动画类"})
+    _claimed: bool = False
+
+    def create(self, runtime) -> ProductionBitableService:
+        if self._claimed:
+            raise RuntimeError("生产多维表格服务已创建")
+        self._claimed = True
+        return ProductionBitableService(
+            bitable=self.bitable,
+            store=self.store,
+            runtime=runtime,
+            sources=self.sources,
+            include_completed_for_test=self.include_completed_for_test,
+            enabled_task_types=self.enabled_task_types,
+        )
+
+    async def close_unclaimed(self) -> None:
+        if not self._claimed:
+            await self.store.close()
+
+
+@dataclass(frozen=True, slots=True)
+class ApplicationServices:
+    graph: GraphServices
+    bitable_factory: BitableServiceFactory | ProductionBitableServiceFactory | None
+    legacy_delivery_configured: bool
+    planner_prompt_store: PlannerPromptStore
+
+
+@asynccontextmanager
+async def open_services(settings: Settings) -> AsyncIterator[GraphServices]:
+    async with _open_application_services(
+        settings, enable_bitable=True
+    ) as application:
+        yield application.graph
+
+
+@asynccontextmanager
+async def open_application_services(
+    settings: Settings,
+) -> AsyncIterator[ApplicationServices]:
+    async with _open_application_services(
+        settings, enable_bitable=True
+    ) as application:
+        yield application
+
+
+@asynccontextmanager
+async def _open_application_services(
+    settings: Settings,
+    *,
+    enable_bitable: bool,
+) -> AsyncIterator[ApplicationServices]:
+    settings.require(*CAPABILITY_FIELDS["core"])
+    settings.require(*CAPABILITY_FIELDS["generation"])
+    bitable_configured = enable_bitable and capability_is_configured(
+        settings, "bitable"
+    )
+    production_bitable_configured = enable_bitable and capability_is_configured(
+        settings, "production_bitable"
+    )
+    legacy_configured = capability_is_configured(settings, "legacy_delivery")
+    if not bitable_configured and not production_bitable_configured and not legacy_configured:
+        settings.require(*CAPABILITY_FIELDS["legacy_delivery"])
+    settings.ensure_paths()
+    repository = await Repository.open(settings.business_db_path)
+    try:
+        planner_prompt_store = await PlannerPromptStore.open(settings.business_db_path)
+    except BaseException:
+        await repository.close()
+        raise
+    provider_http = httpx.AsyncClient(trust_env=False)
+    downloader = SafeResultDownloader(
+        max_bytes=settings.max_download_bytes,
+        allow_benchmark_dns=settings.allow_benchmark_fake_ips,
+    )
+    feishu = FeishuClient(settings)
+    file_store: FileStore | None = None
+    bitable_factory: BitableServiceFactory | ProductionBitableServiceFactory | None = None
+    portrait_store: PortraitAssetStore | None = None
+    asset_library_store: AssetLibraryStore | None = None
+    try:
+        provider_results = ProviderResultStore(
+            settings.data_dir / "provider-results",
+            max_item_bytes=settings.max_download_bytes,
+        )
+        animation_media_host = UguuPublicMediaHost(provider_http)
+        if (
+            settings.volcengine_access_key is not None
+            and settings.volcengine_secret_key is not None
+            and settings.tos_bucket
+        ):
+            animation_media_host = TosPublicMediaHost(
+                provider_http,
+                access_key=settings.volcengine_access_key.get_secret_value(),
+                secret_key=settings.volcengine_secret_key.get_secret_value(),
+                bucket=settings.tos_bucket,
+                region=settings.tos_region,
+            )
+        portrait_generator = None
+        if capability_is_configured(settings, "portrait_generation"):
+            portrait_store = await PortraitAssetStore.open(
+                settings.data_dir / "portrait-assets.sqlite3"
+            )
+            portrait_client = VolcengineAssetClient(
+                provider_http,
+                access_key=settings.volcengine_access_key,
+                secret_key=settings.volcengine_secret_key,
+                project_name=settings.volcengine_project_name,
+                public_media_host=UguuPublicMediaHost(provider_http),
+                store=portrait_store,
+            )
+            portrait_generator = VolcenginePortraitVideoGenerator(
+                provider_http,
+                asset_client=portrait_client,
+                base_url=settings.ark_base_url,
+                api_key=settings.ark_api_key,
+                model=settings.seedance_model,
+                public_media_host=UguuPublicMediaHost(provider_http),
+            )
+        file_store = FileStore(
+            settings.data_dir,
+            settings.outputs_dir,
+            max_bytes=settings.max_download_bytes,
+            result_downloader=downloader,
+            provider_result_store=provider_results,
+        )
+        planner_model = ChatOpenAI(
+            api_key=settings.deepseek_api_key,
+            base_url=settings.deepseek_base_url,
+            model=settings.deepseek_model,
+            temperature=0,
+            max_retries=2,
+            timeout=120,
+        )
+        # 素材库打不开不该阻断整个 agent：图片模式退化成人工挂参考图。
+        try:
+            asset_library_store = await open_asset_library_store(settings)
+        except Exception:
+            asset_library_store = None
+        vision_options = {
+            "api_key": settings.claude_api_key,
+            "model_name": settings.claude_model,
+            "max_tokens_to_sample": 2048,
+            "temperature": 0,
+            "max_retries": 2,
+            "timeout": 120,
+        }
+        if settings.claude_base_url:
+            vision_options["base_url"] = settings.claude_base_url
+        vision_model = ChatAnthropic(**vision_options)
+        legacy_writer = (
+            FeishuDeliveryWriter(
+                feishu,
+                repository,
+                owner_open_id=settings.lark_output_owner_open_id or "",
+            )
+            if legacy_configured
+            else None
+        )
+        delivery_writer = legacy_writer
+        if bitable_configured:
+            location = parse_bitable_url(
+                settings.lark_bitable_url or "",
+                settings.lark_bitable_table_id or "",
+                settings.lark_bitable_view_id or "",
+            )
+            bitable_client = FeishuBitableClient(feishu)
+            bitable_store = await BitableTaskStore.open(
+                settings.data_dir / "bitable.sqlite3"
+            )
+            bitable_factory = BitableServiceFactory(
+                bitable=bitable_client,
+                store=bitable_store,
+                location=location,
+            )
+            bitable_writer = BitableResultWriter(
+                bitable_client,
+                repository,
+                bitable_store,
+            )
+            delivery_writer = RoutingDeliveryWriter(
+                bitable_store,
+                bitable=bitable_writer,
+                legacy=legacy_writer,
+            )
+        if production_bitable_configured:
+            production_location = parse_bitable_url(
+                settings.lark_production_bitable_url or "",
+                settings.lark_production_table_id or "",
+                settings.lark_production_view_id or "",
+            )
+            production_store = await ProductionTaskStore.open(
+                settings.data_dir / "production-bitable.sqlite3"
+            )
+            production_sources = {
+                "animation": ProductionTaskSource(
+                    production_location,
+                    expected_task_type="动画类",
+                )
+            }
+            if settings.lark_production_portrait_view_id:
+                production_sources["portrait"] = ProductionTaskSource(
+                    with_bitable_view(
+                        production_location,
+                        settings.lark_production_portrait_view_id,
+                    ),
+                    expected_task_type="真人类",
+                )
+            if settings.lark_image_bitable_url and settings.lark_image_table_id:
+                # 图片需求在另一张表，不是主表的视图，所以单独解析 location。
+                production_sources["image"] = ProductionTaskSource(
+                    parse_bitable_url(
+                        settings.lark_image_bitable_url,
+                        settings.lark_image_table_id,
+                        settings.lark_image_view_id or "",
+                    ),
+                    expected_task_type="",
+                    planning_mode="image",
+                    declared_task_type="图片类",
+                )
+            production_factory = ProductionBitableServiceFactory(
+                bitable=ProductionBitableClient(feishu),
+                store=production_store,
+                sources=production_sources,
+                include_completed_for_test=settings.lark_include_completed_for_test,
+                enabled_task_types=(
+                    frozenset({"动画类", "真人类", "图片类"})
+                    if portrait_generator is not None
+                    else frozenset({"动画类", "图片类"})
+                ),
+            )
+            production_writer = ProductionResultWriter(
+                client=feishu,
+                store=production_store,
+                repository=repository,
+                result_folder_token=settings.lark_result_folder_token or "",
+            )
+            if isinstance(delivery_writer, RoutingDeliveryWriter):
+                # 直连入口的 run 没有任何 bitable 绑定：legacy 未配置时
+                # 统一结果表兜底，避免产出无处可去（2026-08-18 线上故障根因）。
+                delivery_writer.set_fallback(production_writer)
+            delivery_writer = ProductionRoutingDeliveryWriter(
+                production_store,
+                production=production_writer,
+                legacy=delivery_writer,
+            )
+            # The production table is the operator-facing source when enabled.
+            bitable_factory = production_factory
+        assert delivery_writer is not None
+        services = GraphServices(
+            document_source=FeishuDocumentSource(
+                feishu,
+                file_store,
+                sheet_exporter=FeishuSheetExporter(feishu),
+            ),
+            vision_analyzer=ClaudeVisionAnalyzer(
+                vision_model,
+                repository,
+                prompt_version="v1",
+                model_name=settings.claude_model,
+            ),
+            planner=DeepSeekPlanner(
+                planner_model, max_output_count=settings.max_output_count
+            ),
+            image_generator=ChiyunImageGenerator(
+                provider_http,
+                base_url=settings.chiyun_base_url,
+                api_key=settings.chiyun_api_key,
+                model=settings.chiyun_model,
+                staging_dir=settings.data_dir / "provider-results",
+                result_downloader=downloader,
+                max_result_bytes=settings.max_download_bytes,
+            ),
+            image_providers=build_image_providers(
+                settings,
+                provider_http,
+                staging_dir=settings.data_dir / "provider-results",
+                result_downloader=downloader,
+                max_result_bytes=settings.max_download_bytes,
+            )
+            or None,
+            video_generator=SeedanceVideoGenerator(
+                provider_http,
+                base_url=settings.ark_base_url,
+                api_key=settings.ark_api_key,
+                model=settings.seedance_model,
+                public_media_host=animation_media_host,
+            ),
+            portrait_video_generator=portrait_generator,
+            production_task_store=production_store if production_bitable_configured else None,
+            delivery_writer=delivery_writer,
+            repository=repository,
+            file_store=file_store,
+            settings=settings,
+            asset_library_store=asset_library_store,
+            character_matcher=(
+                DeepSeekCharacterMatcher(planner_model)
+                if asset_library_store is not None
+                else None
+            ),
+        )
+        yield ApplicationServices(
+            graph=services,
+            bitable_factory=bitable_factory,
+            legacy_delivery_configured=legacy_configured,
+            planner_prompt_store=planner_prompt_store,
+        )
+    finally:
+        if bitable_factory is not None:
+            await bitable_factory.close_unclaimed()
+        if file_store is not None:
+            file_store.close()
+        if portrait_store is not None:
+            await portrait_store.close()
+        if asset_library_store is not None:
+            await asset_library_store.close()
+        await feishu.close()
+        await downloader.aclose()
+        await provider_http.aclose()
+        await planner_prompt_store.close()
+        await repository.close()

@@ -26,9 +26,9 @@ function getActiveWorkspaceId() {
   return window._activeWorkspaceId || _workspaceId();
 }
 
-async function api(url, method, body) {
+async function api(url, method, body, workspaceOverride) {
   try {
-    const wsId = getActiveWorkspaceId();
+    const wsId = workspaceOverride || getActiveWorkspaceId();
     const sep = url.includes('?') ? '&' : '?';
     const urlWithWs = url + sep + 'ws=' + encodeURIComponent(wsId);
     const headers = { 'X-Workspace-Id': wsId };
@@ -39,6 +39,32 @@ async function api(url, method, body) {
     const res = await fetch(urlWithWs, opts);
     return await res.json();
   } catch (e) { return null; }
+}
+
+// Status-aware single poll for pollJob's retry logic. Unlike api() — which
+// collapses HTTP 404 / 5xx / network-error / bad-JSON all into null (or a
+// truthy {error:...} body that pollJob looped on forever showing "unknown") —
+// this distinguishes:
+//   {kind:'ok', job}  HTTP 200 + a job object carrying a status field
+//   {kind:'gone'}     HTTP 404 — job gone (sub-app restarted, JOBS cleared)
+//   {kind:'error'}    network error / timeout / 5xx / non-JSON — transient
+async function pollJobOnce(url, workspaceOverride) {
+  try {
+    const wsId = workspaceOverride || getActiveWorkspaceId();
+    const sep = url.includes('?') ? '&' : '?';
+    const urlWithWs = url + sep + 'ws=' + encodeURIComponent(wsId);
+    const headers = { 'X-Workspace-Id': wsId };
+    const keyId = localStorage.getItem('portal_key_id_nano_banana');
+    if (keyId) headers['X-Key-Id'] = keyId;
+    const res = await fetch(urlWithWs, { method: 'GET', headers });
+    if (res.status === 404) return { kind: 'gone' };
+    if (!res.ok) return { kind: 'error' };
+    const job = await res.json();
+    if (!job || typeof job.status === 'undefined') return { kind: 'error' };
+    return { kind: 'ok', job };
+  } catch (e) {
+    return { kind: 'error' };
+  }
 }
 
 function escHtml(s) { return s ? String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') : ''; }
@@ -77,10 +103,14 @@ function wireFileDrop(drop, input) {
     const localUrl = URL.createObjectURL(f);
     showPreview(drop, input.name, localUrl, f.name);
     // Upload to server so the file survives tab switch / refresh / archive save.
+    // The upload is owned by the topic that was active when the file was picked;
+    // a response arriving after a topic switch must not touch the new topic.
+    const ownerWsId = getActiveWorkspaceId();
     try {
       const fd = new FormData();
       fd.set(input.name, f);
-      const res = await api(APP_PATH + '/api/media/upload', 'POST', fd);
+      const res = await api(APP_PATH + '/api/media/upload', 'POST', fd, ownerWsId);
+      if (getActiveWorkspaceId() !== ownerWsId) return;
       if (res && res.stored) {
         const app = window._app_nb;
         const media = (app && app.savedMedia) || window._currentSavedMedia || {};
@@ -254,6 +284,16 @@ function resolveMediaUrl(url) {
 var FALLBACK_PROVIDERS = {
   t8star: { label: 'T8Star Images API', base_url: 'https://ai.t8star.org', models: [{ id: 'nano-banana-2', label: 'nano-banana-2' }, { id: 'gemini-3.1-flash-image-preview', label: 'gemini-3.1-flash-image-preview' }, { id: 'gemini-3-pro-image-2k', label: 'gemini-3-pro-image-2k' }, { id: 'gemini-3-pro-image-4k', label: 'gemini-3-pro-image-4k' }] },
   gemini: { label: 'Chiyun', base_url: 'https://chiyun.work', models: [{ id: 'banana2-ssvip', label: 'banana2-ssvip' }, { id: 'nano-banana2[2K]-base', label: 'nano-banana2[2K]-base' }, { id: 'gpt-image-2', label: 'gpt-image-2' }] },
+  volcengine: {
+    label: '火山引擎官方 (Seedream)',
+    base_url: 'https://ark.cn-beijing.volces.com/api/v3',
+    company_key: true,
+    company_key_available: false,
+    image_size_options: ['1K', '1.5K', '2K'],
+    max_reference_images: 10,
+    supports_seed: false,
+    models: [{ id: 'doubao-seedream-5-0-pro-260628', label: 'Seedream 5.0 Pro' }],
+  },
 };
 
 // ============================================================
@@ -271,8 +311,15 @@ function NanoBananaApp() {
     provider: 't8star',
     models: [],
     baseUrl: 'https://ai.t8star.org',
+    baseUrlReadonly: false,
     providerHint: '',
     keyHint: '',
+    imageSizeOptions: ['1K', '2K', '4K'],
+    supportsSeed: true,
+    maxReferenceImages: 14,
+    _providerKeys: {},
+    _activeProvider: 't8star',
+    _personalKeyHint: '',
     outputDir: '',
     dirHandle: null,
     autoDownload: false,
@@ -316,6 +363,7 @@ function NanoBananaApp() {
     editingTabId: null,         // tab id being renamed inline, or null
     _closeConfirmTabId: null,   // tab id that opened the close-confirm modal
     _tabStateCache: {},         // { wsId: {statusText, eventsText, submitting, baseUrl, provider, models, workspaceName} }
+    _topicSubmissionSeq: {},    // { wsId: latest submit sequence }
 
     // ---- 8b. init() ----
 
@@ -429,16 +477,66 @@ function NanoBananaApp() {
         if (s && s.value !== defaultP) s.value = defaultP;
         if (data.providers[defaultP]) self.applyProvider(defaultP);
       }, 0);
-      this.keyHint = data.has_key ? '已检测到 key: ' + (data.masked_key || '') : '未检测到本地 key';
+      var activeCfg = this.providers[this.provider] || {};
+      if (!activeCfg.company_key) {
+        this._personalKeyHint = data.has_key ? '已检测到 key: ' + (data.masked_key || '') : '未检测到本地 key';
+        this.keyHint = this._personalKeyHint;
+      }
     },
 
-    applyProvider(provider) {
+    applyProvider(provider, skipDefaults) {
       var cfg = this.providers[provider];
       if (!cfg) return;
+      var keyInput = nbField('api_key');
+      var providerKeys = this.providerKeyBucket();
+      // v-model can update ``provider`` before @change invokes this method;
+      // keep an independent applied-provider pointer so the outgoing key is
+      // always saved under the provider it actually belonged to.
+      var previousProvider = this._activeProvider || this.provider;
+      var previousCfg = this.providers[previousProvider] || {};
+      if (!skipDefaults && keyInput && previousProvider && !previousCfg.company_key) {
+        providerKeys[previousProvider] = keyInput.value;
+      }
       this.provider = provider;
+      this._activeProvider = provider;
       this.baseUrl = cfg.base_url || '';
+      this.baseUrlReadonly = !!cfg.company_key;
       this.providerHint = cfg.hint || '';
       this.models = cfg.models || [];
+      this.imageSizeOptions = (cfg.image_size_options || ['1K', '2K', '4K']).slice();
+      this.supportsSeed = cfg.supports_seed !== false;
+      this.maxReferenceImages = Number(cfg.max_reference_images || 14);
+
+      if (keyInput) {
+        if (cfg.company_key) {
+          keyInput.value = '';
+          keyInput.readOnly = true;
+          keyInput.placeholder = cfg.company_key_available
+            ? '已使用官方密钥（服务器托管）'
+            : '官方密钥未配置';
+          this.keyHint = cfg.company_key_available
+            ? '已使用 Seedance 相同的火山方舟密钥（服务器托管）'
+            : '服务器尚未检测到火山方舟密钥，请联系维护者';
+        } else {
+          keyInput.readOnly = false;
+          keyInput.placeholder = '留空使用本地配置';
+          if (Object.prototype.hasOwnProperty.call(providerKeys, provider)) {
+            keyInput.value = providerKeys[provider];
+          }
+          this.keyHint = this._personalKeyHint;
+        }
+      }
+      var seedInput = nbField('seed');
+      var varySeedInput = nbField('vary_seed');
+      if (seedInput) seedInput.disabled = !this.supportsSeed;
+      if (varySeedInput) varySeedInput.disabled = !this.supportsSeed;
+      this.applyReferenceImageLimit();
+      // When restoring a saved draft/preset the form already carries this tab's
+      // own aspect_ratio / image_size / etc. Re-applying provider defaults here
+      // (async, after applyPreset filled the fields) would clobber them back to
+      // defaults on every tab switch. skipDefaults lets the restore path keep
+      // provider metadata (base_url/models) without overwriting form values.
+      if (skipDefaults) return;
       var self = this;
       setTimeout(function () {
         var defaults = cfg.defaults || {};
@@ -456,6 +554,23 @@ function NanoBananaApp() {
           } else el.value = v;
         }
         self.updateResizeState();
+      });
+    },
+
+    providerKeyBucket() {
+      var wsId = this.activeTabId || 'default';
+      if (!this._providerKeys[wsId]) this._providerKeys[wsId] = {};
+      return this._providerKeys[wsId];
+    },
+
+    applyReferenceImageLimit() {
+      var limit = this.maxReferenceImages || 14;
+      document.querySelectorAll('#nb-imageRefs .drop').forEach(function (drop) {
+        var input = drop.querySelector && drop.querySelector('input[type="file"]');
+        var match = input && input.name && input.name.match(/^image_(\d+)$/);
+        var enabled = !match || Number(match[1]) <= limit;
+        if (drop.style) drop.style.display = enabled ? '' : 'none';
+        if (input) input.disabled = !enabled;
       });
     },
 
@@ -491,6 +606,7 @@ function NanoBananaApp() {
             }
           }
         });
+        self.applyReferenceImageLimit();
       }, 0);
     },
 
@@ -498,13 +614,39 @@ function NanoBananaApp() {
 
     async submit() {
       var self = this;
+      var ownerWorkspaceId = self.activeTabId;
+      var ownerExists = function () { return self.tabs.some(function (t) { return t.id === ownerWorkspaceId; }); };
+      var ownerCache = function () {
+        if (!ownerExists()) return null;
+        return (self._tabStateCache[ownerWorkspaceId] = self._tabStateCache[ownerWorkspaceId] || {});
+      };
+      var setOwnerState = function (name, value) {
+        var cache = ownerCache();
+        if (!cache) return;
+        cache[name] = value;
+        if (self.activeTabId === ownerWorkspaceId) self[name] = value;
+      };
       if (self.submitting) return;
-      self.submitting = true;
-      self.statusText = '提交中';
+      var submissionToken = (self._topicSubmissionSeq[ownerWorkspaceId] || 0) + 1;
+      self._topicSubmissionSeq[ownerWorkspaceId] = submissionToken;
+      var delivery = {
+        dirHandle: self.dirHandle,
+        autoDownload: self.autoDownload,
+        outputDir: self.outputDir,
+      };
+      var cache = ownerCache();
+      cache._submissionToken = submissionToken;
+      cache._activeJobId = null;
+      delete cache._latestJob;
+      setOwnerState('submitting', true);
+      setOwnerState('statusText', '提交中');
       var resultsEl = document.getElementById('nb-results');
       var eventsEl = document.getElementById('nb-events');
-      if (resultsEl) resultsEl.innerHTML = '';
-      if (eventsEl) eventsEl.textContent = '';
+      if (self.activeTabId === ownerWorkspaceId) {
+        if (resultsEl) resultsEl.innerHTML = '';
+        if (eventsEl) eventsEl.textContent = '';
+      }
+      setOwnerState('eventsText', '');
 
       // Auto-save workspace draft before submit
       if (self.isStandalone) {
@@ -514,36 +656,85 @@ function NanoBananaApp() {
       var data = await self.formDataWithSavedMedia({ resizeImages: true });
       var res;
       try {
-        res = await api(APP_PATH + '/api/jobs', 'POST', data);
+        res = await api(APP_PATH + '/api/jobs', 'POST', data, ownerWorkspaceId);
       } finally {
-        self.submitting = false;
+        setOwnerState('submitting', false);
       }
       if (!res || res.error) {
-        self.statusText = (res && res.error) || '提交失败';
+        setOwnerState('statusText', (res && res.error) || '提交失败');
         return;
       }
-      self.statusText = '已提交，任务在后台运行';
+      if (!ownerExists() || ownerCache()._submissionToken !== submissionToken) return;
+      ownerCache()._activeJobId = res.job_id;
+      setOwnerState('statusText', '已提交，任务在后台运行');
       try { self.loadActivity(); } catch (e) { /* ignore */ }
-      self.pollJob(res.job_id);
+      self.pollJob(res.job_id, ownerWorkspaceId, submissionToken, delivery);
     },
 
-    async pollJob(jobId) {
+    async pollJob(jobId, ownerWorkspaceId, submissionToken, delivery) {
       var self = this;
-      // Record which tab initiated this poll. If the user switches tabs while
-      // the job is still running, subsequent state writes must NOT contaminate
-      // the now-active tab — they route into _tabStateCache[startWsId] instead.
-      var startWsId = self.activeTabId;
-      var isActive = function () { return self.activeTabId === startWsId; };
-      var cache = function () { return (self._tabStateCache[startWsId] = self._tabStateCache[startWsId] || {}); };
+      var ownerWsId = ownerWorkspaceId || self.activeTabId;
+      var ownerExists = function () { return self.tabs.some(function (t) { return t.id === ownerWsId; }); };
+      var cache = function () {
+        if (!ownerExists()) return null;
+        return (self._tabStateCache[ownerWsId] = self._tabStateCache[ownerWsId] || {});
+      };
+      var isCurrent = function () {
+        var state = cache();
+        if (!state) return false;
+        if (submissionToken !== undefined && state._submissionToken !== submissionToken) return false;
+        return !state._activeJobId || state._activeJobId === jobId;
+      };
+      var isActive = function () { return isCurrent() && self.activeTabId === ownerWsId; };
+      var setState = function (name, value) {
+        if (!isCurrent()) return;
+        var state = cache();
+        state[name] = value;
+        if (isActive()) self[name] = value;
+      };
+      var setStatus = function (t) { setState('statusText', t); };
+      var setEvents = function (t) { setState('eventsText', t); };
+      var setSubmitting = function (v) { setState('submitting', v); };
+      var setLatestJob = function (job) { if (isCurrent()) cache()._latestJob = job; };
 
-      var setStatus = function (t) { if (isActive()) self.statusText = t; else cache().statusText = t; };
-      var setEvents = function (t) { if (isActive()) self.eventsText = t; else cache().eventsText = t; };
-      var setSubmitting = function (v) { if (isActive()) self.submitting = v; else cache().submitting = v; };
-      var setLatestJob = function (job) { cache()._latestJob = job; };
+      // Transient-failure tolerance. A single failed poll (proxy timeout, wifi
+      // blip, sub-app 5xx) used to `break` and permanently abandon the watcher,
+      // leaving a finished result invisible until manual resubmit. Now retry
+      // with backoff, give up only after MAX_FAILS consecutive failures. A 404
+      // ('gone' — sub-app restarted, JOBS cleared) exits cleanly instead of
+      // looping forever on "unknown".
+      var MAX_FAILS = 15;
+      var consecutiveFails = 0;
 
       while (true) {
-        var job = await api(APP_PATH + '/api/jobs/' + jobId);
-        if (!job) break;
+        if (!isCurrent()) break;
+        var r = await pollJobOnce(APP_PATH + '/api/jobs/' + jobId, ownerWsId);
+        if (!isCurrent()) break;
+        if (r.kind === 'gone') {
+          setStatus('任务已失效(服务可能重启过),请查看活动记录或重新提交');
+          break;
+        }
+        if (r.kind === 'error') {
+          consecutiveFails++;
+          if (consecutiveFails >= MAX_FAILS) {
+            setStatus('网络不稳定,已停止刷新 · 稍后可重新提交');
+            break;
+          }
+          var wait = Math.min(10000, 2500 * Math.pow(1.5, consecutiveFails - 1));
+          await new Promise(function (res) { setTimeout(res, wait); });
+          continue;
+        }
+        consecutiveFails = 0;
+        var job = r.job;
+        // Jobs created before the backend started persisting workspace_id have
+        // no owner to compare against. Treating that as a mismatch would hide
+        // every result until the sub-app restarts, since the frontend picks up
+        // new JS on refresh while the backend keeps running old code.
+        if (job.workspace_id && job.workspace_id !== ownerWsId) {
+          setStatus('主题隔离校验失败，已阻止错误结果显示');
+          setSubmitting(false);
+          return;
+        }
         setStatus((job.status || '') + ' ' + (job.done || 0) + '/' + (job.total || 0));
         setEvents((job.events || []).map(function (e) { return '[' + (e.time || '') + '] ' + (e.message || ''); }).join('\n'));
         setLatestJob(job);
@@ -556,12 +747,14 @@ function NanoBananaApp() {
           // Preserved terminal-status behavior from original pollJob:
           //   - job.status === 'succeeded' + dirHandle → saveToClient
           //   - job.status === 'succeeded' + autoDownload → triggerDownloads
-          // dirHandle/autoDownload are read live (this.*) — side effects still
-          // fire even if the user has since switched tabs, matching original.
-          if (job.status === 'succeeded' && self.dirHandle) {
-            await self.saveToClient(job);
-          } else if (job.status === 'succeeded' && self.autoDownload) {
-            self.triggerDownloads(job);
+          // Delivery settings are captured at submit time. Reading self.* here
+          // would use whichever topic happens to be active when the task ends.
+          if (job.status === 'succeeded' && delivery && delivery.dirHandle) {
+            var saved = await self.saveToClient(job, delivery.dirHandle);
+            if (saved) setStatus('已保存 ' + saved + ' 个文件到 ' + delivery.outputDir);
+          } else if (job.status === 'succeeded' && delivery && delivery.autoDownload) {
+            var downloaded = self.triggerDownloads(job);
+            if (downloaded) setStatus('已下载 ' + downloaded + ' 个文件');
           }
           setSubmitting(false);
           setStatus('空闲');
@@ -597,8 +790,29 @@ function NanoBananaApp() {
       var eventsList = (job.events || []).slice(-8).map(function (e) {
         return '<div style="font-size:11px;color:#d1e0ff;padding:2px 0"><span style="color:#697386">' + escHtml(e.time) + '</span> ' + escHtml(e.message) + '</div>';
       }).join('');
+
+      // 友好错误提示：识别错误类型，显示用户友好的消息
+      var errorHint = '';
+      if (job.errors && job.errors.length > 0) {
+        var firstError = job.errors[0];
+        if (firstError.indexOf('[auth_failed]') >= 0 || firstError.indexOf('401') >= 0) {
+          errorHint = '❌ API Key 无效或已过期，请检查配置';
+        } else if (firstError.indexOf('[rate_limited]') >= 0 || firstError.indexOf('429') >= 0) {
+          errorHint = '⏱️ 请求过于频繁，已自动重试多次仍失败，请稍后再试';
+        } else if (firstError.indexOf('[permission_denied]') >= 0 || firstError.indexOf('403') >= 0) {
+          errorHint = '🚫 权限不足或配额已用完，请联系管理员';
+        } else if (firstError.indexOf('[server_error]') >= 0) {
+          errorHint = '⚠️ API 服务暂时不可用，已自动重试失败，请稍后重试';
+        } else if (firstError.indexOf('[network_error]') >= 0) {
+          errorHint = '🌐 网络连接失败，请检查网络或 API 地址';
+        } else {
+          errorHint = escHtml(firstError);
+        }
+      }
+
       resultsEl.innerHTML = '<article class="result" style="border-color:#4f46e5;background:#101828;color:#e2e8f0;grid-column:1/-1">' +
-        '<div class="meta" style="color:#818cf8;font-weight:600;margin-bottom:6px">' + escHtml(job.status) + ' · ' + (job.done || 0) + '/' + (job.total || 0) + ' ' + escHtml((job.errors && job.errors[0]) || '') + '</div>' +
+        '<div class="meta" style="color:#818cf8;font-weight:600;margin-bottom:6px">' + escHtml(job.status) + ' · ' + (job.done || 0) + '/' + (job.total || 0) +
+        (errorHint ? '<br><span style="color:#fca5a5;font-size:12px;font-weight:400">' + errorHint + '</span>' : '') + '</div>' +
         (eventsList || '<div style="color:#697386;font-size:11px">等待服务器响应...</div>') +
         '</article>';
       for (var ri = 0; ri < (job.results || []).length; ri++) {
@@ -613,6 +827,13 @@ function NanoBananaApp() {
       for (var ei = 0; ei < (job.errors || []).length; ei++) {
         resultsEl.innerHTML += '<article class="result" style="color:#ef4444">' + escHtml(job.errors[ei]) + '</article>';
       }
+    },
+
+    _clearTopicResultDom() {
+      var resultsEl = document.getElementById('nb-results');
+      var eventsEl = document.getElementById('nb-events');
+      if (resultsEl) resultsEl.innerHTML = '';
+      if (eventsEl) eventsEl.textContent = '';
     },
 
     async loadJobs() {
@@ -637,7 +858,7 @@ function NanoBananaApp() {
 
     // ---- 8f. saveToClient / triggerDownloads / _blobDownload ----
 
-    async saveToClient(job) {
+    async saveToClient(job, dirHandle) {
       try {
         var files = [];
         for (var ri = 0; ri < (job.results || []).length; ri++) {
@@ -651,14 +872,15 @@ function NanoBananaApp() {
           var f = files[fi];
           var resp = await fetch(f.url);
           var blob = await resp.blob();
-          var fh = await this.dirHandle.getFileHandle(f.filename, { create: true });
+          var fh = await dirHandle.getFileHandle(f.filename, { create: true });
           var w = await fh.createWritable();
           await w.write(blob);
           await w.close();
         }
-        if (files.length) this.statusText = '已保存 ' + files.length + ' 个文件到 ' + this.outputDir;
+        return files.length;
       } catch (e) {
         console.warn('saveToClient failed:', e);
+        return 0;
       }
     },
 
@@ -674,14 +896,19 @@ function NanoBananaApp() {
       for (var ui = 0; ui < urls.length; ui++) {
         this._blobDownload(urls[ui].url, urls[ui].filename);
       }
-      if (urls.length) this.statusText = '已下载 ' + urls.length + ' 个文件';
+      return urls.length;
     },
 
     async _blobDownload(url, filename) {
+      // fetch → blob → <a download> dodges the self-signed-cert trap (Chrome's
+      // download manager re-validates out of page context and rejects our LAN
+      // cert). Cost: whole file into memory, no native progress — so we stream
+      // the response and render our own progress bar (window._dlProgress).
+      var bar = window._dlProgress ? window._dlProgress.start(filename) : null;
       try {
         var resp = await fetch(url);
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        var blob = await resp.blob();
+        var blob = bar ? await bar.readBlob(resp) : await resp.blob();
         var blobUrl = URL.createObjectURL(blob);
         var a = document.createElement('a');
         a.href = blobUrl;
@@ -691,7 +918,9 @@ function NanoBananaApp() {
         a.click();
         document.body.removeChild(a);
         setTimeout(function() { URL.revokeObjectURL(blobUrl); }, 1000);
+        if (bar) bar.done();
       } catch (e) {
+        if (bar) bar.fail();
         var a2 = document.createElement('a');
         a2.href = url;
         a2.download = filename;
@@ -707,15 +936,22 @@ function NanoBananaApp() {
     // ---- 8g. Output directory methods ----
 
     async chooseOutputDir() {
-      var res = await api(APP_PATH + '/api/choose-output-dir', 'POST');
+      // Delivery settings live in the per-topic cache, so a picker that resolves
+      // after the user switched topics must not rewrite the new topic's target.
+      var ownerWsId = this.activeTabId;
+      var res = await api(APP_PATH + '/api/choose-output-dir', 'POST', null, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res && res.path) { this.outputDir = res.path; this.dirHandle = null; return; }
       if (window.showDirectoryPicker) {
         try {
-          this.dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+          var handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+          if (this.activeTabId !== ownerWsId) return;
+          this.dirHandle = handle;
           this.outputDir = this.dirHandle.name;
           this.statusText = '已选择: ' + this.outputDir;
           return;
         } catch (e) { /* user cancelled */ }
+        if (this.activeTabId !== ownerWsId) return;
       }
       this.autoDownload = true;
       this.outputDir = '浏览器下载';
@@ -725,7 +961,9 @@ function NanoBananaApp() {
     },
 
     async desktopOutput() {
-      var res = await api(APP_PATH + '/api/default-output-dir');
+      var ownerWsId = this.activeTabId;
+      var res = await api(APP_PATH + '/api/default-output-dir', 'GET', null, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res && res.path) this.outputDir = res.path;
     },
 
@@ -734,8 +972,10 @@ function NanoBananaApp() {
         this.statusText = '文件将保存到 "' + this.outputDir + '"（浏览器限制无法代为打开）';
         return;
       }
+      var ownerWsId = this.activeTabId;
       var data = new FormData(); data.set('output_dir', this.outputDir);
-      var res = await api(APP_PATH + '/api/open-output-dir', 'POST', data);
+      var res = await api(APP_PATH + '/api/open-output-dir', 'POST', data, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res && res.remote) this.statusText = '远程客户端不支持打开服务端目录';
     },
 
@@ -747,7 +987,9 @@ function NanoBananaApp() {
     // ---- 8h. Archives CRUD ----
 
     async loadArchives() {
-      var res = await api(APP_PATH + '/api/archives');
+      var ownerWsId = this.activeTabId;
+      var res = await api(APP_PATH + '/api/archives', 'GET', null, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       this.archives = (res && res.archives) || [];
       if (this.selectedArchive && !this.archives.some(function(a) { return a.name === this.selectedArchive; }, this)) {
         this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
@@ -755,15 +997,18 @@ function NanoBananaApp() {
     },
 
     async saveArchive() {
+      var ownerWsId = this.activeTabId;
       var data = await this.formDataWithSavedMedia({});
       if (this.savedMedia && Object.keys(this.savedMedia).length) {
         data.set('saved_media', JSON.stringify(this.savedMedia));
       }
-      var res = await api(APP_PATH + '/api/preset', 'POST', data);
+      var res = await api(APP_PATH + '/api/preset', 'POST', data, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       this.archiveHint = (res && res.archive) ? '已保存: ' + res.archive : ((res && res.error) || '保存失败');
       if (res && res.media) this.savedMedia = res.media;
       window._currentSavedMedia = this.savedMedia;
       await this.loadArchives();
+      if (this.activeTabId !== ownerWsId) return;
       this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
     },
 
@@ -775,8 +1020,10 @@ function NanoBananaApp() {
         this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
         return;
       }
+      var ownerWsId = this.activeTabId;
       var data = new FormData(); data.set('archive_name', name);
-      var res = await api(APP_PATH + '/api/archive/load', 'POST', data);
+      var res = await api(APP_PATH + '/api/archive/load', 'POST', data, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (!res) return;
       this.applyPreset(res);
       this.archiveHint = '已读取: ' + name;
@@ -786,14 +1033,17 @@ function NanoBananaApp() {
       if (!this.selectedArchive) return;
       var name = this.selectedArchive;
       if (!confirm('确定删除存档「' + name + '」？此操作不可恢复。')) return;
+      var ownerWsId = this.activeTabId;
       var data = new FormData(); data.set('archive_name', name);
-      var res = await api(APP_PATH + '/api/archive/delete', 'POST', data);
+      var res = await api(APP_PATH + '/api/archive/delete', 'POST', data, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res && res.ok === false) {
         this.archiveHint = '删除失败：' + (res.error || '存档可能已被删除或不存在');
         return;
       }
       this.selectedArchive = '';
       await this.loadArchives();
+      if (this.activeTabId !== ownerWsId) return;
       this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
       this.archiveHint = '已删除：' + name;
     },
@@ -801,7 +1051,9 @@ function NanoBananaApp() {
     // ---- 8i. Activity methods ----
 
     async loadActivity() {
-      var res = await api(APP_PATH + '/api/activity');
+      var ownerWsId = this.activeTabId;
+      var res = await api(APP_PATH + '/api/activity', 'GET', null, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       this.activityRecords = (res && res.records) || [];
       this.activityCounts = (res && res.counts) || null;
       this.activityDetail = null;
@@ -825,7 +1077,9 @@ function NanoBananaApp() {
     },
 
     async showDetail(id) {
-      var res = await api(APP_PATH + '/api/activity/' + id);
+      var ownerWsId = this.activeTabId;
+      var res = await api(APP_PATH + '/api/activity/' + id, 'GET', null, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res) this.activityDetail = res;
     },
 
@@ -834,7 +1088,7 @@ function NanoBananaApp() {
       if (!r) { alert('该记录无法恢复'); return; }
       this.applyPreset(r);
       if (r.values && r.values.provider && this.providers[r.values.provider]) {
-        this.applyProvider(r.values.provider);
+        this.applyProvider(r.values.provider, true);
       }
       this.wsTab = 'jobs';
     },
@@ -844,6 +1098,12 @@ function NanoBananaApp() {
     applyPreset(preset) {
       clearAllMediaInputs();
       var values = (preset && preset.values) || {};
+      if (values.provider && values.api_key !== undefined) {
+        var presetProvider = this.providers[values.provider] || {};
+        if (!presetProvider.company_key) {
+          this.providerKeyBucket()[values.provider] = String(values.api_key || '');
+        }
+      }
       for (var k in values) {
         if (!Object.prototype.hasOwnProperty.call(values, k)) continue;
         var v = values[k];
@@ -860,9 +1120,10 @@ function NanoBananaApp() {
       if (values.base_url !== undefined) this.baseUrl = values.base_url;
       if (values.workspace_name !== undefined) this.workspaceName = values.workspace_name;
 
-      // Update provider if needed
+      // Update provider if needed. skipDefaults: the draft's own field values
+      // were just applied above; don't let applyProvider reset them to defaults.
       if (values.provider && this.providers[values.provider]) {
-        this.applyProvider(values.provider);
+        this.applyProvider(values.provider, true);
       }
 
       // Update resize state
@@ -887,7 +1148,9 @@ function NanoBananaApp() {
     },
 
     async clearPreset() {
-      var res = await api(APP_PATH + '/api/preset/clear', 'POST');
+      var ownerWsId = this.activeTabId;
+      var res = await api(APP_PATH + '/api/preset/clear', 'POST', null, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (!res) return;
       this.savedMedia = {};
       window._currentSavedMedia = this.savedMedia;
@@ -895,16 +1158,23 @@ function NanoBananaApp() {
       this.archiveHint = '已清空当前读取配置';
     },
 
-    async loadInitialPreset() {
-      // In standalone mode, prefer workspace draft
-      if (this.isStandalone && this.loadWorkspaceDraft()) return;
+    async loadInitialPreset(ownerWorkspaceId) {
+      var ownerWsId = ownerWorkspaceId || this.activeTabId;
+      if (this.activeTabId !== ownerWsId) return;
+      // Always prefer the per-tab workspace draft (localStorage). It holds this
+      // tab's api_key / provider / prompt — which the server preset intentionally
+      // strips (api_key is masked/omitted server-side). Gating this on
+      // isStandalone meant that in the portal (isStandalone === false) every tab
+      // switch re-fetched the empty server preset and wiped the form. Matches
+      // seedance's loadPreset() draft-first behavior.
+      if (this.loadWorkspaceDraft()) return;
 
-      // Otherwise load server preset
-      var wsId = getActiveWorkspaceId();
-      var res = await fetch(APP_PATH + '/api/preset?ws=' + encodeURIComponent(wsId), { headers: { 'X-Workspace-Id': wsId } });
+      // Fall back to the server preset only when this tab has no local draft
+      // yet (e.g. first visit on a fresh browser, or a tab restored from server).
+      var res = await fetch(APP_PATH + '/api/preset?ws=' + encodeURIComponent(ownerWsId), { headers: { 'X-Workspace-Id': ownerWsId } });
       if (res.ok) {
         var data = await res.json();
-        this.applyPreset(data);
+        if (this.activeTabId === ownerWsId) this.applyPreset(data);
       }
     },
 
@@ -984,6 +1254,9 @@ function NanoBananaApp() {
       window._activeWorkspaceId = id;
       this.workspaceName = '';
       this.savedMedia = {};
+      this.outputDir = '';
+      this.dirHandle = null;
+      this.autoDownload = false;
       var form = document.querySelector('#nb-form');
       if (form) form.reset();
       // form.reset() clears file inputs' .files but not the preview <img>
@@ -993,6 +1266,7 @@ function NanoBananaApp() {
       this.statusText = '空闲';
       this.eventsText = '';
       this.submitting = false;
+      this._clearTopicResultDom();
       this.saveTabsToLocalStorage();
       var self = this;
       setTimeout(function () { self._scrollActiveTabIntoView(); }, 0);
@@ -1056,6 +1330,9 @@ function NanoBananaApp() {
         provider: this.provider,
         models: this.models ? JSON.parse(JSON.stringify(this.models)) : [],
         workspaceName: this.workspaceName,
+        outputDir: this.outputDir,
+        dirHandle: this.dirHandle,
+        autoDownload: this.autoDownload,
       });
     },
 
@@ -1070,6 +1347,9 @@ function NanoBananaApp() {
       if (cache.provider !== undefined) this.provider = cache.provider;
       if (cache.models !== undefined) this.models = cache.models;
       if (cache.workspaceName !== undefined) this.workspaceName = cache.workspaceName;
+      this.outputDir = cache.outputDir !== undefined ? cache.outputDir : '';
+      this.dirHandle = cache.dirHandle || null;
+      this.autoDownload = cache.autoDownload || false;
       var form = document.querySelector('#nb-form');
       if (form) form.reset();
       this.savedMedia = {};
@@ -1077,13 +1357,13 @@ function NanoBananaApp() {
 
       // If a background pollJob stashed a job snapshot for this tab, replay it
       // into the DOM. Otherwise clear any stale DOM left by the previous tab.
-      if (cache._latestJob) {
+      // The cache key already proves ownership, so a snapshot predating backend
+      // workspace_id persistence is still this tab's own result.
+      if (cache._latestJob && (!cache._latestJob.workspace_id || cache._latestJob.workspace_id === wsId)) {
         self._renderJobToDom(cache._latestJob);
       } else {
-        var resultsEl = document.getElementById('nb-results');
-        var eventsEl = document.getElementById('nb-events');
-        if (resultsEl) resultsEl.innerHTML = '';
-        if (eventsEl) eventsEl.textContent = '';
+        delete cache._latestJob;
+        self._clearTopicResultDom();
       }
     },
 
@@ -1118,6 +1398,13 @@ function NanoBananaApp() {
         if (Object.prototype.hasOwnProperty.call(this.savedMedia, k)) {
           savedForBackend[k] = this.savedMedia[k];
         }
+      }
+      var providerCfg = this.providers[this.provider] || {};
+      if (providerCfg.company_key) data.delete('api_key');
+      var maxRefs = Number(providerCfg.max_reference_images || 14);
+      for (var refIndex = maxRefs + 1; refIndex <= 14; refIndex++) {
+        data.delete('image_' + refIndex);
+        delete savedForBackend['image_' + refIndex];
       }
       if (options.resizeImages) {
         var reInput = nbField('resize_enabled');
@@ -1172,3 +1459,86 @@ document.addEventListener('DOMContentLoaded', function () {
     }
   });
 });
+
+// === Download progress bar (shared, self-contained) ===================
+// blob-download reads the whole file into browser memory with no native
+// progress UI. This overlay reads the response as a stream and shows a
+// bottom-of-screen bar ("已下载 42.0 / 180.0 MB") so users don't think it hung.
+// Injects its own DOM+CSS on first use; concurrent downloads each get a row.
+(function () {
+  if (window._dlProgress) return;
+  var MB = 1024 * 1024;
+  var container = null;
+  function ensureContainer() {
+    if (container) return container;
+    var style = document.createElement('style');
+    style.textContent =
+      '#_dlProgWrap{position:fixed;left:16px;bottom:16px;z-index:99999;display:flex;flex-direction:column;gap:8px;pointer-events:none}' +
+      '#_dlProgWrap .dlp{background:#17191f;color:#e2e8f0;border-radius:8px;padding:10px 12px;min-width:240px;max-width:340px;box-shadow:0 4px 16px rgba(0,0,0,.35);font-size:12px;pointer-events:auto}' +
+      '#_dlProgWrap .dlp .name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:6px}' +
+      '#_dlProgWrap .dlp .track{height:6px;background:#2d3340;border-radius:3px;overflow:hidden}' +
+      '#_dlProgWrap .dlp .fill{height:100%;width:0;background:#3b82f6;transition:width .15s ease}' +
+      '#_dlProgWrap .dlp .txt{margin-top:5px;color:#94a3b8;font-size:11px}' +
+      '#_dlProgWrap .dlp.done .fill{background:#22c55e}' +
+      '#_dlProgWrap .dlp.fail .fill{background:#ef4444}';
+    document.head.appendChild(style);
+    container = document.createElement('div');
+    container.id = '_dlProgWrap';
+    document.body.appendChild(container);
+    return container;
+  }
+  function fmt(bytes) { return (bytes / MB).toFixed(1); }
+  window._dlProgress = {
+    start: function (filename) {
+      var wrap = ensureContainer();
+      var row = document.createElement('div');
+      row.className = 'dlp';
+      row.innerHTML =
+        '<div class="name">⬇ ' + (filename || '下载中') + '</div>' +
+        '<div class="track"><div class="fill"></div></div>' +
+        '<div class="txt">准备中…</div>';
+      wrap.appendChild(row);
+      var fill = row.querySelector('.fill');
+      var txt = row.querySelector('.txt');
+      var removed = false;
+      function remove(delay) {
+        if (removed) return; removed = true;
+        setTimeout(function () { if (row.parentNode) row.parentNode.removeChild(row); }, delay);
+      }
+      return {
+        readBlob: async function (resp) {
+          var total = Number(resp.headers.get('Content-Length')) || 0;
+          if (!resp.body || !resp.body.getReader) { txt.textContent = '下载中…'; return await resp.blob(); }
+          var reader = resp.body.getReader();
+          var chunks = [];
+          var received = 0;
+          for (;;) {
+            var r = await reader.read();
+            if (r.done) break;
+            chunks.push(r.value);
+            received += r.value.length;
+            if (total) {
+              var pct = Math.min(100, received / total * 100);
+              fill.style.width = pct.toFixed(1) + '%';
+              txt.textContent = '已下载 ' + fmt(received) + ' / ' + fmt(total) + ' MB (' + pct.toFixed(0) + '%)';
+            } else {
+              txt.textContent = '已下载 ' + fmt(received) + ' MB';
+            }
+          }
+          return new Blob(chunks);
+        },
+        done: function () {
+          row.classList.add('done');
+          fill.style.width = '100%';
+          txt.textContent = '完成';
+          remove(1200);
+        },
+        fail: function () {
+          row.classList.add('fail');
+          txt.textContent = '下载出错，已尝试直接下载';
+          remove(2500);
+        },
+      };
+    },
+  };
+})();

@@ -80,6 +80,18 @@ document.querySelectorAll('.app-tab').forEach(btn => btn.addEventListener('click
   document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
 }));
 
+// Iframe URLs are supplied by the Portal's app registry so they stay relative
+// to whichever origin, protocol, and hostname serves this Portal instance.
+async function initConfiguredIframes() {
+  const res = await api('/api/apps');
+  if (!res?.ok || !Array.isArray(res.apps)) return;
+  document.querySelectorAll('iframe[data-app]').forEach(iframe => {
+    const app = res.apps.find(item => item.name === iframe.dataset.app);
+    if (app?.mount === 'iframe' && app.iframe_url) iframe.src = app.iframe_url;
+  });
+}
+initConfiguredIframes();
+
 document.getElementById('closePreviewBtn').addEventListener('click', () => document.getElementById('previewDialog').close());
 document.getElementById('previewDialog').addEventListener('click', e => { if (e.target.id === 'previewDialog') e.target.close(); });
 
@@ -372,10 +384,15 @@ function DreaminaApp() {
     async saveDreaminaToClient(files) {
       try {
         let saved = 0;
+        let failed = 0;
         for (const f of files) {
           const url = '/dreamina/' + f.replace(/^\//, '');
           const filename = f.split('/').pop();
           const resp = await fetch(url);
+          // Guard resp.ok like _blobDownload does: without this a 404/500
+          // error page (HTML/JSON) gets written to disk as if it were the
+          // image/video, handing the user a corrupt file with no warning.
+          if (!resp.ok) { failed++; continue; }
           const blob = await resp.blob();
           const fh = await this.dirHandle.getFileHandle(filename, { create: true });
           const w = await fh.createWritable();
@@ -383,9 +400,12 @@ function DreaminaApp() {
           await w.close();
           saved++;
         }
-        if (saved) this.statusText = `已保存 ${saved} 个文件到 ${this.outputDir}`;
+        if (saved && failed) this.statusText = `已保存 ${saved} 个文件到 ${this.outputDir}，${failed} 个失败`;
+        else if (saved) this.statusText = `已保存 ${saved} 个文件到 ${this.outputDir}`;
+        else if (failed) this.statusText = `保存失败：${failed} 个文件无法下载`;
       } catch (e) {
         console.warn('saveDreaminaToClient failed:', e);
+        this.statusText = '保存到本地失败：' + (e && e.message ? e.message : e);
       }
     },
 
@@ -399,10 +419,18 @@ function DreaminaApp() {
     },
 
     async _blobDownload(url, filename) {
+      // We deliberately fetch → blob → <a download> (instead of a plain
+      // <a href download>) to dodge the self-signed-cert trap: Chrome's
+      // download manager re-validates the request out of page context and
+      // rejects our LAN self-signed cert ("检查网络连接"). The blob path keeps
+      // it inside the page's TLS context. Cost: the whole file streams into
+      // browser memory first with no native progress UI — so we render our own
+      // progress bar by reading the response as a stream.
+      const bar = window._dlProgress ? window._dlProgress.start(filename) : null;
       try {
         const resp = await fetch(url);
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        const blob = await resp.blob();
+        const blob = bar ? await bar.readBlob(resp) : await resp.blob();
         const blobUrl = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = blobUrl;
@@ -412,7 +440,9 @@ function DreaminaApp() {
         a.click();
         document.body.removeChild(a);
         setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+        if (bar) bar.done();
       } catch (e) {
+        if (bar) bar.fail();
         const a = document.createElement('a');
         a.href = url;
         a.download = filename;
@@ -561,6 +591,33 @@ function DreaminaApp() {
           previewWrap.appendChild(img);
         }
         card.appendChild(previewWrap);
+      }
+
+      // Download links for every result file. History cards previously offered
+      // ONLY the native <video> 3-dot menu / long-press as a download path, which
+      // hits the browser download manager and fails under self-signed HTTPS
+      // ("请检查互联网连接状况"). Since users often refresh away a finished job and
+      // can only retrieve it from history, that left them with no working way to
+      // download. These links reuse _blobDownload (fetch → blob → local save),
+      // the same self-signed-safe path the live result panel uses.
+      if (files.length) {
+        const dl = document.createElement('div');
+        dl.className = 'dm-hist-downloads';
+        for (const f of files) {
+          const url = '/dreamina/' + f.replace(/^\//, '');
+          const name = f.split('/').pop();
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = name;
+          a.className = 'dm-hist-dl-link';
+          a.textContent = files.length > 1 ? `下载 ${name}` : '下载';
+          a.addEventListener('click', (e) => {
+            e.preventDefault();
+            this._blobDownload(url, name);
+          });
+          dl.appendChild(a);
+        }
+        card.appendChild(dl);
       }
 
       if (files.length > 1) {
@@ -834,6 +891,92 @@ function DreaminaApp() {
 window._dmRestore = null;
 window.openPreview = openPreview;
 
+// === Download progress bar (shared, self-contained) ===================
+// blob-download reads the whole file into browser memory with no native
+// progress UI. This overlay reads the response as a stream and shows a
+// bottom-of-screen bar ("已下载 42.0 / 180.0 MB") so users don't think it hung.
+// Injects its own DOM+CSS on first use; concurrent downloads each get a row.
+(function () {
+  if (window._dlProgress) return;
+  const MB = 1024 * 1024;
+  let container = null;
+  function ensureContainer() {
+    if (container) return container;
+    const style = document.createElement('style');
+    style.textContent = `
+      #_dlProgWrap{position:fixed;left:16px;bottom:16px;z-index:99999;display:flex;flex-direction:column;gap:8px;pointer-events:none}
+      #_dlProgWrap .dlp{background:#17191f;color:#e2e8f0;border-radius:8px;padding:10px 12px;min-width:240px;max-width:340px;box-shadow:0 4px 16px rgba(0,0,0,.35);font-size:12px;pointer-events:auto}
+      #_dlProgWrap .dlp .name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:6px}
+      #_dlProgWrap .dlp .track{height:6px;background:#2d3340;border-radius:3px;overflow:hidden}
+      #_dlProgWrap .dlp .fill{height:100%;width:0;background:#3b82f6;transition:width .15s ease}
+      #_dlProgWrap .dlp .txt{margin-top:5px;color:#94a3b8;font-size:11px}
+      #_dlProgWrap .dlp.done .fill{background:#22c55e}
+      #_dlProgWrap .dlp.fail .fill{background:#ef4444}
+    `;
+    document.head.appendChild(style);
+    container = document.createElement('div');
+    container.id = '_dlProgWrap';
+    document.body.appendChild(container);
+    return container;
+  }
+  function fmt(bytes) { return (bytes / MB).toFixed(1); }
+  window._dlProgress = {
+    start(filename) {
+      const wrap = ensureContainer();
+      const row = document.createElement('div');
+      row.className = 'dlp';
+      row.innerHTML =
+        '<div class="name">⬇ ' + (filename || '下载中') + '</div>' +
+        '<div class="track"><div class="fill"></div></div>' +
+        '<div class="txt">准备中…</div>';
+      wrap.appendChild(row);
+      const fill = row.querySelector('.fill');
+      const txt = row.querySelector('.txt');
+      let removed = false;
+      function remove(delay) {
+        if (removed) return; removed = true;
+        setTimeout(() => { if (row.parentNode) row.parentNode.removeChild(row); }, delay);
+      }
+      return {
+        // Read a fetch Response as a stream, updating the bar, return a Blob.
+        // Falls back to resp.blob() if the body isn't streamable.
+        async readBlob(resp) {
+          const total = Number(resp.headers.get('Content-Length')) || 0;
+          if (!resp.body || !resp.body.getReader) { txt.textContent = '下载中…'; return await resp.blob(); }
+          const reader = resp.body.getReader();
+          const chunks = [];
+          let received = 0;
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+            received += value.length;
+            if (total) {
+              const pct = Math.min(100, received / total * 100);
+              fill.style.width = pct.toFixed(1) + '%';
+              txt.textContent = '已下载 ' + fmt(received) + ' / ' + fmt(total) + ' MB (' + pct.toFixed(0) + '%)';
+            } else {
+              txt.textContent = '已下载 ' + fmt(received) + ' MB';
+            }
+          }
+          return new Blob(chunks);
+        },
+        done() {
+          row.classList.add('done');
+          fill.style.width = '100%';
+          txt.textContent = '完成';
+          remove(1200);
+        },
+        fail() {
+          row.classList.add('fail');
+          txt.textContent = '下载出错，已尝试直接下载';
+          remove(2500);
+        },
+      };
+    },
+  };
+})();
+
 // === Stats App ===
 function StatsApp() {
   return {
@@ -841,6 +984,10 @@ function StatsApp() {
     todayRequests: 0,
     byApp: {},
     byUser: {},
+    // AppSpec metadata: name → {display_name, mount, iframe_url, color, metrics, unit_label, stats_combine}
+    // Loaded from /api/apps at init(); helpers appColor/appUnit/appLabel/pickAppValues
+    // consult this first, fall back to hardcoded golden set if fetch failed.
+    appsMeta: {},
     recentActivity: [],
     isAdmin: false,
     users: [],
@@ -894,6 +1041,8 @@ function StatsApp() {
     async init() {
       const me = await api('/api/auth/me');
       this.isAdmin = me?.role === 'admin';
+      // Load app metadata before rendering stats — pickAppValues/appColor/etc read from it.
+      await this.initAppsMeta();
       // Default day-picker to today (local date string)
       const today = new Date();
       const tz = today.getTimezoneOffset() * 60000;
@@ -1073,12 +1222,26 @@ function StatsApp() {
       this.loadHistory();
     },
 
-    // Pick the metric series most relevant to each subapp.
-    // seedance / volcengine-portrait: seconds (video)
-    // nano-banana: images
-    // dreamina: images + seconds elementwise (mixed media)
+    // Pick the metric series most relevant to each subapp. Driven by
+    // appsMeta.metrics + stats_combine loaded from /api/apps — see initAppsMeta().
+    // Fallback preserves legacy behavior if /api/apps failed.
     pickAppValues(stats, app) {
       if (!stats) return [];
+      const meta = this.appsMeta[app];
+      if (meta) {
+        if (meta.stats_combine === 'images_and_seconds') {
+          const a = stats.images || [];
+          const b = stats.seconds || [];
+          const n = Math.max(a.length, b.length);
+          const out = [];
+          for (let i = 0; i < n; i++) out.push((a[i] || 0) + (b[i] || 0));
+          return out;
+        }
+        // stats_combine === 'images_or_seconds': first-listed metric wins
+        const metric = (meta.metrics && meta.metrics[0]) || 'images';
+        return stats[metric] || [];
+      }
+      // Fallback (pre-appsMeta) — matches legacy hardcoded logic byte-for-byte
       if (app === 'nano-banana') return stats.images || [];
       if (app === 'dreamina') {
         const a = stats.images || [];
@@ -1092,12 +1255,16 @@ function StatsApp() {
     },
 
     appUnit(app) {
+      const meta = this.appsMeta[app];
+      if (meta) return meta.unit_label || '';
       if (app === 'nano-banana') return '张';
       if (app === 'dreamina') return '张+秒';
       return '秒';
     },
 
     appColor(app) {
+      const meta = this.appsMeta[app];
+      if (meta && meta.color) return meta.color;
       return {
         'seedance': '#2563eb',
         'nano-banana': '#10b981',
@@ -1107,12 +1274,29 @@ function StatsApp() {
     },
 
     appLabel(app) {
+      const meta = this.appsMeta[app];
+      if (meta && meta.display_name) return meta.display_name;
       return {
         'seedance': 'Seedance',
-        'nano-banana': 'Nano Banana',
+        'nano-banana': '图像生成模块',
         'dreamina': 'Dreamina',
         'volcengine-portrait': '人像生成',
       }[app] || app;
+    },
+
+    async initAppsMeta() {
+      // Loaded once at init(); backend list drives display metadata but
+      // NEVER security decisions (those stay server-side in AppSpec).
+      try {
+        const res = await api('/api/apps');
+        if (res?.ok && Array.isArray(res.apps)) {
+          const map = {};
+          for (const a of res.apps) map[a.name] = a;
+          this.appsMeta = map;
+        }
+      } catch (e) {
+        // Silent fallback — helpers above degrade to hardcoded golden set.
+      }
     },
 
     svgSpark(values, app) {
@@ -1360,7 +1544,39 @@ function VolcenginePortraitApp() {
     assets: [],
     assetName: '',
     genAssetId: '', extraAssetIds: [], extraFiles: [],
-    prompt: '', duration: 12, resolution: '720p', ratio: '16:9', repeat: 1,
+    prompt: '', model: 'doubao-seedance-2-0-260128', duration: 12, resolution: '720p', ratio: '16:9', repeat: 1,
+    // Task-type switch — see seedance/static/app.js for the rationale.
+    // Ark 2.5 auto-classifies as reference / extend / edit from the prompt;
+    // this makes the classification explicit so the user can't accidentally
+    // send a positive duration into an edit task.
+    taskMode: 'reference',
+    _prevTaskMode: 'reference',
+    _taskModeMemory: {
+      reference: { ratio: '16:9', duration: 12 },
+      extend:    { ratio: 'adaptive', duration: 5 },
+      edit:      { ratio: 'adaptive', duration: -1 },
+    },
+    // Per-model limits from the official capability matrix. Ark only validates
+    // these after the job is queued, so an out-of-range value costs a wait plus
+    // an async error rather than failing fast.
+    portraitModels: [
+      {
+        id: 'doubao-seedance-2-0-260128', label: 'Seedance 2.0（最高 4k）',
+        maxDuration: 15, resolutions: ['480p', '720p', '1080p', '4k'],
+      },
+      {
+        id: 'doubao-seedance-2-0-fast-260128', label: 'Seedance 2.0 fast',
+        maxDuration: 15, resolutions: ['480p', '720p'],
+      },
+      {
+        id: 'doubao-seedance-2-0-mini-260615', label: 'Seedance 2.0 mini（最快）',
+        maxDuration: 15, resolutions: ['480p', '720p'],
+      },
+      {
+        id: 'doubao-seedance-2-5-260628', label: 'Seedance 2.5（最长 30s）',
+        maxDuration: 30, resolutions: ['480p', '720p'],
+      },
+    ],
     submitting: false, events: '', results: [], jobs: [],
     runtimeTick: 0,
     outputDir: '', outputDirInput: '', showOutputDirInput: false,
@@ -1422,6 +1638,19 @@ function VolcenginePortraitApp() {
       return '';
     },
 
+    // 把 errors 数组转成用户友好的提示文案。兼容两种格式：
+    // seedance/nano-banana 的 "[rate_limited] ..." 前缀，以及 volcengine 的裸 "HTTP 429" 码。
+    friendlyErrors(errors) {
+      if (!errors || !errors.length) return '';
+      const first = String(errors[0]);
+      if (first.includes('[auth_failed]') || first.includes('401')) return '❌ API Key 无效或已过期，请检查配置';
+      if (first.includes('[rate_limited]') || first.includes('429')) return '⏱️ 请求过于频繁，已自动重试多次仍失败，请稍后再试';
+      if (first.includes('[permission_denied]') || first.includes('403')) return '🚫 权限不足或配额已用完，请联系管理员';
+      if (first.includes('[server_error]') || /HTTP 5\d\d/.test(first)) return '⚠️ API 服务暂时不可用，已自动重试失败，请稍后重试';
+      if (first.includes('[network_error]')) return '🌐 网络连接失败，请检查网络或 API 地址';
+      return errors.join('; ');
+    },
+
     // === Groups ===
     async createGroup() {
       this.creatingGroup = true;
@@ -1433,6 +1662,7 @@ function VolcenginePortraitApp() {
         this.assetGroupId = res.group_id;
         this.uploadMsg = '组创建成功: ' + res.group_id;
         this.uploadError = false;
+        await this.loadGroups();
       } else {
         this.uploadMsg = (res?.error || '创建失败') + (res?.detail ? ' — ' + res.detail.slice(0, 120) : '');
         this.uploadError = true;
@@ -1702,6 +1932,51 @@ function VolcenginePortraitApp() {
     },
 
     // === Jobs ===
+    // Capabilities of the currently selected model, read from portraitModels.
+    modelSpec() {
+      return this.portraitModels.find(m => m.id === this.model) || this.portraitModels[0];
+    },
+    modelResolutions() { return this.modelSpec().resolutions; },
+    modelMaxDuration() { return this.modelSpec().maxDuration; },
+    // Called from index.html on model change so a stale resolution or an
+    // out-of-range duration is corrected before the user can submit.
+    onModelChange() {
+      const spec = this.modelSpec();
+      if (!spec.resolutions.includes(this.resolution)) this.resolution = spec.resolutions[0];
+      // -1 means "let Ark pick the length" and is required by video edit /
+      // extend tasks, so it must survive a model switch instead of being clamped.
+      if (Number(this.duration) !== -1 && Number(this.duration) > spec.maxDuration) {
+        this.duration = spec.maxDuration;
+      }
+    },
+
+    // Task-type switch. reference / extend / edit each impose different
+    // constraints on ratio + duration (see seedance side for the full rules).
+    // Values are remembered per-mode so switching away and back restores what
+    // the user typed. Session-only, no persistence.
+    changeTaskMode() {
+      const from = this._prevTaskMode || 'reference';
+      const to = this.taskMode || 'reference';
+      const mem = this._taskModeMemory;
+      if (mem[from]) {
+        mem[from].ratio = this.ratio;
+        mem[from].duration = Number(this.duration);
+      }
+      const target = mem[to] || mem.reference;
+      if (to === 'extend' || to === 'edit') {
+        this.ratio = 'adaptive';
+      } else {
+        this.ratio = target.ratio || '16:9';
+      }
+      this.duration = (to === 'edit') ? -1
+        : (Number.isFinite(target.duration) ? target.duration : 5);
+      this._prevTaskMode = to;
+      if (mem[to]) {
+        mem[to].ratio = this.ratio;
+        mem[to].duration = Number(this.duration);
+      }
+    },
+
     async createJob() {
       if (!this.genAssetId) { this.statusText = '请选择资产 ID（图1）'; return; }
       if (!this.prompt) { this.statusText = '请输入 Prompt'; return; }
@@ -1715,6 +1990,7 @@ function VolcenginePortraitApp() {
           const fd = new FormData();
           fd.append('asset_id', this.genAssetId);
           fd.append('prompt', this.prompt);
+          fd.append('model', this.model);
           fd.append('duration', this.duration);
           fd.append('resolution', this.resolution);
           fd.append('ratio', this.ratio);
@@ -1730,6 +2006,7 @@ function VolcenginePortraitApp() {
             asset_id: this.genAssetId,
             extra_asset_ids: this.extraAssetIds,
             prompt: this.prompt,
+            model: this.model,
             duration: this.duration, resolution: this.resolution, ratio: this.ratio, repeat_count: this.repeat
           }));
         }

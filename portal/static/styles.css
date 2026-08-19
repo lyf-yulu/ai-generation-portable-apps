@@ -83,9 +83,16 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline: non
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { min-height: 100vh; }
 
+/* === Topbar Stack === */
+/* 统一吸顶容器：标题栏 + 应用切换栏整块一起 sticky。
+   两条栏自身不再各自 sticky，避免「切换栏钉在写死偏移量、被更高层级的
+   标题栏盖住」的错位问题（标题栏高度变化时也不会再复发）。 */
+.topbar-stack {
+  position: sticky; top: 0; z-index: 100;
+}
+
 /* === Portal Bar === */
 .portal-bar {
-  position: sticky; top: 0; z-index: 100;
   display: flex; align-items: center; justify-content: space-between;
   padding: 10px 20px;
   background: var(--surface); border-bottom: 1px solid var(--border);
@@ -96,8 +103,8 @@ body { min-height: 100vh; }
 .portal-bar-stats { font-size: 12px; color: var(--muted); font-weight: 600; }
 
 /* === App Tabs === */
+/* 吸顶由父级 .topbar-stack 统一负责，这里不再自己 sticky。 */
 .app-tabs-bar {
-  position: sticky; top: 47px; z-index: 99;
   display: flex; gap: 0;
   background: var(--surface); border-bottom: 1px solid var(--border);
   padding: 0 20px;
@@ -551,7 +558,6 @@ button:disabled,
     gap: 8px;
     flex-direction: column;
   }
-  .app-tabs-bar { top: 70px; }
   .sidebar { padding: 14px; }
   .workspace { padding: 14px; }
 }
@@ -750,6 +756,25 @@ button:disabled,
 }
 video.dm-hist-thumb { background: transparent; }
 img.dm-hist-thumb { cursor: zoom-in; }
+
+.dm-hist-downloads {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.dm-hist-dl-link {
+  display: inline-block;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--accent, #2563eb);
+  background: var(--surface, #f1f5f9);
+  border: 1px solid var(--border-strong, #cbd5e1);
+  border-radius: var(--radius-md, 6px);
+  text-decoration: none;
+  cursor: pointer;
+}
+.dm-hist-dl-link:hover { background: var(--border, #e2e8f0); }
 
 .dm-hist-log-panel {
   display: block;
