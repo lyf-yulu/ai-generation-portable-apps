@@ -157,6 +157,17 @@ dreamina/         → Image/video via Dreamina CLI wrapper
 - **数据布局（2026-07-22 起）**：各子应用的 `outputs/`、`state/`、`archives/`、`uploads/`、`accounts/` 以及 `portal/state/` 已从软链改为**主仓库内的真实目录**，不再依赖 `ai-generation-portable-apps-backup-2026-07-14-1653/`（该 backup 目录已删除，主干数据打包留档在 `~/backup-trunk-2026-07-22.zip`）。迁移时**弃掉了草稿缓存** `state/workspaces/` 和 `state/media/`（历史参考图需用户重传）以及 `portal/state/logs/`。`activity_log.json` / `usage.json` / `users.json` / `accounts.json` 等主干与统计数据完整保留。
 - **飞书产出搬运**：独立服务 `com.feishu-output-sync`（launchd，**独立于 com.ai-portal**）常驻轮询 `feishu-output-sync/sync.py`，把各子应用 outputs 增量搬进「每人一张多维表格」（组织内可编辑）。日志 `~/Library/Logs/feishu-output-sync.log`；配置 `feishu-output-sync/config.json`（gitignored）。
 
+## 无限画布 2026-08-19 上游同步（新增功能）
+
+从 `~/ai-creation-canvas`（上游 fork）同步了 8/14 之后 72 个提交的功能，**translated** 进 `infinite-canvas/`：
+
+- **画布改进**：preset 参数控件（Ark 尺寸 1K..4K + 自定义宽x高，schema 用 `x-ark-size`）、结果派生引用 `job-result.{jobId}.{index}`（翻译层 `_resolve_asset` 解析，前端 deriveResultAssetId 生成）、nanoid 替代 crypto.randomUUID（plain-HTTP 浏览器修复）、提交超时 600s。
+- **Ark 人像素材库**：画布右下角「人像资产库」按钮 → 上传 PNG/JPEG/WebP（10MB 内、**宽高 300-6000px**，方舟硬限制）→ TOS PUT → CreateAsset 进方舟 AIGC 素材库 → 本地副本保留，生成时走本地字节。配置 `infinite-canvas/state/asset-library.json`（gitignored，已从 volcengine-portrait config 派生）；**SK 一律原始值**，勿 base64 解码（控制台复制值恰好是合法 base64，解码 = SignatureDoesNotMatch）。后端模块 `ark_library.py`。
+- **ComfyUI 工作流库**：管理员侧边栏「工作流库」→ 导入/预览/导出/启停工作流；`execution_available` 恒 False（执行切片上游也没交付）。服务配置 `state/comfyui-services.json`（可选）；启用但未配置服务时 409。放行策略：**启用即全员可见**（上游按人授权在 Portal 形态不可用）。模块 `comfy_lib.py`（解析/校验）+ `comfy_api.py`（API）。
+- **TOS 预签名 GET 的坑**：canonical_headers 必须以 `\n` 结尾、模板再补 `\n`（即空行），否则 SignatureDoesNotMatch —— 与 AWS SigV4 不同，与 volcengine-portrait/app.py:246-254 一致。
+- **跳过**：注册/密码管理/凭证池/后台日志等上游服务端功能（Portal 负责身份与统计，见 docs/infinite-canvas/01-前端改造.md 的裁剪原则）。
+- 上游同步点：`c3d5aed` → `6d1d2c6`（前端源码 58 文件、后端语义对齐）；前端单测 428 全过。
+
 ## 稳定教训（跨版本长期有效）
 
 ### 部署与重启
