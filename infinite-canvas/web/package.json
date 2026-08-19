@@ -12,7 +12,8 @@
         "test:browser": "vitest run --config vitest.browser.config.ts",
         "verify:release": "npm test && npm run typecheck && npm run build && npm run test:browser",
         "format": "prettier --write .",
-        "format:check": "prettier --check ."
+        "format:check": "prettier --check .",
+        "lint": "npm run typecheck"
     },
     "dependencies": {
         "@ant-design/icons": "^6.1.1",

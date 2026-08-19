@@ -2,12 +2,13 @@ import type { ModelOperation, ModelSpec } from "@/api/contracts";
 
 export type ParameterControl = {
     name: string;
-    type: "number" | "integer" | "string" | "boolean" | "enum";
+    type: "number" | "integer" | "string" | "boolean" | "enum" | "preset";
     required?: boolean;
     minimum?: number;
     maximum?: number;
     default?: string | number | boolean;
     enum?: readonly (string | number)[];
+    presets?: readonly string[];
     title?: string;
     description?: string;
     visibleWhen?: { name: string; equals: string | number | boolean };
@@ -41,6 +42,15 @@ export function parameterControls(schema: Record<string, unknown>): ParameterCon
             const values = value.enum as (string | number)[];
             if ((type === "string" && values.some((item) => typeof item !== "string")) || ((type === "number" || type === "integer") && values.some((item) => typeof item !== "number" || (type === "integer" && !Number.isInteger(item)))) || (value.default !== undefined && !values.some((item) => Object.is(item, value.default)))) return [];
             return [{ name, type: "enum", required: required.has(name) || value.required === true, enum: values, default: value.default as string | number | undefined, ...presentation(value) }];
+        }
+        if (type === "string") {
+            const constraint = value["x-ark-size"];
+            const presets = constraint && typeof constraint === "object" && !Array.isArray(constraint) ? (constraint as Record<string, unknown>).presets : undefined;
+            if (Array.isArray(presets) && presets.length > 0 && presets.length <= 16 && presets.every((item) => typeof item === "string" && item.length > 0 && item.length <= 16) && new Set(presets).size === presets.length) {
+                const fallback = value.default;
+                const validDefault = typeof fallback === "string" && presets.includes(fallback);
+                return [{ name, type: "preset", required: required.has(name) || value.required === true, presets: presets as string[], ...(validDefault ? { default: fallback as string } : {}), ...presentation(value) }];
+            }
         }
         if (type === "number" || type === "integer" || type === "string" || type === "boolean") {
             const result: ParameterControl = { name, type, required: required.has(name) || value.required === true, ...presentation(value) };

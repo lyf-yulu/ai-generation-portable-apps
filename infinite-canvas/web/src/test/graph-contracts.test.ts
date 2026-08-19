@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
     GRAPH_SCHEMA_VERSION,
     createGraphSubmissionSnapshot,
+    type GraphNodeRole,
     type GraphMediaCollectionMetadata,
     type GraphModelMetadata,
     type GraphPromptMetadata,
@@ -41,6 +42,11 @@ function project(nodes: CanvasNodeData[], connections: CanvasProjectInput["conne
 }
 
 describe("graph contracts", () => {
+    it("recognizes ComfyUI workflow as a graph role", () => {
+        const role: GraphNodeRole = "comfy-workflow";
+        expect(role).toBe("comfy-workflow");
+    });
+
     it("represents the four graph roles with bounded media, ports, and model parameters", () => {
         const prompt: GraphPromptMetadata = { schemaVersion: GRAPH_SCHEMA_VERSION, role: "prompt", text: "镜头向前", outputPortId: "prompt" };
         const collection: GraphMediaCollectionMetadata = {
@@ -169,6 +175,27 @@ describe("legacy graph normalization", () => {
             { id: "video-edge", fromNodeId: "video", fromPortId: "media", toNodeId: "model", toPortId: "reference_video" },
             { id: "output-edge", fromNodeId: "model", fromPortId: "result", toNodeId: "output", toPortId: "result" },
         ]);
+    });
+
+    it("migrates legacy result ownership into a reusable reference asset", () => {
+        const legacyResult = node("output", CanvasNodeType.Image, { content: "/api/v1/results/job-9", status: "success", sourceJobId: "job-9" });
+        const legacyIndexed = node("frame", CanvasNodeType.Image, { content: "/api/v1/results/job-9/2", status: "success", sourceJobId: "job-9", sourceResultIndex: 2 });
+        const legacyAnonymous = node("upload", CanvasNodeType.Image, { content: "/api/v1/assets/x.png", status: "success" });
+
+        const normalized = normalizeCanvasProject(project([legacyResult, legacyIndexed, legacyAnonymous]));
+
+        expect(normalized.nodes[0].metadata?.graph).toMatchObject({
+            role: "result",
+            mediaType: "image",
+            inputPortId: "result",
+            outputPortId: "media",
+            jobId: "job-9",
+            assetId: "job-result.job-9.0",
+        });
+        expect(normalized.nodes[1].metadata?.graph).toMatchObject({ assetId: "job-result.job-9.2", jobId: "job-9" });
+        expect(normalized.nodes[2].metadata?.graph).toMatchObject({ role: "result", mediaType: "image" });
+        const anonymousGraph = normalized.nodes[2].metadata?.graph;
+        expect(anonymousGraph?.role === "result" ? anonymousGraph.assetId : undefined).toBeUndefined();
     });
 
     it("rejects dangling, self and ambiguous edges while preserving raw duplicates and prompt conflicts", () => {

@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { useLocation, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 
 import { useSessionStore } from "@/stores/portal/use-session-store";
 
@@ -38,18 +38,19 @@ export default function LoginPage() {
     };
 
     return (
-        <main className="flex min-h-dvh items-center justify-center bg-[#f3f6fa] px-5 text-[#172033]">
-            <section className="w-full max-w-sm rounded-2xl border border-[#252f47] bg-[#ffffff] p-7 shadow-2xl">
-                <p className="text-xs tracking-[0.25em] text-[#698fe9]">AI CREATION CANVAS</p>
+        <main className="flex min-h-dvh items-center justify-center bg-[#050806] px-5 text-[#e5f5e9]">
+            <section className="w-full max-w-sm rounded-2xl border border-[#21472f] bg-[#0a130d] p-7 shadow-2xl">
+                <p className="text-xs tracking-[0.25em] text-[#55e986]">AI CREATION CANVAS</p>
                 <h1 className="mt-3 text-2xl font-semibold">{changing ? "设置新密码" : "登录 AI 创作画布"}</h1>
-                <p className="mt-2 text-sm text-[#9097a9]">{changing ? "首次登录必须更换一次性密码。" : "使用管理员派发的本地账号。"}</p>
+                <p className="mt-2 text-sm text-[#8da995]">{changing ? "首次登录必须更换一次性密码。" : "使用管理员派发的本地账号。"}</p>
                 <form className="mt-6 space-y-4" onSubmit={(event) => void submit(event)}>
-                    {!changing ? <label className="block text-sm">用户名<input aria-label="用户名" autoComplete="username" className="mt-1 w-full rounded-lg border border-[#2c364d] bg-[#ffffff] px-3 py-2 text-[#172033] outline-none focus:border-[#6b92ed]" value={username} onChange={(event) => setUsername(event.target.value)} /></label> : null}
-                    <label className="block text-sm">{changing ? "当前密码" : "密码"}<input aria-label={changing ? "当前密码" : "密码"} type="password" autoComplete={changing ? "current-password" : "current-password"} className="mt-1 w-full rounded-lg border border-[#2c364d] bg-[#ffffff] px-3 py-2 text-[#172033] outline-none focus:border-[#6b92ed]" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
-                    {changing ? <label className="block text-sm">新密码<input aria-label="新密码" type="password" autoComplete="new-password" minLength={12} className="mt-1 w-full rounded-lg border border-[#2c364d] bg-[#ffffff] px-3 py-2 text-[#172033] outline-none focus:border-[#6b92ed]" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} /></label> : null}
-                    {message ? <p role="alert" className="text-sm text-[#92400e]">{message}</p> : null}
-                    <button type="submit" disabled={loading || (!changing && (!username || !password)) || (changing && (!password || newPassword.length < 12))} className="w-full rounded-lg bg-[#698fe9] px-4 py-2.5 font-semibold text-[#080a11] disabled:opacity-45">{loading ? "处理中…" : changing ? "保存新密码" : "登录"}</button>
+                    {!changing ? <label className="block text-sm">用户名<input aria-label="用户名" autoComplete="username" className="mt-1 w-full rounded-lg border border-[#284d35] bg-[#071009] px-3 py-2 text-[#ecfff1] outline-none focus:border-[#59ed87]" value={username} onChange={(event) => setUsername(event.target.value)} /></label> : null}
+                    <label className="block text-sm">{changing ? "当前密码" : "密码"}<input aria-label={changing ? "当前密码" : "密码"} type="password" autoComplete={changing ? "current-password" : "current-password"} className="mt-1 w-full rounded-lg border border-[#284d35] bg-[#071009] px-3 py-2 text-[#ecfff1] outline-none focus:border-[#59ed87]" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+                    {changing ? <label className="block text-sm">新密码<input aria-label="新密码" type="password" autoComplete="new-password" minLength={12} className="mt-1 w-full rounded-lg border border-[#284d35] bg-[#071009] px-3 py-2 text-[#ecfff1] outline-none focus:border-[#59ed87]" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} /></label> : null}
+                    {message ? <p role="alert" className="text-sm text-[#ffbd73]">{message}</p> : null}
+                    <button type="submit" disabled={loading || (!changing && (!username || !password)) || (changing && (!password || newPassword.length < 12))} className="w-full rounded-lg bg-[#54e982] px-4 py-2.5 font-semibold text-[#041108] disabled:opacity-45">{loading ? "处理中…" : changing ? "保存新密码" : "登录"}</button>
                 </form>
+                {!changing ? <p className="mt-5 text-center text-sm text-[#8da995]">没有账号？<Link to="/register" className="text-[#55e986] hover:underline">注册</Link></p> : null}
             </section>
         </main>
     );

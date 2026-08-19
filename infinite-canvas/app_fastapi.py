@@ -177,7 +177,10 @@ async def api_upload_asset(request: Request, file: UploadFile = File(...),
     path = user_dir / f"{asset_id}{ext}"
     path.write_bytes(payload)
 
-    return store.insert_asset(user["user_id"], asset_id, media_type, mime, len(payload), str(path))
+    row = store.insert_asset(user["user_id"], asset_id, media_type, mime, len(payload), str(path))
+    # 前端现在要求上传响应必须带 content_url（web/src/api/assets.ts:37-44
+    # ownedAssetFromResponse），存裸路径 —— 挂载前缀由前端 safeApiPath 处理。
+    return {**row, "content_url": f"/api/v1/assets/{asset_id}/content"}
 
 
 @app.get("/api/v1/assets/{asset_id}")
@@ -190,7 +193,8 @@ async def api_get_asset(request: Request, asset_id: str):
         return _error(404, "not_found", "资产不存在。")
     return {"asset_id": row["asset_id"], "kind": "reference", "status": "active",
             "media_type": row["media_type"], "mime_type": row["mime_type"],
-            "size_bytes": int(row["size_bytes"])}
+            "size_bytes": int(row["size_bytes"]),
+            "content_url": f"/api/v1/assets/{asset_id}/content"}
 
 
 @app.get("/api/v1/assets/{asset_id}/content")

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { cancelJob, createJob, fetchJob } from "@/api/jobs";
 import type { JobRequest, JobState } from "@/api/contracts";
 import { captureScopedStore, isStorageLeaseActive, onStorageScopeChanged, onStorageScopeCleared, type ScopedStoreLease } from "@/storage/scope";
+import { randomId } from "@/lib/utils";
 import { generationErrorMessage, safeFailureMetadata } from "./error-message";
 import { ApiRequestError } from "@/api/client";
 import { create } from "zustand";
@@ -104,7 +105,7 @@ export function useGenerationJob(options: Options = {}) {
         const captured = lease.current = captureScopedStore(REFS_KEY);
         await restore(captured);
         const { projectId, sourceNodeId, ...jobInput } = input;
-        const request = { ...jobInput, idempotency_key: optionsRef.current.idempotencyKey?.() ?? crypto.randomUUID() };
+        const request = { ...jobInput, idempotency_key: optionsRef.current.idempotencyKey?.() ?? randomId() };
         refs.current.set(request.idempotency_key, { request, projectId, sourceNodeId }); await persist(); publish({ status: "submitting" }, captured);
         useGenerationTasks.getState().upsert({ jobId: request.idempotency_key, title: request.prompt.slice(0, 32), status: "submitting", sourceNodeId });
         try {

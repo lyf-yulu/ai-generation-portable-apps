@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Film, ImagePlus, MessageSquareText, Music2, Sparkles } from "lucide-react";
+import { Boxes, Film, ImagePlus, MessageSquareText, Music2, Sparkles } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { ContextMenuState } from "@/types/canvas";
 
-export type CanvasCreationKind = "prompt" | "image" | "video" | "audio" | "image-model" | "video-model";
+export type CanvasCreationKind = "prompt" | "image" | "video" | "audio" | "comfy-workflow" | "image-model" | "video-model";
 
 type Item = { kind: CanvasCreationKind; label: string; icon: ReactNode; disabled?: boolean; reason?: string };
 
@@ -22,6 +22,7 @@ export function CanvasCreateContextMenu({ menu, imageModelDisabled, videoModelDi
         { kind: "image", label: "参考图片", icon: <ImagePlus className="size-4" /> },
         { kind: "video", label: "参考视频", icon: <Film className="size-4" /> },
         { kind: "audio", label: "参考音频", icon: <Music2 className="size-4" /> },
+        { kind: "comfy-workflow", label: "ComfyUI 工作流", icon: <Boxes className="size-4" /> },
         { kind: "image-model", label: "图片生成", icon: <Sparkles className="size-4" />, disabled: imageModelDisabled, reason: "管理员尚未派发图片模型" },
         { kind: "video-model", label: "视频生成", icon: <Sparkles className="size-4" />, disabled: videoModelDisabled, reason: "管理员尚未派发视频模型" },
     ];

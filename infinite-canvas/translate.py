@@ -19,6 +19,7 @@ import base64
 import json
 import mimetypes
 import os
+import re
 import secrets
 import ssl
 import time
@@ -76,7 +77,7 @@ def _image_schema(provider: str, cfg: dict) -> dict:
     """把 nano-banana 的 provider 配置翻成画布认识的 JSON Schema 子集。
 
     只支持 parameterControls 认识的字段（web/src/components/model-picker.tsx:31-56）：
-    type/enum/default/minimum/maximum/title/description。enum 校验很严 ——
+    type/enum/default/minimum/maximum/title/description/x-ark-size。enum 校验很严 ——
     default 必须是 enum 中的值，否则该控件被静默丢弃。
     """
     defaults = cfg.get("defaults") or {}
@@ -88,9 +89,18 @@ def _image_schema(provider: str, cfg: dict) -> dict:
     ratio_default = defaults.get("aspect_ratio", "auto")
     if ratio_default not in ratios:
         ratio_default = "auto"
+    # 火山 Seedream 的 imageSize 接受预设档位（1K/1.5K/2K…）也接受自定义
+    # "宽x高"（如 2048x1024）。x-ark-size 让画布渲染成「预设 + 自定义」控件，
+    # 与上游 Ark 图片比例支持一致（web/src/components/model-picker.tsx:47-52）。
+    # nano-banana JSON 路径不校验该值、原样透传（nano-banana/app.py:1841-1842）。
+    if provider == "volcengine":
+        size_rule: dict = {"type": "string", "x-ark-size": {"presets": list(sizes)},
+                           "default": size_default, "title": "尺寸"}
+    else:
+        size_rule = {"type": "string", "enum": list(sizes), "default": size_default, "title": "尺寸"}
     properties = {
         "aspect_ratio": {"type": "string", "enum": ratios, "default": ratio_default, "title": "画幅"},
-        "image_size": {"type": "string", "enum": list(sizes), "default": size_default, "title": "尺寸"},
+        "image_size": size_rule,
         "repeat_count": {"type": "integer", "minimum": 1, "maximum": 10,
                          "default": int(defaults.get("repeat_count") or 1), "title": "生成数量"},
     }
@@ -204,6 +214,31 @@ def _data_url(path: str, mime: str) -> str:
     return f"data:{mime};base64,{base64.b64encode(blob).decode('ascii')}"
 
 
+# 结果派生引用：前端把结果节点的输出连到下一个生成节点的参考端口时，
+# asset_id 形如 job-result.{jobId}.{index}（web/src/features/graph/contracts.ts
+# 的 deriveResultAssetId）。解析规则与上游 server/api/jobs.py 的 _RESULT_ASSET
+# 一致：任务属于同一用户、已 succeeded、索引在结果范围内。
+_RESULT_ASSET_RE = re.compile(r"job-result\.([A-Za-z0-9_-]{1,128})\.([0-9]{1,2})\Z")
+
+
+def _resolve_asset(user_id: str, asset_id: str, expect_media: str) -> dict:
+    matched = _RESULT_ASSET_RE.fullmatch(asset_id)
+    if matched is not None:
+        source = store.get_job(matched.group(1))
+        index = int(matched.group(2))
+        if (source is None or source["user_id"] != user_id
+                or source["status"] != "succeeded"):
+            raise store.NotFoundError(asset_id)
+        results = source.get("results") or []
+        if index >= len(results) or not isinstance(results[index], dict):
+            raise store.NotFoundError(asset_id)
+        asset_id = results[index]["asset_id"]
+    row = store.get_asset(user_id, asset_id)
+    if row["media_type"] != expect_media:
+        raise store.NotFoundError(asset_id)
+    return row
+
+
 def _collect_asset_ids(payload: dict) -> tuple[list[str], dict[str, list[str]]]:
     asset_ids = [a for a in (payload.get("asset_ids") or []) if isinstance(a, str)]
     inputs = payload.get("inputs") if isinstance(payload.get("inputs"), dict) else {}
@@ -299,17 +334,17 @@ async def api_create_job(request: Request):
         if app == "nano-banana":
             ordered = inputs.get("reference_images") or asset_ids
             for index, asset_id in enumerate(ordered[:14], start=1):
-                row = store.get_asset(user["user_id"], asset_id)
+                row = _resolve_asset(user["user_id"], asset_id, "image")
                 media[f"image_{index}"] = {"data_url": _data_url(row["path"], row["mime_type"])}
         else:
             for slot, ids in (("first_frame", inputs.get("first_frame") or []),
                               ("last_frame", inputs.get("last_frame") or [])):
                 if ids:
-                    row = store.get_asset(user["user_id"], ids[0])
+                    row = _resolve_asset(user["user_id"], ids[0], "image")
                     media[slot] = {"data_url": _data_url(row["path"], row["mime_type"])}
             refs = inputs.get("reference_images") or ([] if media else asset_ids)
             for index, asset_id in enumerate(refs[:9], start=1):
-                row = store.get_asset(user["user_id"], asset_id)
+                row = _resolve_asset(user["user_id"], asset_id, "image")
                 media[f"ref_image_{index}"] = {"data_url": _data_url(row["path"], row["mime_type"])}
     except store.NotFoundError:
         return _err(400, "invalid_request", "引用的素材不存在。")
@@ -326,7 +361,10 @@ async def api_create_job(request: Request):
         "X-Workspace-Id": "infinite-canvas",
     }
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        # 提交是同步等待上游建任务的：seedance 带参考图时要把图片逐张传 TOS
+        # 再交方舟（seedance/app.py:1427-1455），慢的时候要几分钟 ——
+        # 超时放宽到 10 分钟，与上游 702104c「generation timeouts to ten minutes」一致。
+        async with httpx.AsyncClient(timeout=600) as client:
             resp = await client.post(f"http://127.0.0.1:{APPS[app]}/api/jobs/json",
                                      content=json.dumps(body), headers=headers)
         upstream = resp.json()

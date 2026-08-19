@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { GRAPH_SCHEMA_VERSION } from "@/features/graph/contracts";
 import { connectGraphPorts, getNodePorts, resolveActiveConnections, type GraphPortRef } from "@/features/graph/connect";
+import { normalizeCanvasProject } from "@/features/graph/normalize-project";
+import { createComfyWorkflowNode } from "@/features/nodes/comfy-workflow";
 import { createNodeRegistry, nodeRegistry } from "@/features/nodes/registry";
 import CanvasProjectPage from "@/pages/canvas/project";
 import { useCanvasStore, type CanvasProject } from "@/stores/canvas/use-canvas-store";
@@ -91,6 +93,41 @@ afterEach(() => {
 });
 
 describe("named-port graph rules", () => {
+    it("connects typed prompt data to one static ComfyUI workflow node", () => {
+        const prompt = promptNode("prompt");
+        const workflow = createComfyWorkflowNode({
+            workflowId: "wf-1",
+            revision: 2,
+            title: "Core",
+            inputs: [{ id: "prompt", accepts: "prompt" }],
+            executionEnabled: false,
+        });
+        workflow.id = "workflow";
+
+        expect(connectGraphPorts(port("prompt", "prompt", "source"), port("workflow", "prompt", "target"), [prompt, workflow], [], "prompt-workflow")).toMatchObject({
+            ok: true,
+            connection: { fromNodeId: "prompt", fromPortId: "prompt", toNodeId: "workflow", toPortId: "prompt" },
+        });
+    });
+
+    it("keeps a ComfyUI workflow output connected to a result node after normalization", () => {
+        const workflow = createComfyWorkflowNode({ workflowId: "wf-1", revision: 2, title: "Core", inputs: [], executionEnabled: false });
+        workflow.id = "workflow";
+        const result = mediaNode("result", "image");
+        const connection = connectGraphPorts(port("workflow", "result", "source"), port("result", "result", "target"), [workflow, result], [], "workflow-result");
+
+        expect(connection).toMatchObject({ ok: true });
+        if (!connection.ok) throw new Error("expected a ComfyUI result connection");
+        const normalized = normalizeCanvasProject({
+            id: "project", title: "Project", createdAt: "2026-08-16T00:00:00.000Z", updatedAt: "2026-08-16T00:00:00.000Z",
+            nodes: [workflow, result], connections: [connection.connection], chatSessions: [], activeChatId: null,
+            backgroundMode: "lines", showImageInfo: false, viewport: { x: 0, y: 0, k: 1 },
+        });
+
+        expect(normalized.connections).toEqual([connection.connection]);
+        expect(resolveActiveConnections(normalized.connections, normalized.nodes).map(({ active }) => active)).toEqual([true]);
+    });
+
     it("exposes only stable ports declared by graph metadata", () => {
         const model = modelNode("model", ["prompt", "first_frame", "reference_audio"]);
 

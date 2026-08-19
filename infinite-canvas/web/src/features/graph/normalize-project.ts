@@ -1,4 +1,4 @@
-import { GRAPH_SCHEMA_VERSION, STANDARD_MODEL_INPUT_PORTS, assertSafeGraphInputPorts, assertSafeGraphPortId, assertSafeLegacyGraphInputPortIds, graphInputPortDescriptor, isGraphPortValueType, type CanvasGraphNodeMetadata, type GraphInputPortDescriptor, type GraphMediaType, type GraphParameterValue, type GraphPortValueType } from "@/features/graph/contracts";
+import { GRAPH_SCHEMA_VERSION, STANDARD_MODEL_INPUT_PORTS, assertSafeGraphInputPorts, assertSafeGraphPortId, assertSafeLegacyGraphInputPortIds, deriveResultAssetId, graphInputPortDescriptor, isGraphNodeRole, isGraphPortValueType, type CanvasGraphNodeMetadata, type GraphInputPortDescriptor, type GraphMediaType, type GraphParameterValue, type GraphPortValueType } from "@/features/graph/contracts";
 import type { NodeDefinition } from "@/features/nodes/types";
 import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
 import { CanvasNodeType, type CanvasConnection, type CanvasNodeData, type CanvasNodeMetadata } from "@/types/canvas";
@@ -58,7 +58,7 @@ function assertSupportedSchema(project: CanvasProjectInput) {
         if (!graph || typeof graph !== "object") continue;
         if (Object.prototype.hasOwnProperty.call(graph, "schemaVersion")) assertCurrentSchemaVersion((graph as { schemaVersion?: unknown }).schemaVersion);
         const candidate = graph as Record<string, unknown>;
-        if (candidate.schemaVersion === GRAPH_SCHEMA_VERSION && candidate.role === "model") {
+        if (candidate.schemaVersion === GRAPH_SCHEMA_VERSION && (candidate.role === "model" || candidate.role === "comfy-workflow")) {
             if (Object.prototype.hasOwnProperty.call(candidate, "inputPorts")) {
                 assertSafeGraphInputPorts(candidate.inputPorts);
                 assertSafeGraphPortId(candidate.outputPortId);
@@ -70,6 +70,10 @@ function assertSupportedSchema(project: CanvasProjectInput) {
         if (candidate.schemaVersion === GRAPH_SCHEMA_VERSION && (candidate.role === "prompt" || candidate.role === "media-collection" || candidate.role === "result")) {
             if (Object.prototype.hasOwnProperty.call(candidate, "outputPortId")) assertSafeGraphPortId(candidate.outputPortId);
             if (candidate.role === "result" && Object.prototype.hasOwnProperty.call(candidate, "inputPortId")) assertSafeGraphPortId(candidate.inputPortId);
+        }
+        if (candidate.schemaVersion === GRAPH_SCHEMA_VERSION && candidate.role === "comfy-workflow") {
+            assertSafeGraphPortId(candidate.workflowId);
+            if (!Number.isInteger(candidate.workflowRevision) || (candidate.workflowRevision as number) < 1 || candidate.executionEnabled !== false) throw new TypeError("Invalid ComfyUI workflow metadata");
         }
     }
 }
@@ -126,15 +130,24 @@ function canonicalJson(value: unknown): string {
 function normalizeNode(node: CanvasNodeInput): CanvasNodeData {
     const metadata = node.metadata ? { ...node.metadata } : undefined;
     if (!isBuiltInGraphNode(node.type)) return { ...node, position: { ...node.position }, metadata: metadata as CanvasNodeMetadata | undefined };
+    const graph = normalizeGraphMetadata(node, metadata);
+    if (node.type === "comfy.workflow") {
+        // A later execution slice must re-authorize this ID/revision server-side; local project data never proves assignment.
+        return { ...node, position: { ...node.position }, metadata: { status: safeCanvasNodeStatus(metadata?.status), graph } };
+    }
     return {
         ...node,
         position: { ...node.position },
-        metadata: { ...metadata, graph: normalizeGraphMetadata(node, metadata) },
+        metadata: { ...metadata, graph },
     };
 }
 
+function safeCanvasNodeStatus(value: unknown): CanvasNodeMetadata["status"] {
+    return value === "success" || value === "loading" || value === "error" ? value : "idle";
+}
+
 function isBuiltInGraphNode(type: CanvasNodeData["type"]) {
-    return type === CanvasNodeType.Text || type === CanvasNodeType.Config || type === CanvasNodeType.Image || type === CanvasNodeType.Video || type === CanvasNodeType.Audio;
+    return type === CanvasNodeType.Text || type === CanvasNodeType.Config || type === CanvasNodeType.Image || type === CanvasNodeType.Video || type === CanvasNodeType.Audio || type === "comfy.workflow";
 }
 
 function normalizeGraphMetadata(node: CanvasNodeInput, metadata?: CanvasNodeInput["metadata"]): CanvasGraphNodeMetadata {
@@ -147,13 +160,17 @@ function normalizeGraphMetadata(node: CanvasNodeInput, metadata?: CanvasNodeInpu
             operation: metadata.graph.operation,
             inputPorts: metadata.graph.inputPortIds.map(graphInputPortDescriptor),
             outputPortId: metadata.graph.outputPortId,
-            parameters: { ...metadata.graph.parameters },
+            parameters: pruneModelParameters(metadata.graph.modelId, { ...metadata.graph.parameters }),
         };
     }
-    if (isLegacyGraphResultMetadata(metadata?.graph)) return {
-        ...metadata.graph,
-        inputPortId: "result",
-    };
+    if (isLegacyGraphResultMetadata(metadata?.graph)) {
+        const assetId = metadata.graph.assetId ?? deriveResultAssetId(metadata);
+        return {
+            ...metadata.graph,
+            inputPortId: "result",
+            ...(assetId ? { assetId } : {}),
+        };
+    }
     if (node.type === CanvasNodeType.Text) {
         return {
             schemaVersion: GRAPH_SCHEMA_VERSION,
@@ -173,7 +190,17 @@ function normalizeGraphMetadata(node: CanvasNodeInput, metadata?: CanvasNodeInpu
             parameters: scalarParameters(metadata?.params),
         };
     }
+    if (node.type === "comfy.workflow") return {
+        schemaVersion: GRAPH_SCHEMA_VERSION,
+        role: "comfy-workflow",
+        workflowId: "unassigned",
+        workflowRevision: 1,
+        inputPorts: [],
+        outputPortId: "result",
+        executionEnabled: false,
+    };
     const mediaType = mediaTypeForNode(node.type) ?? "image";
+    const assetId = deriveResultAssetId(metadata);
     return {
         schemaVersion: GRAPH_SCHEMA_VERSION,
         role: "result",
@@ -181,6 +208,7 @@ function normalizeGraphMetadata(node: CanvasNodeInput, metadata?: CanvasNodeInpu
         inputPortId: "result",
         outputPortId: "media",
         ...(metadata?.sourceJobId ? { jobId: metadata.sourceJobId } : {}),
+        ...(assetId ? { assetId } : {}),
     };
 }
 
@@ -188,6 +216,7 @@ function isCurrentGraphMetadata(value: unknown): value is CanvasGraphNodeMetadat
     if (!value || typeof value !== "object") return false;
     const candidate = value as Record<string, unknown>;
     if (candidate.schemaVersion !== GRAPH_SCHEMA_VERSION) return false;
+    if (!isGraphNodeRole(candidate.role)) return false;
     if (candidate.role === "prompt") return typeof candidate.text === "string" && typeof candidate.outputPortId === "string";
     if (candidate.role === "media-collection") {
         return isMediaType(candidate.mediaType)
@@ -202,6 +231,16 @@ function isCurrentGraphMetadata(value: unknown): value is CanvasGraphNodeMetadat
             && Array.isArray(candidate.inputPorts)
             && candidate.inputPorts.every(isGraphInputPortDescriptor)
             && isParameterRecord(candidate.parameters);
+    }
+    if (candidate.role === "comfy-workflow") {
+        return typeof candidate.workflowId === "string"
+            && typeof candidate.workflowRevision === "number"
+            && Number.isInteger(candidate.workflowRevision)
+            && candidate.workflowRevision > 0
+            && typeof candidate.outputPortId === "string"
+            && Array.isArray(candidate.inputPorts)
+            && candidate.inputPorts.every(isGraphInputPortDescriptor)
+            && candidate.executionEnabled === false;
     }
     if (candidate.role === "result") {
         return isMediaType(candidate.mediaType)
@@ -264,6 +303,7 @@ function isGraphMediaItem(value: unknown) {
         && typeof item.displayName === "string"
         && typeof item.mimeType === "string"
         && isFiniteNonNegative(item.bytes)
+        && (item.kind === undefined || item.kind === "library")
         && (item.width === undefined || isFiniteNonNegative(item.width))
         && (item.height === undefined || isFiniteNonNegative(item.height))
         && (item.durationMs === undefined || isFiniteNonNegative(item.durationMs));
@@ -277,10 +317,42 @@ function isParameterRecord(value: unknown): value is Record<string, GraphParamet
     return Boolean(value && typeof value === "object" && !Array.isArray(value) && Object.values(value).every((item) => item === null || typeof item === "string" || typeof item === "boolean" || (typeof item === "number" && Number.isFinite(item))));
 }
 
+const KNOWN_MODEL_PARAMETERS: Readonly<Record<string, ReadonlySet<string>>> = {
+    "demo-image-v1": new Set(["size", "ratio"]),
+};
+
+function pruneModelParameters(modelId: string, parameters: Record<string, GraphParameterValue>): Record<string, GraphParameterValue> {
+    const allowed = KNOWN_MODEL_PARAMETERS[modelId];
+    if (!allowed) return { ...parameters };
+    return Object.fromEntries(Object.entries(parameters).filter(([name]) => allowed.has(name)));
+}
+
 function cloneGraphMetadata(metadata: CanvasGraphNodeMetadata): CanvasGraphNodeMetadata {
     if (metadata.role === "media-collection") return { ...metadata, items: metadata.items.map((item) => ({ ...item })) };
-    if (metadata.role === "model") return { ...metadata, inputPorts: metadata.inputPorts.map((port) => ({ ...port })), parameters: { ...metadata.parameters } };
+    if (metadata.role === "model") return {
+        schemaVersion: GRAPH_SCHEMA_VERSION,
+        role: "model",
+        modelId: metadata.modelId,
+        operation: metadata.operation,
+        inputPorts: metadata.inputPorts.map(projectGraphInputPortDescriptor),
+        outputPortId: metadata.outputPortId,
+        parameters: pruneModelParameters(metadata.modelId, metadata.parameters),
+    };
+    if (metadata.role === "comfy-workflow") return {
+        schemaVersion: GRAPH_SCHEMA_VERSION,
+        role: "comfy-workflow",
+        workflowId: metadata.workflowId,
+        workflowRevision: metadata.workflowRevision,
+        inputPorts: metadata.inputPorts.map(projectGraphInputPortDescriptor),
+        outputPortId: metadata.outputPortId,
+        executionEnabled: false,
+    };
     return { ...metadata };
+}
+
+function projectGraphInputPortDescriptor(port: GraphInputPortDescriptor): GraphInputPortDescriptor {
+    const label = typeof port.label === "string" && port.label.length > 0 && port.label.length <= 64 && !/[\u0000-\u001f\u007f]/.test(port.label) ? port.label : undefined;
+    return { id: port.id, accepts: port.accepts, ...(label === undefined ? {} : { label }) };
 }
 
 function inferLegacyOperation(metadata?: CanvasNodeInput["metadata"]) {
@@ -340,7 +412,7 @@ function classifyExplicitConnection(from: CanvasNodeData, fromPortId: string, to
     if (!target) {
         return "invalid";
     }
-    if (target.role === "model") {
+    if (target.role === "model" || target.role === "comfy-workflow") {
         const input = target.inputPorts.find((port) => port.id === toPortId);
         if (!input) return "invalid";
         if (sourceType === "unknown") return "opaque";
@@ -348,7 +420,7 @@ function classifyExplicitConnection(from: CanvasNodeData, fromPortId: string, to
         if (standard) return sourceType === standard.accepts ? "valid" : "invalid";
         return portTypesMatch(sourceType, input.accepts) ? "valid" : "invalid";
     }
-    if (target.role === "result" && toPortId === target.inputPortId && source?.role === "model" && fromPortId === source.outputPortId) return "valid";
+    if (target.role === "result" && toPortId === target.inputPortId && (source?.role === "model" || source?.role === "comfy-workflow") && fromPortId === source.outputPortId) return "valid";
     return "invalid";
 }
 

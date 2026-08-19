@@ -492,6 +492,27 @@ describe("canvas editing shortcuts", () => {
 });
 
 describe("blank canvas creation menu", () => {
+    it("creates only the generic ComfyUI workflow node from the actual canvas context menu", async () => {
+        const projectId = await renderProject();
+        fireEvent.contextMenu(screen.getByTestId("infinite-canvas"), { clientX: 320, clientY: 210 });
+        const menu = screen.getByRole("menu", { name: "创建节点" });
+
+        fireEvent.click(within(menu).getByRole("menuitem", { name: "ComfyUI 工作流" }));
+
+        const created = useCanvasStore.getState().openProject(projectId)?.nodes.find((item) => item.type === "comfy.workflow");
+        expect(created?.metadata?.graph).toEqual({
+            schemaVersion: 1,
+            role: "comfy-workflow",
+            workflowId: "unassigned",
+            workflowRevision: 1,
+            inputPorts: [],
+            outputPortId: "result",
+            executionEnabled: false,
+        });
+        expect(created?.type).toBe("comfy.workflow");
+        expect(created?.type).not.toBe("MiniMaxH3ImageToVideo");
+    });
+
     it("creates an image edit model node from the canvas menu when it is the assigned image capability", async () => {
         const projectId = await renderProject([], [], [{
             model_id: "edit-only",

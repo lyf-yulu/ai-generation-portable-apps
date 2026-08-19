@@ -16,7 +16,7 @@ function assetFromResponse(value: unknown): AssetRef {
     const response = value as UploadResponse;
     const id = response.asset_id;
     if (typeof id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(id)
-        || (response.kind !== "reference" && response.kind !== "portrait")
+        || (response.kind !== "reference" && response.kind !== "portrait" && response.kind !== "library")
         || (response.status !== "processing" && response.status !== "active" && response.status !== "failed")
         || (response.media_type !== "image" && response.media_type !== "video" && response.media_type !== "audio")
         || typeof response.mime_type !== "string" || !response.mime_type.startsWith(`${response.media_type}/`)
@@ -52,7 +52,13 @@ export async function deleteMediaAsset(id: string): Promise<void> {
     await apiFetch<void>(assetUrl(id), { method: "DELETE" });
 }
 
-export function uploadMediaAsset(file: File, mediaType: GraphMediaType, onProgress: (percent: number) => void = () => undefined, signal?: AbortSignal): Promise<OwnedMediaAsset> {
+function uploadAsset(
+    file: File,
+    mediaType: GraphMediaType,
+    kind: "reference" | "library",
+    onProgress: (percent: number) => void,
+    signal?: AbortSignal,
+): Promise<AssetRef> {
     if (signal?.aborted) return Promise.reject(new DOMException("The upload was cancelled.", "AbortError"));
     return new Promise((resolve, reject) => {
         const request = new XMLHttpRequest();
@@ -74,7 +80,9 @@ export function uploadMediaAsset(file: File, mediaType: GraphMediaType, onProgre
                 return;
             }
             try {
-                const asset = ownedAssetFromResponse(JSON.parse(request.responseText) as unknown, mediaType);
+                const asset = kind === "library"
+                    ? libraryAssetFromResponse(JSON.parse(request.responseText) as unknown, mediaType)
+                    : ownedAssetFromResponse(JSON.parse(request.responseText) as unknown, mediaType);
                 onProgress(100);
                 cleanup();
                 resolve(asset);
@@ -86,10 +94,36 @@ export function uploadMediaAsset(file: File, mediaType: GraphMediaType, onProgre
         request.addEventListener("error", () => { cleanup(); reject(new Error("媒体上传失败，请检查网络后重试。")); });
         request.addEventListener("abort", () => { cleanup(); reject(new DOMException("The upload was cancelled.", "AbortError")); });
         const body = new FormData();
-        body.append("kind", "reference");
+        body.append("kind", kind);
         body.append("media_type", mediaType);
         body.append("file", file, file.name);
         signal?.addEventListener("abort", abortRequest, { once: true });
         request.send(body);
+    });
+}
+
+export function uploadMediaAsset(file: File, mediaType: GraphMediaType, onProgress: (percent: number) => void = () => undefined, signal?: AbortSignal): Promise<OwnedMediaAsset> {
+    return uploadAsset(file, mediaType, "reference", onProgress, signal) as Promise<OwnedMediaAsset>;
+}
+
+function libraryAssetFromResponse(value: unknown, expectedMediaType: GraphMediaType): AssetRef {
+    const asset = assetFromResponse(value);
+    if (asset.kind !== "library" || asset.media_type !== expectedMediaType || typeof asset.content_url !== "string") {
+        throw new Error("资产库响应无效，请重试。");
+    }
+    return asset;
+}
+
+export function uploadLibraryAsset(file: File, onProgress: (percent: number) => void = () => undefined, signal?: AbortSignal): Promise<AssetRef> {
+    return uploadAsset(file, "image", "library", onProgress, signal);
+}
+
+export async function fetchLibraryAssets(): Promise<AssetRef[]> {
+    const response = await apiFetch<{ assets: unknown[] }>("/api/v1/library-assets");
+    if (!response || !Array.isArray(response.assets)) throw new Error("资产库响应无效，请重试。");
+    return response.assets.map((item) => {
+        const asset = assetFromResponse(item);
+        if (asset.kind !== "library") throw new Error("资产库响应无效，请重试。");
+        return asset;
     });
 }

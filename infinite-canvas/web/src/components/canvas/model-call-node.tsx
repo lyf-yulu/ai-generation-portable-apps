@@ -1,5 +1,5 @@
 import { Play, Sparkles } from "lucide-react";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 
 import type { ModelSpec } from "@/api/contracts";
 import { parameterControls } from "@/components/model-picker";
@@ -25,6 +25,7 @@ function defaults(model: ModelSpec) {
 export function ModelCallNode({ node, models, disabled = false, message, onChange, onRun, onRetry, onCancel }: Props) {
     const graph = node.metadata?.graph;
     if (graph?.role !== "model") return null;
+    const [customOpen, setCustomOpen] = useState<Record<string, boolean>>({});
     const selected = models.find((model) => model.model_id === graph.modelId) ?? models[0];
     const controls = useMemo(() => parameterControls(selected?.parameter_schema ?? {}), [selected]);
     const visibleControls = controls.filter((control) => !control.visibleWhen || Object.is(graph.parameters[control.visibleWhen.name], control.visibleWhen.equals));
@@ -68,19 +69,70 @@ export function ModelCallNode({ node, models, disabled = false, message, onChang
                     <label key={control.name} className="block text-[11px] text-[#687386]">
                         {control.title ?? control.name}
                         {control.type === "enum" ? (
-                            <select
-                                aria-label={control.title ?? control.name}
-                                disabled={editDisabled}
-                                value={String(control.enum?.findIndex((value) => Object.is(value, graph.parameters[control.name])) ?? 0)}
-                                onChange={(event) => updateParameter(control.name, control.enum?.[Number(event.target.value)] ?? null)}
-                                className="mt-1 block w-full rounded-md border border-[#d9e0ea] bg-[#f3f6fa] p-2"
-                            >
-                                {control.enum?.map((value, index) => (
-                                    <option key={String(value)} value={index}>
-                                        {String(value)}
-                                    </option>
-                                ))}
-                            </select>
+                            (() => {
+                                const effective = graph.parameters[control.name] ?? control.default;
+                                const index = control.enum?.findIndex((value) => Object.is(value, effective)) ?? -1;
+                                return (
+                                    <select
+                                        aria-label={control.title ?? control.name}
+                                        disabled={editDisabled}
+                                        value={String(index >= 0 ? index : 0)}
+                                        onChange={(event) => updateParameter(control.name, control.enum?.[Number(event.target.value)] ?? null)}
+                                        className="mt-1 block w-full rounded-md border border-[#d9e0ea] bg-[#f3f6fa] p-2"
+                                    >
+                                        {control.enum?.map((value, optionIndex) => (
+                                            <option key={String(value)} value={optionIndex}>
+                                                {String(value)}
+                                            </option>
+                                        ))}
+                                    </select>
+                                );
+                            })()
+                        ) : control.type === "preset" ? (
+                            (() => {
+                                const presets = control.presets ?? [];
+                                const raw = graph.parameters[control.name];
+                                const value = typeof raw === "string" ? raw : typeof control.default === "string" ? control.default : "";
+                                const custom = customOpen[control.name] === true || (typeof raw === "string" && !presets.includes(raw));
+                                const index = !custom && presets.includes(value) ? presets.indexOf(value) : presets.length;
+                                return (
+                                    <div>
+                                        <select
+                                            aria-label={control.title ?? control.name}
+                                            disabled={editDisabled}
+                                            value={String(index)}
+                                            onChange={(event) => {
+                                                const next = Number(event.target.value);
+                                                if (next === presets.length) {
+                                                    setCustomOpen((previous) => ({ ...previous, [control.name]: true }));
+                                                    return;
+                                                }
+                                                setCustomOpen((previous) => ({ ...previous, [control.name]: false }));
+                                                updateParameter(control.name, presets[next]);
+                                            }}
+                                            className="mt-1 block w-full rounded-md border border-[#d9e0ea] bg-[#f3f6fa] p-2"
+                                        >
+                                            {presets.map((preset) => (
+                                                <option key={preset} value={presets.indexOf(preset)}>
+                                                    {preset}
+                                                </option>
+                                            ))}
+                                            <option value={presets.length}>自定义（宽x高）</option>
+                                        </select>
+                                        {custom ? (
+                                            <input
+                                                aria-label={`${control.title ?? control.name}（自定义宽x高）`}
+                                                disabled={editDisabled}
+                                                type="text"
+                                                placeholder="如 2048x1024"
+                                                value={typeof raw === "string" ? raw : ""}
+                                                onChange={(event) => updateParameter(control.name, event.target.value)}
+                                                className="mt-1 block w-full rounded-md border border-[#d9e0ea] bg-[#f3f6fa] p-2"
+                                            />
+                                        ) : null}
+                                    </div>
+                                );
+                            })()
                         ) : control.type === "boolean" ? (
                             <input
                                 aria-label={control.title ?? control.name}

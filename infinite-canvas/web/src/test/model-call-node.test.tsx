@@ -88,6 +88,59 @@ describe("ModelCallNode", () => {
         expect(screen.getByRole("button", { name: "运行模型" })).toBeDisabled();
     });
 
+    it("renders the size tier presets with a custom widthxheight fallback and the ratio enum", () => {
+        const onChange = vi.fn();
+        const ratioModel: ModelSpec = {
+            ...models[0],
+            parameter_schema: {
+                type: "object",
+                properties: {
+                    size: { type: "string", default: "2K", title: "尺寸档位", "x-ark-size": { presets: ["1K", "1.5K", "2K"], min_pixels: 921600, max_pixels: 4624220, min_ratio: 0.0625, max_ratio: 16 } },
+                    ratio: { type: "string", enum: ["1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3", "21:9"], default: "1:1", title: "比例" },
+                },
+                additionalProperties: false,
+            },
+            parameter_mappings: { size: "size", ratio: "ratio" },
+        };
+        const graph = { ...node.metadata.graph!, parameters: { size: "2K", ratio: "1:1" } } as GraphModelMetadata;
+        const ratioNode: CanvasNodeData = { ...node, metadata: { ...node.metadata, graph } };
+        render(<ModelCallNode node={ratioNode} models={[ratioModel]} onChange={onChange} onRun={vi.fn()} />);
+
+        expect(screen.getByLabelText("尺寸档位")).toHaveValue("2");
+        expect(screen.getByLabelText("比例")).toHaveValue("0");
+
+        fireEvent.change(screen.getByLabelText("尺寸档位"), { target: { value: "0" } });
+        expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ parameters: expect.objectContaining({ size: "1K" }) }));
+        fireEvent.change(screen.getByLabelText("比例"), { target: { value: "3" } });
+        expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ parameters: expect.objectContaining({ ratio: "16:9" }) }));
+
+        fireEvent.change(screen.getByLabelText("尺寸档位"), { target: { value: "3" } });
+        const custom = screen.getByLabelText("尺寸档位（自定义宽x高）");
+        fireEvent.change(custom, { target: { value: "2048x1024" } });
+        expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ parameters: expect.objectContaining({ size: "2048x1024" }) }));
+    });
+
+    it("shows the schema defaults when a legacy node carries no parameters", () => {
+        const ratioModel: ModelSpec = {
+            ...models[0],
+            parameter_schema: {
+                type: "object",
+                properties: {
+                    size: { type: "string", default: "2K", title: "尺寸档位", "x-ark-size": { presets: ["1K", "1.5K", "2K"], min_pixels: 921600, max_pixels: 4624220, min_ratio: 0.0625, max_ratio: 16 } },
+                    ratio: { type: "string", enum: ["1:1", "16:9"], default: "1:1", title: "比例" },
+                },
+                additionalProperties: false,
+            },
+            parameter_mappings: { size: "size", ratio: "ratio" },
+        };
+        const graph = { ...node.metadata.graph!, parameters: {} } as GraphModelMetadata;
+        const emptyNode: CanvasNodeData = { ...node, metadata: { ...node.metadata, graph } };
+        render(<ModelCallNode node={emptyNode} models={[ratioModel]} onChange={vi.fn()} onRun={vi.fn()} />);
+
+        expect(screen.getByLabelText("尺寸档位")).toHaveValue("2");
+        expect(screen.getByLabelText("比例")).toHaveValue("0");
+    });
+
     it("shows friendly labels and only reveals dependent group controls when active", () => {
         const onChange = vi.fn();
         const groupModel: ModelSpec = {

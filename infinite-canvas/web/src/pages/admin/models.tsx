@@ -25,6 +25,7 @@ import {
 import type { ModelSpec } from "@/api/contracts";
 import { ModelEditor } from "@/components/admin/model-editor";
 import { CredentialPoolImport } from "@/components/admin/credential-pool-import";
+import { ArkKeyImport } from "@/components/admin/ark-key-import";
 import { ModelCallSettings } from "@/components/admin/model-call-settings";
 import { callingPresetsForModel, routeMatchesCallingPreset } from "@/components/admin/model-templates";
 import { ObjectLifecycleActions } from "@/components/admin/object-lifecycle-actions";
@@ -167,33 +168,35 @@ export default function AdminModelsPage() {
     const unavailableAssigned = assignedIds.filter((id) => !assignable.some((model) => model.model_id === id));
 
     return (
-        <section className="mx-auto min-w-0 max-w-7xl overflow-x-clip px-4 py-7 text-[#172033] sm:px-5">
-            <p className="text-xs tracking-[0.2em] text-[#6b92ed]">ADMIN · LOGICAL MODELS</p>
+        <section className="mx-auto min-w-0 max-w-7xl overflow-x-clip px-4 py-7 text-[#e5f5e9] sm:px-5">
+            <p className="text-xs tracking-[0.2em] text-[#58ed87]">ADMIN · LOGICAL MODELS</p>
             <div className="mt-2 flex flex-wrap items-end justify-between gap-3">
                 <div>
                     <h1 className="text-2xl font-semibold sm:text-3xl">模型与调用线路</h1>
-                    <p className="mt-2 max-w-3xl text-sm text-[#979ead]">用户只选择逻辑模型。Provider、线路和凭据池由管理员在这里隔离管理，真实凭据仅由部署配置提供。</p>
+                    <p className="mt-2 max-w-3xl text-sm text-[#95ad9c]">用户只选择逻辑模型。Provider、线路和凭据池由管理员在这里隔离管理，真实凭据仅由部署配置提供。</p>
                 </div>
                 <label className="flex items-center gap-2 text-sm text-[#b9d0c0]">
-                    <input type="checkbox" checked={showArchived} onChange={(event) => setShowArchived(event.target.checked)} className="accent-[#6b92ed]" />
+                    <input type="checkbox" checked={showArchived} onChange={(event) => setShowArchived(event.target.checked)} className="accent-[#58ed87]" />
                     显示已归档
                 </label>
             </div>
             {status === "loading" && (
-                <p role="status" className="mt-5 text-sm text-[#8a93a9]">
+                <p role="status" className="mt-5 text-sm text-[#86a991]">
                     正在加载管理配置…
                 </p>
             )}
             {status === "failed" && (
-                <p role="alert" className="mt-5 text-sm text-[#92400e]">
+                <p role="alert" className="mt-5 text-sm text-[#ffbd73]">
                     管理配置未能加载，请重试。
                 </p>
             )}
 
             <CredentialPoolImport onImported={setPools} />
 
+            <ArkKeyImport />
+
             <div className="mt-6 grid min-w-0 gap-5 lg:grid-cols-[17rem_minmax(0,1fr)]">
-                <aside className="min-w-0 rounded-xl border border-[#29385a] bg-[#080b11] p-3">
+                <aside className="min-w-0 rounded-xl border border-[#245a35] bg-[#07110b] p-3">
                     <div className="flex items-center justify-between gap-2">
                         <h2 className="font-semibold">逻辑模型</h2>
                         <button
@@ -202,7 +205,7 @@ export default function AdminModelsPage() {
                                 setCreatingModel(true);
                                 setSelectedModelId("");
                             }}
-                            className="rounded bg-[#1c273f] px-2.5 py-1.5 text-xs text-[#99b3f0]"
+                            className="rounded bg-[#183f26] px-2.5 py-1.5 text-xs text-[#8ff0aa]"
                         >
                             新建
                         </button>
@@ -217,10 +220,10 @@ export default function AdminModelsPage() {
                                     setCreatingModel(false);
                                     setSelectedModelId(model.model_id);
                                 }}
-                                className={`min-w-0 rounded-lg border p-3 text-left ${selectedModelId === model.model_id ? "border-[#6b92ed] bg-[#121927]" : "border-[#222e48] bg-[#0b0f17]"}`}
+                                className={`min-w-0 rounded-lg border p-3 text-left ${selectedModelId === model.model_id ? "border-[#58ed87] bg-[#102719]" : "border-[#1e482b] bg-[#0a1710]"}`}
                             >
                                 <span className="block truncate text-sm font-medium">{model.display_name}</span>
-                                <span className="mt-1 block truncate text-xs text-[#8a93a9]">
+                                <span className="mt-1 block truncate text-xs text-[#86a991]">
                                     {model.modality === "image" ? "图像" : "视频"} · {model.enabled ? "已启用" : "已停用"}
                                     {model.archived_at ? " · 已归档" : ""}
                                 </span>
@@ -255,7 +258,7 @@ export default function AdminModelsPage() {
                                 onChanged={replaceModel}
                                 onDeleted={removeModel}
                             />
-                            <section className="min-w-0 rounded-xl border border-[#29385a] bg-[#080b11] p-4">
+                            <section className="min-w-0 rounded-xl border border-[#245a35] bg-[#07110b] p-4">
                                 <h2 className="text-lg font-semibold">历史线路</h2>
                                 <div className="mt-4 grid min-w-0 gap-2 sm:grid-cols-2">
                                     {routes.map((route) => (
@@ -263,7 +266,7 @@ export default function AdminModelsPage() {
                                             key={route.route_id}
                                             type="button"
                                             onClick={() => setSelectedRouteId(route.route_id)}
-                                            className={`min-w-0 rounded-lg border p-3 text-left ${selectedRouteId === route.route_id ? "border-[#6b92ed] bg-[#121927]" : "border-[#222e48] bg-[#0b0f17]"}`}
+                                            className={`min-w-0 rounded-lg border p-3 text-left ${selectedRouteId === route.route_id ? "border-[#58ed87] bg-[#102719]" : "border-[#1e482b] bg-[#0a1710]"}`}
                                         >
                                             {route.route_id}
                                         </button>
@@ -360,12 +363,12 @@ export default function AdminModelsPage() {
                 </main>
             </div>
 
-            <section className="mt-8 min-w-0 rounded-xl border border-[#29385a] bg-[#080b11] p-4">
+            <section className="mt-8 min-w-0 rounded-xl border border-[#245a35] bg-[#07110b] p-4">
                 <h2 className="text-lg font-semibold">用户模型派发</h2>
-                <p className="mt-1 text-xs text-[#8a93a9]">只派发逻辑模型 ID；线路和凭据池对普通用户不可见。</p>
+                <p className="mt-1 text-xs text-[#86a991]">只派发逻辑模型 ID；线路和凭据池对普通用户不可见。</p>
                 <label className="mt-4 block max-w-md text-sm">
                     选择账号
-                    <select aria-label="选择账号" value={userId} onChange={(event) => setUserId(event.target.value)} className="mt-1 block w-full min-w-0 rounded border border-[#2c3750] bg-[#0c0f17] px-3 py-2">
+                    <select aria-label="选择账号" value={userId} onChange={(event) => setUserId(event.target.value)} className="mt-1 block w-full min-w-0 rounded border border-[#285038] bg-[#0b1710] px-3 py-2">
                         <option value="">请选择账号</option>
                         {users.map((item) => (
                             <option key={item.user_id} value={item.user_id}>
@@ -376,8 +379,8 @@ export default function AdminModelsPage() {
                 </label>
                 <div className="mt-4 grid min-w-0 gap-2 sm:grid-cols-2 lg:grid-cols-3">
                     {assignable.map((model) => (
-                        <label key={model.model_id} className="flex min-w-0 gap-2 rounded-lg border border-[#222e48] bg-[#0b0f17] p-3 text-sm">
-                            <input type="checkbox" aria-label={model.display_name} disabled={!userId} checked={assignedIds.includes(model.model_id)} onChange={() => toggleAssignment(model.model_id)} className="accent-[#6b92ed]" />
+                        <label key={model.model_id} className="flex min-w-0 gap-2 rounded-lg border border-[#1e482b] bg-[#0a1710] p-3 text-sm">
+                            <input type="checkbox" aria-label={model.display_name} disabled={!userId} checked={assignedIds.includes(model.model_id)} onChange={() => toggleAssignment(model.model_id)} className="accent-[#58ed87]" />
                             <span className="min-w-0 truncate">{model.display_name}</span>
                         </label>
                     ))}
@@ -389,11 +392,11 @@ export default function AdminModelsPage() {
                     ))}
                 </div>
                 <div className="mt-4 flex flex-wrap items-center gap-3">
-                    <button type="button" disabled={!userId || status === "saving"} onClick={() => void saveAssignments()} className="rounded bg-[#6285d9] px-4 py-2 text-sm font-semibold text-[#070a10] disabled:opacity-40">
+                    <button type="button" disabled={!userId || status === "saving"} onClick={() => void saveAssignments()} className="rounded bg-[#42d977] px-4 py-2 text-sm font-semibold text-[#041008] disabled:opacity-40">
                         保存派发
                     </button>
                     {status === "saved" && (
-                        <span role="status" className="text-sm text-[#6587d8]">
+                        <span role="status" className="text-sm text-[#58d881]">
                             派发已保存
                         </span>
                     )}

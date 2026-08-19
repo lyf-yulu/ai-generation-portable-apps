@@ -13,7 +13,9 @@ import { RenameNodeDialog } from "@/components/canvas/rename-node-dialog";
 import { GenerationNodeCard } from "@/components/canvas/generation-node-card";
 import { InfiniteCanvas } from "@/components/canvas/infinite-canvas";
 import { MediaCollectionNode, type MediaItemsUpdater } from "@/components/canvas/media-collection-node";
+import { AssetLibraryPanel } from "@/components/canvas/asset-library-panel";
 import { ModelCallNode } from "@/components/canvas/model-call-node";
+import { ComfyWorkflowNodeCard, createUnassignedComfyWorkflowNode } from "@/features/nodes/comfy-workflow";
 import { NodePort } from "@/components/canvas/node-port";
 import { PromptNodeCard } from "@/components/canvas/prompt-node-card";
 import { CanvasNavigationControls } from "@/components/canvas/canvas-navigation-controls";
@@ -47,6 +49,7 @@ export default function CanvasProjectPage() {
     const [connectionMessage, setConnectionMessage] = useState<string | null>(null);
     const [canvasCommandMessage, setCanvasCommandMessage] = useState<string | null>(null);
     const [renamingNodeId, setRenamingNodeId] = useState<string | null>(null);
+    const [libraryPanelOpen, setLibraryPanelOpen] = useState(false);
     const [connectionPointerWorld, setConnectionPointerWorld] = useState<Position>({ x: 0, y: 0 });
     const [measuredNodeSizes, setMeasuredNodeSizes] = useState<Map<string, { width: number; height: number }>>(() => new Map());
     const pendingPortRef = useRef<GraphPortRef | null>(null);
@@ -207,6 +210,28 @@ export default function CanvasProjectPage() {
             .then(setModels)
             .catch(() => setModels([]));
     }, []);
+
+    // 模型目录与节点声明对账:旧版本保存的模型节点可能缺失端口(如本地演示模型当时未声明任何端口),
+    // 导致提示词无法连入;目录就绪后按当前声明补齐端口并修正不再支持的 operation。
+    useEffect(() => {
+        if (readOnly || models.length === 0) return;
+        const current = useCanvasStore.getState().openProject(id);
+        if (!current) return;
+        let changed = false;
+        const nodes = current.nodes.map((node) => {
+            const graph = node.metadata?.graph;
+            if (graph?.role !== "model") return node;
+            const model = models.find((candidate) => candidate.model_id === graph.modelId);
+            if (!model) return node;
+            const ports = graphPortsForModel(model);
+            const operation = model.operations.includes(graph.operation as ModelOperation) ? graph.operation : model.operations[0];
+            const portsMatch = graph.inputPorts.length === ports.length && graph.inputPorts.every((port, index) => port.id === ports[index].id && port.accepts === ports[index].accepts);
+            if (operation === graph.operation && portsMatch) return node;
+            changed = true;
+            return { ...node, metadata: { ...node.metadata, graph: { ...graph, operation, inputPorts: ports } } };
+        });
+        if (changed) updateProject(id, { nodes });
+    }, [id, models, readOnly, updateProject]);
 
     const onSucceeded = useCallback(
         (job: JobState, ref?: PendingRef) => {
@@ -498,7 +523,10 @@ export default function CanvasProjectPage() {
             if (sourceNode?.metadata?.status === "loading" || sourceNode?.metadata?.jobStatus === "queued" || sourceNode?.metadata?.jobStatus === "running") return;
             const graph = sourceNode?.metadata?.graph;
             const model = graph?.role === "model" ? models.find((candidate) => candidate.model_id === graph.modelId) : undefined;
-            if (!current || !model) return;
+            if (!current || !model) {
+                setModelMessages((messages) => ({ ...messages, [nodeId]: "当前账号没有该模型的授权，请管理员在「用户模型派发」中授权后重试。" }));
+                return;
+            }
             try {
                 const frozen = compileGraphJob(current.nodes, current.connections, nodeId, model);
                 updateProject(id, {
@@ -630,6 +658,15 @@ export default function CanvasProjectPage() {
         [id, readOnly, updateProject],
     );
 
+    const addComfyWorkflowNode = useCallback((position?: Position) => {
+        if (readOnly) return;
+        const current = useCanvasStore.getState().openProject(id);
+        if (!current) return;
+        const node = createUnassignedComfyWorkflowNode(position ?? { x: 96 + current.nodes.length * 24, y: 112 + current.nodes.length * 24 });
+        updateProject(id, { nodes: [...current.nodes, node] });
+        setSelectedNodeIds(new Set([node.id]));
+    }, [id, readOnly, updateProject]);
+
     const openCanvasContextMenu = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
         if (readOnly) return;
         const target = event.target instanceof Element ? event.target : null;
@@ -649,12 +686,13 @@ export default function CanvasProjectPage() {
         let created = true;
         if (kind === "prompt") addPromptNode(position);
         else if (kind === "image" || kind === "video" || kind === "audio") addMediaCollectionNode(kind, position);
+        else if (kind === "comfy-workflow") addComfyWorkflowNode(position);
         else if (kind === "image-model" && imageCreateOperation) addModelNode(imageCreateOperation, position);
         else if (kind === "video-model" && videoCreateOperation) addModelNode(videoCreateOperation, position);
         else created = false;
         setContextMenu(null);
         setCanvasCommandMessage(created ? "节点已创建在右键位置。" : "没有已授权的对应模型。");
-    }, [addMediaCollectionNode, addModelNode, addPromptNode, contextMenu, imageCreateOperation, videoCreateOperation]);
+    }, [addComfyWorkflowNode, addMediaCollectionNode, addModelNode, addPromptNode, contextMenu, imageCreateOperation, videoCreateOperation]);
 
     const openNodeContextMenu = useCallback(
         (nodeId: string, position: { x: number; y: number }, trigger: HTMLDivElement) => {
@@ -682,6 +720,13 @@ export default function CanvasProjectPage() {
         setContextMenu(null);
         if (restoreFocus) contextTriggerRef.current?.focus();
     }, []);
+
+    const libraryTargets = useMemo(() => {
+        if (!project) return [];
+        return project.nodes
+            .filter((node) => node.metadata?.graph?.role === "media-collection" && node.metadata.graph.mediaType === "image")
+            .map((node) => ({ nodeId: node.id, label: node.title || node.id }));
+    }, [project]);
 
     if (!project) {
         if (loadError)
@@ -824,6 +869,7 @@ export default function CanvasProjectPage() {
                             const promptNode = nodeGraph?.role === "prompt";
                             const mediaCollectionNode = nodeGraph?.role === "media-collection";
                             const modelNode = nodeGraph?.role === "model";
+                            const comfyWorkflowNode = nodeGraph?.role === "comfy-workflow";
                             const modelOperation = modelNode ? (nodeGraph.operation as ModelOperation) : undefined;
                             const ports = getNodePorts(node);
                             const measuredNode = measuredNodeMap.get(node.id) ?? node;
@@ -862,6 +908,8 @@ export default function CanvasProjectPage() {
                                             onRetry={(token) => void generation.retry(token).catch(() => undefined)}
                                             onCancel={(jobId) => void generation.cancelQueued(jobId).catch((error) => setModelMessages((messages) => ({ ...messages, [node.id]: generationErrorMessage(error) })))}
                                         />
+                                    ) : comfyWorkflowNode ? (
+                                        <ComfyWorkflowNodeCard node={node} />
                                     ) : (
                                         <GenerationNodeCard node={node} onRetry={readOnly ? undefined : (token) => void generation.retry(token).catch(() => undefined)} onDelete={readOnly ? undefined : () => deleteNodes(new Set([node.id]))} />
                                     )}
@@ -882,6 +930,23 @@ export default function CanvasProjectPage() {
                         })}
                     </InfiniteCanvas>
                     <CanvasNavigationControls viewport={viewport} onViewportChange={changeViewport} />
+                    <button
+                        type="button"
+                        onClick={() => setLibraryPanelOpen((open) => !open)}
+                        aria-label="打开人像资产库"
+                        className="absolute right-6 bottom-20 z-30 rounded-lg border border-[#c3ccd9] bg-[#eef2f7] px-3 py-2 text-xs text-[#465267] hover:border-[#2f6bdd]"
+                    >
+                        人像资产库
+                    </button>
+                    {libraryPanelOpen ? (
+                        <AssetLibraryPanel
+                            targets={libraryTargets}
+                            onClose={() => setLibraryPanelOpen(false)}
+                            addToCollection={(nodeId, items) => {
+                                if (!readOnly) updateMediaCollection(nodeId, (current) => [...current, ...items]);
+                            }}
+                        />
+                    ) : null}
                     {connectionMessage ? (
                         <p
                             data-testid="connection-status"

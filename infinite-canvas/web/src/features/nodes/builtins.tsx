@@ -1,6 +1,7 @@
 import { FileText, Group, Image as ImageIcon, Music2, Settings2, Video } from "lucide-react";
 
 import { graphInputPortDescriptor } from "@/features/graph/contracts";
+import { comfyWorkflowNodeDefinition } from "@/features/nodes/comfy-workflow";
 import { CanvasNodeType, type CanvasNodeData } from "@/types/canvas";
 import type { NodeDefinition } from "./types";
 
@@ -22,6 +23,7 @@ const definitions: NodeDefinition[] = [
     { id: CanvasNodeType.Audio, version: 1, title: "音频", connectionTitle: "音频参考", inputs: Object.freeze([]), outputs: Object.freeze([{ id: "media", provides: "audio" as const }]), createMetadata: () => ({ content: "", status: "idle" }), render: BuiltinNodeRenderer, icon: <Music2 className={iconClass} />, defaultSize: Object.freeze({ width: 340, height: 120 }), minimapColor: "#a855f7", resource: builtinResource },
     { id: CanvasNodeType.Config, version: 1, title: "生成配置", connectionTitle: "配置节点", description: "模型、尺寸、数量和输入顺序", inputs: Object.freeze(["prompt", "reference_images", "first_frame", "last_frame", "reference_video", "reference_audio"].map(graphInputPortDescriptor)), outputs: Object.freeze([{ id: "result", provides: "any" as const }]), createMetadata: () => ({ content: "", status: "idle", generationMode: "image" }), render: BuiltinNodeRenderer, icon: <Settings2 className={iconClass} />, defaultSize: Object.freeze({ width: 340, height: 240 }), minimapColor: "#60a5fa", hasSourceHandle: false, resource: builtinResource },
     { id: CanvasNodeType.Group, version: 1, title: "组", connectionTitle: "组", inputs: Object.freeze([]), outputs: Object.freeze([]), createMetadata: () => ({ status: "idle" }), render: BuiltinNodeRenderer, icon: <Group className={iconClass} />, defaultSize: Object.freeze({ width: 760, height: 480 }), minimapColor: "#94a3b8", resource: builtinResource },
+    comfyWorkflowNodeDefinition,
 ];
 
 /** Static local built-in data. Registration is performed only by the registry singleton. */

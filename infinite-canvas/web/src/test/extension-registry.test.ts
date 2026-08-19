@@ -109,6 +109,8 @@ it("keeps isolated registries empty and rejects every duplicate ID", () => {
 
 it("initializes singleton registries with built-ins exactly once", () => {
     expect(nodeRegistry.getNode("text")?.version).toBe(1);
+    expect(nodeRegistry.getNode("comfy.workflow")).toMatchObject({ version: 1, showInCreateMenu: true });
+    expect(nodeRegistry.listNodes().filter((node) => node.id === "comfy.workflow")).toHaveLength(1);
     expect(workflowRegistry.getWorkflow("portrait.video")?.version).toBe(1);
     expect(nodeRegistry.listNodes().filter((node) => node.id === "text")).toHaveLength(1);
 });

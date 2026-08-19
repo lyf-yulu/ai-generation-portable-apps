@@ -2,7 +2,11 @@ export const GRAPH_SCHEMA_VERSION = 1 as const;
 
 export type GraphParameterValue = string | number | boolean | null;
 export type GraphMediaType = "image" | "video" | "audio";
-export type GraphNodeRole = "prompt" | "media-collection" | "model" | "result";
+export type GraphNodeRole = "prompt" | "media-collection" | "model" | "comfy-workflow" | "result";
+
+export function isGraphNodeRole(value: unknown): value is GraphNodeRole {
+    return value === "prompt" || value === "media-collection" || value === "model" || value === "comfy-workflow" || value === "result";
+}
 export type GraphPortValueType = "prompt" | GraphMediaType | "result" | "any";
 
 export type GraphInputPortDescriptor = {
@@ -41,6 +45,7 @@ export type GraphMediaItem = Readonly<{
     displayName: string;
     mimeType: string;
     bytes: number;
+    kind?: "library";
     width?: number;
     height?: number;
     durationMs?: number;
@@ -71,6 +76,17 @@ export type GraphModelMetadata = {
     parameters: Record<string, GraphParameterValue>;
 };
 
+export type GraphComfyWorkflowMetadata = {
+    schemaVersion: typeof GRAPH_SCHEMA_VERSION;
+    role: "comfy-workflow";
+    workflowId: string;
+    workflowRevision: number;
+    inputPorts: GraphInputPortDescriptor[];
+    outputPortId: string;
+    /** Always false until the separately verified ComfyUI execution slice. */
+    executionEnabled: false;
+};
+
 export type GraphResultMetadata = {
     schemaVersion: typeof GRAPH_SCHEMA_VERSION;
     role: "result";
@@ -83,6 +99,17 @@ export type GraphResultMetadata = {
 
 export const MAX_GRAPH_PORTS = 32;
 export const SAFE_GRAPH_PORT_ID = /^[A-Za-z][A-Za-z0-9._:-]{0,63}$/;
+
+// 服务端以 job-result.{jobId}.{index} 解析历史任务结果资产(见 server/api/jobs.py 的 _RESULT_ASSET)。
+// 旧版结果节点只记录 sourceJobId,这里按同一契约派生 asset id,使历史结果也能连入新生成节点。
+// 失败/进行中的节点没有可引用的输出,不派生。
+export function deriveResultAssetId(metadata: { sourceJobId?: string; sourceResultIndex?: number; status?: string } | undefined): string | undefined {
+    if (metadata?.status !== undefined && metadata.status !== "success") return undefined;
+    const jobId = metadata?.sourceJobId;
+    if (typeof jobId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(jobId)) return undefined;
+    const index = typeof metadata?.sourceResultIndex === "number" && Number.isInteger(metadata.sourceResultIndex) && metadata.sourceResultIndex >= 0 && metadata.sourceResultIndex < 100 ? metadata.sourceResultIndex : 0;
+    return `job-result.${jobId}.${index}`;
+}
 
 export class InvalidGraphPortDeclarationError extends TypeError {
     constructor() {
@@ -118,7 +145,7 @@ export function isGraphPortValueType(value: unknown): value is GraphPortValueTyp
     return value === "prompt" || value === "image" || value === "video" || value === "audio" || value === "result" || value === "any";
 }
 
-export type CanvasGraphNodeMetadata = GraphPromptMetadata | GraphMediaCollectionMetadata | GraphModelMetadata | GraphResultMetadata;
+export type CanvasGraphNodeMetadata = GraphPromptMetadata | GraphMediaCollectionMetadata | GraphModelMetadata | GraphComfyWorkflowMetadata | GraphResultMetadata;
 
 export type GraphSubmissionInput = Readonly<{
     portId: string;

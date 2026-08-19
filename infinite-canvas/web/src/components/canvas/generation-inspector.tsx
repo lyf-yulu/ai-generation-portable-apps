@@ -19,6 +19,7 @@ function defaultsFor(controls: ParameterControl[]) { return Object.fromEntries(c
 function invalid(control: ParameterControl, value: unknown) {
     if (value === undefined) return Boolean(control.required);
     if (control.type === "string") return typeof value !== "string";
+    if (control.type === "preset") return typeof value !== "string";
     if (control.type === "boolean") return typeof value !== "boolean";
     if (control.type === "number" || control.type === "integer") return typeof value !== "number" || !Number.isFinite(value) || (control.type === "integer" && !Number.isInteger(value)) || (control.minimum !== undefined && value < control.minimum) || (control.maximum !== undefined && value > control.maximum);
     return !control.enum?.some((item) => Object.is(item, value));

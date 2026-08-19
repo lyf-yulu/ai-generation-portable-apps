@@ -18,3 +18,10 @@ export const changeLocalPassword = (currentPassword: string, newPassword: string
         headers: json,
         body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
     });
+
+export const registerLocal = (username: string, displayName: string, password: string) =>
+    apiFetch<{ registered: true }>("/api/v1/auth/register", {
+        method: "POST",
+        headers: json,
+        body: JSON.stringify({ username, display_name: displayName, password }),
+    });

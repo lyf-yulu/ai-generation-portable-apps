@@ -74,6 +74,10 @@ export function getNodePorts(node: CanvasNodeData, registry: Pick<NodeRegistry, 
             targets: inputPorts.map((descriptor) => targetPort(node.id, descriptor.id, descriptor.accepts, descriptor.label)),
         };
     }
+    if (graph?.role === "comfy-workflow") return {
+        sources: [sourcePort(node.id, graph.outputPortId, "result")],
+        targets: graph.inputPorts.map((descriptor) => targetPort(node.id, descriptor.id, descriptor.accepts, descriptor.label)),
+    };
     const definition = registry.getNode(String(node.type));
     if (!definition) return { sources: [], targets: [] };
     return {
@@ -198,7 +202,7 @@ function portsAreCompatible(source: GraphPortRef, target: GraphPortRef, sourceNo
     const targetGraph = targetNode.metadata?.graph;
     if (targetGraph?.role === "result" && target.portId === targetGraph.inputPortId) {
         const sourceGraph = sourceNode.metadata?.graph;
-        return sourceGraph?.role === "model" && source.portId === sourceGraph.outputPortId && source.valueType === "result" && target.valueType === "result";
+        return (sourceGraph?.role === "model" || sourceGraph?.role === "comfy-workflow") && source.portId === sourceGraph.outputPortId && source.valueType === "result" && target.valueType === "result";
     }
     const standard = targetGraph?.role === "model" || targetNode.type === "config" ? STANDARD_MODEL_INPUT_PORTS[target.portId] : undefined;
     if (standard) return source.valueType === standard.accepts;

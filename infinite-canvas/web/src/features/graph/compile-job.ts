@@ -1,6 +1,7 @@
 import type { JobRequest, ModelSpec } from "@/api/contracts";
 import { parameterControls } from "@/components/model-picker";
 import type { CanvasConnection, CanvasNodeData } from "@/types/canvas";
+import { deriveResultAssetId } from "./contracts";
 import { declaredModelPorts } from "./model-capabilities";
 
 export type FrozenGraphJob = Readonly<{
@@ -20,6 +21,7 @@ function validateParameter(control: ReturnType<typeof parameterControls>[number]
     if (value === undefined) return !control.required;
     if (control.type === "enum") return control.enum?.some((candidate) => Object.is(candidate, value)) === true;
     if (control.type === "string") return typeof value === "string";
+    if (control.type === "preset") return typeof value === "string";
     if (control.type === "boolean") return typeof value === "boolean";
     return typeof value === "number" && Number.isFinite(value) && (control.type !== "integer" || Number.isInteger(value))
         && (control.minimum === undefined || value >= control.minimum) && (control.maximum === undefined || value <= control.maximum);
@@ -43,10 +45,17 @@ export function compileGraphJob(nodes: readonly CanvasNodeData[], connections: r
         if (port.media_type === "text") continue;
         const assetIds: string[] = [];
         for (const connection of incoming.filter((edge) => edge.toPortId === port.port_id)) {
-            const source = nodeMap.get(connection.fromNodeId)?.metadata?.graph;
-            if (source?.role === "media-collection" && source.mediaType === port.media_type) assetIds.push(...source.items.map((item) => item.assetId));
-            else if (source?.role === "result" && source.mediaType === port.media_type && source.assetId) assetIds.push(source.assetId);
-            else throw new CompileJobError(`${port.port_id} 的连接类型不正确。`);
+            const sourceNode = nodeMap.get(connection.fromNodeId);
+            const source = sourceNode?.metadata?.graph;
+            if (source?.role === "media-collection" && source.mediaType === port.media_type) {
+                assetIds.push(...source.items.map((item) => item.assetId));
+            } else if (source?.role === "result" && source.mediaType === port.media_type) {
+                const assetId = source.assetId ?? deriveResultAssetId(sourceNode?.metadata);
+                if (!assetId) throw new CompileJobError(`${port.port_id} 的连接类型不正确。`);
+                assetIds.push(assetId);
+            } else {
+                throw new CompileJobError(`${port.port_id} 的连接类型不正确。`);
+            }
         }
         if (assetIds.length < port.min_items) throw new CompileJobError(`${port.port_id} 至少需要 ${port.min_items} 个输入。`);
         if (assetIds.length > port.max_items) throw new CompileJobError(`${port.port_id} 最多允许 ${port.max_items} 个输入。`);

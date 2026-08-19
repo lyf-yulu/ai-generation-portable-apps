@@ -31,6 +31,50 @@ it("creates an image edit node when the assigned catalog has no image generate m
     expect(model?.metadata?.graph).toMatchObject({ modelId: "chiyun-gpt-image-2", operation: "image.edit" });
 });
 
+it("repairs a stored model node with missing ports once the catalog is available", async () => {
+    await setStorageScope({ environment: "test", userId: "u-a" });
+    const projectId = useCanvasStore.getState().createProject("Canvas");
+    const stored: CanvasNodeData = {
+        id: "stored-model",
+        type: CanvasNodeType.Config,
+        title: "图片生成",
+        position: { x: 10, y: 20 },
+        width: 300,
+        height: 140,
+        metadata: {
+            status: "idle",
+            model: "demo-image-v1",
+            graph: {
+                schemaVersion: 1,
+                role: "model",
+                modelId: "demo-image-v1",
+                operation: "image.generate",
+                inputPorts: [],
+                outputPortId: "result",
+                parameters: {},
+            },
+        },
+    };
+    useCanvasStore.getState().updateProject(projectId, { nodes: [stored] });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ models: [{
+        model_id: "demo-image-v1", service_id: "demo-image", display_name: "本地演示图片",
+        operations: ["image.generate"], input_media: ["text", "image"],
+        input_ports: [
+            { port_id: "prompt", media_type: "text", min_items: 1, max_items: 1 },
+            { port_id: "reference_images", media_type: "image", min_items: 0, max_items: 4 },
+        ],
+        parameter_mappings: {}, parameter_schema: {},
+    }] }), { headers: { "content-type": "application/json" } })));
+    render(<MemoryRouter initialEntries={[`/canvas/${projectId}`]}><Routes><Route path="/canvas/:id" element={<CanvasProjectPage />} /></Routes></MemoryRouter>);
+
+    await waitFor(() => {
+        const model = useCanvasStore.getState().openProject(projectId)?.nodes.find((node) => node.id === "stored-model");
+        expect(model?.metadata?.graph?.role === "model" ? model.metadata.graph.inputPorts.map((port) => port.id) : []).toEqual(["prompt", "reference_images"]);
+    });
+    const repaired = useCanvasStore.getState().openProject(projectId)!.nodes.find((node) => node.id === "stored-model")!;
+    expect(getNodePorts(repaired).targets.map((port) => port.portId)).toEqual(["prompt", "reference_images"]);
+});
+
 it("submits canvas image generation through jobs and writes its result node", async () => {
     await setStorageScope({ environment: "test", userId: "u-a" });
     const projectId = useCanvasStore.getState().createProject("Canvas");
