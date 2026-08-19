@@ -91,7 +91,11 @@ class JobsListWorkspaceIdTests(unittest.TestCase):
         try:
             req = urllib.request.Request(
                 f"http://{host}:{port}/api/jobs",
-                headers={"X-Is-Admin": "1"},
+                # Exercise the normal user-level history scope. A bare
+                # X-Is-Admin header is intentionally ignored unless Portal
+                # signs it, so identifying the fixture owner is the correct
+                # way to retrieve Alice's jobs here.
+                headers={"X-Username": "alice"},
             )
             with urllib.request.urlopen(req, timeout=5) as resp:
                 self.assertEqual(resp.status, 200)

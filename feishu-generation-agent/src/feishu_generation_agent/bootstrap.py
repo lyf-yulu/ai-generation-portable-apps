@@ -1,6 +1,8 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import httpx
 from langchain_anthropic import ChatAnthropic
@@ -41,7 +43,11 @@ from feishu_generation_agent.integrations.production_routing import (
 from feishu_generation_agent.integrations.safe_download import (
     SafeResultDownloader,
 )
+from feishu_generation_agent.integrations.character_semantic_matcher import (
+    DeepSeekCharacterMatcher,
+)
 from feishu_generation_agent.integrations.seedance import SeedanceVideoGenerator
+from feishu_generation_agent.integrations.seedream import SeedreamImageGenerator
 from feishu_generation_agent.integrations.public_media import (
     TosPublicMediaHost,
     UguuPublicMediaHost,
@@ -54,6 +60,7 @@ from feishu_generation_agent.integrations.vision import ClaudeVisionAnalyzer
 from feishu_generation_agent.storage.files import FileStore
 from feishu_generation_agent.storage.bitable_tasks import BitableTaskStore
 from feishu_generation_agent.storage.production_tasks import ProductionTaskStore
+from feishu_generation_agent.storage.asset_library import AssetLibraryStore
 from feishu_generation_agent.storage.portrait_assets import PortraitAssetStore
 from feishu_generation_agent.storage.provider_results import ProviderResultStore
 from feishu_generation_agent.storage.planner_prompts import PlannerPromptStore
@@ -112,6 +119,65 @@ def runtime_is_configured(settings: Settings) -> bool:
             or capability_is_configured(settings, "production_bitable")
             or capability_is_configured(settings, "legacy_delivery")
         )
+    )
+
+
+def build_image_providers(
+    settings: Settings,
+    http_client: Any,
+    *,
+    staging_dir: Path,
+    result_downloader: Any | None,
+    max_result_bytes: int,
+) -> dict[str, Any]:
+    """构建图片模式的 provider registry。
+
+    banana 与 gpt-image2 都走 chiyun 中转，由 ChiyunImageGenerator 按 model
+    名前缀自动分流（gpt-image* → OpenAI 风格，其余 → Gemini 风格），
+    因此只需用不同 model 各实例化一次。seedream 走火山方舟，复用 seedance
+    的 ark 传输层。
+    """
+    providers: dict[str, Any] = {}
+    if settings.chiyun_api_key is not None:
+        models = {
+            "banana": settings.banana_model,
+            "gpt-image2": settings.gpt_image_model,
+        }
+        providers.update(
+            {
+                name: ChiyunImageGenerator(
+                    http_client,
+                    base_url=settings.chiyun_base_url,
+                    api_key=settings.chiyun_api_key,
+                    model=model,
+                    staging_dir=staging_dir,
+                    result_downloader=result_downloader,
+                    max_result_bytes=max_result_bytes,
+                    # 必须以 registry 的键自报身份，否则 nodes.py 的
+                    # provider 一致性校验会把成功的出图判成失败。
+                    provider_name=name,
+                )
+                for name, model in models.items()
+            }
+        )
+    if settings.ark_api_key is not None:
+        providers["seedream"] = SeedreamImageGenerator(
+            http_client,
+            base_url=settings.ark_base_url,
+            api_key=settings.ark_api_key,
+            model=settings.seedream_model,
+            staging_dir=staging_dir,
+            result_downloader=result_downloader,
+            max_result_bytes=max_result_bytes,
+        )
+    return providers
+
+
+async def open_asset_library_store(settings: Settings) -> AssetLibraryStore:
+    return await AssetLibraryStore.open(
+        db_path=settings.asset_library_db_path,
+        assets_dir=settings.asset_library_dir,
+        base_url=settings.asset_base_url,
     )
 
 
@@ -224,6 +290,7 @@ async def _open_application_services(
     file_store: FileStore | None = None
     bitable_factory: BitableServiceFactory | ProductionBitableServiceFactory | None = None
     portrait_store: PortraitAssetStore | None = None
+    asset_library_store: AssetLibraryStore | None = None
     try:
         provider_results = ProviderResultStore(
             settings.data_dir / "provider-results",
@@ -278,6 +345,11 @@ async def _open_application_services(
             max_retries=2,
             timeout=120,
         )
+        # 素材库打不开不该阻断整个 agent：图片模式退化成人工挂参考图。
+        try:
+            asset_library_store = await open_asset_library_store(settings)
+        except Exception:
+            asset_library_store = None
         vision_options = {
             "api_key": settings.claude_api_key,
             "model_name": settings.claude_model,
@@ -347,14 +419,27 @@ async def _open_application_services(
                     ),
                     expected_task_type="真人类",
                 )
+            if settings.lark_image_bitable_url and settings.lark_image_table_id:
+                # 图片需求在另一张表，不是主表的视图，所以单独解析 location。
+                production_sources["image"] = ProductionTaskSource(
+                    parse_bitable_url(
+                        settings.lark_image_bitable_url,
+                        settings.lark_image_table_id,
+                        settings.lark_image_view_id or "",
+                    ),
+                    expected_task_type="",
+                    planning_mode="image",
+                    declared_task_type="图片类",
+                )
             production_factory = ProductionBitableServiceFactory(
                 bitable=ProductionBitableClient(feishu),
                 store=production_store,
                 sources=production_sources,
                 include_completed_for_test=settings.lark_include_completed_for_test,
                 enabled_task_types=(
-                    frozenset({"动画类", "真人类"})
-                    if portrait_generator is not None else frozenset({"动画类"})
+                    frozenset({"动画类", "真人类", "图片类"})
+                    if portrait_generator is not None
+                    else frozenset({"动画类", "图片类"})
                 ),
             )
             production_writer = ProductionResultWriter(
@@ -363,6 +448,10 @@ async def _open_application_services(
                 repository=repository,
                 result_folder_token=settings.lark_result_folder_token or "",
             )
+            if isinstance(delivery_writer, RoutingDeliveryWriter):
+                # 直连入口的 run 没有任何 bitable 绑定：legacy 未配置时
+                # 统一结果表兜底，避免产出无处可去（2026-08-18 线上故障根因）。
+                delivery_writer.set_fallback(production_writer)
             delivery_writer = ProductionRoutingDeliveryWriter(
                 production_store,
                 production=production_writer,
@@ -395,6 +484,14 @@ async def _open_application_services(
                 result_downloader=downloader,
                 max_result_bytes=settings.max_download_bytes,
             ),
+            image_providers=build_image_providers(
+                settings,
+                provider_http,
+                staging_dir=settings.data_dir / "provider-results",
+                result_downloader=downloader,
+                max_result_bytes=settings.max_download_bytes,
+            )
+            or None,
             video_generator=SeedanceVideoGenerator(
                 provider_http,
                 base_url=settings.ark_base_url,
@@ -408,6 +505,12 @@ async def _open_application_services(
             repository=repository,
             file_store=file_store,
             settings=settings,
+            asset_library_store=asset_library_store,
+            character_matcher=(
+                DeepSeekCharacterMatcher(planner_model)
+                if asset_library_store is not None
+                else None
+            ),
         )
         yield ApplicationServices(
             graph=services,
@@ -422,6 +525,8 @@ async def _open_application_services(
             file_store.close()
         if portrait_store is not None:
             await portrait_store.close()
+        if asset_library_store is not None:
+            await asset_library_store.close()
         await feishu.close()
         await downloader.aclose()
         await provider_http.aclose()

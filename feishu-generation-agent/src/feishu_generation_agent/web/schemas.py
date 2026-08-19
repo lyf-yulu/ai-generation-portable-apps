@@ -3,6 +3,7 @@ from urllib.parse import quote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from feishu_generation_agent.domain.asset_library import CharacterAsset
 from feishu_generation_agent.domain.document import RequirementRequest
 from feishu_generation_agent.domain.plan import (
     ApprovalDecision,
@@ -17,6 +18,8 @@ class CreateRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     source_url: str = Field(min_length=1)
+    # 直连文档时由调用方声明产出类型；多维表格来的 run 走 binding 判定。
+    planning_mode: Literal["video", "image"] = "video"
 
     @field_validator("source_url")
     @classmethod
@@ -29,7 +32,10 @@ class CreateRunRequest(BaseModel):
         return f"https://{hostname.lower()}/{source_type.value}/{quote(token, safe='')}"
 
     def to_domain(self) -> RequirementRequest:
-        return RequirementRequest(source_url=self.source_url.strip())
+        return RequirementRequest(
+            source_url=self.source_url.strip(),
+            planning_mode=self.planning_mode,
+        )
 
 
 class DecisionRequest(BaseModel):
@@ -96,3 +102,62 @@ class BitableClaimResponse(BaseModel):
 
 class BitableRetryResponse(BitableClaimResponse):
     status: Literal["accepted"] = "accepted"
+
+
+class AssetLibraryItem(BaseModel):
+    asset_id: str
+    name: str
+    variant: str
+    kind: str
+    description: str
+    aliases: list[str]
+    tags: list[str]
+    model_prefs: list[str]
+    prompt_fragment: str
+    url: str
+    mime_type: str
+    byte_size: int
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_domain(cls, asset: CharacterAsset) -> "AssetLibraryItem":
+        return cls(
+            asset_id=asset.asset_id,
+            name=asset.name,
+            variant=asset.variant,
+            kind=asset.kind.value,
+            description=asset.description,
+            aliases=list(asset.aliases),
+            tags=list(asset.tags),
+            model_prefs=list(asset.model_prefs),
+            prompt_fragment=asset.prompt_fragment,
+            url=asset.storage_url,
+            mime_type=asset.mime_type,
+            byte_size=asset.byte_size,
+            created_at=asset.created_at.isoformat(),
+            updated_at=asset.updated_at.isoformat(),
+        )
+
+
+class AssetLibraryListResponse(BaseModel):
+    items: list[AssetLibraryItem]
+    total: int
+
+    @classmethod
+    def from_domain(
+        cls, assets: list[CharacterAsset]
+    ) -> "AssetLibraryListResponse":
+        items = [AssetLibraryItem.from_domain(asset) for asset in assets]
+        return cls(items=items, total=len(items))
+
+
+class AssetLibraryUpdateRequest(BaseModel):
+    name: str | None = None
+    variant: str | None = None
+    kind: str | None = None
+    description: str | None = None
+    aliases: list[str] | None = None
+    tags: list[str] | None = None
+    model_prefs: list[str] | None = None
+    prompt_fragment: str | None = None

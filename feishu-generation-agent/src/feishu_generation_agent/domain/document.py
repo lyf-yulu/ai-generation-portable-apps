@@ -320,6 +320,8 @@ class RequirementRequest(BaseModel):
     trigger_type: str = "local_link"
     reply_context: dict[str, str] = Field(default_factory=dict)
     planning_prompt: PlanningPromptSnapshot | None = None
+    # 直连文档创建的 run 没有多维表格 binding，模式在创建时声明。
+    planning_mode: Literal["video", "image"] = "video"
 
 
 class DocumentBlock(BaseModel):

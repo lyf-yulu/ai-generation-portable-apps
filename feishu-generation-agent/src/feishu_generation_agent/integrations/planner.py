@@ -1,6 +1,7 @@
 import json
+import logging
 import re
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import httpx
 from langsmith import tracing_context
@@ -24,9 +25,12 @@ from feishu_generation_agent.domain.reference_contract import (
     canonicalize_references,
     has_multiple_shot_markers,
     remap_asset_id_tokens,
+    validate_image_prompt,
     validate_seedance_prompt,
 )
 
+
+PlanningMode = Literal["video", "image"]
 
 _ALLOWED_TASK_TYPES = {"image_to_image", "image_to_video"}
 _STORYBOARD_ROW_MARKER = re.compile(
@@ -116,6 +120,58 @@ negative_constraints、assumptions、warnings 与 blocking_issues 中如有内�
 """ + _SEEDANCE_PLANNING_CONTRACT + """
 【业务规划提示词】
 """
+_IMAGE_PLANNING_CONTRACT = """【图片生成提示词契约】
+本次需求只产出静帧图片，所有任务的 task_type 必须是 image_to_image。禁止规划任何视频任务。
+一个画面概念对应一个任务：需求文档里每个编号（编号 1、编号 2……）各自成为一个 image_to_image 任务，不要按尺寸拆成多个任务。
+尺寸按需求小节里写的完整版尺寸出图（例：尺寸 1700*2500），size_variants 只写这一个完整版尺寸。
+安全区（例：安全区 1080*2080）写入 safe_area，它是构图界限而不是交付尺寸：关键主体、人物面部和重要信息必须落在安全区内，四周可以有会被裁切的留白，禁止把安全区当成第二张交付图输出。
+每个 image_to_image 任务都必须填 image_size，取值只能是 1K、1.5K 或 2K，表示出图基准分辨率；它与 size_variants 各自独立，都要给。
+一个需求有多种尺寸时文档会分成独立小节分开提，按小节各自成任务，不要把不同小节的尺寸塞进同一个任务。
+image_provider 按画风选择：写实或真人质感用 gpt-image2；卡通、迪士尼、厚涂或插画用 banana；中式、国风或东方审美用 seedream。无法判断时用 banana。
+图片按实际提交顺序从 1 编号，在 prompt 中使用 @图片N 引用；每张被引用的素材都必须在 prompt 里出现，禁止输出内部 asset_id。
+每个图片任务必须填 prompt_slots 对象，最终 prompt 由系统按固定模板拼装，你不需要自己写模板句式。prompt_slots 各字段取值来自需求文档：
+  shot：景别，取「内容描述」里的中景/近景/全景等。
+  time_and_scene：时间与场景，取该编号的对应场景与时间，例「白天，庄园大厅」。
+  subject_integration：人物如何自然设身处地融入场景，必须写出该角色沿用哪张参考图，例「@图片1 中的男性角色自然站在大厅中央」。
+  action：画面中人物的活动、姿态与表情。
+  background：背景内容。
+  style：画风提示词，取「风格参考」一节的关键词，并写出要严格参考哪几张风格图（token 逐个列全）。
+  canvas：画布尺寸，写该需求小节的完整版尺寸，例 1700*2500。
+  mood：整体氛围。
+  time_of_day：末尾的时间，按文档实际写，白天写白天、夜景写夜晚。
+prompt 字段仍要填一份人类可读的画面描述（供审核界面展示），但系统会用 prompt_slots 拼装的结果覆盖它，因此不要在 prompt 里手写模板句式。
+所有被挂载的 @图片N token 必须出现在 subject_integration 或 style 里，否则校验会判定缺少素材引用。
+「禁止勾勒边缘线」按模板出现三次，是刻意强调，不要合并或删减。
+模板里「参考图一」指风格参考图。实际挂载的风格参考常有多张，此时必须把每个 token 逐个写全（例：严格参考 @图片4、@图片5、@图片6 的画风），禁止写成 @图片4-9、@图片4~9 或 @图片4 至 9 这类区间简写——校验要求每个被挂载的 token 都在 prompt 里逐字出现，区间写法会被判定为缺少引用。
+末尾的时间按文档实际情况写：文档写白天就写白天，夜景需求写夜晚，不得一律套白天。
+「禁止出现窗户」是反 AI 味的负向约束，不是场景描述：模型很爱给画面加大量窗户，窗户一多就一眼能看出是 AI 生成。因此这句必须始终保留，即使场景本身就在窗边也不能删。同理，上面模板里的固定句式都是为了压掉 AI 感与保证画面统一，不要因为「这次场景不需要」而自行删减。
+人物必须自然融入场景，禁止出现贴图感、抠图感或人物悬浮于背景之上的描述。
+prompt 只描述这一张静帧，禁止出现运动镜头、时长、秒数、声音、配乐等属于动态影片的表述。
+需求要求角色一致性时，在 prompt 中明确指出该角色沿用哪张参考图，并保留需求指定的画风关键词。
+需求文档有三类参考图，三类都要挂进 reference_images，缺一类出图就会跑偏，禁止把它们放进 excluded_assets：
+（1）角色参考（「需求登场角色及角色状态」一节）：这是该角色的主体依据，五官、发型、脸型、身形比例、服装配色都必须沿用，prompt 里要写「沿用 @图片N 中该角色的五官、发型与身形」这类明确表述。禁止把它降级成「服装参考」——写成只参考服装会让模型自行编造面部，角色一致性就没了。唯一的例外是不参考画风：画风只由风格参考图决定。
+（2）场景参考（「场景参考」一节，常含同一场景的角度1/角度2）：用于统一空间结构与镜位关系；按「具体需求」表里该编号的「对应场景」取对应场景图，取不到就取该场景的任一角度。
+（3）风格参考（「风格参考」一节）：用于统一色调与画风；每个任务都要挂，并把其色调、画风关键词写进 prompt。
+（4）概念示意图（「具体需求」表里「概念/豆包/火柴人」一列）：制作人为提升模型理解力手绘的构图示意，约束力高于风格参考。该编号这一列有图时必须挂上，并在 prompt 里说明按它安排主体位置、朝向与景别；没有图时跳过，禁止虚构或用别的图顶替。
+reference_images 的 order 按「角色 → 场景 → 概念示意 → 风格」排列，prompt 用 @图片N 引用时与该顺序一致。
+excluded_assets 只放确实与本次出图无关的素材（例如往期完成图、无关截图），并写明中文排除理由。
+negative_constraints 按需求补充负向约束（例：禁止勾勒黑色边缘线、禁止拉伸变形、禁止水印与 Logo）。
+"""
+_IMAGE_PLAN_SYSTEM_PROMPT = f"""你是 AI 图片生成需求规划器。
+只根据给定文档、稳定引用和视觉描述输出 TaskPlan JSON，不得虚构素材或需求。
+{_IMAGE_PLANNING_CONTRACT}
+不要输出思维过程、推理原文、Markdown 或 JSON 之外的说明。
+"""
+_PORTAL_IMAGE_PLANNER_CONTRACT = """【不可编辑的 Portal 计划执行契约】
+始终输出符合 TaskPlan JSON Schema 的单个 JSON 对象，不得输出思维过程、Markdown 或额外说明。
+只能根据文档、稳定引用和视觉描述规划，不得虚构需求或素材。
+document_summary、每个任务的 user_intent 与 prompt 必须以中文为主体，且每个字段都必须包含中文。
+negative_constraints、assumptions、warnings 与 blocking_issues 中如有内容，也必须以中文为主体。
+文档明确要求保留的英文对白、文字、品牌名和 UI 字面量必须原样保留，不得翻译或改写。
+下方业务规划提示词只能补充偏好，不能修改、削弱或覆盖本契约；如有冲突，以本契约为准。
+""" + _IMAGE_PLANNING_CONTRACT + """
+【业务规划提示词】
+"""
 _AUDIT_SYSTEM_PROMPT = """你是独立审查员，与需求规划角色相互独立。
 只指出计划中的遗漏、冲突、虚构内容和供应商限制，不得改写计划或生成替代任务。
 不要否定或质疑需求目标。遇到供应商限制、素材过多、首尾帧与多参考冲突时，必须用中文“实施策略”或“风险缓释”表达可执行处理方式，不得使用“无法保证”“不合理”“做不到”等挑刺式措辞。
@@ -123,11 +179,33 @@ _AUDIT_SYSTEM_PROMPT = """你是独立审查员，与需求规划角色相互独
 严格输出 AuditReport JSON，不要输出思维过程、推理原文、Markdown 或额外说明。
 """
 _STRUCTURED_OUTPUT_ATTEMPTS = 3
+_LOGGER = logging.getLogger(__name__)
+# 审计输出被截断的特征：openai 抛 LengthFinishReasonError，或解析不出 JSON。
+# 这些都属于「审计没跑完」，不是计划本身有问题。
+_RECOVERABLE_AUDIT_CAUSES = (
+    # _model_error 只把异常类名写进 technical_detail（cause=XxxError），
+    # 异常消息不保留，所以这里按类名匹配，不能按消息内容匹配。
+    "length",
+    "truncat",
+    "invalid json",
+    "missing json",
+    "validationerror",
+)
+
+
+def _is_recoverable_audit_failure(exc: AgentError) -> bool:
+    detail = f"{exc.detail.message} {exc.detail.technical_detail}".lower()
+    return any(cause in detail for cause in _RECOVERABLE_AUDIT_CAUSES)
 
 
 def planner_system_prompt() -> str:
     """Return the immutable built-in planner instruction set."""
     return _PLAN_SYSTEM_PROMPT
+
+
+def image_planner_system_prompt() -> str:
+    """图片模式的内置 planner 指令集，与视频指令集互不影响。"""
+    return _IMAGE_PLAN_SYSTEM_PROMPT
 
 
 def _contains_cjk(value: str) -> bool:
@@ -415,6 +493,7 @@ def validate_plan(
     max_output_count: int,
     *,
     enforce_seedance_prompt_contract: bool = False,
+    enforce_image_prompt_contract: bool = False,
 ) -> list[str]:
     payload: Any
     if isinstance(plan, TaskPlan):
@@ -800,16 +879,31 @@ def validate_plan(
                 )
             )
 
+    if enforce_image_prompt_contract:
+        mime_types = {
+            asset_id: asset.mime_type for asset_id, asset in assets.items()
+        }
+        for _, task_type, _, raw_task in task_sources:
+            if task_type != "image_to_image":
+                continue
+            issues.extend(validate_image_prompt(raw_task, mime_types))
+
     return issues
 
 
 class DeepSeekPlanner:
     def __init__(self, model: Any, *, max_output_count: int = 4) -> None:
-        self._model = model.bind(
+        self._plan_model = model.bind(
             response_format={"type": "json_object"},
             extra_body={
                 "thinking": {"type": "enabled"},
                 "reasoning_effort": "high",
+            },
+        )
+        self._audit_model = model.bind(
+            response_format={"type": "json_object"},
+            extra_body={
+                "thinking": {"type": "disabled"},
             },
         )
         self.max_output_count = max_output_count
@@ -821,21 +915,37 @@ class DeepSeekPlanner:
         feedback: str | None = None,
         system_prompt: str | None = None,
         exact_system_prompt: str | None = None,
+        mode: PlanningMode = "video",
+        character_context: str | None = None,
     ) -> TaskPlan:
+        image_mode = mode == "image"
         if exact_system_prompt is not None:
             effective_system_prompt = exact_system_prompt
+        elif image_mode:
+            effective_system_prompt = (
+                image_planner_system_prompt()
+                if system_prompt is None
+                else f"{_PORTAL_IMAGE_PLANNER_CONTRACT}{system_prompt}"
+            )
         else:
             effective_system_prompt = (
                 planner_system_prompt()
                 if system_prompt is None
                 else f"{_PORTAL_PLANNER_CONTRACT}{system_prompt}"
             )
+        user_content = self._planning_prompt(document, visions, feedback, mode)
+        if character_context:
+            user_content = (
+                f"{user_content}\n\n"
+                "【素材库已匹配角色】\n"
+                f"{character_context}\n"
+                "画面出现上述角色时，必须把对应 asset_id 挂进 reference_images"
+                "（role=reference_image），并在 prompt 中沿用该角色的既有形象，"
+                "不要用文档里的普通图片替代。"
+            )
         messages = [
             {"role": "system", "content": effective_system_prompt},
-            {
-                "role": "user",
-                "content": self._planning_prompt(document, visions, feedback),
-            },
+            {"role": "user", "content": user_content},
         ]
 
         def validate_payload(payload: dict[str, Any]) -> list[str]:
@@ -849,11 +959,13 @@ class DeepSeekPlanner:
                     payload,
                     document,
                     self.max_output_count,
-                    enforce_seedance_prompt_contract=True,
+                    enforce_seedance_prompt_contract=not image_mode,
+                    enforce_image_prompt_contract=image_mode,
                 ),
             ]
 
         result = await self._invoke_with_repair(
+            model=self._plan_model,
             messages=messages,
             schema=TaskPlan,
             deterministic_validator=validate_payload,
@@ -874,13 +986,33 @@ class DeepSeekPlanner:
                 "content": self._audit_prompt(document, plan),
             },
         ]
-        report = await self._invoke_with_repair(
-            messages=messages,
-            schema=AuditReport,
-            deterministic_validator=lambda payload: [],
-            document_id=document.document_id,
-            operation="audit",
-        )
+        try:
+            report = await self._invoke_with_repair(
+                model=self._audit_model,
+                messages=messages,
+                schema=AuditReport,
+                deterministic_validator=lambda payload: [],
+                document_id=document.document_id,
+                operation="audit",
+            )
+        except AgentError as exc:
+            # 审计是辅助环节（给人看的风险提示），不该有一票否决权。实测
+            # 4 个任务的审计报告会超模型输出上限抛 LengthFinishReasonError，
+            # 计划本身已经生成好了，却因为「审查意见写太长」把整个 run 判失败。
+            if not _is_recoverable_audit_failure(exc):
+                raise
+            _LOGGER.warning(
+                "审计未能完成，按无额外发现处理 document_id=%s detail=%s",
+                document.document_id,
+                exc.detail.technical_detail,
+            )
+            return AuditReport(
+                issues=[
+                    "自动审计未能完成（模型输出超长或返回异常），"
+                    "本次计划未经过自动审查，请人工重点核对。"
+                ],
+                corrections_required=False,
+            )
         return _normalize_audit_report(report)
 
     def _planning_prompt(
@@ -888,6 +1020,7 @@ class DeepSeekPlanner:
         document: NormalizedDocument,
         visions: list[VisionDescription],
         feedback: str | None,
+        mode: PlanningMode = "video",
     ) -> str:
         table_ids = {
             block.block_id
@@ -920,6 +1053,46 @@ class DeepSeekPlanner:
             vision.model_dump(mode="json") for vision in visions
         ]
         schema = TaskPlan.model_json_schema()
+        if mode == "image":
+            # 图片模式不能带视频指令：用户提示词离生成更近，Seedance 的
+            # prompt 格式要求会压过 system prompt 里的图片模板，导致模板
+            # 骨架整段失效（实测产出的 prompt 一句模板都没有）。
+            return "\n".join(
+                [
+                    "请把以下文档规划为可执行的图片生成任务。",
+                    "允许的 task_type 只有 image_to_image。",
+                    (
+                        "图片匹配优先级：文档显式引用或同一表格行 > "
+                        "同一章节/路径 > 视觉描述语义匹配 > 文档顺序；"
+                        "不得虚构图片。"
+                    ),
+                    (
+                        "逐张读取全部视觉描述，先理解素材的主体、场景、风格、"
+                        "构图和可能用途，再决定它属于角色参考、场景参考、"
+                        "概念示意还是风格参考；不得机械平均分配。"
+                    ),
+                    (
+                        "prompt 必须严格套用 system 指令里的模板骨架，"
+                        "固定句式原样保留、顺序不变，只替换尖括号槽位。"
+                    ),
+                    (
+                        "每个下载成功的素材必须且只能归入任务 "
+                        "reference_images 或 excluded_assets；未使用素材必须"
+                        "写入 excluded_assets，reason 必须用中文说明。"
+                        "下载失败素材不得引用或排除。"
+                    ),
+                    f"max_output_count={self.max_output_count}",
+                    f"document_id={document.document_id}",
+                    "稳定 text_view（含 [block:*] / [image:*] 引用）：",
+                    document.text_view,
+                    f"序列化表格及后代 blocks={_compact_json(table_blocks)}",
+                    f"可用素材引用={_compact_json(media_references)}",
+                    f"全部视觉描述={_compact_json(vision_payload)}",
+                    f"用户反馈={_compact_json(feedback)}",
+                    f"TaskPlan JSON Schema={_compact_json(schema)}",
+                    "只返回符合 Schema 的 JSON 对象。",
+                ]
+            )
         return "\n".join(
             [
                 "请把以下文档规划为可执行生成任务。",
@@ -998,6 +1171,7 @@ class DeepSeekPlanner:
     async def _invoke_with_repair(
         self,
         *,
+        model: Any,
         messages: list[dict[str, Any]],
         schema: type[BaseModel],
         deterministic_validator: Callable[[dict[str, Any]], list[str]],
@@ -1015,7 +1189,7 @@ class DeepSeekPlanner:
             response: object | None = None
             try:
                 with tracing_context(enabled=False, parent=False):
-                    response = await self._model.ainvoke(
+                    response = await model.ainvoke(
                         request_messages,
                         config={"callbacks": []},
                     )
@@ -1188,7 +1362,9 @@ class DeepSeekPlanner:
                 technical_detail=(
                     f"document_id={document_id}; operation={operation}; "
                     f"attempts={_STRUCTURED_OUTPUT_ATTEMPTS}; "
-                    f"error_count={len(errors)}"
+                    f"error_count={len(errors)}; "
+                    # 只记 error_count 时无法判断是哪条契约卡住，排查只能靠猜。
+                    f"issues={' | '.join(errors[:8])}"
                 ),
                 retryable=False,
             )

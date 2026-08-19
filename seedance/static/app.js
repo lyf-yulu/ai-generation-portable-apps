@@ -24,9 +24,9 @@ function getActiveWorkspaceId() {
   return window._activeWorkspaceId || workspaceId();
 }
 
-async function api(url, method, body) {
+async function api(url, method, body, workspaceOverride) {
   try {
-    const wsId = getActiveWorkspaceId();
+    const wsId = workspaceOverride || getActiveWorkspaceId();
     const sep = url.includes('?') ? '&' : '?';
     const urlWithWs = url + sep + 'ws=' + encodeURIComponent(wsId);
     const headers = { 'X-Workspace-Id': wsId };
@@ -48,9 +48,9 @@ async function api(url, method, body) {
 //                     cleared its in-memory JOBS). Poll stops cleanly.
 //   {kind:'error'}    network error / timeout / 5xx / non-JSON — transient,
 //                     caller retries with backoff.
-async function pollJobOnce(url) {
+async function pollJobOnce(url, workspaceOverride) {
   try {
-    const wsId = getActiveWorkspaceId();
+    const wsId = workspaceOverride || getActiveWorkspaceId();
     const sep = url.includes('?') ? '&' : '?';
     const urlWithWs = url + sep + 'ws=' + encodeURIComponent(wsId);
     const headers = { 'X-Workspace-Id': wsId };
@@ -119,10 +119,14 @@ function wireFileDrop(drop, input, name) {
     const localUrl = URL.createObjectURL(f);
     showPreview(drop, name, localUrl, f.name);
     // Upload to server so the file survives tab switch / refresh / archive save.
+    // The upload is owned by the topic that was active when the file was picked;
+    // a response arriving after a topic switch must not touch the new topic.
+    const ownerWsId = getActiveWorkspaceId();
     try {
       const fd = new FormData();
       fd.set(input.name, f);
-      const res = await api(APP_PATH + '/api/media/upload', 'POST', fd);
+      const res = await api(APP_PATH + '/api/media/upload', 'POST', fd, ownerWsId);
+      if (getActiveWorkspaceId() !== ownerWsId) return;
       if (res && res.stored) {
         const app = window._app_sd;
         const media = (app && app.savedMedia) || window._currentSavedMedia || {};
@@ -217,7 +221,17 @@ function providersFromConfig(providers) {
       base_url: p.base_url || '',
       models: (p.models || []).map(m => {
         if (typeof m === 'string') return { id: m, label: m };
-        return { id: m.id || m, label: m.label || m.id || m };
+        return {
+          id: m.id || m,
+          label: m.label || m.id || m,
+          // Per-model capability limits from providers.json. Ark rejects an
+          // out-of-range value only after the job is queued, so the form has to
+          // narrow itself when the model changes.
+          duration_range: m.duration_range || null,
+          resolutions: m.resolutions || null,
+          ratios: m.ratios || null,
+          defaults: m.defaults || null,
+        };
       }),
       hint: p.hint || '',
       label: p.label || id,
@@ -233,9 +247,31 @@ function providersFromConfig(providers) {
 const FALLBACK_PROVIDERS = {
   volcengine: {
     base_url: 'https://ark.cn-beijing.volces.com/api/v3',
+    // Capability limits must be repeated here, not just in providers.json:
+    // this list is what applyModelLimits() reads when /api/config fails, and
+    // without them the form would silently stop narrowing itself.
     models: [
-      { id: 'doubao-seedance-2-0-260128', label: 'doubao-seedance-2-0-260128' },
-      { id: 'doubao-seedance-2-0-fast-260128', label: 'doubao-seedance-2-0-fast-260128' },
+      {
+        id: 'doubao-seedance-2-0-260128', label: 'Seedance 2.0（最高 4k）',
+        duration_range: [4, 15], resolutions: ['480p', '720p', '1080p', '4k'],
+        ratios: ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16', 'adaptive'],
+      },
+      {
+        id: 'doubao-seedance-2-0-fast-260128', label: 'Seedance 2.0 fast',
+        duration_range: [4, 15], resolutions: ['480p', '720p'],
+        ratios: ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16', 'adaptive'],
+      },
+      {
+        id: 'doubao-seedance-2-0-mini-260615', label: 'Seedance 2.0 mini（最快）',
+        duration_range: [4, 15], resolutions: ['480p', '720p'],
+        ratios: ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16', 'adaptive'],
+      },
+      {
+        id: 'doubao-seedance-2-5-260628', label: 'Seedance 2.5（最长 30s / 50 素材）',
+        duration_range: [4, 30], resolutions: ['480p', '720p'],
+        ratios: ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16', 'adaptive'],
+        defaults: { duration: 10 },
+      },
     ],
     hint: '豆包官方火山方舟 API。本地图/视频/音频参考素材会先上传到公司 TOS bucket，再以预签名 URL 传给方舟。',
     label: '豆包官方 / 火山方舟',
@@ -328,6 +364,23 @@ function SeedanceApp() {
     activityCounts: null,
     activityDetail: null,
 
+    // Task-type switch. Ark 2.5 auto-classifies a request as reference /
+    // extend / edit from the prompt wording, and edit/extend impose extra
+    // constraints (ratio=adaptive, duration=-1). If the user types a phrase
+    // that flips the classifier without knowing it, Ark rejects the job as
+    // "you asked for edit but sent a positive duration". This picker moves
+    // that decision from post-hoc keyword sniffing to an explicit control.
+    // Session-only — no persistence, matches the user's request.
+    taskMode: 'reference',
+    _prevTaskMode: 'reference',
+    // Per-mode memory of ratio + duration, so switching away and back
+    // preserves what the user typed in each mode.
+    _taskModeMemory: {
+      reference: { ratio: '16:9', duration: 12 },
+      extend:    { ratio: 'adaptive', duration: 5 },
+      edit:      { ratio: 'adaptive', duration: -1 },
+    },
+
     // Standalone-specific fields
     customModel: '',
     webSearch: false,
@@ -342,6 +395,7 @@ function SeedanceApp() {
     editingTabId: null,         // tab id being renamed inline, or null
     _closeConfirmTabId: null,   // tab id that opened the close-confirm modal
     _tabStateCache: {},         // { wsId: {statusText, eventsText, submitting, baseUrl, provider, models, workspaceName} }
+    _topicSubmissionSeq: {},    // { wsId: latest submit sequence }
 
     // Internal (non-reactive but accessible)
     _workspaceId: effectiveWorkspaceId,
@@ -386,6 +440,11 @@ function SeedanceApp() {
       if (form) {
         form.addEventListener('input', () => this.scheduleWorkspaceSave());
         form.addEventListener('change', () => this.scheduleWorkspaceSave());
+      }
+
+      const modelEl = field('model');
+      if (modelEl) {
+        modelEl.addEventListener('change', () => this.applyModelLimits());
       }
 
       // Download links: use blob download to avoid iframe navigation timeout.
@@ -488,14 +547,103 @@ function SeedanceApp() {
         }
         // API Key UI removed — provider is locked to volcengine and the key
         // lives in seedance/state/secrets.json on the server.
+        this.applyModelLimits();
       });
+    },
+
+    // Narrow duration / resolution / ratio to what the selected model accepts.
+    // Ark validates these only after the job is queued, so an out-of-range value
+    // costs the user a wait and an async error instead of failing fast.
+    applyModelLimits() {
+      const modelEl = field('model');
+      if (!modelEl) return;
+      const cfg = (this.models || []).find(m => m.id === modelEl.value);
+      if (!cfg) return;
+
+      const durationEl = field('duration');
+      if (durationEl && Array.isArray(cfg.duration_range)) {
+        const [lo, hi] = cfg.duration_range;
+        // Keep min at -1 regardless of the model's positive range: -1 is a
+        // sentinel meaning "let Ark pick" and is legal (in fact required) for
+        // video edit / extend tasks on every model.
+        durationEl.min = '-1';
+        durationEl.max = String(hi);
+        const current = parseInt(durationEl.value, 10);
+        // -1 is the sentinel and must survive a model switch untouched; only a
+        // real out-of-range number gets clamped.
+        if (!Number.isNaN(current) && current !== -1) {
+          durationEl.value = String(Math.min(hi, Math.max(lo, current)));
+        }
+      }
+
+      for (const [name, allowed] of [['resolution', cfg.resolutions], ['ratio', cfg.ratios]]) {
+        const el = field(name);
+        if (!el || !Array.isArray(allowed) || !allowed.length) continue;
+        const previous = el.value;
+        el.innerHTML = '';
+        for (const value of allowed) {
+          const option = document.createElement('option');
+          option.value = value;
+          option.textContent = value;
+          el.appendChild(option);
+        }
+        el.value = allowed.includes(previous) ? previous : allowed[0];
+      }
+    },
+
+    // Called when the user picks a different task type. Ark 2.5 imposes:
+    //   reference: ratio + duration are free
+    //   extend:    ratio must be 'adaptive', duration is free
+    //   edit:      ratio must be 'adaptive' AND duration must be -1
+    // Values are remembered per-mode so switching away and back restores what
+    // the user typed. Session-only, no localStorage.
+    changeTaskMode() {
+      const from = this._prevTaskMode || 'reference';
+      const to = this.taskMode || 'reference';
+      const ratioEl = field('ratio');
+      const durationEl = field('duration');
+      const mem = this._taskModeMemory;
+      // 1) Save the leaving mode's current values.
+      if (mem[from]) {
+        if (ratioEl) mem[from].ratio = ratioEl.value;
+        if (durationEl) mem[from].duration = parseInt(durationEl.value, 10);
+      }
+      // 2) Restore or seed the incoming mode's values.
+      const target = mem[to] || mem.reference;
+      if (ratioEl) {
+        const forced = (to === 'extend' || to === 'edit') ? 'adaptive' : null;
+        const wanted = forced || target.ratio || '16:9';
+        if (![...ratioEl.options].some(o => o.value === wanted)) {
+          // If the model doesn't currently list this ratio (applyModelLimits
+          // narrowed it away), fall back to the first available option so the
+          // select is never left in an invalid state.
+          ratioEl.value = ratioEl.options[0]?.value || wanted;
+        } else {
+          ratioEl.value = wanted;
+        }
+      }
+      if (durationEl) {
+        const forced = (to === 'edit') ? -1 : null;
+        const wanted = (forced !== null) ? forced
+          : (Number.isFinite(target.duration) ? target.duration : 5);
+        durationEl.value = String(wanted);
+      }
+      this._prevTaskMode = to;
+      // Save the entering mode's values too, so a later switch reads current
+      // state (in case the user typed something before switching again).
+      if (mem[to]) {
+        if (ratioEl) mem[to].ratio = ratioEl.value;
+        if (durationEl) mem[to].duration = parseInt(durationEl.value, 10);
+      }
     },
 
     // ============================================================
     // ARCHIVES
     // ============================================================
     async loadArchives() {
-      const res = await api(APP_PATH + '/api/archives');
+      const ownerWsId = this.activeTabId;
+      const res = await api(APP_PATH + '/api/archives', 'GET', null, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res) this.archives = res.archives || [];
       if (this.selectedArchive && !this.archives.some(a => a.name === this.selectedArchive)) {
         this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
@@ -503,16 +651,19 @@ function SeedanceApp() {
     },
 
     async saveArchive() {
+      const ownerWsId = this.activeTabId;
       this.archiveHint = '保存中...';
       const data = new FormData(document.getElementById('sd-form'));
       if (Object.keys(this.savedMedia).length) {
         data.set('saved_media', JSON.stringify(this.savedMedia));
       }
-      const res = await api(APP_PATH + '/api/preset', 'POST', data);
+      const res = await api(APP_PATH + '/api/preset', 'POST', data, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res) {
         this.archiveHint = res.archive ? '已保存：' + res.archive : (res.error || '保存失败');
         if (res.media) this.savedMedia = res.media;
         await this.loadArchives();
+        if (this.activeTabId !== ownerWsId) return;
         this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
       } else {
         this.archiveHint = '保存失败';
@@ -530,9 +681,11 @@ function SeedanceApp() {
         this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
         return;
       }
+      const ownerWsId = this.activeTabId;
       const data = new FormData();
       data.set('archive_name', name);
-      const res = await api(APP_PATH + '/api/archive/load', 'POST', data);
+      const res = await api(APP_PATH + '/api/archive/load', 'POST', data, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (!res) {
         this.archiveHint = '读取失败';
         return;
@@ -550,15 +703,18 @@ function SeedanceApp() {
       }
       const name = this.selectedArchive;
       if (!confirm('确定删除存档「' + name + '」？此操作不可恢复。')) return;
+      const ownerWsId = this.activeTabId;
       const data = new FormData();
       data.set('archive_name', name);
-      const res = await api(APP_PATH + '/api/archive/delete', 'POST', data);
+      const res = await api(APP_PATH + '/api/archive/delete', 'POST', data, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (!res || res.ok === false) {
         this.archiveHint = '删除失败：' + (res && res.error ? res.error : '存档可能已被删除或不存在');
         return;
       }
       this.selectedArchive = '';
       await this.loadArchives();
+      if (this.activeTabId !== ownerWsId) return;
       this.selectedArchive = this.archives.length > 0 ? this.archives[0].name : '';
       this.archiveHint = '已删除：' + name;
     },
@@ -571,11 +727,13 @@ function SeedanceApp() {
         this.optimizeError = '请先输入提示词';
         return;
       }
+      const ownerWsId = this.activeTabId;
       this.optimizing = true;
       this.optimizedPrompt = '';
       this.optimizeError = '';
       try {
-        const res = await api(APP_PATH + '/api/optimize-prompt', 'POST', JSON.stringify({ prompt: prompt }));
+        const res = await api(APP_PATH + '/api/optimize-prompt', 'POST', JSON.stringify({ prompt: prompt }), ownerWsId);
+        if (this.activeTabId !== ownerWsId) return;
         if (!res) {
           this.optimizeError = '优化失败：网络异常，请检查服务是否运行';
         } else if (!res.ok) {
@@ -584,9 +742,14 @@ function SeedanceApp() {
           this.optimizedPrompt = res.optimized;
         }
       } catch (e) {
-        this.optimizeError = '优化失败：' + (e.message || '未知异常');
+        if (this.activeTabId === ownerWsId) {
+          this.optimizeError = '优化失败：' + (e.message || '未知异常');
+        }
+      } finally {
+        // Must run even when the owner check bails out, or the spinner stays
+        // stuck for every topic.
+        this.optimizing = false;
       }
-      this.optimizing = false;
     },
     replacePrompt() {
       const promptEl = document.querySelector('textarea[name="prompt"][form="sd-form"]');
@@ -609,7 +772,9 @@ function SeedanceApp() {
     },
 
     async clearPreset() {
-      const res = await api(APP_PATH + '/api/preset/clear', 'POST');
+      const ownerWsId = this.activeTabId;
+      const res = await api(APP_PATH + '/api/preset/clear', 'POST', null, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (!res) return;
       this.savedMedia = {};
       clearAllMediaPreviews();
@@ -620,7 +785,9 @@ function SeedanceApp() {
     // ACTIVITY
     // ============================================================
     async loadActivity() {
-      const res = await api(APP_PATH + '/api/activity');
+      const ownerWsId = this.activeTabId;
+      const res = await api(APP_PATH + '/api/activity', 'GET', null, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res) {
         this.activityRecords = res.records || [];
         this.activityCounts = res.counts || null;
@@ -671,7 +838,9 @@ function SeedanceApp() {
     },
 
     async showDetail(id) {
-      const res = await api(APP_PATH + '/api/activity/' + id);
+      const ownerWsId = this.activeTabId;
+      const res = await api(APP_PATH + '/api/activity/' + id, 'GET', null, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res) this.activityDetail = res;
     },
 
@@ -698,8 +867,12 @@ function SeedanceApp() {
     // OUTPUT DIRECTORY
     // ============================================================
     async chooseOutputDir() {
+      // Delivery settings live in the per-topic cache, so a picker that resolves
+      // after the user switched topics must not rewrite the new topic's target.
+      const ownerWsId = this.activeTabId;
       // Backend native directory picker
-      const res = await api(APP_PATH + '/api/choose-output-dir', 'POST');
+      const res = await api(APP_PATH + '/api/choose-output-dir', 'POST', null, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res?.path) {
         this.outputDir = res.path;
         this.dirHandle = null;
@@ -708,11 +881,14 @@ function SeedanceApp() {
       // Browser File System Access API
       if (window.showDirectoryPicker) {
         try {
-          this.dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+          const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+          if (this.activeTabId !== ownerWsId) return;
+          this.dirHandle = handle;
           this.outputDir = this.dirHandle.name;
           this.statusText = '已选择: ' + this.outputDir;
           return;
         } catch (e) { /* user cancelled */ }
+        if (this.activeTabId !== ownerWsId) return;
       }
       // Fallback to browser download
       this.autoDownload = true;
@@ -723,7 +899,9 @@ function SeedanceApp() {
     },
 
     async desktopOutput() {
-      const res = await api(APP_PATH + '/api/default-output-dir');
+      const ownerWsId = this.activeTabId;
+      const res = await api(APP_PATH + '/api/default-output-dir', 'GET', null, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res?.path) this.outputDir = res.path;
     },
 
@@ -732,9 +910,11 @@ function SeedanceApp() {
         this.statusText = '文件将保存到 "' + this.outputDir + '"（浏览器限制无法代为打开）';
         return;
       }
+      const ownerWsId = this.activeTabId;
       const data = new FormData();
       data.set('output_dir', this.outputDir);
-      const res = await api(APP_PATH + '/api/open-output-dir', 'POST', data);
+      const res = await api(APP_PATH + '/api/open-output-dir', 'POST', data, ownerWsId);
+      if (this.activeTabId !== ownerWsId) return;
       if (res?.remote) this.statusText = '远程客户端不支持打开服务端目录';
     },
 
@@ -749,14 +929,39 @@ function SeedanceApp() {
     // FORM SUBMISSION
     // ============================================================
     async submit() {
+      const ownerWorkspaceId = this.activeTabId;
+      const ownerExists = () => this.tabs.some(t => t.id === ownerWorkspaceId);
+      const ownerCache = () => {
+        if (!ownerExists()) return null;
+        return (this._tabStateCache[ownerWorkspaceId] = this._tabStateCache[ownerWorkspaceId] || {});
+      };
+      const setOwnerState = (name, value) => {
+        const cache = ownerCache();
+        if (!cache) return;
+        cache[name] = value;
+        if (this.activeTabId === ownerWorkspaceId) this[name] = value;
+      };
       if (this.submitting) return;
-      this.submitting = true;
-      this.statusText = '提交中';
+      const submissionToken = (this._topicSubmissionSeq[ownerWorkspaceId] || 0) + 1;
+      this._topicSubmissionSeq[ownerWorkspaceId] = submissionToken;
+      const delivery = {
+        dirHandle: this.dirHandle,
+        autoDownload: this.autoDownload,
+        outputDir: this.outputDir,
+      };
+      const cache = ownerCache();
+      cache._submissionToken = submissionToken;
+      cache._activeJobId = null;
+      delete cache._latestJob;
+      setOwnerState('submitting', true);
+      setOwnerState('statusText', '提交中');
       const resultsEl = document.getElementById('sd-results');
       const eventsEl = document.getElementById('sd-events');
-      if (resultsEl) resultsEl.innerHTML = '';
-      if (eventsEl) eventsEl.textContent = '';
-      this.eventsText = '';
+      if (this.activeTabId === ownerWorkspaceId) {
+        if (resultsEl) resultsEl.innerHTML = '';
+        if (eventsEl) eventsEl.textContent = '';
+      }
+      setOwnerState('eventsText', '');
 
       const data = new FormData(document.getElementById('sd-form'));
       if (Object.keys(this.savedMedia).length) {
@@ -765,31 +970,45 @@ function SeedanceApp() {
 
       let res;
       try {
-        res = await api(APP_PATH + '/api/jobs', 'POST', data);
+        res = await api(APP_PATH + '/api/jobs', 'POST', data, ownerWorkspaceId);
       } finally {
-        this.submitting = false;
+        setOwnerState('submitting', false);
       }
       if (!res || res.error) {
-        this.statusText = res?.error || '提交失败';
+        setOwnerState('statusText', res?.error || '提交失败');
         return;
       }
-      this.statusText = '已提交，任务在后台运行';
+      if (!ownerExists() || ownerCache()._submissionToken !== submissionToken) return;
+      ownerCache()._activeJobId = res.job_id;
+      setOwnerState('statusText', '已提交，任务在后台运行');
       this.loadJobs();
-      this.pollJob(res.job_id);
+      this.pollJob(res.job_id, ownerWorkspaceId, submissionToken, delivery);
     },
 
-    async pollJob(jobId) {
-      // Record which tab initiated this poll. If the user switches tabs while the
-      // job is still running, subsequent state writes must NOT contaminate the
-      // now-active tab — they route into _tabStateCache[startWsId] instead.
-      const startWsId = this.activeTabId;
-      const isActive = () => this.activeTabId === startWsId;
-      const cache = () => (this._tabStateCache[startWsId] = this._tabStateCache[startWsId] || {});
-
-      const setStatus = (t) => { if (isActive()) this.statusText = t; else cache().statusText = t; };
-      const setEvents = (t) => { if (isActive()) this.eventsText = t; else cache().eventsText = t; };
-      const setSubmitting = (v) => { if (isActive()) this.submitting = v; else cache().submitting = v; };
-      const setLatestJob = (job) => { cache()._latestJob = job; };
+    async pollJob(jobId, ownerWorkspaceId, submissionToken, delivery) {
+      const ownerWsId = ownerWorkspaceId || this.activeTabId;
+      const ownerExists = () => this.tabs.some(t => t.id === ownerWsId);
+      const cache = () => {
+        if (!ownerExists()) return null;
+        return (this._tabStateCache[ownerWsId] = this._tabStateCache[ownerWsId] || {});
+      };
+      const isCurrent = () => {
+        const state = cache();
+        if (!state) return false;
+        if (submissionToken !== undefined && state._submissionToken !== submissionToken) return false;
+        return !state._activeJobId || state._activeJobId === jobId;
+      };
+      const isActive = () => isCurrent() && this.activeTabId === ownerWsId;
+      const setState = (name, value) => {
+        if (!isCurrent()) return;
+        const state = cache();
+        state[name] = value;
+        if (isActive()) this[name] = value;
+      };
+      const setStatus = (t) => setState('statusText', t);
+      const setEvents = (t) => setState('eventsText', t);
+      const setSubmitting = (v) => setState('submitting', v);
+      const setLatestJob = (job) => { if (isCurrent()) cache()._latestJob = job; };
 
       // Transient-failure tolerance. A single failed poll (proxy timeout, wifi
       // blip, sub-app 5xx) used to `break` and permanently abandon the watcher,
@@ -801,7 +1020,9 @@ function SeedanceApp() {
       let consecutiveFails = 0;
 
       while (true) {
-        const r = await pollJobOnce(APP_PATH + '/api/jobs/' + jobId);
+        if (!isCurrent()) break;
+        const r = await pollJobOnce(APP_PATH + '/api/jobs/' + jobId, ownerWsId);
+        if (!isCurrent()) break;
         if (r.kind === 'gone') {
           // Job no longer exists server-side (restart). Refresh the jobs list so
           // any completed result recorded in activity can still surface there.
@@ -821,6 +1042,15 @@ function SeedanceApp() {
         }
         consecutiveFails = 0;
         const job = r.job;
+        // Jobs created before the backend started persisting workspace_id have
+        // no owner to compare against. Treating that as a mismatch would hide
+        // every result until the sub-app restarts, since the frontend picks up
+        // new JS on refresh while the backend keeps running old code.
+        if (job.workspace_id && job.workspace_id !== ownerWsId) {
+          setStatus('主题隔离校验失败，已阻止错误结果显示');
+          setSubmitting(false);
+          return;
+        }
         setStatus((job.status || 'unknown') + ' ' + (job.done || 0) + '/' + (job.total || 0));
         setEvents((job.events || []).map(e => '[' + (e.time || '') + '] ' + (e.message || '')).join('\n'));
         setLatestJob(job);
@@ -833,17 +1063,14 @@ function SeedanceApp() {
           // Preserved terminal-status behavior from original pollJob:
           //   - job.status === 'succeeded' + dirHandle → saveToClient
           //   - job.status === 'succeeded' + autoDownload → triggerDownloads
-          // Note: saveToClient/triggerDownloads still key on the literal 'succeeded'
-          // (not the whole TERMINAL_STATUSES set) so failed/cancelled jobs never
-          // trigger downloads. dirHandle/autoDownload are tab-scoped via
-          // saveCurrentTabState/loadTargetTabState, but here we intentionally read
-          // this.dirHandle/this.autoDownload at terminal time — matching the
-          // original behavior of using whatever is live now (side-effects still
-          // fire even if the user has since switched tabs).
-          if (job.status === 'succeeded' && this.dirHandle) {
-            await this.saveToClient(job);
-          } else if (job.status === 'succeeded' && this.autoDownload) {
-            this.triggerDownloads(job);
+          // Delivery settings are captured at submit time. Reading this.* here
+          // would use whichever topic happens to be active when the task ends.
+          if (job.status === 'succeeded' && delivery?.dirHandle) {
+            const saved = await this.saveToClient(job, delivery.dirHandle);
+            if (saved) setStatus('已保存 ' + saved + ' 个文件到 ' + delivery.outputDir);
+          } else if (job.status === 'succeeded' && delivery?.autoDownload) {
+            const downloaded = this.triggerDownloads(job);
+            if (downloaded) setStatus('已下载 ' + downloaded + ' 个文件');
           }
           setSubmitting(false);
           setStatus('空闲');
@@ -868,12 +1095,12 @@ function SeedanceApp() {
     // work.
     _renderJobToDom(job) {
       const resultsEl = document.getElementById('sd-results');
-      const eventsEl = document.getElementById('sd-events');
-      if (!resultsEl && !eventsEl) return;
+      if (!resultsEl) return;
 
-      if (eventsEl) {
-        eventsEl.textContent = (job.events || []).map(e => '[' + (e.time || '') + '] ' + (e.message || '')).join('\n');
-      }
+      // #sd-events is owned by PetiteVue's {{ eventsText }} binding. Writing
+      // it here as well makes live polling and tab-state restoration compete
+      // for the same node, which causes the dark log panel to flicker when
+      // multiple topic tabs have running jobs.
 
       if (resultsEl) {
         const recentEvents = (job.events || []).slice(-8);
@@ -940,7 +1167,14 @@ function SeedanceApp() {
       }
     },
 
-    async saveToClient(job) {
+    _clearTopicResultDom() {
+      const resultsEl = document.getElementById('sd-results');
+      const eventsEl = document.getElementById('sd-events');
+      if (resultsEl) resultsEl.innerHTML = '';
+      if (eventsEl) eventsEl.textContent = '';
+    },
+
+    async saveToClient(job, dirHandle) {
       try {
         const files = [];
         for (const r of job.results || []) {
@@ -949,14 +1183,15 @@ function SeedanceApp() {
         for (const { url, filename } of files) {
           const resp = await fetch(url);
           const blob = await resp.blob();
-          const fh = await this.dirHandle.getFileHandle(filename, { create: true });
+          const fh = await dirHandle.getFileHandle(filename, { create: true });
           const w = await fh.createWritable();
           await w.write(blob);
           await w.close();
         }
-        if (files.length) this.statusText = '已保存 ' + files.length + ' 个文件到 ' + this.outputDir;
+        return files.length;
       } catch (e) {
         console.warn('saveToClient failed:', e);
+        return 0;
       }
     },
 
@@ -968,7 +1203,7 @@ function SeedanceApp() {
       for (const { url, filename } of urls) {
         this._blobDownload(url, filename);
       }
-      if (urls.length) this.statusText = '已下载 ' + urls.length + ' 个文件';
+      return urls.length;
     },
 
     async _blobDownload(url, filename) {
@@ -1085,6 +1320,14 @@ function SeedanceApp() {
         this.savedMedia = {};
       }
 
+      // Re-narrow duration/resolution/ratio to the restored model's limits.
+      // The loop above writes the model <select> with `el.value = ...`, which
+      // does NOT fire a 'change' event, so the listener wired in init() never
+      // runs on restore. Without this call the duration input keeps the static
+      // max="15" from index.html, and the number-stepper refuses to reach 30
+      // even when Seedance 2.5 (duration_range [4,30]) is selected.
+      this.applyModelLimits();
+
       const mediaCount = Object.keys(this.savedMedia).length;
       if (mediaCount) this.archiveHint = '已读取保存配置：' + mediaCount + ' 个素材';
     },
@@ -1137,19 +1380,21 @@ function SeedanceApp() {
     },
 
     loadPreset() {
+      const ownerWorkspaceId = this.activeTabId;
       // Try workspace draft first
       if (this.loadWorkspaceDraft()) return;
 
       // Fall back to API preset
       if (this._workspaceId === 'default' || !this._workspaceId) {
         // Will load after init via the async pattern
-        this._loadApiPreset();
+        this._loadApiPreset(ownerWorkspaceId);
       }
     },
 
-    async _loadApiPreset() {
-      const res = await api(APP_PATH + '/api/preset');
-      if (res) {
+    async _loadApiPreset(ownerWorkspaceId) {
+      const ownerWsId = ownerWorkspaceId || this.activeTabId;
+      const res = await api(APP_PATH + '/api/preset', 'GET', null, ownerWsId);
+      if (res && this.activeTabId === ownerWsId) {
         this.applyPreset(res);
       }
     },
@@ -1176,6 +1421,9 @@ function SeedanceApp() {
       window._activeWorkspaceId = id;
       this.workspaceName = '';
       this.savedMedia = {};
+      this.outputDir = '';
+      this.dirHandle = null;
+      this.autoDownload = false;
       const form = document.querySelector('#sd-form');
       if (form) form.reset();
       // form.reset() clears file inputs' .files but not the preview <img>/<video>
@@ -1185,6 +1433,14 @@ function SeedanceApp() {
       this.statusText = '空闲';
       this.eventsText = '';
       this.submitting = false;
+      this.taskMode = 'reference';
+      this._prevTaskMode = 'reference';
+      this._taskModeMemory = {
+        reference: { ratio: '16:9', duration: 12 },
+        extend:    { ratio: 'adaptive', duration: 5 },
+        edit:      { ratio: 'adaptive', duration: -1 },
+      };
+      this._clearTopicResultDom();
       this.saveTabsToLocalStorage();
       setTimeout(() => this._scrollActiveTabIntoView(), 0);
     },
@@ -1248,6 +1504,12 @@ function SeedanceApp() {
         provider: this.provider,
         models: this.models ? JSON.parse(JSON.stringify(this.models)) : [],
         workspaceName: this.workspaceName,
+        outputDir: this.outputDir,
+        dirHandle: this.dirHandle,
+        autoDownload: this.autoDownload,
+        taskMode: this.taskMode,
+        _prevTaskMode: this._prevTaskMode,
+        _taskModeMemory: JSON.parse(JSON.stringify(this._taskModeMemory)),
       };
     },
 
@@ -1261,20 +1523,39 @@ function SeedanceApp() {
       if (cache.provider !== undefined) this.provider = cache.provider;
       if (cache.models !== undefined) this.models = cache.models;
       if (cache.workspaceName !== undefined) this.workspaceName = cache.workspaceName;
+      this.outputDir = cache.outputDir !== undefined ? cache.outputDir : '';
+      this.dirHandle = cache.dirHandle || null;
+      this.autoDownload = cache.autoDownload || false;
+      // Task-type mode is per-tab: the提示 <p class="hint" v-if="taskMode..."> and
+      // the ratio/duration memory would otherwise leak across topics.
+      this.taskMode = cache.taskMode || 'reference';
+      this._prevTaskMode = cache._prevTaskMode || this.taskMode;
+      this._taskModeMemory = cache._taskModeMemory
+        ? JSON.parse(JSON.stringify(cache._taskModeMemory))
+        : {
+            reference: { ratio: '16:9', duration: 12 },
+            extend:    { ratio: 'adaptive', duration: 5 },
+            edit:      { ratio: 'adaptive', duration: -1 },
+          };
       const form = document.querySelector('#sd-form');
       if (form) form.reset();
       this.savedMedia = {};
       if (typeof this.loadPreset === 'function') this.loadPreset();
+      // form.reset() restores the duration input's default *value* but not the
+      // min/max *attributes* we set from the previous tab's model, and a tab
+      // with no saved draft never reaches applyPreset(). Re-narrow here so the
+      // limits always match whichever model the select is actually showing.
+      this.applyModelLimits();
 
       // If a background pollJob stashed a job snapshot for this tab, replay it
       // into the DOM. Otherwise clear any stale DOM left by the previous tab.
-      if (cache._latestJob) {
+      // The cache key already proves ownership, so a snapshot predating backend
+      // workspace_id persistence is still this tab's own result.
+      if (cache._latestJob && (!cache._latestJob.workspace_id || cache._latestJob.workspace_id === wsId)) {
         this._renderJobToDom(cache._latestJob);
       } else {
-        const resultsEl = document.getElementById('sd-results');
-        const eventsEl = document.getElementById('sd-events');
-        if (resultsEl) resultsEl.innerHTML = '';
-        if (eventsEl) eventsEl.textContent = '';
+        delete cache._latestJob;
+        this._clearTopicResultDom();
       }
     },
 

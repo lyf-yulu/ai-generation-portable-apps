@@ -578,6 +578,24 @@ class AppManager:
         except Exception:
             return "", ""
 
+    def _read_ark_key(self) -> str:
+        """Read Seedance's server-managed Ark Bearer key for child apps.
+
+        Only the child-process environment receives the plaintext value. API
+        config responses expose availability as a boolean, never the key.
+        """
+        seedance_spec = SPEC_BY_NAME.get("seedance")
+        if seedance_spec is None:
+            return ""
+        try:
+            secrets_path = seedance_spec.dir_path / "state" / "secrets.json"
+            if not secrets_path.exists():
+                return ""
+            data = json.loads(secrets_path.read_text("utf-8"))
+            return str(data.get("volcengine_api_key") or "").strip()
+        except Exception:
+            return ""
+
     def start_app(self, name: str, config: dict):
         spec: AppSpec | None = config.get("spec")
         if spec is not None and not spec.managed:
@@ -603,6 +621,10 @@ class AppManager:
             if ak and sk:
                 env["TOS_ACCESS_KEY"] = ak
                 env["TOS_SECRET_KEY"] = sk
+        if spec is not None and spec.needs_ark_key:
+            ark_key = self._read_ark_key()
+            if ark_key:
+                env["VOLCENGINE_ARK_API_KEY"] = ark_key
         old_log = self.log_handles.pop(name, None)
         if old_log:
             try: old_log.close()
@@ -1043,7 +1065,16 @@ class UsageTracker:
         """Idempotent: mark a job final. If status indicates failure/cancel,
         roll back the +1 that inc_daily_jobs applied at registration time.
         Returns True if the rollback was applied (i.e. first time we saw
-        a failure for this job), False otherwise."""
+        a failure for this job), False otherwise.
+
+        This must NOT drop the job from _pending_jobs. Sub-apps report
+        final_status="failed" whenever a single item errored, so a partial
+        success (3 of 4 images generated and billed) arrives here as a failure.
+        The two paths write disjoint counters — this one owns daily.jobs, the
+        poll loop owns by_user.images/seconds — and the `finalized` flag above
+        already makes the daily.jobs rollback idempotent. Removing the job from
+        pending would leave those 3 real images uncounted forever.
+        """
         status = (status or "").lower()
         is_failure = status in ("failed", "fail", "failure", "cancelled", "canceled", "error")
         with self._lock:
@@ -1064,10 +1095,6 @@ class UsageTracker:
                 app_stats = day_stats.setdefault(app, {"requests": 0, "jobs": 0})
                 app_stats["jobs"] = max(0, int(app_stats.get("jobs", 0)) - 1)
                 rolled = True
-                # Drop from pending_jobs so the poll loop does not double-act.
-                self._pending_jobs = [
-                    j for j in self._pending_jobs if not (j["app"] == app and j["job_id"] == job_id)
-                ]
             self._save()
             return rolled
 
@@ -1076,7 +1103,12 @@ class UsageTracker:
             return False
         job_patterns = ["/api/jobs", "/api/text2image", "/api/image2image", "/api/text2video",
                         "/api/image2video", "/api/frames2video", "/api/multimodal2video", "/api/multiframe2video",
-                        "/api/virtual/jobs", "/api/real/jobs"]
+                        "/api/virtual/jobs", "/api/real/jobs",
+                        # infinite-canvas 的画布前端契约固定用 /api/v1/jobs（其 web/src/api/jobs.ts:4），
+                        # 而 "/api/v1/jobs".startswith("/api/jobs") 是 False —— 不列在这里就完全不计数。
+                        # 注意 /api/v1/jobs/{id}/cancel 也是 POST 且命中本前缀，但取消接口
+                        # 刻意不返回 X-Job-Id，因此 :2093-2097 的第三个条件不满足，不会误登记。
+                        "/api/v1/jobs"]
         return any(path.startswith(p) for p in job_patterns)
 
     def get_stats(self, username: str = "", role: str = "user") -> dict[str, Any]:

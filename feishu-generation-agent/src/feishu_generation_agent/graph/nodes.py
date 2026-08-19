@@ -1,6 +1,7 @@
 import asyncio
 from inspect import Parameter, signature
 import json
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -14,6 +15,17 @@ from langgraph.types import Command, interrupt
 from pydantic import ValidationError
 
 from feishu_generation_agent.config import Settings
+from io import BytesIO
+from pathlib import Path
+
+from PIL import Image
+
+from feishu_generation_agent.domain.asset_library import normalize_alias
+from feishu_generation_agent.domain.character_matcher import match_characters
+from feishu_generation_agent.integrations.image_resize import (
+    cover_crop,
+    parse_size_variant,
+)
 from feishu_generation_agent.domain.document import (
     MediaAsset,
     NormalizedDocument,
@@ -43,6 +55,7 @@ from feishu_generation_agent.domain.artifact import (
     ProviderSubmission,
 )
 from feishu_generation_agent.integrations.planner import (
+    image_planner_system_prompt,
     language_validation_message,
     planner_system_prompt,
     validate_plan,
@@ -74,6 +87,13 @@ class GraphServices:
     settings: Settings
     portrait_video_generator: Any | None = None
     production_task_store: Any | None = None
+    # 图片 provider registry：{"banana": gen, "seedream": gen, "gpt-image2": gen}。
+    # 为 None 时回落到单实例 image_generator，保持存量调用方零改动。
+    image_providers: Mapping[str, ImageGenerator] | None = None
+    # 角色素材库与语义匹配器，图片模式下用于自动挂载角色参考图。
+    # 未配置时跳过自动挂载，人工仍可在审核界面手动挂。
+    asset_library_store: Any | None = None
+    character_matcher: Any | None = None
 
 
 _Result = TypeVar("_Result")
@@ -135,11 +155,22 @@ def _safe_error(exc: BaseException) -> AgentError:
         category = ErrorCategory.TRANSIENT
         retryable = False
         message = "The workflow node could not be completed"
+    # 保留原始 technical_detail：planner 会把具体校验失败项写进去，
+    # 无条件覆盖成通用文案会让「三次校验未通过」这类故障完全不可诊断，
+    # 每次都得另写脚本复现。message 仍走上面的脱敏逻辑。
+    inner_detail = (
+        exc.detail.technical_detail
+        if isinstance(exc, AgentError) and exc.detail.technical_detail
+        else None
+    )
+    technical_detail = f"{category.value} in workflow node"
+    if inner_detail:
+        technical_detail = f"{technical_detail}; {inner_detail}"
     return AgentError(
         ErrorDetail(
             category=category,
             message=message,
-            technical_detail=f"{category.value} in workflow node",
+            technical_detail=technical_detail,
             retryable=retryable,
         )
     )
@@ -247,12 +278,314 @@ def _planning_prompt(state: AgentState) -> PlanningPromptSnapshot:
     value = state.get("planning_prompt")
     if value is not None:
         return PlanningPromptSnapshot.model_validate(value)
+    # 快照必须按 mode 选契约：直连 run 走 prime-local 分支，快照会通过
+    # exact_system_prompt 传给 planner，而该分支排在 image_mode 判断之前，
+    # 直接压过图片契约。快照装错内容，图片模板就永远不会被执行。
+    prompt_text = (
+        image_planner_system_prompt()
+        if state.get("planning_mode") == "image"
+        else planner_system_prompt()
+    )
     return build_planning_prompt_snapshot(
         owner_user_id="prime-local",
         source="prime",
         version=0,
-        prompt_text=planner_system_prompt(),
+        prompt_text=prompt_text,
     )
+
+
+_IMAGE_REQUIREMENT_TYPE = "图片类"
+_LOGGER = logging.getLogger(__name__)
+# 同步型出图 provider：submit 即终态、结果直接落盘，没有异步轮询阶段。
+# 下面两类判定原先写死 provider == "chiyun"，registry 拆出 banana /
+# gpt-image2 / seedream 后必须一起覆盖，否则它们会绕过标识校验与
+# 「落盘失败 → 提交状态未定」的判定。
+_SYNC_IMAGE_PROVIDERS = frozenset(
+    {"chiyun", "banana", "gpt-image2", "seedream"}
+)
+
+
+async def _resolve_character_assets(
+    document: NormalizedDocument,
+    services: GraphServices,
+) -> list[Any]:
+    """把文档里出现的角色对应到素材库条目。
+
+    两级匹配：先按名字/别名字面命中，未覆盖的描述式指代交给语义匹配层。
+    任一环节失败都退回已有结果，不让素材库问题拖垮整个 run——挂不上参考图
+    只是少了自动化，人工仍可在审核界面手动挂。
+    """
+    store = getattr(services, "asset_library_store", None)
+    if store is None:
+        return []
+    try:
+        library = await store.list_all(limit=500)
+    except Exception:
+        _LOGGER.warning("素材库读取失败，跳过角色自动挂载", exc_info=True)
+        return []
+    if not library:
+        return []
+
+    by_id = {asset.asset_id: asset for asset in library}
+    exact_matches = match_characters(list(document.blocks), library)
+    exact_ids = [anchor.asset_id for anchor in exact_matches]
+    semantic_ids: list[str] = []
+
+    # 只有单一变体的角色才作为锚点。锚点的含义是「已确定、不要再输出」，
+    # 而同名多变体恰恰需要语义层按上下文挑一个，把它们锁成锚点会剥夺
+    # 这个判断机会。
+    grouped: dict[str, list[Any]] = {}
+    for anchor in exact_matches:
+        grouped.setdefault(normalize_alias(anchor.name), []).append(anchor)
+    anchors = [group[0] for group in grouped.values() if len(group) == 1]
+
+    matcher = getattr(services, "character_matcher", None)
+    if matcher is not None:
+        try:
+            result = await matcher.match(
+                document.text_view, library, anchors=anchors
+            )
+        except Exception:
+            _LOGGER.warning("角色语义匹配失败，仅使用精确匹配", exc_info=True)
+        else:
+            semantic_ids = [item.asset_id for item in result.matches]
+            # 文档里出现但库里没有的角色，首次遇到即自动建档并一并挂上。
+            for record in await _auto_ingest_characters(
+                document, list(result.unresolved_candidates), store
+            ):
+                by_id[record.asset_id] = record
+                semantic_ids.append(record.asset_id)
+
+    return _collapse_variants(exact_ids, semantic_ids, by_id)
+
+
+def _collapse_variants(
+    exact_ids: list[str],
+    semantic_ids: list[str],
+    by_id: dict[str, Any],
+) -> list[Any]:
+    """同一角色只保留一个着装变体。
+
+    角色名字面命中时，库里该角色的所有变体都会被精确匹配挑出来。把两套
+    冲突服装同时作为参考图会让模型不知道该用哪套——角色一致性正是要避免
+    这个。因此按角色名收敛：语义层明确挑过的变体优先，否则取精确匹配的
+    第一个。
+    """
+    chosen: dict[str, str] = {}
+    order: list[str] = []
+    for asset_id in [*exact_ids, *semantic_ids]:
+        asset = by_id.get(asset_id)
+        if asset is None:
+            continue
+        key = normalize_alias(asset.name)
+        if key not in chosen:
+            chosen[key] = asset_id
+            order.append(key)
+        elif asset_id in semantic_ids and chosen[key] not in semantic_ids:
+            # 语义层的选择覆盖精确匹配的任意变体。
+            chosen[key] = asset_id
+    return [by_id[chosen[key]] for key in order]
+
+
+async def _auto_ingest_characters(
+    document: NormalizedDocument,
+    candidates: list[Any],
+    store: Any | None,
+) -> list[Any]:
+    """把文档里出现、但素材库还没有的角色自动建档。
+
+    参考图取「候选人物所在 block 之后最近的一张图」——需求文档惯例是
+    角色名在前、设定图紧随其后。找不到图就跳过，宁可少建也不建错。
+
+    自动入库的条目打 auto-ingested 标签并记录来源文档，方便人工事后复核；
+    variant 一律先用「默认」，同人不同着装由人工在素材库界面拆分改名。
+    """
+    if store is None or not candidates:
+        return []
+
+    image_blocks = [
+        block
+        for block in sorted(document.blocks, key=lambda item: item.order)
+        if block.image_asset_id
+    ]
+    if not image_blocks:
+        return []
+    assets_by_id = {
+        asset.asset_id: asset for asset in document.media_assets
+    }
+    block_order = {
+        block.block_id: block.order for block in document.blocks
+    }
+
+    created: list[Any] = []
+    for candidate in candidates:
+        name = candidate.proposed_name.strip()
+        if not name:
+            continue
+        asset = _nearest_image_asset(
+            candidate.block_ids, image_blocks, block_order, assets_by_id
+        )
+        if asset is None:
+            continue
+        try:
+            content = asset.local_path.read_bytes()
+        except OSError:
+            _LOGGER.warning("自动入库读取参考图失败 name=%s", name)
+            continue
+        try:
+            record = await store.create(
+                name=name,
+                variant="默认",
+                content=content,
+                mime_type=asset.mime_type,
+                description=candidate.reason or "",
+                tags=["auto-ingested", f"需求文档:{document.document_id}"],
+            )
+        except Exception:
+            # 重名冲突或落盘失败都只跳过该候选，不影响其它候选与整个 run。
+            _LOGGER.warning("自动入库失败 name=%s", name, exc_info=True)
+            continue
+        created.append(record)
+    return created
+
+
+def _nearest_image_asset(
+    block_ids: tuple[str, ...],
+    image_blocks: list[Any],
+    block_order: dict[str, int],
+    assets_by_id: dict[str, Any],
+) -> Any | None:
+    anchors = [
+        block_order[block_id]
+        for block_id in block_ids
+        if block_id in block_order
+    ]
+    if not anchors:
+        return None
+    anchor = min(anchors)
+    following = [
+        block for block in image_blocks if block.order >= anchor
+    ]
+    chosen = following[0] if following else image_blocks[-1]
+    return assets_by_id.get(chosen.image_asset_id)
+
+
+async def _character_media_assets(
+    resolved: list[Any],
+    store: Any | None,
+) -> list[MediaAsset]:
+    """把素材库条目转成 MediaAsset，使其能被下游按普通参考图消费。
+
+    转换后追加进 document.media_assets，_task_assets / provider / 校验
+    全部走既有路径，无需为素材库单开分支。
+    """
+    if store is None or not resolved:
+        return []
+    media: list[MediaAsset] = []
+    for asset in resolved:
+        try:
+            path = store.local_path(asset)
+            content = path.read_bytes()
+        except (OSError, AttributeError):
+            _LOGGER.warning(
+                "素材库文件不可读，跳过挂载 asset_id=%s", asset.asset_id
+            )
+            continue
+        media.append(
+            MediaAsset(
+                asset_id=asset.asset_id,
+                source_block_id=f"asset-library:{asset.asset_id}",
+                origin="asset_library",
+                local_path=path,
+                mime_type=asset.mime_type,
+                size=len(content),
+                sha256=sha256(content).hexdigest(),
+            )
+        )
+    return media
+
+
+def _character_context_argument(
+    planner: RequirementPlanner,
+    resolved: list[Any],
+) -> dict[str, str]:
+    """把已解析的角色素材描述成 planner 可读的上下文。
+
+    与 _planner_prompt_argument / _planner_mode_argument 同样的签名探测做法：
+    老 planner 没有该参数时省略，避免 TypeError。
+    """
+    if not resolved:
+        return {}
+    try:
+        parameters = signature(planner.plan).parameters
+    except (TypeError, ValueError):
+        return {}
+    parameter = parameters.get("character_context")
+    if parameter is None or parameter.kind is Parameter.POSITIONAL_ONLY:
+        return {}
+
+    lines = [
+        f"- {asset.name} / {asset.variant}（asset_id={asset.asset_id}）"
+        f"：{asset.prompt_fragment or asset.description or '无附加描述'}"
+        for asset in resolved
+    ]
+    return {"character_context": "\n".join(lines)}
+
+
+async def _planning_mode_for_run(
+    run_id: str,
+    services: GraphServices,
+    state: Mapping[str, Any] | None = None,
+) -> str:
+    """推导规划模式。
+
+    优先级：
+    1. state 里的显式声明——直连文档创建的 run 没有多维表格 binding，
+       模式在创建时声明；人工改过模式时也以此为准。
+    2. binding.planning_mode——图片需求来自另一张表，那张表没有
+       「需求类型」字段，无法靠字段值判定。
+    3. 需求类型字段——存量 binding 没有 planning_mode 时的回落。
+
+    读取失败一律回落 video，不让一次多维表格抖动把整个 run 拖挂。
+    """
+    declared_state = (state or {}).get("planning_mode")
+    if declared_state in {"image", "video"}:
+        return declared_state
+    store = getattr(services, "production_task_store", None)
+    if store is None:
+        return "video"
+    try:
+        binding = await store.get_by_run(run_id)
+    except Exception:
+        return "video"
+    if binding is None:
+        return "video"
+    declared = getattr(binding, "planning_mode", None)
+    if declared in {"image", "video"}:
+        return declared
+    task_type = getattr(getattr(binding, "snapshot", None), "task_type", None)
+    return "image" if task_type == _IMAGE_REQUIREMENT_TYPE else "video"
+
+
+def _planner_mode_argument(
+    planner: RequirementPlanner,
+    mode: str,
+) -> dict[str, str]:
+    """只在 planner 支持 mode 且需要非默认值时才传。
+
+    存量测试里的 fake planner 大多没有 mode 参数，直接传会 TypeError；
+    video 是默认值，省略可进一步减少对存量调用方的干扰。
+    """
+    if mode == "video":
+        return {}
+    try:
+        parameters = signature(planner.plan).parameters
+    except (TypeError, ValueError):
+        return {}
+    parameter = parameters.get("mode")
+    if parameter is None or parameter.kind is Parameter.POSITIONAL_ONLY:
+        return {}
+    return {"mode": mode}
 
 
 def _planner_prompt_argument(
@@ -356,6 +689,9 @@ async def normalize_document(
     return await _run_node(state, "normalize_document", services, operation)
 
 
+_VISION_MAX_CONCURRENCY = 5
+
+
 async def analyze_images(
     state: AgentState,
     config: RunnableConfig,
@@ -367,22 +703,34 @@ async def analyze_images(
         document = NormalizedDocument.model_validate(
             state.get("normalized_document")
         )
+        assets = list(document.media_assets)
+        semaphore = asyncio.Semaphore(_VISION_MAX_CONCURRENCY)
+
+        async def analyze_one(asset: MediaAsset) -> VisionDescription | Exception:
+            async with semaphore:
+                try:
+                    return await services.vision_analyzer.analyze(asset)
+                except Exception as exc:
+                    return exc
+
+        outcomes = await asyncio.gather(
+            *(analyze_one(asset) for asset in assets)
+        )
+
         descriptions: list[VisionDescription] = []
         issues: list[str] = []
-        for asset in document.media_assets:
-            try:
-                descriptions.append(
-                    await services.vision_analyzer.analyze(asset)
-                )
-            except Exception as exc:
-                reason = (
-                    exc.detail.message
-                    if isinstance(exc, AgentError)
-                    else "图片无法完成视觉分析"
-                )
-                issues.append(
-                    f"素材 {asset.asset_id} 视觉分析失败：{reason}"
-                )
+        for asset, outcome in zip(assets, outcomes):
+            if isinstance(outcome, VisionDescription):
+                descriptions.append(outcome)
+                continue
+            reason = (
+                outcome.detail.message
+                if isinstance(outcome, AgentError)
+                else "图片无法完成视觉分析"
+            )
+            issues.append(
+                f"素材 {asset.asset_id} 视觉分析失败：{reason}"
+            )
         return {
             "vision_descriptions": [
                 _json_model(description) for description in descriptions
@@ -409,14 +757,44 @@ async def plan_requirements(
             for item in state.get("vision_descriptions", [])
         ]
         planning_prompt = _planning_prompt(state)
+        mode = await _planning_mode_for_run(state["run_id"], services, state)
+        resolved_characters = (
+            await _resolve_character_assets(document, services)
+            if mode == "image"
+            else []
+        )
         plan = await services.planner.plan(
             document,
             descriptions,
             state.get("planner_feedback"),
             **_planner_prompt_argument(services.planner, planning_prompt),
+            **_planner_mode_argument(services.planner, mode),
+            **_character_context_argument(
+                services.planner, resolved_characters
+            ),
         )
         plan_json = _json_model(plan)
-        return {"draft_plan": plan_json, "task_plan": plan_json}
+        updates: AgentState = {
+            "draft_plan": plan_json,
+            "task_plan": plan_json,
+        }
+        # 素材库参考图要进 document.media_assets，否则 _task_assets 解析
+        # 不到这些 asset_id，执行阶段会直接判定计划无效。
+        character_media = await _character_media_assets(
+            resolved_characters,
+            getattr(services, "asset_library_store", None),
+        )
+        if character_media:
+            known = {asset.asset_id for asset in document.media_assets}
+            merged = list(document.media_assets) + [
+                asset
+                for asset in character_media
+                if asset.asset_id not in known
+            ]
+            updates["normalized_document"] = _json_model(
+                document.model_copy(update={"media_assets": merged})
+            )
+        return updates
 
     return await _run_node(state, "plan_requirements", services, operation)
 
@@ -768,7 +1146,9 @@ _OUTPUT_SLOT_MARKER = "::output:"
 
 
 def _execution_units(task: GenerationTask) -> list[GenerationTask]:
-    if task.task_type is not TaskType.IMAGE_TO_VIDEO or task.output_count == 1:
+    # 图片与视频都按 output_count 拆分执行单元；早期只有视频支持多产出，
+    # 图片模式接入后这个类型门槛不再成立。
+    if task.output_count == 1:
         return [task]
     return [
         task.model_copy(
@@ -867,7 +1247,18 @@ async def _keep_submission_intent_alive(
 
 async def _generator_for_task(run_id: str, task: GenerationTask, services: GraphServices):
     if task.task_type is TaskType.IMAGE_TO_IMAGE:
-        return "chiyun", services.image_generator
+        registry = getattr(services, "image_providers", None)
+        if not registry:
+            # 未配置 registry：沿用单实例与历史 provider 名，存量 run 不受影响。
+            return "chiyun", services.image_generator
+        requested = task.resolved_image_provider
+        generator = registry.get(requested)
+        if generator is None:
+            raise _validation_error(
+                f"图片 provider {requested} 未配置，"
+                f"当前可用：{'、'.join(sorted(registry))}"
+            )
+        return requested, generator
     if services.portrait_video_generator is not None and services.production_task_store is not None:
         binding = await services.production_task_store.get_by_run(run_id)
         if binding is not None and binding.snapshot.task_type == "真人类":
@@ -954,6 +1345,36 @@ async def _poll_submission(
     return None
 
 
+def _resize_image_bytes(content: bytes, variant: str | None) -> bytes | None:
+    """把出图字节裁到需求要求的尺寸；无需处理时返回 None。
+
+    必须在落盘前处理：FileStore.verify_artifact 要求产物文件名恰好是
+    {sha256}.{extension}，落盘后另写文件会破坏这个契约，导致产物校验
+    失败、任务被判 failed。
+
+    裁切失败一律返回 None 走原图——出原图比整个 run 失败好，人工在审核
+    界面能看到实际尺寸。
+    """
+    if not variant:
+        return None
+    try:
+        target = parse_size_variant(variant)
+    except ValueError:
+        _LOGGER.warning("尺寸变体无法解析，保留原图 variant=%s", variant)
+        return None
+    try:
+        with Image.open(BytesIO(content)) as image:
+            if (image.width, image.height) == (target.width, target.height):
+                return None
+            resized = cover_crop(image.convert("RGB"), target)
+            buffer = BytesIO()
+            resized.save(buffer, format="PNG")
+    except (OSError, ValueError):
+        _LOGGER.warning("出图裁切失败，保留原图 variant=%s", variant)
+        return None
+    return buffer.getvalue()
+
+
 async def _materialize_submission(
     services: GraphServices,
     run_id: str,
@@ -965,6 +1386,13 @@ async def _materialize_submission(
     kind = "image" if task.task_type is TaskType.IMAGE_TO_IMAGE else "video"
     artifacts: list[Artifact] = []
     for index, result in enumerate(submission.result_items):
+        # 模型原生出图尺寸与需求要求的尺寸通常不同，落盘前裁一次才是
+        # 可交付产物；落盘后再改会破坏 {sha256}.{ext} 的产物命名契约。
+        variant = (
+            next(iter(task.resolved_size_variants), None)
+            if kind == "image"
+            else None
+        )
         materialized = await services.file_store.materialize_provider_result(
             run_id,
             task.task_id,
@@ -972,6 +1400,11 @@ async def _materialize_submission(
             index,
             result,
             kind=kind,
+            transform=(
+                (lambda content: _resize_image_bytes(content, variant))
+                if variant
+                else None
+            ),
         )
         stored = materialized.stored
         artifact = Artifact(
@@ -1271,7 +1704,7 @@ async def _execute_one_task(
             official_id = immediate.provider_task_id
             if immediate.provider != provider:
                 raise _provider_terminal_error("供应商任务身份不一致")
-            if provider == "chiyun" and official_id != client_id:
+            if provider in _SYNC_IMAGE_PROVIDERS and official_id != client_id:
                 raise _provider_terminal_error("供应商任务标识不一致")
             transitioned = await _transition_operation(
                 services,
@@ -1395,7 +1828,7 @@ async def _execute_one_task(
             run_id, task.task_id, "submit"
         )
         chiyun_staging_invalid = (
-            provider == "chiyun"
+            provider in _SYNC_IMAGE_PROVIDERS
             and isinstance(exc, AgentError)
             and exc.detail.category is ErrorCategory.PROVIDER_TERMINAL
             and (

@@ -557,7 +557,13 @@ async def test_planning_input_contains_stable_document_and_rules(
                 "thinking": {"type": "enabled"},
                 "reasoning_effort": "high",
             },
-        }
+        },
+        {
+            "response_format": {"type": "json_object"},
+            "extra_body": {
+                "thinking": {"type": "disabled"},
+            },
+        },
     ]
     request = model.requests[0]
     user_prompt = request[1]["content"]

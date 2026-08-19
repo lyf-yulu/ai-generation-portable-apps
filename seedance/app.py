@@ -31,6 +31,14 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 _DATA_BASE = Path(os.environ.get("DATA_DIR", str(ROOT)))
 STATIC_DIR = ROOT / "static"
+
+# Ark error translations live under portal/ so seedance and volcengine-portrait
+# share one table — the two sub-apps hit the same Ark video endpoint and would
+# otherwise duplicate the mapping.
+_PORTAL_DIR = str(ROOT.parent / "portal")
+if _PORTAL_DIR not in sys.path:
+    sys.path.insert(0, _PORTAL_DIR)
+from ark_errors import translate_ark_error  # noqa: E402
 OUTPUT_DIR = _DATA_BASE / "outputs"
 STATE_DIR = _DATA_BASE / "state"
 MEDIA_DIR = STATE_DIR / "media"
@@ -491,6 +499,10 @@ def _ws_preset_path(ws_id: str) -> Path:
 
 OFFICIAL_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 TERMINAL_STATUSES = {"succeeded", "success", "failed", "fail", "failure", "cancelled", "canceled"}
+
+# translate_ark_error lives in portal/ark_errors.py so seedance and
+# volcengine-portrait share one table; see the module for the matcher rules.
+
 
 JOBS: dict[str, dict[str, Any]] = {}
 FILES: dict[str, Path] = {}
@@ -1463,9 +1475,16 @@ def extract_video_url(data: dict[str, Any]) -> str | None:
                     return str(value["url"])
                 if isinstance(value, str):
                     return value
-    for key in ("video_url", "videoUrl", "output"):
+    for key in ("video_url", "videoUrl"):
         if data.get(key):
             return str(data[key])
+    output = data.get("output")
+    if isinstance(output, dict):
+        url = output.get("video_url") or output.get("videoUrl")
+        if url:
+            return str(url)
+    elif isinstance(output, str) and output:
+        return output
     results = data.get("results")
     if isinstance(results, list):
         for item in results:
@@ -1921,11 +1940,18 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
         per_item_duration = int(values.get("duration") or 0)
     except (TypeError, ValueError):
         per_item_duration = 0
+    # duration=-1 asks the model to choose the length. Store 0 rather than -1:
+    # Portal bills video seconds as done * duration, so a negative value would
+    # subtract from by_user.seconds. run_one() backfills the real length once Ark
+    # reports it.
+    if per_item_duration < 0:
+        per_item_duration = 0
     with JOBS_LOCK:
         JOBS[job_id] = {
             "id": job_id, "status": "queued", "events": [], "results": [], "errors": [],
             "done": 0, "total": 0, "duration": per_item_duration,
             "username": username,
+            "workspace_id": ws_id,
             "submitted_at": time.time(),
             "started_at": None,
             "finished_at": None,
@@ -1945,7 +1971,7 @@ def create_job(values: dict[str, Any], files: dict[str, tuple[str, bytes]], sour
         "username": username,
         "started_at": time.time(),
         "restore": copy_files_to_restore(values, files, activity_id, ws_id),
-    })
+    }, ws_id)
     thread = threading.Thread(target=run_job, args=(job_id, values, files, activity_id, ws_id), daemon=True)
     thread.start()
     return job_id
@@ -1990,6 +2016,22 @@ def run_one(job_id: str, index: int, form_values: dict[str, Any], form_files: di
         if status not in TERMINAL_STATUSES:
             continue
         if status != "succeeded":
+            # Ark returns errors as {"code": ..., "message": ...}. Look the pair
+            # up in ARK_ERROR_MATCHERS for a Chinese explanation; if none of the
+            # matchers fires, still surface the raw code + message so the
+            # operator can find the request id — better than dumping the whole
+            # response dict.
+            err = status_result.get("error") if isinstance(status_result.get("error"), dict) else None
+            if err:
+                code = str(err.get("code") or "").strip()
+                message = str(err.get("message") or "").strip()
+                zh = translate_ark_error(code, message)
+                if zh:
+                    raise RuntimeError(f"Task {task_id}: {zh} 原始错误：{code}: {message}")
+                raise RuntimeError(
+                    f"Task {task_id} ended as {status}: {code} — {message}" if code
+                    else f"Task {task_id} ended as {status}: {message or status_result}"
+                )
             raise RuntimeError(f"Task {task_id} ended as {status}: {status_result}")
         video_url = extract_video_url(status_result)
         if not video_url:
@@ -2027,11 +2069,22 @@ def run_one(job_id: str, index: int, form_values: dict[str, Any], form_files: di
             FILES[file_token] = out_path
         save_files_map()
         add_event(job_id, f"Run {index}: downloaded {out_name}")
+        # Ark reports the produced length back, which matters when the request
+        # asked for duration=-1 (model picks the length). Portal's usage poller
+        # bills seconds as done * job["duration"], so leaving -1 there would
+        # subtract from by_user.seconds instead of adding.
+        actual_duration = status_result.get("duration")
+        if isinstance(actual_duration, (int, float)) and actual_duration > 0:
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+                if job is not None and int(job.get("duration") or 0) <= 0:
+                    job["duration"] = int(actual_duration)
         return {
             "index": index,
             "task_id": task_id,
             "status": "succeeded",
             "video_url": video_url,
+            "duration": int(actual_duration) if isinstance(actual_duration, (int, float)) else None,
             "download_url": f"/api/download/{file_token}",
             "filename": out_name,
             "local_path": str(out_path),

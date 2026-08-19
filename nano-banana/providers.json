@@ -63,6 +63,39 @@
         {"id": "nano-banana2[2K]-base", "label": "nano-banana2[2K]-base"},
         {"id": "gpt-image-2", "label": "gpt-image-2"}
       ]
+    },
+    "volcengine": {
+      "label": "火山引擎官方 (Seedream)",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "api_style": "ark_seedream",
+      "company_key": true,
+      "hint": "Seedream 5.0 Pro；使用 Seedance 相同的火山方舟密钥（服务器托管）。",
+      "image_size_options": ["1K", "1.5K", "2K"],
+      "max_reference_images": 10,
+      "supports_seed": false,
+      "defaults": {
+        "mode": "img2img",
+        "model": "doubao-seedream-5-0-pro-260628",
+        "aspect_ratio": "auto",
+        "image_size": "2K",
+        "response_format": "url",
+        "control_after_generate": "randomize",
+        "repeat_count": 1,
+        "concurrency": 1,
+        "poll_interval": 10,
+        "timeout": 300,
+        "vary_seed": false,
+        "resize_enabled": false,
+        "resize_width": 1700,
+        "resize_height": 2500,
+        "resize_interpolation": "high",
+        "resize_method": "stretch",
+        "resize_condition": "always",
+        "resize_multiple_of": 0
+      },
+      "models": [
+        {"id": "doubao-seedream-5-0-pro-260628", "label": "Seedream 5.0 Pro"}
+      ]
     }
   }
 }

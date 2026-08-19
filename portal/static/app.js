@@ -1278,7 +1278,7 @@ function StatsApp() {
       if (meta && meta.display_name) return meta.display_name;
       return {
         'seedance': 'Seedance',
-        'nano-banana': 'Nano Banana',
+        'nano-banana': '图像生成模块',
         'dreamina': 'Dreamina',
         'volcengine-portrait': '人像生成',
       }[app] || app;
@@ -1544,7 +1544,39 @@ function VolcenginePortraitApp() {
     assets: [],
     assetName: '',
     genAssetId: '', extraAssetIds: [], extraFiles: [],
-    prompt: '', duration: 12, resolution: '720p', ratio: '16:9', repeat: 1,
+    prompt: '', model: 'doubao-seedance-2-0-260128', duration: 12, resolution: '720p', ratio: '16:9', repeat: 1,
+    // Task-type switch — see seedance/static/app.js for the rationale.
+    // Ark 2.5 auto-classifies as reference / extend / edit from the prompt;
+    // this makes the classification explicit so the user can't accidentally
+    // send a positive duration into an edit task.
+    taskMode: 'reference',
+    _prevTaskMode: 'reference',
+    _taskModeMemory: {
+      reference: { ratio: '16:9', duration: 12 },
+      extend:    { ratio: 'adaptive', duration: 5 },
+      edit:      { ratio: 'adaptive', duration: -1 },
+    },
+    // Per-model limits from the official capability matrix. Ark only validates
+    // these after the job is queued, so an out-of-range value costs a wait plus
+    // an async error rather than failing fast.
+    portraitModels: [
+      {
+        id: 'doubao-seedance-2-0-260128', label: 'Seedance 2.0（最高 4k）',
+        maxDuration: 15, resolutions: ['480p', '720p', '1080p', '4k'],
+      },
+      {
+        id: 'doubao-seedance-2-0-fast-260128', label: 'Seedance 2.0 fast',
+        maxDuration: 15, resolutions: ['480p', '720p'],
+      },
+      {
+        id: 'doubao-seedance-2-0-mini-260615', label: 'Seedance 2.0 mini（最快）',
+        maxDuration: 15, resolutions: ['480p', '720p'],
+      },
+      {
+        id: 'doubao-seedance-2-5-260628', label: 'Seedance 2.5（最长 30s）',
+        maxDuration: 30, resolutions: ['480p', '720p'],
+      },
+    ],
     submitting: false, events: '', results: [], jobs: [],
     runtimeTick: 0,
     outputDir: '', outputDirInput: '', showOutputDirInput: false,
@@ -1630,6 +1662,7 @@ function VolcenginePortraitApp() {
         this.assetGroupId = res.group_id;
         this.uploadMsg = '组创建成功: ' + res.group_id;
         this.uploadError = false;
+        await this.loadGroups();
       } else {
         this.uploadMsg = (res?.error || '创建失败') + (res?.detail ? ' — ' + res.detail.slice(0, 120) : '');
         this.uploadError = true;
@@ -1899,6 +1932,51 @@ function VolcenginePortraitApp() {
     },
 
     // === Jobs ===
+    // Capabilities of the currently selected model, read from portraitModels.
+    modelSpec() {
+      return this.portraitModels.find(m => m.id === this.model) || this.portraitModels[0];
+    },
+    modelResolutions() { return this.modelSpec().resolutions; },
+    modelMaxDuration() { return this.modelSpec().maxDuration; },
+    // Called from index.html on model change so a stale resolution or an
+    // out-of-range duration is corrected before the user can submit.
+    onModelChange() {
+      const spec = this.modelSpec();
+      if (!spec.resolutions.includes(this.resolution)) this.resolution = spec.resolutions[0];
+      // -1 means "let Ark pick the length" and is required by video edit /
+      // extend tasks, so it must survive a model switch instead of being clamped.
+      if (Number(this.duration) !== -1 && Number(this.duration) > spec.maxDuration) {
+        this.duration = spec.maxDuration;
+      }
+    },
+
+    // Task-type switch. reference / extend / edit each impose different
+    // constraints on ratio + duration (see seedance side for the full rules).
+    // Values are remembered per-mode so switching away and back restores what
+    // the user typed. Session-only, no persistence.
+    changeTaskMode() {
+      const from = this._prevTaskMode || 'reference';
+      const to = this.taskMode || 'reference';
+      const mem = this._taskModeMemory;
+      if (mem[from]) {
+        mem[from].ratio = this.ratio;
+        mem[from].duration = Number(this.duration);
+      }
+      const target = mem[to] || mem.reference;
+      if (to === 'extend' || to === 'edit') {
+        this.ratio = 'adaptive';
+      } else {
+        this.ratio = target.ratio || '16:9';
+      }
+      this.duration = (to === 'edit') ? -1
+        : (Number.isFinite(target.duration) ? target.duration : 5);
+      this._prevTaskMode = to;
+      if (mem[to]) {
+        mem[to].ratio = this.ratio;
+        mem[to].duration = Number(this.duration);
+      }
+    },
+
     async createJob() {
       if (!this.genAssetId) { this.statusText = '请选择资产 ID（图1）'; return; }
       if (!this.prompt) { this.statusText = '请输入 Prompt'; return; }
@@ -1912,6 +1990,7 @@ function VolcenginePortraitApp() {
           const fd = new FormData();
           fd.append('asset_id', this.genAssetId);
           fd.append('prompt', this.prompt);
+          fd.append('model', this.model);
           fd.append('duration', this.duration);
           fd.append('resolution', this.resolution);
           fd.append('ratio', this.ratio);
@@ -1927,6 +2006,7 @@ function VolcenginePortraitApp() {
             asset_id: this.genAssetId,
             extra_asset_ids: this.extraAssetIds,
             prompt: this.prompt,
+            model: this.model,
             duration: this.duration, resolution: this.resolution, ratio: this.ratio, repeat_count: this.repeat
           }));
         }

@@ -264,8 +264,30 @@ button {
   resize: vertical;
   line-height: 1.5;
 }
+.direct-run-panel { margin-bottom: 1rem; }
+.direct-run-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .5rem;
+  align-items: center;
+}
+.direct-run-form input[type="url"] {
+  flex: 1 1 22rem;
+  min-width: 14rem;
+}
 .task-prompt-editor { min-height: 18rem; }
 .task-negative-editor { min-height: 10rem; }
+.task-size-variants-editor { min-height: 4.5rem; }
+.task-style-presets { display: flex; flex-wrap: wrap; gap: .4rem; }
+.task-style-preset {
+  cursor: pointer;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: .3rem .7rem;
+  font-size: .78rem;
+  background: #f6f8f7;
+}
+.task-style-preset:hover { background: #e8eeea; }
 .task-notes { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .7rem; }
 .note { border-radius: 999px; padding: .25rem .5rem; font-size: .72rem; background: #eef1ef; }
 .note.blocking { color: #7d241e; background: #fdeae8; }

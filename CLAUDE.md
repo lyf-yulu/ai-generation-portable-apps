@@ -12,6 +12,28 @@ token 做 live 实测 / 并行探查 / 端到端验证把问题一锤定音，�
 靠猜测反复打补丁、反复让用户重启验证。定位生产问题时，能真实复现就真实复现
 （哪怕产生少量出图费用），不要用推断代替证据。
 
+## 长任务防卡死：产出优先落盘，别攒在上下文
+
+**症状**：写实施 plan / 长文档 / 多步方案时，会陷入"复述状态→摸信息→再复述"的循环，API
+每断一次就丢工作、从头开始，用户看到"一直在工作但没产出"。
+
+**根因**：`superpowers:writing-plans` 这类 skill 强制走 announce → 摸信息 → self-review
+→ execution handoff 一串前置流程；内容全在上下文里、没落磁盘，断链就丢。系统 reminder
+和 auto-mode 又会不断触发我复述状态而不是往下写。
+
+**修复方式（对任何多轮长产出都适用）**：
+
+1. **绕开 skill 的流程壳，直接 Write 文件**。skill 里的**格式指引**（TDD 五步、每步含
+   代码 / 命令 / 期望输出、无 placeholder）值得保留；**流程指引**（announce、摸信息、
+   self-review、handoff）跳过——它们不落盘、断链即丢。
+2. **文件一落盘 = 一个 checkpoint**。下次续写从磁盘读，不依赖上下文。写完一个文件立刻
+   commit 的心态：宁可多份短 plan，不要一份憋大的。
+3. **分批产出而不是一次全写**。3 份 plan 就 3 次 Write，不要合成一份大 plan——大 plan
+   写到一半断链是灾难，短 plan 断了只丢一份。
+4. **信息够就写，不追求穷尽**。plan 的完整性靠"格式对了 + 决策对了"，不靠"摸到所有
+   行号"。行号写错执行者能自己修，决策错了返工代价大得多。
+5. **不要每轮口头解释"我在做什么"**。用户看到 Write 工具在跑就知道，反复复述是噪音。
+
 ## 项目定位
 
 这是一个部署在**服务机**（用户本机 Mac）上的多子应用聚合平台，聚合 Seedance / Nano Banana / Dreamina / Volcengine Portrait 等 AI 生成能力，统一 Portal 前端 + 反向代理暴露给使用者。
@@ -46,7 +68,8 @@ cd dreamina && python3 app.py    # port 8888
 portal/           → Unified SPA + reverse proxy (port 9090)
 ├── app.py        → ThreadingHTTPServer: serves static/, proxies /seedance/*, /nano-banana/*, /dreamina/* to sub-apps, tracks usage stats (by_ip), polls job completion
 ├── static/
-│   ├── index.html  → All 4 tabs (Seedance, Nano Banana, Dreamina, 统计)
+│   ├── index.html  → 全部 tab（Seedance / 图像生成 / 飞书 Agent / Dreamina / 人像 / 无限画布 / 密钥库 / 统计）
+│   │                 tab 按钮与面板是硬编码的，加子应用要手工改；面板 id 必须是 "tab-" + data-tab
 │   ├── app.js      → Single IIFE: tab switching, form submission, provider binding, stats rendering
 │   └── styles.css
 
@@ -78,7 +101,9 @@ dreamina/         → Image/video via Dreamina CLI wrapper
 - `/api/jobs` POST creates jobs, GET returns status
 - Archives stored as `.seedance`/`.nanobanana`/`.dreamina` zip files in `archives/`
 
-**Portal proxy**: `_proxy()` reads full response body to extract `job_id` from job-creation responses, then registers the job for usage tracking. All other requests are pass-through.
+**Portal proxy**: `_proxy()` 全程流式转发（`shutil.copyfileobj`，64KB 块），**不缓冲响应体**。任务 id 由子应用通过 **`X-Job-Id` 响应头**上报，Portal 据此登记用量（`portal/app.py:2089-2097`）。登记的三个必要条件：POST 路径命中 `_is_job_request` 白名单、响应状态 200/201、`X-Job-Id` 非空。
+
+> 早期实现是「读完整 body 提取 job_id」，因长任务阻塞代理线程已于 #15 改掉。新增子应用若不发 `X-Job-Id`，统计会**静默不计数**（功能全正常、数字永远是 0）。
 
 **Provider system** (seedance, nano-banana): `providers.json` defines available providers with `base_url`, `models[]`, `defaults{}`. Frontend `bindProviderSwitch()` rebuilds model dropdown and updates URL on provider change.
 
@@ -112,7 +137,8 @@ dreamina/         → Image/video via Dreamina CLI wrapper
 - **重启命令**：`launchctl kickstart -k gui/$(id -u)/com.ai-portal`（改 plist 后必须重载，`launchctl list | grep com.ai-portal` 看状态）
 - **cloudflared 已 unload**（`com.ai-portal-tunnel.plist`），改走局域网 HTTPS
 - **访问 URL**：`https://192.168.30.5:9090`（自签证书，首次访问需点「高级 → 继续」）；9089 是 HTTP→HTTPS 跳转
-- **Python 路径**：plist 里是 `/usr/bin/python3`（3.9）；手动重启必须用 `/opt/homebrew/bin/python3.12`，3.9 会让所有代理请求静默超时
+- **Python 路径**：plist 里是 `/opt/homebrew/bin/python3.12`（2026-08-14 实测确认）；**不要**用系统 `/usr/bin/python3`（3.9），它会让所有代理请求静默超时
+- **改 plist 后必须 `unload` + `load`**：`launchctl kickstart -k` 只重启进程、**不重读 plist**（2026-08-14 实测：加了 `INFINITE_CANVAS_ENGINE` 后 kickstart 无效，子应用回退到 stdlib 引擎）
 - **端口表**：
 
 | App | 生产 | 测试 |
@@ -123,11 +149,24 @@ dreamina/         → Image/video via Dreamina CLI wrapper
 | Nano Banana | 8797 | 8798 |
 | Dreamina | 8888 | 8890 |
 | Volcengine Portrait | 8891 | 8892 |
+| Infinite Canvas | 8893 | 8894 |
+| Feishu Generation Agent | 8765 | — |
 
 - **证书文件**：`portal/state/portal.pem` + `portal.key`；LAN IP 变化时 `ensure_certs()` 自动重生（`portal/app.py:101-131`）
 - **下载映射持久化**：`state/download_files.json`（token→文件路径）
 - **数据布局（2026-07-22 起）**：各子应用的 `outputs/`、`state/`、`archives/`、`uploads/`、`accounts/` 以及 `portal/state/` 已从软链改为**主仓库内的真实目录**，不再依赖 `ai-generation-portable-apps-backup-2026-07-14-1653/`（该 backup 目录已删除，主干数据打包留档在 `~/backup-trunk-2026-07-22.zip`）。迁移时**弃掉了草稿缓存** `state/workspaces/` 和 `state/media/`（历史参考图需用户重传）以及 `portal/state/logs/`。`activity_log.json` / `usage.json` / `users.json` / `accounts.json` 等主干与统计数据完整保留。
 - **飞书产出搬运**：独立服务 `com.feishu-output-sync`（launchd，**独立于 com.ai-portal**）常驻轮询 `feishu-output-sync/sync.py`，把各子应用 outputs 增量搬进「每人一张多维表格」（组织内可编辑）。日志 `~/Library/Logs/feishu-output-sync.log`；配置 `feishu-output-sync/config.json`（gitignored）。
+
+## 无限画布 2026-08-19 上游同步（新增功能）
+
+从 `~/ai-creation-canvas`（上游 fork）同步了 8/14 之后 72 个提交的功能，**translated** 进 `infinite-canvas/`：
+
+- **画布改进**：preset 参数控件（Ark 尺寸 1K..4K + 自定义宽x高，schema 用 `x-ark-size`）、结果派生引用 `job-result.{jobId}.{index}`（翻译层 `_resolve_asset` 解析，前端 deriveResultAssetId 生成）、nanoid 替代 crypto.randomUUID（plain-HTTP 浏览器修复）、提交超时 600s。
+- **Ark 人像素材库**：画布右下角「人像资产库」按钮 → 上传 PNG/JPEG/WebP（10MB 内、**宽高 300-6000px**，方舟硬限制）→ TOS PUT → CreateAsset 进方舟 AIGC 素材库 → 本地副本保留，生成时走本地字节。配置 `infinite-canvas/state/asset-library.json`（gitignored，已从 volcengine-portrait config 派生）；**SK 一律原始值**，勿 base64 解码（控制台复制值恰好是合法 base64，解码 = SignatureDoesNotMatch）。后端模块 `ark_library.py`。
+- **ComfyUI 工作流库**：管理员侧边栏「工作流库」→ 导入/预览/导出/启停工作流；`execution_available` 恒 False（执行切片上游也没交付）。服务配置 `state/comfyui-services.json`（可选）；启用但未配置服务时 409。放行策略：**启用即全员可见**（上游按人授权在 Portal 形态不可用）。模块 `comfy_lib.py`（解析/校验）+ `comfy_api.py`（API）。
+- **TOS 预签名 GET 的坑**：canonical_headers 必须以 `\n` 结尾、模板再补 `\n`（即空行），否则 SignatureDoesNotMatch —— 与 AWS SigV4 不同，与 volcengine-portrait/app.py:246-254 一致。
+- **跳过**：注册/密码管理/凭证池/后台日志等上游服务端功能（Portal 负责身份与统计，见 docs/infinite-canvas/01-前端改造.md 的裁剪原则）。
+- 上游同步点：`c3d5aed` → `6d1d2c6`（前端源码 58 文件、后端语义对齐）；前端单测 428 全过。
 
 ## 稳定教训（跨版本长期有效）
 

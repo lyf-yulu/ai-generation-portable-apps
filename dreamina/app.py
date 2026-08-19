@@ -1226,20 +1226,20 @@ def _execute_task_impl(job_id: str, task_type: str, args: list[str], params: dic
     with LOCK:
         job["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         job["finished_epoch"] = time.time()
-        if job["errors"] and not job["results"]:
+        if len(job["results"]) == 1:
+            job["result"] = job["results"][0]
+        else:
+            all_files = []
+            for r in job["results"]:
+                if isinstance(r, dict):
+                    all_files.extend(r.get("files", []))
+            job["result"] = {"files": all_files, "count": len(job["results"])}
+        if job["errors"]:
             job["status"] = "failed"
             job["error"] = "; ".join(job["errors"][:3])
             job["retryable"] = True
         else:
             job["status"] = "completed"
-            if len(job["results"]) == 1:
-                job["result"] = job["results"][0]
-            else:
-                all_files = []
-                for r in job["results"]:
-                    if isinstance(r, dict):
-                        all_files.extend(r.get("files", []))
-                job["result"] = {"files": all_files, "count": len(job["results"])}
         _final_status_for_callback = job["status"]
 
     with LOCK:

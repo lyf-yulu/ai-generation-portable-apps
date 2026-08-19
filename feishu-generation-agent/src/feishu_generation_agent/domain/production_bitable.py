@@ -37,7 +37,7 @@ class ProductionTaskSummary(BaseModel):
     @computed_field
     @property
     def deliverable(self) -> bool:
-        return self.task_type in {"动画类", "真人类"}
+        return self.task_type in {"动画类", "真人类", "图片类"}
 
     @computed_field
     @property

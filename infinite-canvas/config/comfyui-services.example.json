@@ -1,0 +1,10 @@
+{
+  "services": [
+    {
+      "service_id": "comfy-local",
+      "base_url": "http://127.0.0.1:8188",
+      "timeout_seconds": 10,
+      "auth_header_ref": null
+    }
+  ]
+}

@@ -69,9 +69,10 @@ def test_image_task_requires_image_size_and_rejects_video_fields():
         with pytest.raises(ValidationError, match=field):
             GenerationTask.model_validate(invalid_payload)
 
+    # image_size 缺失时兜底为 2K：出图分辨率由我们统一决定（统一按最高档
+    # 出图再裁到交付尺寸），不该因为 planner 漏填就让整个计划失败。
     del payload["image_size"]
-    with pytest.raises(ValidationError, match="image_size"):
-        GenerationTask.model_validate(payload)
+    assert GenerationTask.model_validate(payload).image_size == "2K"
 
 
 @pytest.mark.parametrize("generate_audio", [None, True, False])

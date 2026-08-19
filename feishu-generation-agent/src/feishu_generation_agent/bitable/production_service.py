@@ -43,6 +43,20 @@ _SHARED_RESULT_TARGET = "__shared_production_result__"
 class ProductionTaskSource:
     location: BitableLocation
     expected_task_type: str
+    # 图片类需求来自另一张表，那张表没有「需求类型」字段，无法靠字段值
+    # 判定模式，因此把模式与类型声明在来源上。
+    planning_mode: str = "video"
+    declared_task_type: str = ""
+
+    def matches_task_type(self, task_type: str) -> bool:
+        """expected_task_type 留空表示本表所有行都算数。
+
+        没有「需求类型」字段的表，行上的 task_type 恒为空，不能拿它过滤，
+        否则会把整张表的记录全部滤掉。
+        """
+        if not self.expected_task_type:
+            return True
+        return task_type == self.expected_task_type
 
 
 class ProductionBitableService:
@@ -86,10 +100,31 @@ class ProductionBitableService:
         }
         return [
             task
-            for task in tasks
-            if task.task_type == source.expected_task_type
+            for task in (
+                self._stamp_declared_type(task, source) for task in tasks
+            )
+            if source.matches_task_type(task.task_type)
             and task.record_id not in active_record_ids
         ]
+
+    @staticmethod
+    def _stamp_declared_type(task, source: ProductionTaskSource):
+        """给没有「需求类型」字段的表补上来源声明的类型。
+
+        图片需求来自另一张多维表格，那张表没有该字段，行上的 task_type
+        恒为空。在这里补齐后，下游的交付白名单、binding 快照、规划模式
+        判定全部走既有路径，无需为图片表另开分支。
+        """
+        if task.task_type or not source.declared_task_type:
+            return task
+        return task.model_copy(
+            update={
+                "task_type": source.declared_task_type,
+                "snapshot": task.snapshot.model_copy(
+                    update={"task_type": source.declared_task_type}
+                ),
+            }
+        )
 
     async def claim(
         self,

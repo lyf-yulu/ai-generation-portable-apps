@@ -28,6 +28,13 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 _DATA_BASE = Path(os.environ.get("DATA_DIR", str(ROOT)))
 STATIC_DIR = ROOT / "static"
+
+# Share Ark error translations with seedance — same Ark video endpoint, same
+# error taxonomy. See portal/ark_errors.py for the matcher rules.
+_PORTAL_DIR = str(ROOT.parent / "portal")
+if _PORTAL_DIR not in sys.path:
+    sys.path.insert(0, _PORTAL_DIR)
+from ark_errors import translate_ark_error  # noqa: E402
 OUTPUT_DIR = _DATA_BASE / "outputs"
 STATE_DIR = _DATA_BASE / "state"
 LOG_DIR = _DATA_BASE / "logs"
@@ -1095,11 +1102,27 @@ def handle_virtual_assets_post(handler):
     elif fmime.startswith("audio/"):
         asset_type = "Audio"
 
-    # Upload to a public host to get an accessible URL for CreateAsset
-    source_url = _upload_to_public_host(fdata, fname, fmime)
-    if not source_url:
-        json_response(handler, 502, {"ok": False, "error": "failed to get public URL for file"})
-        return
+    # Upload to a location Ark can fetch. TOS 优先（大文件稳定，尤其视频），
+    # 未配 TOS 时回退 uguu.se 免费图床以兼容旧部署。TOS 若配了却上传失败，
+    # 直接抛错不回退——否则权限 / bucket / region 错配会被静默回退掩盖，
+    # 让人误以为已经在走 TOS。
+    source_url = None
+    if TOS_ACCESS_KEY and TOS_SECRET_KEY and TOS_BUCKET:
+        try:
+            source_url = tos_upload(fdata, fmime, fname)
+            print(f"  [asset_upload] TOS OK ({len(fdata)} bytes, {fmime})", flush=True)
+        except Exception as e:
+            print(f"  [asset_upload] TOS FAIL: {e}", flush=True)
+            json_response(handler, 502, {
+                "ok": False,
+                "error": f"TOS 上传失败: {e}",
+            })
+            return
+    else:
+        source_url = _upload_to_public_host(fdata, fname, fmime)
+        if not source_url:
+            json_response(handler, 502, {"ok": False, "error": "failed to get public URL for file"})
+            return
 
     # Call CreateAsset via OpenAPI
     create_body = {
@@ -1601,7 +1624,12 @@ def handle_virtual_jobs_post(handler, task_type: str = "virtual"):
             "extra_asset_ids": extra_asset_ids,
             "prompt": prompt,
             "model": model,
-            "duration": duration,
+            # Two fields on purpose. `requested_duration` is what Ark receives and
+            # may legitimately be -1 ("model picks the length"). `duration` is what
+            # Portal's usage poller bills as done * duration, so it must never be
+            # negative — it stays 0 until the real length is backfilled on success.
+            "requested_duration": duration,
+            "duration": max(0, duration),
             "resolution": resolution,
             "ratio": ratio,
             "status": "queued",
@@ -1743,7 +1771,8 @@ def _run_virtual_job_impl(job_id, job):
     extra_asset_ids = job.get("extra_asset_ids", []) or []
     prompt = job.get("prompt", "")
     model = job.get("model", "doubao-seedance-2-0-260128")
-    duration = int(job.get("duration", 12))
+    # Read the requested value (may be -1), not the billing-safe `duration`.
+    duration = int(job.get("requested_duration", job.get("duration", 12)))
     resolution = job.get("resolution", "720p")
     ratio = job.get("ratio", "16:9")
     repeat_count = int(job.get("total", 1))
@@ -1815,7 +1844,15 @@ def _run_virtual_job_impl(job_id, job):
                         with FILES_LOCK:
                             FILES[file_token] = local_path
                         save_files_map()
+                    # Ark reports the produced length, which is the only source
+                    # of truth when the request asked for duration=-1. Portal
+                    # bills video seconds as done * job["duration"], so a
+                    # negative value there would subtract from by_user.seconds.
+                    actual_duration = task_result.get("duration")
                     with JOBS_LOCK:
+                        if (isinstance(actual_duration, (int, float)) and actual_duration > 0
+                                and int(job.get("duration") or 0) <= 0):
+                            job["duration"] = int(actual_duration)
                         job["results"].append({
                             "index": idx,
                             "task_id": task_id,
@@ -1827,23 +1864,41 @@ def _run_virtual_job_impl(job_id, job):
                         job["events"].append({"time": time.strftime("%H:%M:%S"), "message": f"Run {idx} 完成"})
                 else:
                     with JOBS_LOCK:
-                        job["results"].append({
-                            "index": idx,
-                            "task_id": task_id,
-                            "filename": f"output_{idx}.mp4",
-                            "download_url": extract_video_url(task_result) or "",
-                            "status": "succeeded",
-                        })
+                        job["errors"].append(f"Run {idx}: 任务已成功但没有视频地址")
                         job["done"] += 1
+                        job["events"].append({
+                            "time": time.strftime("%H:%M:%S"),
+                            "message": f"Run {idx} 失败: 任务已成功但没有视频地址",
+                        })
                 break
             elif t_status in ("failed", "error"):
+                # Surface Ark's error.code and message, and translate the
+                # common ones to Chinese so a non-English user doesn't need
+                # DevTools to know what went wrong (see portal/ark_errors.py).
+                err = task_result.get("error") if isinstance(task_result.get("error"), dict) else {}
+                code = str(err.get("code") or "").strip()
+                message = str(err.get("message") or "").strip()
+                zh = translate_ark_error(code, message) if code or message else None
+                if zh:
+                    detail = f"{code}: {message}" if code else message
+                    summary = f"Run {idx}: {zh} 原始错误：{detail}"
+                else:
+                    # Compose from whatever pieces Ark provided so nothing gets
+                    # swallowed: message alone, code alone, or both together.
+                    detail_bits = [b for b in (code, message) if b]
+                    detail = ": ".join(detail_bits) if len(detail_bits) == 2 else (detail_bits[0] if detail_bits else "")
+                    summary = f"Run {idx}: {t_status}" + (f" — {detail}" if detail else "")
                 with JOBS_LOCK:
-                    job["errors"].append(f"Run {idx}: {t_status}")
+                    job["errors"].append(summary)
                     job["done"] += 1
+                    job["events"].append({
+                        "time": time.strftime("%H:%M:%S"),
+                        "message": summary,
+                    })
                 break
 
     with JOBS_LOCK:
-        job["status"] = "succeeded" if len(job.get("results", [])) > 0 else "failed"
+        job["status"] = "failed" if job.get("errors") else "succeeded"
         job["finished_at"] = time.time()
         job["events"].append({"time": time.strftime("%H:%M:%S"), "message": f"任务结束: {job['status']}"})
         final_snapshot = {

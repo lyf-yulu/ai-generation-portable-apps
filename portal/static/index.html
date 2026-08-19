@@ -24,10 +24,11 @@
 
     <div class="app-tabs-bar">
       <button class="app-tab active" data-tab="seedance">Seedance</button>
-      <button class="app-tab" data-tab="nb">Nano Banana</button>
+      <button class="app-tab" data-tab="nb">图像生成模块</button>
       <button class="app-tab" data-tab="feishu-generation-agent">飞书任务 Agent</button>
       <button class="app-tab" data-tab="dreamina">Dreamina</button>
       <button class="app-tab" data-tab="volcengine-portrait">人像生成</button>
+      <button class="app-tab" data-tab="infinite-canvas">无限画布</button>
       <button class="app-tab" data-tab="keys">密钥库</button>
       <button class="app-tab" data-tab="stats">统计</button>
     </div>
@@ -46,6 +47,14 @@
   <!-- FEISHU GENERATION AGENT -->
   <div class="tab-panel" id="tab-feishu-generation-agent">
     <iframe id="iframe-feishu-generation-agent" data-app="feishu-generation-agent" style="width:100%;height:calc(100vh - 48px);border:none;display:block" allow="fullscreen"></iframe>
+  </div>
+
+  <!-- INFINITE CANVAS -->
+  <!-- id 必须是 "tab-" + data-tab 的值：切换逻辑用 getElementById('tab-'+dataset.tab)
+       （portal/static/app.js:80），拼错会 null.classList 抛错并卡死整个 tab 栏。
+       src 由 initConfiguredIframes() 从 /api/apps 注入，不写死。 -->
+  <div class="tab-panel" id="tab-infinite-canvas">
+    <iframe id="iframe-infinite-canvas" data-app="infinite-canvas" style="width:100%;height:calc(100vh - 48px);border:none;display:block" allow="fullscreen"></iframe>
   </div>
 
   <!-- DREAMINA -->
@@ -433,16 +442,48 @@
             </div>
 
             <label style="margin-top:10px">Prompt <textarea v-model="prompt" rows="3" placeholder="描述你想生成的内容..."></textarea></label>
+            <label style="margin-top:8px">模型
+              <select v-model="model" @change="onModelChange()">
+                <option v-for="m in portraitModels" :value="m.id">{{ m.label }}</option>
+              </select>
+            </label>
+            <label style="margin-top:8px">任务类型
+              <select v-model="taskMode" @change="changeTaskMode()">
+                <option value="reference">参考生视频（默认）</option>
+                <option value="extend">视频延长（ratio 锁 adaptive）</option>
+                <option value="edit">视频编辑（ratio=adaptive, duration=-1）</option>
+              </select>
+            </label>
+            <p class="hint" v-if="taskMode === 'reference'" style="margin:4px 0 6px">
+              <strong>参考生视频</strong>：ratio 与 duration 均可自定义。
+            </p>
+            <p class="hint" v-if="taskMode === 'extend'" style="margin:4px 0 6px;color:#b45309">
+              <strong>视频延长</strong>：ratio 锁 adaptive；duration 可自定义。参考素材需包含待延长的视频。
+            </p>
+            <p class="hint" v-if="taskMode === 'edit'" style="margin:4px 0 6px;color:#b45309">
+              <strong>视频编辑</strong>：ratio=adaptive、duration=-1（即由模型自动决定时长，均锁定）。参考素材需包含待编辑的视频。
+            </p>
             <div class="row" style="flex-wrap:wrap;gap:8px;margin-top:8px">
-              <label style="flex:1;min-width:100px">时长(秒) <input type="number" v-model="duration" min="4" max="60"></label>
+              <label style="flex:1;min-width:100px">时长(秒) <input type="number" v-model="duration" min="-1" :max="modelMaxDuration()"></label>
               <label style="flex:1;min-width:100px">分辨率
-                <select v-model="resolution"><option>720p</option><option>1080p</option></select>
+                <select v-model="resolution">
+                  <option v-for="r in modelResolutions()" :value="r">{{ r }}</option>
+                </select>
               </label>
               <label style="flex:1;min-width:100px">比例
-                <select v-model="ratio"><option>16:9</option><option>9:16</option><option>1:1</option></select>
+                <select v-model="ratio">
+                  <option>16:9</option><option>9:16</option><option>1:1</option>
+                  <option>4:3</option><option>3:4</option><option>21:9</option>
+                  <option>adaptive</option>
+                </select>
               </label>
               <label style="flex:1;min-width:80px">次数 <input type="number" v-model="repeat" min="1" max="4"></label>
             </div>
+            <p class="hint" style="margin-top:6px">
+              时长填 <strong>-1</strong> = 由模型自动决定。<strong>视频编辑</strong>（提示词含「删除/去掉、修改/替换/改成、增加/加上」）
+              必须时长 -1 + 比例 adaptive；<strong>视频延长</strong>（「续写、向前/向后延长」）必须比例 adaptive；
+              <strong>首帧/首尾帧</strong>也必须比例 adaptive。普通参考生视频填正常秒数即可。
+            </p>
             <button @click="createJob()" :disabled="submitting" class="primary" style="margin-top:8px;width:100%">
               {{ submitting ? statusText : '开始生成' }}
             </button>
@@ -638,7 +679,7 @@
       <section class="stats-panel">
         <h2>按用户统计</h2>
         <table class="ip-stats-table">
-          <thead><tr><th>用户</th><th>Seedance<br><small style="font-weight:400;color:#94a3b8">秒</small></th><th>Nano Banana<br><small style="font-weight:400;color:#94a3b8">张</small></th><th>Dreamina<br><small style="font-weight:400;color:#94a3b8">张/秒</small></th><th>人像生成<br><small style="font-weight:400;color:#94a3b8">秒</small></th></tr></thead>
+          <thead><tr><th>用户</th><th>Seedance<br><small style="font-weight:400;color:#94a3b8">秒</small></th><th>图像生成模块<br><small style="font-weight:400;color:#94a3b8">张</small></th><th>Dreamina<br><small style="font-weight:400;color:#94a3b8">张/秒</small></th><th>人像生成<br><small style="font-weight:400;color:#94a3b8">秒</small></th></tr></thead>
           <tbody>
             <tr v-for="(stats, uname) in byUser">
               <td>{{ uname }}</td>
@@ -662,7 +703,7 @@
           </span>
         </div>
         <table class="ip-stats-table" v-if="daySnapshot">
-          <thead><tr><th>用户</th><th>Seedance<br><small style="font-weight:400;color:#94a3b8">秒</small></th><th>Nano Banana<br><small style="font-weight:400;color:#94a3b8">张</small></th><th>Dreamina<br><small style="font-weight:400;color:#94a3b8">张/秒</small></th><th>人像生成<br><small style="font-weight:400;color:#94a3b8">秒</small></th></tr></thead>
+          <thead><tr><th>用户</th><th>Seedance<br><small style="font-weight:400;color:#94a3b8">秒</small></th><th>图像生成模块<br><small style="font-weight:400;color:#94a3b8">张</small></th><th>Dreamina<br><small style="font-weight:400;color:#94a3b8">张/秒</small></th><th>人像生成<br><small style="font-weight:400;color:#94a3b8">秒</small></th></tr></thead>
           <tbody>
             <tr v-for="(stats, uname) in (daySnapshot.by_user || {})">
               <td>{{ uname }}</td>
@@ -705,7 +746,7 @@
             <tr>
               <th>用户</th>
               <th>Seedance<br><small style="font-weight:400;color:#94a3b8">秒</small></th>
-              <th>Nano Banana<br><small style="font-weight:400;color:#94a3b8">张</small></th>
+              <th>图像生成模块<br><small style="font-weight:400;color:#94a3b8">张</small></th>
               <th>Dreamina<br><small style="font-weight:400;color:#94a3b8">张/秒</small></th>
               <th>人像生成<br><small style="font-weight:400;color:#94a3b8">秒</small></th>
               <th>合计<br><small style="font-weight:400;color:#94a3b8">张/秒</small></th>

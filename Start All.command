@@ -4,13 +4,13 @@ cd "$SCRIPT_DIR/portal"
 
 echo "Stopping previous instances (projects ports only)..."
 PROJECT_ROOT="$SCRIPT_DIR"
-for port in 8787 8797 8888 9089 9090; do
+for port in 8787 8797 8888 8891 8893 9089 9090; do
   pids=$(lsof -ti :$port 2>/dev/null | sort -u)
   for pid in $pids; do
     # Only stop Python app.py processes launched from this project.
     cmd=$(ps -p "$pid" -o command= 2>/dev/null)
     cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
-    if echo "$cmd" | grep -q "app.py"; then
+    if echo "$cmd" | grep -qE "app\.py|app_fastapi:app"; then
       case "$cwd" in
         "$PROJECT_ROOT"/*)
           kill "$pid" 2>/dev/null && echo "  Stopping app.py on port $port (pid $pid)"
@@ -26,12 +26,12 @@ for port in 8787 8797 8888 9089 9090; do
 done
 
 sleep 1
-for port in 8787 8797 8888 9089 9090; do
+for port in 8787 8797 8888 8891 8893 9089 9090; do
   pids=$(lsof -ti :$port 2>/dev/null | sort -u)
   for pid in $pids; do
     cmd=$(ps -p "$pid" -o command= 2>/dev/null)
     cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
-    if echo "$cmd" | grep -q "app.py"; then
+    if echo "$cmd" | grep -qE "app\.py|app_fastapi:app"; then
       case "$cwd" in
         "$PROJECT_ROOT"/*)
           kill -9 "$pid" 2>/dev/null && echo "  Force stopped stuck app.py on port $port (pid $pid)"
