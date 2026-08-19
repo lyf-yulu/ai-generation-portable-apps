@@ -191,7 +191,11 @@ async def _fetch_catalog(app: str) -> list:
                             _prompt_port(),
                             {"port_id": "first_frame", "media_type": "image", "min_items": 0, "max_items": 1},
                             {"port_id": "last_frame", "media_type": "image", "min_items": 0, "max_items": 1},
-                            {"port_id": "reference_images", "media_type": "image", "min_items": 0, "max_items": 9},
+                            # Seedance 参考图端口绑定素材库（与上游 932aaac 一致）：
+                            # 端口既接受普通上传也接受素材库资产，画布素材库面板
+                            # 按此端口把选中的人像加进参考集合。
+                            {"port_id": "reference_images", "media_type": "image",
+                             "min_items": 0, "max_items": 9, "asset_kind": "library"},
                         ],
                     })
     except Exception:

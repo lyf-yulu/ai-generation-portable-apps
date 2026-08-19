@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import mimetypes
 import re
 import secrets
@@ -18,6 +19,8 @@ from pathlib import Path
 from fastapi import FastAPI, Request, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse, Response
 
+import ark_library
+import comfy_api
 import store
 import translate
 from portal_identity import verify_portal_identity
@@ -154,6 +157,12 @@ async def api_upload_asset(request: Request, file: UploadFile = File(...),
     user = request.state.user
     if media_type not in ("image", "video", "audio"):
         return _error(400, "invalid_request", "媒体类型无效。")
+    # 素材库（kind=library）只收人像图：与上游一致（ark_assets._IMAGE_MIMES），
+    # 生成的视频要拿它做资产引用，视频/音频进不了 AIGC 素材库。
+    if kind not in ("reference", "library"):
+        return _error(400, "invalid_request", "资产类型无效。")
+    if kind == "library" and media_type != "image":
+        return _error(400, "invalid_request", "素材库只支持图片。")
     payload = await file.read()
     if not payload:
         # 前端要求 size_bytes >= 1（web/src/api/assets.ts:24），空文件必须拒绝。
@@ -177,6 +186,40 @@ async def api_upload_asset(request: Request, file: UploadFile = File(...),
     path = user_dir / f"{asset_id}{ext}"
     path.write_bytes(payload)
 
+    if kind == "library":
+        if mime not in ("image/png", "image/jpeg", "image/webp"):
+            path.unlink(missing_ok=True)
+            return _error(400, "invalid_request", "素材库只支持 10MB 以内的 PNG/JPEG/WebP 图片。")
+        cfg = ark_library.load_config()
+        if cfg is None:
+            # code 与上游一致，前端统一走「上传失败，请重试」的提示。
+            path.unlink(missing_ok=True)
+            return _error(503, "LIBRARY_ASSETS_UNAVAILABLE", "素材库未配置。",
+                          retryable=True, phase="library")
+        # 传方舟是同步串行（TOS PUT + CreateAsset + GetAsset 轮询），
+        # 放到线程池跑，别阻塞事件循环。本地副本无论如何都保留 ——
+        # 画布渲染与生成取字节走本地文件，不依赖方舟的可达性。
+        try:
+            upstream_id, status = await asyncio.to_thread(
+                ark_library.upload_image, cfg, str(path), mime, len(payload),
+                file.filename or "portrait.png")
+        except ValueError as exc:
+            path.unlink(missing_ok=True)
+            return _error(400, "invalid_request", str(exc))
+        except ark_library.LibraryError as exc:
+            path.unlink(missing_ok=True)
+            return _error(502 if exc.retryable else 422, "UPSTREAM_UNAVAILABLE",
+                          str(exc), retryable=exc.retryable, phase="library")
+        except ark_library.LibraryInvalid as exc:
+            path.unlink(missing_ok=True)
+            return _error(502, "UPSTREAM_INVALID", str(exc), phase="library")
+        row = store.insert_asset(user["user_id"], asset_id, media_type, mime,
+                                 len(payload), str(path), kind="library",
+                                 status=status, service_id="ark-video",
+                                 upstream_asset_id=upstream_id)
+        # 前端 libraryAssetFromResponse 要求 content_url（web/src/api/assets.ts）。
+        return {**row, "content_url": f"/api/v1/assets/{asset_id}/content"}
+
     row = store.insert_asset(user["user_id"], asset_id, media_type, mime, len(payload), str(path))
     # 前端现在要求上传响应必须带 content_url（web/src/api/assets.ts:37-44
     # ownedAssetFromResponse），存裸路径 —— 挂载前缀由前端 safeApiPath 处理。
@@ -191,10 +234,35 @@ async def api_get_asset(request: Request, asset_id: str):
         row = store.get_asset(request.state.user["user_id"], asset_id)
     except store.NotFoundError:
         return _error(404, "not_found", "资产不存在。")
-    return {"asset_id": row["asset_id"], "kind": "reference", "status": "active",
+    # 素材库资产还在方舟侧 Processing 时刷新状态（前端面板 5s 轮询走这里，
+    # web/src/components/canvas/asset-library-panel.tsx settleProcessing）。
+    if row["kind"] == "library" and row["status"] == "processing":
+        cfg = ark_library.load_config()
+        if cfg is not None and row.get("upstream_asset_id"):
+            try:
+                status = await asyncio.to_thread(
+                    ark_library.get_asset_status, cfg, row["upstream_asset_id"])
+            except (ark_library.LibraryError, ark_library.LibraryInvalid):
+                status = "processing"
+            updated = store.update_asset_status(request.state.user["user_id"], asset_id, status)
+            if updated is not None:
+                row = updated
+    return {"asset_id": row["asset_id"], "kind": row["kind"], "status": row["status"],
             "media_type": row["media_type"], "mime_type": row["mime_type"],
             "size_bytes": int(row["size_bytes"]),
             "content_url": f"/api/v1/assets/{asset_id}/content"}
+
+
+@app.get("/api/v1/library-assets")
+async def api_list_library_assets(request: Request):
+    rows = store.list_library_assets(request.state.user["user_id"])
+    return {"assets": [
+        {"asset_id": r["asset_id"], "kind": "library", "status": r["status"],
+         "media_type": r["media_type"], "mime_type": r["mime_type"],
+         "size_bytes": int(r["size_bytes"]),
+         "content_url": f"/api/v1/assets/{r['asset_id']}/content"}
+        for r in rows
+    ]}
 
 
 @app.get("/api/v1/assets/{asset_id}/content")
@@ -253,6 +321,7 @@ async def api_prompt_skills():
 # --------------------------------------------------------- models / jobs
 
 app.include_router(translate.router)
+app.include_router(comfy_api.router)
 
 
 # ------------------------------------------------------------ static / SPA
