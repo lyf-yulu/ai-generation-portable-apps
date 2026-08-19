@@ -324,6 +324,13 @@ app.include_router(translate.router)
 app.include_router(comfy_api.router)
 
 
+@app.exception_handler(comfy_api._HTTP)
+async def _comfy_http_handler(request: Request, exc):
+    return JSONResponse(status_code=exc.status, content={
+        "code": exc.code, "message": exc.message, "retryable": exc.retryable,
+        "request_id": "canvas", "phase": "request"})
+
+
 # ------------------------------------------------------------ static / SPA
 
 @app.get("/{requested_path:path}")

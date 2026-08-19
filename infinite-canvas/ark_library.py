@@ -11,12 +11,11 @@ TOS SigV4 PUT 传对象 → TOS 预签名 GET URL → OpenAPI v4 签名 CreateAs
 
 配置：infinite-canvas/state/asset-library.json（gitignored），
 模板见 infinite-canvas/config/asset-library.example.json。
-SK 可能是控制台复制出来的 base64，读配置时规范化（normalize_secret_key）。
+SK 一律按原始值使用，不做 base64 解码（原因见 load_config 注释）。
 """
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import hmac
 import json
@@ -59,19 +58,6 @@ class LibraryInvalid(Exception):
 
 # ------------------------------------------------------------------- 配置
 
-def normalize_secret_key(value: str) -> str:
-    """控制台复制出的 SK 是 base64，解码成明文；明文则原样返回。"""
-    try:
-        decoded = base64.b64decode(value.encode("utf-8"), validate=True)
-        if decoded and base64.b64encode(decoded) == value.encode("utf-8"):
-            text = decoded.decode("utf-8")
-            if text.isprintable() and not any(ord(c) < 32 or ord(c) == 127 for c in text):
-                return text
-    except (ValueError, UnicodeError):
-        pass
-    return value
-
-
 def load_config() -> dict | None:
     """读取并校验素材库配置。缺失或非法一律返回 None —— 调用方按 503 处理。"""
     try:
@@ -95,9 +81,14 @@ def load_config() -> dict | None:
         return None
     cfg = {
         "ark_access_key": data["ark_access_key"].strip(),
-        "ark_secret_key": normalize_secret_key(data["ark_secret_key"]),
+        # SK 一律按原始值使用，不做 base64 解码。本仓库的密钥沿革自
+        # volcengine-portrait/config.json，那里约定 SK 就是原始值
+        # （CLAUDE.md「Volcengine Portrait 子应用要点」）。而火山控制台复制出的
+        # SK 恰好常常是合法 base64（60 字符），自动解码会把原始值改掉 →
+        # SignatureDoesNotMatch。需要解码时由运维在配置文件里直接存解码后的值。
+        "ark_secret_key": data["ark_secret_key"].strip(),
         "tos_access_key": data["tos_access_key"].strip(),
-        "tos_secret_key": normalize_secret_key(data["tos_secret_key"]),
+        "tos_secret_key": data["tos_secret_key"].strip(),
         "tos_bucket": data["tos_bucket"],
         "tos_region": data["tos_region"],
         "project_name": str(data.get("project_name") or "Seedance2.0")[:64],
@@ -202,7 +193,11 @@ def _tos_presigned_get_url(cfg: dict, object_key: str) -> str:
               "X-Tos-SignedHeaders": "host"}
     canonical_query = "&".join(f"{quote(k, safe='')}={quote(values[k], safe='')}" for k in sorted(values))
     canonical_uri = "/" + quote(object_key, safe="/")
-    canonical_request = f"GET\n{canonical_uri}\n{canonical_query}\nhost:{host}\nhost\nUNSIGNED-PAYLOAD"
+    # canonical_headers 以 \n 结尾，模板再补一个 \n 才是 TOS 认可的形式
+    # （与 volcengine-portrait/app.py:246-254 生产实现一致；缺这个空行会
+    # SignatureDoesNotMatch —— 实测比对过 TOS 回显的 StringToSign）。
+    canonical_headers = f"host:{host}\n"
+    canonical_request = f"GET\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\nhost\nUNSIGNED-PAYLOAD"
     string_to_sign = f"TOS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{_sha256_hex(canonical_request.encode('utf-8'))}"
     signature = hmac.new(_signing_key(cfg["tos_secret_key"], date_stamp, cfg["tos_region"], "tos"),
                          string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -222,7 +217,18 @@ def _openapi_call(cfg: dict, action: str, payload: dict) -> dict:
     if response.status_code in {408, 429} or response.status_code >= 500:
         raise LibraryError("素材库服务不可用。", retryable=True)
     if response.status_code < 200 or response.status_code >= 300:
-        raise LibraryError("素材库拒绝了该请求。")
+        # 把方舟的业务错误透传给用户（如「Width must be between 300px and
+        # 6000px」），比一句笼统的「被拒绝」可诊断得多。
+        detail = ""
+        try:
+            payload = response.json()
+            error = payload.get("ResponseMetadata", {}).get("Error", {}) if isinstance(payload, dict) else {}
+            message = error.get("Message")
+            if isinstance(message, str) and message:
+                detail = message[:200]
+        except (ValueError, TypeError):
+            detail = ""
+        raise LibraryError(f"素材库拒绝了该请求：{detail}" if detail else "素材库拒绝了该请求。")
     content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if content_type != "application/json":
         raise LibraryInvalid("素材库返回了无法解析的响应。")

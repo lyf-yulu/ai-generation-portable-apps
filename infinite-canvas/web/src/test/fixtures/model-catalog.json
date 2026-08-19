@@ -528,11 +528,13 @@
           },
           "image_size": {
             "type": "string",
-            "enum": [
-              "1K",
-              "1.5K",
-              "2K"
-            ],
+            "x-ark-size": {
+              "presets": [
+                "1K",
+                "1.5K",
+                "2K"
+              ]
+            },
             "default": "2K",
             "title": "尺寸"
           },
@@ -644,7 +646,8 @@
           "port_id": "reference_images",
           "media_type": "image",
           "min_items": 0,
-          "max_items": 9
+          "max_items": 9,
+          "asset_kind": "library"
         }
       ]
     },
@@ -729,7 +732,8 @@
           "port_id": "reference_images",
           "media_type": "image",
           "min_items": 0,
-          "max_items": 9
+          "max_items": 9,
+          "asset_kind": "library"
         }
       ]
     },
@@ -814,7 +818,8 @@
           "port_id": "reference_images",
           "media_type": "image",
           "min_items": 0,
-          "max_items": 9
+          "max_items": 9,
+          "asset_kind": "library"
         }
       ]
     },
@@ -899,7 +904,8 @@
           "port_id": "reference_images",
           "media_type": "image",
           "min_items": 0,
-          "max_items": 9
+          "max_items": 9,
+          "asset_kind": "library"
         }
       ]
     }
