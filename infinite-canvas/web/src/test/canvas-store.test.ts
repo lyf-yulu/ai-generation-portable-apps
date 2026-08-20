@@ -147,6 +147,27 @@ describe("canvas graph persistence", () => {
         expect(stored.nodes[0].metadata?.graph?.role).toBe("prompt");
     });
 
+    it("sanitizes node scales when normalizing stored projects", () => {
+        const source: CanvasProjectInput = {
+            ...legacyProject("scaled"),
+            nodes: [
+                { id: "ok", type: CanvasNodeType.Text, title: "OK", position: { x: 0, y: 0 }, width: 200, height: 100, scale: 0.5 },
+                { id: "high", type: CanvasNodeType.Text, title: "High", position: { x: 0, y: 0 }, width: 200, height: 100, scale: 99 },
+                { id: "low", type: CanvasNodeType.Text, title: "Low", position: { x: 0, y: 0 }, width: 200, height: 100, scale: 0.01 },
+                { id: "bad", type: CanvasNodeType.Text, title: "Bad", position: { x: 0, y: 0 }, width: 200, height: 100, scale: "abc" as unknown as number },
+                { id: "plain", type: CanvasNodeType.Text, title: "Plain", position: { x: 0, y: 0 }, width: 200, height: 100 },
+            ],
+        };
+        useCanvasStore.getState().replaceProjects([source]);
+
+        const nodes = useCanvasStore.getState().openProject("scaled")!.nodes;
+        expect(nodes.find((node) => node.id === "ok")?.scale).toBe(0.5);
+        expect(nodes.find((node) => node.id === "high")?.scale).toBe(4);
+        expect(nodes.find((node) => node.id === "low")?.scale).toBe(0.25);
+        expect(nodes.find((node) => node.id === "bad")?.scale).toBeUndefined();
+        expect(nodes.find((node) => node.id === "plain")?.scale).toBeUndefined();
+    });
+
     it("normalizes old persisted projects and marks their sync metadata as legacy", () => {
         const source = legacyProject();
         const migrated = migrateCanvasPersistedState({ projects: [source] }, 0);

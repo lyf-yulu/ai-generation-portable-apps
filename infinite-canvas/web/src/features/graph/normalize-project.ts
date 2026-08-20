@@ -1,6 +1,7 @@
 import { GRAPH_SCHEMA_VERSION, STANDARD_MODEL_INPUT_PORTS, assertSafeGraphInputPorts, assertSafeGraphPortId, assertSafeLegacyGraphInputPortIds, deriveResultAssetId, graphInputPortDescriptor, isGraphNodeRole, isGraphPortValueType, type CanvasGraphNodeMetadata, type GraphInputPortDescriptor, type GraphMediaType, type GraphParameterValue, type GraphPortValueType } from "@/features/graph/contracts";
 import type { NodeDefinition } from "@/features/nodes/types";
 import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
+import { normalizeNodeScale } from "@/lib/canvas/node-scale";
 import { CanvasNodeType, type CanvasConnection, type CanvasNodeData, type CanvasNodeMetadata } from "@/types/canvas";
 
 export class UnsupportedGraphSchemaError extends Error {
@@ -129,15 +130,17 @@ function canonicalJson(value: unknown): string {
 
 function normalizeNode(node: CanvasNodeInput): CanvasNodeData {
     const metadata = node.metadata ? { ...node.metadata } : undefined;
-    if (!isBuiltInGraphNode(node.type)) return { ...node, position: { ...node.position }, metadata: metadata as CanvasNodeMetadata | undefined };
+    const { scale: rawScale, ...rest } = node;
+    const scale = normalizeNodeScale(rawScale);
+    const base = { ...rest, position: { ...node.position }, ...(scale === undefined ? {} : { scale }) };
+    if (!isBuiltInGraphNode(node.type)) return { ...base, metadata: metadata as CanvasNodeMetadata | undefined };
     const graph = normalizeGraphMetadata(node, metadata);
     if (node.type === "comfy.workflow") {
         // A later execution slice must re-authorize this ID/revision server-side; local project data never proves assignment.
-        return { ...node, position: { ...node.position }, metadata: { status: safeCanvasNodeStatus(metadata?.status), graph } };
+        return { ...base, metadata: { status: safeCanvasNodeStatus(metadata?.status), graph } };
     }
     return {
-        ...node,
-        position: { ...node.position },
+        ...base,
         metadata: { ...metadata, graph },
     };
 }

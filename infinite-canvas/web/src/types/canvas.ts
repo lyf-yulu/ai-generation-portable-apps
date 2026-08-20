@@ -86,6 +86,8 @@ export type CanvasNodeData = {
     position: Position;
     width: number;
     height: number;
+    /** Node-level zoom relative to the node's base size; 1 is the real size at generation time. */
+    scale?: number;
     metadata?: CanvasNodeMetadata;
 };
 

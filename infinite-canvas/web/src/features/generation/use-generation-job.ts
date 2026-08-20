@@ -71,9 +71,31 @@ export function useGenerationJob(options: Options = {}) {
         useGenerationTasks.getState().upsert({ jobId, title: refAtStart?.request.prompt.slice(0, 32) || jobId, status: "queued", sourceNodeId: refAtStart?.sourceNodeId });
         const signal = new AbortController(); controllers.current.set(jobId, signal);
         let wait = optionsRef.current.pollDelayMs ?? 1_000;
+        let missingAttempts = 0;
         try {
             while (!signal.signal.aborted && (!captured || isStorageLeaseActive(captured))) {
-                const job = await apiRef.current.fetch(jobId, signal.signal);
+                let job: JobState;
+                try {
+                    job = await apiRef.current.fetch(jobId, signal.signal);
+                } catch (error) {
+                    if (error instanceof DOMException && error.name === "AbortError") return;
+                    const missing = error instanceof ApiRequestError && error.code === "JOB_NOT_FOUND";
+                    if (missing) missingAttempts += 1;
+                    if (!missing || missingAttempts < 3) {
+                        await delay(wait, signal.signal);
+                        wait = Math.min(wait * 2, 10_000);
+                        continue;
+                    }
+                    const ref = refs.current.get(jobId);
+                    refs.current.delete(jobId);
+                    await persist();
+                    const message = generationErrorMessage(error);
+                    publish({ status: "failed", jobId, message, retryable: true }, captured);
+                    useGenerationTasks.getState().upsert({ jobId, title: ref?.request.prompt.slice(0, 32) || jobId, status: "failed", sourceNodeId: ref?.sourceNodeId });
+                    if (ref) optionsRef.current.onFailed?.({ request: ref.request, projectId: ref.projectId, sourceNodeId: ref.sourceNodeId, message });
+                    return;
+                }
+                missingAttempts = 0;
                 const status = stateFor(job);
                 optionsRef.current.onStateChanged?.(job, refs.current.get(jobId));
                 publish({ status, jobId }, captured);

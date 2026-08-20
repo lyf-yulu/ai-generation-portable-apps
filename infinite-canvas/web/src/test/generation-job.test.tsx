@@ -2,6 +2,7 @@ import { act, cleanup, render, renderHook, screen, waitFor } from "@testing-libr
 import { afterEach, expect, it, vi } from "vitest";
 
 import { clearStorageScope, setScopedStoreFactoryForTest, setStorageScope } from "@/storage/scope";
+import { ApiRequestError } from "@/api/client";
 import { useGenerationJob } from "@/features/generation/use-generation-job";
 import { clearGenerationTasks, useGenerationTasks } from "@/features/generation/use-generation-job";
 import { TaskTray } from "@/components/layout/task-tray";
@@ -201,25 +202,88 @@ it("cancels an old scope poll and never publishes it into a new scope", async ()
         ),
     };
     const { result } = renderHook(() => useGenerationJob({ api: api as any, pollDelayMs: 1 }));
-    void act(async () => result.current.resume("j-a"));
+    await act(async () => { void result.current.resume("j-a"); });
     await waitFor(() => expect(api.fetch).toHaveBeenCalled());
     await setStorageScope({ environment: "test", userId: "u-b" });
     await act(async () => resolve({ id: "j-a", status: "succeeded", result_url: "/api/v1/results/r-a" }));
     expect(result.current.state.status).not.toBe("succeeded");
 });
 
-it("creates typed same-origin result nodes once with a safe source offset", () => {
+it("keeps polling through a transient fetch failure and delivers the succeeded result live", async () => {
+    await setStorageScope({ environment: "test", userId: "u-a" });
+    const api = {
+        create: vi.fn(),
+        fetch: vi.fn()
+            .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+            .mockResolvedValueOnce({ id: "j-retry", status: "queued" })
+            .mockResolvedValue({ id: "j-retry", status: "succeeded", result_url: "/api/v1/results/r-1" }),
+    };
+    const onSucceeded = vi.fn();
+    const { result } = renderHook(() => useGenerationJob({ api: api as any, pollDelayMs: 1, onSucceeded }));
+
+    await act(async () => result.current.resume("j-retry"));
+    await waitFor(() => expect(onSucceeded).toHaveBeenCalledWith(expect.objectContaining({ id: "j-retry", result_url: "/api/v1/results/r-1" }), undefined));
+    expect(result.current.state.status).toBe("succeeded");
+    expect(api.fetch.mock.calls.length).toBeGreaterThanOrEqual(3);
+});
+
+it("stops polling a permanently missing job, clears its saved reference and reports the failure", async () => {
+    const savedWrites: unknown[] = [];
+    setScopedStoreFactoryForTest(
+        () =>
+            ({
+                getItem: async () => [{ jobId: "j-missing", projectId: "project-a", sourceNodeId: "model-a", request: { operation: "image.generate", model_id: "m", prompt: "p", params: {}, asset_ids: [], idempotency_key: "key" } }],
+                setItem: async (_name: string, value: unknown) => { savedWrites.push(value); },
+                removeItem: async () => undefined,
+                iterate: async () => undefined,
+            }) as never,
+    );
+    await setStorageScope({ environment: "test", userId: "u-a" });
+    const missing = new ApiRequestError({ code: "JOB_NOT_FOUND", message: "The job was not found.", retryable: false, request_id: "r", phase: "response" });
+    const api = { create: vi.fn(), fetch: vi.fn().mockRejectedValue(missing) };
+    const onFailed = vi.fn();
+    const { result } = renderHook(() => useGenerationJob({ api: api as any, pollDelayMs: 1, onFailed }));
+
+    await waitFor(() => expect(onFailed).toHaveBeenCalledTimes(1));
+    expect(onFailed).toHaveBeenCalledWith(expect.objectContaining({ projectId: "project-a", sourceNodeId: "model-a", message: expect.any(String) }));
+    expect(result.current.state).toMatchObject({ status: "failed", jobId: "j-missing" });
+    expect(api.fetch.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(api.fetch.mock.calls.length).toBeLessThanOrEqual(4);
+    const lastWrite = savedWrites.at(-1);
+    expect(JSON.stringify(lastWrite)).not.toContain("j-missing");
+});
+
+it("creates typed same-origin result nodes once beside their source node", () => {
     const source = { id: "source", type: "text", title: "source", position: { x: 10, y: 20 }, width: 100, height: 100 };
     const image = createResultNode({ id: "image-job", operation: "image.generate", status: "succeeded", result_url: "/api/v1/results/image" }, source);
     const video = createResultNode({ id: "video-job", operation: "video.generate", status: "succeeded", result_url: "/api/v1/results/video" });
     expect(image).toMatchObject({
         type: "image",
-        position: { x: 58, y: 68 },
+        position: { x: 158, y: 20 },
         metadata: { content: "/api/v1/results/image", sourceJobId: "image-job", graph: { role: "result", inputPortId: "result", outputPortId: "media", mediaType: "image", jobId: "image-job" } },
     });
     expect(video).toMatchObject({ metadata: { graph: { role: "result", inputPortId: "result", outputPortId: "media", mediaType: "video", jobId: "video-job" } } });
     expect(video).toMatchObject({ type: "video", position: { x: 80, y: 80 } });
     expect(appendResultNode([image], { id: "image-job", operation: "image.generate", status: "succeeded", result_url: "/api/v1/results/image" }, source)).toHaveLength(1);
+});
+
+it("sizes result nodes from the generation settings", () => {
+    const model: CanvasNodeData = { id: "model", type: "config", title: "图片生成", position: { x: 0, y: 0 }, width: 340, height: 300, metadata: { params: {} } };
+    const landscape = createResultNode({ id: "j-1", operation: "image.generate", status: "succeeded", result_url: "/api/v1/results/j-1" }, { ...model, metadata: { params: { ratio: "16:9", size: "2K" } } });
+    expect(landscape.width).toBe(3641);
+    expect(landscape.height).toBe(2048);
+
+    const portrait = createResultNode({ id: "j-2", operation: "image.generate", status: "succeeded", result_url: "/api/v1/results/j-2" }, { ...model, metadata: { params: { ratio: "3:4", size: "1K" } } });
+    expect(portrait.width).toBe(1024);
+    expect(portrait.height).toBe(1365);
+
+    const custom = createResultNode({ id: "j-3", operation: "image.generate", status: "succeeded", result_url: "/api/v1/results/j-3" }, { ...model, metadata: { params: { size: "1024x768" } } });
+    expect(custom.width).toBe(1024);
+    expect(custom.height).toBe(768);
+
+    const fallback = createResultNode({ id: "j-4", operation: "image.generate", status: "succeeded", result_url: "/api/v1/results/j-4" }, model);
+    expect(fallback.width).toBe(340);
+    expect(fallback.height).toBe(240);
 });
 
 it("creates one reusable result node per protected multi-result item", () => {

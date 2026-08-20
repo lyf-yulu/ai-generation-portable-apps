@@ -132,6 +132,15 @@ export default function CanvasProjectPage() {
         },
         [id, readOnly, updateProject],
     );
+    const changeNodeScale = useCallback(
+        (nodeId: string, scale: number) => {
+            if (readOnly) return;
+            const current = useCanvasStore.getState().openProject(id);
+            if (!current) return;
+            updateProject(id, { nodes: current.nodes.map((node) => (node.id === nodeId ? { ...node, scale } : node)) });
+        },
+        [id, readOnly, updateProject],
+    );
 
     useEffect(() => {
         setSelectedNodeIds(new Set());
@@ -892,6 +901,19 @@ export default function CanvasProjectPage() {
                                     onContextMenu={readOnly ? undefined : openNodeContextMenu}
                                     onPositionChange={moveNode}
                                     onMeasuredSize={recordMeasuredNodeSize}
+                                    onScaleChange={readOnly ? undefined : changeNodeScale}
+                                    overlays={[...ports.targets, ...ports.sources].map((port) => (
+                                        <NodePort
+                                            key={`${port.direction}:${port.portId}`}
+                                            node={measuredNode}
+                                            port={port}
+                                            active={pendingPort?.nodeId === port.nodeId && pendingPort.portId === port.portId && pendingPort.direction === port.direction}
+                                            disabled={readOnly}
+                                            onClick={handlePortClick}
+                                            onPointerDown={handlePortPointerDown}
+                                            onPointerUp={handlePortPointerUp}
+                                        />
+                                    ))}
                                 >
                                     {promptNode ? (
                                         <PromptNodeCard node={node} disabled={readOnly} onTextChange={(text) => updatePromptNode(node.id, text)} />
@@ -913,18 +935,6 @@ export default function CanvasProjectPage() {
                                     ) : (
                                         <GenerationNodeCard node={node} onRetry={readOnly ? undefined : (token) => void generation.retry(token).catch(() => undefined)} onDelete={readOnly ? undefined : () => deleteNodes(new Set([node.id]))} />
                                     )}
-                                    {[...ports.targets, ...ports.sources].map((port) => (
-                                        <NodePort
-                                            key={`${port.direction}:${port.portId}`}
-                                            node={measuredNode}
-                                            port={port}
-                                            active={pendingPort?.nodeId === port.nodeId && pendingPort.portId === port.portId && pendingPort.direction === port.direction}
-                                            disabled={readOnly}
-                                            onClick={handlePortClick}
-                                            onPointerDown={handlePortPointerDown}
-                                            onPointerUp={handlePortPointerUp}
-                                        />
-                                    ))}
                                 </DraggableCanvasNode>
                             );
                         })}

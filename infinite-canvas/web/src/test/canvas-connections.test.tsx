@@ -454,7 +454,8 @@ describe("canvas named-port interactions", () => {
         const edge: CanvasConnection = { id: "measured-edge", fromNodeId: "prompt", fromPortId: "prompt", toNodeId: "model", toPortId: "prompt" };
         const { projectId, unmount } = await renderProject([promptNode("prompt"), modelNode("model", ["prompt"])], [edge]);
         const modelElement = screen.getByTestId("draggable-node-model");
-        const callback = callbacks.get(modelElement);
+        const contentElement = screen.getByTestId("node-content-model");
+        const callback = callbacks.get(contentElement);
         expect(callback).toBeDefined();
 
         act(() => callback?.([{ target: modelElement, contentRect: { width: 240, height: 320 } } as unknown as ResizeObserverEntry], {} as ResizeObserver));
@@ -479,8 +480,9 @@ describe("canvas named-port interactions", () => {
         const edge: CanvasConnection = { id: "edge", fromNodeId: "prompt", fromPortId: "prompt", toNodeId: "model", toPortId: "prompt" };
         const { projectId } = await renderProject([prompt, model], [edge]);
         const modelElement = screen.getByTestId("draggable-node-model");
-        const lateCallback = callbacks.get(modelElement)!;
-        act(() => lateCallback([{ target: modelElement, contentRect: { width: 240, height: 320 } } as unknown as ResizeObserverEntry], {} as ResizeObserver));
+        const contentElement = screen.getByTestId("node-content-model");
+        const lateCallback = callbacks.get(contentElement)!;
+        act(() => lateCallback([{ target: contentElement, contentRect: { width: 240, height: 320 } } as unknown as ResizeObserverEntry], {} as ResizeObserver));
         await waitFor(() => expect(document.querySelector("[data-connection-id='edge']")).toHaveAttribute("d", "M 280 130 C 350 130, 350 240, 420 240"));
 
         fireEvent.keyDown(modelElement, { key: "Enter" });
@@ -492,8 +494,9 @@ describe("canvas named-port interactions", () => {
         await waitFor(() => expect(document.querySelector("[data-connection-id='edge']")).toHaveAttribute("d", "M 280 130 C 350 130, 350 160, 420 160"));
 
         const recreatedElement = screen.getByTestId("draggable-node-model");
-        const secondLateCallback = callbacks.get(recreatedElement)!;
-        act(() => secondLateCallback([{ target: recreatedElement, contentRect: { width: 240, height: 360 } } as unknown as ResizeObserverEntry], {} as ResizeObserver));
+        const recreatedContentElement = screen.getByTestId("node-content-model");
+        const secondLateCallback = callbacks.get(recreatedContentElement)!;
+        act(() => secondLateCallback([{ target: recreatedContentElement, contentRect: { width: 240, height: 360 } } as unknown as ResizeObserverEntry], {} as ResizeObserver));
         fireEvent.keyDown(recreatedElement, { key: "Enter" });
         fireEvent.keyDown(window, { key: "Delete" });
         await waitFor(() => expect(screen.queryByTestId("draggable-node-model")).not.toBeInTheDocument());
